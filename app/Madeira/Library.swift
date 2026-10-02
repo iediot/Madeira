@@ -1859,7 +1859,7 @@ struct LibraryView: View {
         .navigationTitle("")
         .toolbar {
             LibraryLargeTitle(enableJIT: enableJIT)
-            if tab == 0 { libraryToolbar } else { settingsToolbar }
+            jitToolbar
         }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
         .onAppear {
@@ -1875,35 +1875,17 @@ struct LibraryView: View {
             if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
         }
     }
-    @ToolbarContentBuilder private var libraryToolbar: some ToolbarContent {
+    /// Enable JIT, top right on both tabs and always there (disabled once JIT is on),
+    /// so the header does not change between tabs or states.
+    @ToolbarContentBuilder private var jitToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) {
-            Menu {
-                Picker("Library layout", selection: $layout) {
-                    Label("Cards", systemImage: "square.grid.2x2").tag("cards")
-                    Label("Compact cards", systemImage: "square.grid.3x3").tag("compact")
-                    Label("List", systemImage: "list.bullet").tag("list")
-                    Label("Compact list", systemImage: "list.dash").tag("compactList")
-                }
-                Picker("Sort by", selection: $sort) {
-                    Label("Last played", systemImage: "clock").tag("played")
-                    Label("Name", systemImage: "textformat.abc").tag("name")
-                    Label("Recently added", systemImage: "plus").tag("added")
-                    Label("Folder size", systemImage: "internaldrive").tag("size")
-                }
-            } label: { Label("Library options", systemImage: "line.3.horizontal.decrease") }
-        }
-        ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
-    }
-    @ToolbarContentBuilder private var settingsToolbar: some ToolbarContent {
-        if !jitState.enabled {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button(action: enableJIT) {
-                    HStack(spacing: 6) {
-                        Text("Enable JIT")
-                        Image(systemName: "bolt.fill").accessibilityHidden(true)
-                    }
+            Button(action: enableJIT) {
+                HStack(spacing: 6) {
+                    Text("Enable JIT")
+                    Image(systemName: "bolt.fill").accessibilityHidden(true)
                 }
             }
+            .disabled(jitState.enabled)
         }
     }
     private func switchTab(to newTab: Int) {
@@ -1978,37 +1960,72 @@ struct LibraryView: View {
             }
         }
     }
+    /// A round button in the row's style (library options, add executable).
+    @ViewBuilder private func rowIcon(_ systemImage: String) -> some View {
+        if liquidMetal.on {
+            let light = colorScheme == .light
+            Image(systemName: systemImage)
+                .font(.subheadline.weight(.semibold)).foregroundStyle(light ? .black : .white)
+                .shadow(color: (light ? Color.white : .black).opacity(0.75), radius: 2.5)
+                .frame(width: 44, height: 44)
+                .background(LiquidMetalFill())
+        } else {
+            Image(systemName: systemImage)
+                .font(.subheadline.weight(.medium)).frame(width: 44, height: 44)
+                .libraryRowGlass(Circle())
+        }
+    }
+
+    /// The capsule the library's top-row buttons share (Desktop): liquid metal when it
+    /// is on, else the grouped background.
+    @ViewBuilder private func rowPill(_ title: String, systemImage: String) -> some View {
+        if liquidMetal.on {
+            // On the chrome's middle band (dark, or light in light mode), with a soft
+            // halo of the other tone for the moments a highlight passes under it.
+            let light = colorScheme == .light
+            Label(title, systemImage: systemImage)
+                .font(.subheadline.weight(.semibold)).foregroundStyle(light ? .black : .white)
+                .shadow(color: (light ? Color.white : .black).opacity(0.75), radius: 2.5)
+                .padding(.horizontal, 14).frame(minHeight: 44)
+                .background(LiquidMetalFill())
+        } else {
+            Label(title, systemImage: systemImage)
+                .font(.subheadline.weight(.medium)).padding(.horizontal, 14).frame(minHeight: 44)
+                .libraryRowGlass(Capsule())
+        }
+    }
     private var library: some View {
         GeometryReader { viewport in
         ScrollViewReader { reader in
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                // Until JIT is on nothing can start: say so where the games are.
-                if !jitState.enabled {
-                    LibraryJITBanner(enableJIT: enableJIT)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-                HStack {
+                HStack(spacing: 10) {
                     Button { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry } label: {
-                        if liquidMetal.on {
-                            // On the chrome's middle band (dark, or light in light mode), with a soft
-                            // halo of the other tone for the moments a highlight passes under it.
-                            let light = colorScheme == .light
-                            Label("Desktop", systemImage: "desktopcomputer")
-                                .font(.subheadline.weight(.semibold)).foregroundStyle(light ? .black : .white)
-                                .shadow(color: (light ? Color.white : .black).opacity(0.75), radius: 2.5)
-                                .padding(.horizontal, 14).frame(minHeight: 44)
-                                .background(LiquidMetalFill())
-                        } else {
-                            Label("Desktop", systemImage: "desktopcomputer")
-                                .font(.subheadline.weight(.medium)).padding(.horizontal, 14).frame(minHeight: 44)
-                                .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
-                        }
+                        rowPill("Desktop", systemImage: "desktopcomputer")
                     }.buttonStyle(.plain)
-                        .animation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.4), value: liquidMetal.on)
                         .id(LibraryEntry.desktopID)
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
+                    Spacer()
+                    Menu {
+                        Picker("Library layout", selection: $layout) {
+                            Label("Cards", systemImage: "square.grid.2x2").tag("cards")
+                            Label("Compact cards", systemImage: "square.grid.3x3").tag("compact")
+                            Label("List", systemImage: "list.bullet").tag("list")
+                            Label("Compact list", systemImage: "list.dash").tag("compactList")
+                        }
+                        Picker("Sort by", selection: $sort) {
+                            Label("Last played", systemImage: "clock").tag("played")
+                            Label("Name", systemImage: "textformat.abc").tag("name")
+                            Label("Recently added", systemImage: "plus").tag("added")
+                            Label("Folder size", systemImage: "internaldrive").tag("size")
+                        }
+                    } label: { rowIcon("line.3.horizontal.decrease") }
+                        .accessibilityLabel("Library options")
+                    Button { browser = true } label: { rowIcon("plus") }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Add executable")
                 }
+                .animation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.4), value: liquidMetal.on)
                 // The library's sections, as in the fork: Steam (installed and downloading
                 // Steam games, then Not installed), then Other games, the games you added.
                 // Steam games start through Madeira Dock (SteamGames.swift); an installed one
@@ -3089,31 +3106,6 @@ extension View {
     }
 }
 
-/// The library's top card while JIT is off: what is missing and the button that fixes it.
-/// It goes away by itself once the debugger attaches (LibraryJITState, every 2 s).
-struct LibraryJITBanner: View {
-    var enableJIT: () -> Void
-    var body: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "bolt.slash.fill")
-                .font(.title2).foregroundStyle(.yellow)
-                .frame(width: 32)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("JIT is off").font(.headline)
-                Text("Games need JIT to start.").font(.subheadline).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 8)
-            Button(action: enableJIT) {
-                Label("Enable", systemImage: "bolt.fill").font(.subheadline.weight(.semibold))
-            }
-            .buttonStyle(.borderedProminent)
-            .buttonBorderShape(.capsule)
-        }
-        .padding(14)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
-        .accessibilityElement(children: .combine)
-    }
-}
 
 /// Whether the library is scrolling: the ambient light and liquid metal hold still
 /// meanwhile and resume when it settles (iOS 18+; earlier systems keep animating).
@@ -3192,5 +3184,17 @@ enum ArtworkCache {
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
         return UIImage(cgImage: cg)
+    }
+}
+
+extension View {
+    /// The library row's buttons in Liquid Glass (iOS 26), the material of the toolbar's
+    /// buttons; a frosted material before it.
+    @ViewBuilder func libraryRowGlass<S: Shape>(_ shape: S) -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular.interactive(), in: shape)
+        } else {
+            self.background(.regularMaterial, in: shape)
+        }
     }
 }
