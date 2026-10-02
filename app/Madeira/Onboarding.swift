@@ -306,8 +306,6 @@ struct SteamSettingsSection: View {
             }
         } header: {
             Text("Steam")
-        } footer: {
-            Text("Madeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it.")
         }
         .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { signIn.signOut() }

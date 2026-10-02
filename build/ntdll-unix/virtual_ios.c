@@ -630,6 +630,11 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+/* ml2109: the probes in this loop are diagnostics (heap validation, region walks,
+ * trial allocations, thread sampling) and run only with the ml649 switch on. The
+ * pool warming and the footprint line are functional and always run. */
+int madeira_get_diag_enabled( void );
+
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -730,7 +735,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * ios_jit_mappings already records text_offset/text_size per module,
              * so walk exactly those ranges: any .text page whose max_prot has
              * lost EXECUTE is real corruption, with no benign explanation. */
-            if ((cycle % 5) == 0 && rx)
+            if ((cycle % 5) == 0 && rx && madeira_get_diag_enabled())
             {
                 unsigned mi;
                 size_t bad = 0, checked = 0;
@@ -770,7 +775,7 @@ static void *ios_pool_warmer_thread( void *arg )
                     dprintf(2, "[pool-rot] clean: %lu .text pages sampled across %u mappings (cycle=%u)\n",
                             (unsigned long)checked, ios_jit_mapping_count, cycle);
             }
-            if (cycle == 1 || (cycle % 15) == 0)
+            if ((cycle == 1 || (cycle % 15) == 0) && madeira_get_diag_enabled())
             {
                 /* ml469 (wall #79): one-shot proof of whether TCP loopback
                  * works at all under this port — the webhelper's transport
@@ -812,7 +817,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * signal_arm64_ios.c. */
             {
                 extern void ios_pump_sample(void);
-                ios_pump_sample();
+                if (madeira_get_diag_enabled()) ios_pump_sample();
             }
             {
                 task_vm_info_data_t vmi;
@@ -830,6 +835,7 @@ static void *ios_pool_warmer_thread( void *arg )
                      *   vm_allocate(task, &addr, size, 0x33000003)
                      * = ANYWHERE | PURGABLE | VM_MAKE_TAG(51), and the tag picks
                      * the address range. Four variants isolate tag vs purgable. */
+                    if (madeira_get_diag_enabled())
                     {
                         static kern_return_t last[4] = { -1, -1, -1, -1 };
                         static const int fl[4] = { 0x33000003, 0x33000001, 0x00000003, 0x00000001 };
@@ -880,7 +886,7 @@ static void *ios_pool_warmer_thread( void *arg )
             {
                 extern boolean_t malloc_zone_check( malloc_zone_t *zone );
                 static int zone_bad, zone_announced;
-                if (!zone_bad)
+                if (!zone_bad && madeira_get_diag_enabled())
                 {
                     struct timeval t0, t1;
                     int ok;
@@ -915,7 +921,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * addresses identify the owner offline (pool = RX base, FEX bands,
              * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
              * walk is tens of thousands of kernel calls. */
-            if (cycle == 2 || (cycle % 5) == 0)
+            if ((cycle == 2 || (cycle % 5) == 0) && madeira_get_diag_enabled())
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
@@ -11215,7 +11221,34 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
     if (!ios_guest_image_write_enabled()) return 0;
     if (!ios_wow_in_window( base )) return 0;
     if (!(view = find_view( base, size ))) return 0;
-    return (view->protect & SEC_IMAGE) != 0;
+    if (view->protect & SEC_IMAGE) return 1;
+    /* ml2104: ANONYMOUS memory in the window too. Observed: a 32-bit Unity Mono title
+     * (Mono's JIT writes code into its own RWX allocations) faulted 2,000 times on one
+     * store -- "Handled self-modifying code" each time, the untrap's
+     * PAGE_EXECUTE_READWRITE landing in the read-only dead end described at
+     * mprotect_exec -- until [redeliv] terminated the process. The store-emulation path
+     * the note above expected did not catch it. Nothing in a guest window ever runs
+     * from its own VA (the emulator runs its translation out of the JIT pool), so EXEC
+     * has no host meaning for ANY view here, and the SMC contract holds the same way:
+     * the emulator invalidates before it untraps. MADEIRA_GUEST_ANON_WRITE=0 restores
+     * the image-only rule. */
+    {
+        static int anon = -1;
+        if (anon < 0)
+        {
+            const char *s = getenv( "MADEIRA_GUEST_ANON_WRITE" );
+            anon = (s && (*s == '0' || *s == 'n' || *s == 'N')) ? 0 : 1;
+        }
+        if (anon)
+        {
+            static unsigned long n;
+            if (++n <= 8 && !ios_in_mach_exc)
+                dprintf( 2, "[guest-anon] ml2104 #%lu %p+0x%lx: anonymous 32-bit view, EXEC dropped so write can land\n",
+                         n, base, (unsigned long)size );
+            return 1;
+        }
+    }
+    return 0;
 #else
     return 0;
 #endif

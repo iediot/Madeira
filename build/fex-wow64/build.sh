@@ -4,6 +4,9 @@
 # programs. See docs/WOW64.md, "Building". The options are the iOS host build's:
 # FEX_IOS_HOST_BUILD turns on the 32-bit guest window (ENABLE_GUEST_WINDOW),
 # which FEX refuses for the ARM64EC module.
+# The DISABLE_FIND_PACKAGE options keep CMake from picking up a host (e.g. Homebrew)
+# copy of fmt and friends, which cannot link into this Windows DLL; FEX then uses
+# its bundled External/ copies.
 set -eu
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PATH="$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
@@ -16,7 +19,10 @@ if [ ! -f "$B/CMakeCache.txt" ]; then
         -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST \
         -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
         -DBUILD_TESTING=OFF -DBUILD_FEXCONFIG=OFF -DTUNE_ARCH=generic -DTUNE_CPU=none \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON -DCMAKE_DISABLE_FIND_PACKAGE_unordered_dense=ON \
+        -DCMAKE_DISABLE_FIND_PACKAGE_range-v3=ON -DCMAKE_DISABLE_FIND_PACKAGE_xxhash=ON \
+        -DCMAKE_DISABLE_FIND_PACKAGE_Zydis=ON -DCMAKE_DISABLE_FIND_PACKAGE_Zycore=ON
 fi
 cmake --build "$B" --target wow64fex
 cp "$B/Bin/libwow64fex.dll" "$R/app/Madeira/aarch64-windows/xtajit.dll" && ls -l "$R/app/Madeira/aarch64-windows/xtajit.dll"

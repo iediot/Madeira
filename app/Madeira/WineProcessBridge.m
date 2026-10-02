@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/sysctl.h>
+#include <pwd.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -861,6 +862,14 @@ static void *wine_process_thread(void *arg) {
          * so the next log proves it arrived rather than leaving us to infer it. */
         setenv("FNA3D_FORCE_DRIVER", "D3D11", 0);
 
+        /* ml2110: throttle DXMT's [mem-census] report to once per 10 s (memory
+         * warnings always pass) for 64-bit games too. Unthrottled it runs on every
+         * high-water mark: up to 24 reports a second during a load, each about 15
+         * log lines and a Metal currentAllocatedSize round trip. The i386 build
+         * already throttles (util_madeira_switch.hpp); overwrite=0 so an explicit
+         * DXMT_CENSUS_THROTTLE=0 still restores the upstream cadence. */
+        setenv("DXMT_CENSUS_THROTTLE", "1", 0);
+
         /* ml720: make Mono report unhandled exceptions and assembly-load failures.
          *
          * DIAGNOSTIC — revisit before shipping; this is chatty and costs startup time.
@@ -914,6 +923,49 @@ static void *wine_process_thread(void *arg) {
                           aerr.localizedDescription.UTF8String);
             else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
                      session.sampleRate, session.outputLatency * 1000.0);
+        }
+
+        /* ml2106: map the RemoteIO stack now, while the address space is roomy.
+         *
+         * A 32-bit session died inside dyld (a deliberate halt, BRK in dyld, reached
+         * from AudioToolboxCore) the moment the game opened its audio device, with
+         * [holes<64G] reporting 400 MB free and a 292 MB largest gap: without
+         * extended-virtual-addressing the map is small, and the JIT pool plus a 4 GB
+         * guest window had taken most of it before AudioUnitInitialize asked dyld to
+         * load its plugins. Doing that here -- after the pool, but before Wine starts
+         * any 32-bit process and its 4 GB window -- leaves those images mapped for the
+         * driver (audio_null_ios.c, ios_dev_create_locked).
+         * The unit is disposed again: a process gets one RemoteIO, and the driver
+         * creates the real one. MADEIRA_AUDIO_WARMUP=0 skips this. */
+        {
+            const char *w = getenv("MADEIRA_AUDIO_WARMUP");
+            if (!(w && *w == '0')) {
+                AudioComponentDescription desc = {0};
+                desc.componentType = kAudioUnitType_Output;
+                desc.componentSubType = kAudioUnitSubType_RemoteIO;
+                desc.componentManufacturer = kAudioUnitManufacturer_Apple;
+                AudioComponent comp = AudioComponentFindNext(NULL, &desc);
+                AudioUnit au = NULL;
+                OSStatus err = comp ? AudioComponentInstanceNew(comp, &au) : -1;
+                if (!err && au) {
+                    AudioStreamBasicDescription asbd = {0};
+                    asbd.mSampleRate = 48000;
+                    asbd.mFormatID = kAudioFormatLinearPCM;
+                    asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+                    asbd.mFramesPerPacket = 1;
+                    asbd.mChannelsPerFrame = 2;
+                    asbd.mBitsPerChannel = 32;
+                    asbd.mBytesPerFrame = 8;
+                    asbd.mBytesPerPacket = 8;
+                    AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0,
+                                         &asbd, sizeof(asbd));
+                    err = AudioUnitInitialize(au);
+                    if (!err) AudioUnitUninitialize(au);
+                    AudioComponentInstanceDispose(au);
+                }
+                LOG("[audio-warmup] ml2106 RemoteIO mapped before any guest window (status %d)",
+                    (int)err);
+            }
         }
 
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes

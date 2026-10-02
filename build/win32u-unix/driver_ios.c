@@ -233,8 +233,11 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
  * title, style and rects. Driven from the app side (Winios.m
  * ProcessEvents drain) every few seconds in desktop mode — ground truth
  * for "does the taskbar exist / is it visible / where is it". */
+int madeira_get_diag_enabled(void);   /* ml649, ntdll-unix/virtual_ios.c */
+
 void winios_dump_window_tree(void)
 {
+    if (!madeira_get_diag_enabled()) return;   /* ml2111: diagnostics only */
     HWND list[128];
     ULONG size = ARRAY_SIZE(list), i;
     NTSTATUS status;
@@ -672,7 +675,8 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         /* ml529: 200 was too tight — the Steam login popup's events land at
          * #190-200, i.e. exactly where the log ran out, which made a
          * swp=0 signature indistinguishable from absence. */
-        if (n <= 1200 || (n % 128) == 0)
+        /* ml2111: window-position and window-name logging is diagnostics only. */
+        if ((n <= 1200 || (n % 128) == 0) && madeira_get_diag_enabled())
         {
             const RECT *v = &new_rects->visible;
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "

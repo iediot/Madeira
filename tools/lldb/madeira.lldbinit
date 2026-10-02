@@ -1,0 +1,15 @@
+# LLDB init file for running Madeira from Xcode (the Madeira scheme's
+# LLDB Init File). It makes an Xcode launch behave like a StikDebug one.
+#
+# The two settings mirror madeira-jit.js's QSetIgnoredExceptions and
+# QPassSignals: Wine handles bad accesses with its own Mach handlers and
+# signals itself constantly, so LLDB must neither intercept those exceptions
+# nor stop on any signal. SIGTRAP still stops: with a debugger attached it is
+# a crash (an abort in a library), which Xcode should show; continuing passes it. A BRK
+# arrives as an EXC_BREAKPOINT exception, not as this signal.
+settings set platform.plugin.darwin.ignored-exceptions EXC_BAD_ACCESS|EXC_BAD_INSTRUCTION
+process handle -p true -s true -n true SIGTRAP
+process handle -p true -s false -n false SIGHUP SIGINT SIGQUIT SIGILL SIGABRT SIGEMT SIGFPE SIGBUS SIGSEGV SIGSYS SIGPIPE SIGALRM SIGTERM SIGURG SIGTSTP SIGCONT SIGCHLD SIGTTIN SIGTTOU SIGIO SIGXCPU SIGXFSZ SIGVTALRM SIGPROF SIGWINCH SIGINFO SIGUSR1 SIGUSR2
+
+# Answers Madeira's BRK #0xf00d JIT requests (tools/lldb/madeira_jit.py).
+command script import -c madeira_jit.py

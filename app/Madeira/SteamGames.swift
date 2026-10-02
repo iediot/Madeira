@@ -596,63 +596,56 @@ struct SteamGameArtwork: View {
     /// of the art for that glyph to sit on.
     var notDownloaded = false
     @ObservedObject private var steam = SteamOwnedLibrary.shared
-    @State private var index = 0
+    @State private var image: UIImage?
+    @State private var blurred: UIImage?
 
     var body: some View {
-        let urls = SteamGamesRules.artwork(appID: appID) { steam.game($0) }
         GeometryReader { geometry in
             ZStack {
                 Color(uiColor: .secondarySystemFill)
-                if !notDownloaded {
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height).clipped()
+                        .overlay { if notDownloaded, let blurred { SteamArtworkBlurSpot(image: Image(uiImage: blurred), size: geometry.size) } }
+                } else if !notDownloaded {
                     Image(systemName: "gamecontroller.fill").font(.largeTitle).foregroundStyle(.secondary)
-                }
-                AsyncImage(url: index < urls.count ? urls[index] : nil) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable().scaledToFill()
-                            .frame(width: geometry.size.width, height: geometry.size.height).clipped()
-                            .overlay { if notDownloaded { SteamArtworkBlurSpot(image: image, size: geometry.size) } }
-                    case .failure:
-                        Color.clear.onAppear { if index + 1 < urls.count { index += 1 } }
-                    default:
-                        Color.clear
-                    }
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height).clipped()
         }
         .accessibilityHidden(true)
-        .task(id: appID) { index = 0 }
+        // Decoded once at card size and cached (ArtworkCache); the first URL that loads wins.
+        .task(id: appID) {
+            let urls = SteamGamesRules.artwork(appID: appID) { steam.game($0) }
+            if let hit = urls.lazy.compactMap({ ArtworkCache.cached($0) }).first { image = hit }
+            for url in urls {
+                if image == nil { image = await ArtworkCache.image(url) }
+                if image != nil {
+                    if notDownloaded { blurred = await ArtworkCache.blur(url, fraction: 0.03) }
+                    break
+                }
+            }
+        }
     }
 }
 
-/// A soft circle of progressive blur in the middle of a game's artwork, under a
-/// not-downloaded game's download glyph. There is no variable blur for views, so
-/// it stacks copies of the same loaded image, each blurred more and masked to a
-/// smaller radial fade: the blur ramps from the centre out to the sharp artwork
-/// with no edge. Sizes follow the artwork's shorter side, so a list thumbnail gets
-/// the same look as a grid card.
+/// A soft circle of blur in the middle of a not-downloaded game's artwork, under its
+/// download glyph: one pre-blurred copy (ArtworkCache.blur) faded out radially. It
+/// used to stack three live blurs per card, which made the Not installed grid stutter.
 private struct SteamArtworkBlurSpot: View {
     let image: Image
     let size: CGSize
-    /// (blur radius, fade radius) as fractions of the shorter side, outermost first.
-    private static let steps: [(blur: CGFloat, radius: CGFloat)] = [(0.008, 0.55), (0.015, 0.42), (0.025, 0.30)]
 
     var body: some View {
         let side = min(size.width, size.height)
-        ZStack {
-            ForEach(Self.steps.indices, id: \.self) { i in
-                image.resizable().scaledToFill()
-                    .frame(width: size.width, height: size.height).clipped()
-                    .blur(radius: side * Self.steps[i].blur, opaque: true)
-                    .mask {
-                        RadialGradient(stops: [.init(color: .black, location: 0), .init(color: .black.opacity(0.85), location: 0.35),
-                                               .init(color: .black.opacity(0.35), location: 0.7), .init(color: .clear, location: 1)],
-                                       center: .center, startRadius: 0, endRadius: side * Self.steps[i].radius)
-                    }
+        image.resizable().scaledToFill()
+            .frame(width: size.width, height: size.height).clipped()
+            .mask {
+                RadialGradient(stops: [.init(color: .black, location: 0), .init(color: .black.opacity(0.85), location: 0.35),
+                                       .init(color: .black.opacity(0.35), location: 0.7), .init(color: .clear, location: 1)],
+                               center: .center, startRadius: 0, endRadius: side * 0.5)
             }
-        }
-        .allowsHitTesting(false)
+            .allowsHitTesting(false)
     }
 }
 
@@ -728,13 +721,13 @@ private struct SteamGameCell: View {
                 VStack(alignment: .leading, spacing: 6) {
                     SteamGameArtwork(appID: item.id, notDownloaded: notDownloaded).aspectRatio(2.0 / 3.0, contentMode: .fit)
                         .overlay { overlay(download) }
-                        .overlay { if notDownloaded { notDownloadedFace(.largeTitle) } }
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay { if notDownloaded { notDownloadedFace(.title) } }
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
                         .modifier(LibraryCardArtworkPress { pressed, bounds in
                             AmbientGlowItem(id: "steam-\(item.id)", seed: item.id, art: .steam(item.id), dimmed: notDownloaded,
                                             pressed: pressed, bounds: bounds)
                         })
-                    Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
+                    Text(item.name).font(.footnote.weight(.semibold)).lineLimit(2)
                     pills(status, entry)
                     if let played = steam.playtime[item.id]?.played {
                         Text(played).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
@@ -997,13 +990,6 @@ struct SteamEntrySection: View {
                         if entry.steamProgram == nil { Text("Choose…").tag("") }
                         ForEach(pickerPrograms, id: \.self) { Text($0).tag($0) }
                     }.pickerStyle(.navigationLink)
-                    if entry.steamProgramSource == "steam" {
-                        if (entry.steamProgramArguments ?? "").isEmpty {
-                            Text("From Steam's launch configuration for this game.").font(.caption).foregroundStyle(.secondary)
-                        } else {
-                            Text("From Steam's launch configuration for this game, with its arguments.").font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
                 }
             } else {
                 if !dock.clientInstalled {
@@ -1033,8 +1019,6 @@ struct SteamEntrySection: View {
             if downloads, download == nil {
                 Button { steam.repair(appID) } label: { Label("Repair installed files", systemImage: "arrow.triangle.2.circlepath") }
                     .disabled(!steam.signedIn)
-                Text("Checks installed content and downloads missing or changed files from the current Steam build.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
             LabeledContent("App ID", value: String(appID))
             if let freeSpace { LabeledContent("Free space on this device", value: formatBytes(freeSpace)) }
@@ -1049,12 +1033,6 @@ struct SteamEntrySection: View {
             }
         } header: {
             Text("Steam")
-        } footer: {
-            if direct {
-                Text("The game starts its own program in Wine, without Steam. This suits games that run without Steam (DRM-free); a game that needs Steam or its licence check does not start this way, so choose Madeira Dock for it.")
-            } else {
-                Text("Madeira Dock starts the game through Valve's own Steam client, without the Steam desktop window. Valve's client signs in with your account and decides whether the game may run.")
-            }
         }
         .onAppear { dock.refresh(); games.refresh() }
         .task(id: download?.state) {

@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 import UIKit
 import Darwin
 import ImageIO
+import CoreImage
 import Combine
 
 // ============================================================================
@@ -925,38 +926,62 @@ enum LibraryRendererBadge {
 /// behind it on iOS 26. LibraryHeaderAlignment lines its first letter up with
 /// the search field below.
 struct LibraryLargeTitle: ToolbarContent {
+    var enableJIT: () -> Void = {}
     var body: some ToolbarContent {
         if #available(iOS 26.0, *) {
-            ToolbarItem(placement: .topBarLeading) { LibraryTitleText() }.sharedBackgroundVisibility(.hidden)
+            ToolbarItem(placement: .topBarLeading) { LibraryTitleText(enableJIT: enableJIT) }.sharedBackgroundVisibility(.hidden)
         } else {
-            ToolbarItem(placement: .topBarLeading) { LibraryTitleText() }
+            ToolbarItem(placement: .topBarLeading) { LibraryTitleText(enableJIT: enableJIT) }
         }
     }
 }
 
-/// The title, then a bolt for JIT: a thin outline in the title's colour until
-/// the debugger is attached, then filled in the accent colour (LibraryJITState;
-/// the SF Symbols replace effect animates the change).
-/// The bolt is as tall as the title's capitals and centred on them: an SF
-/// Symbol at the title's own size is nearly twice the height of its M.
+/// The title, then the session status: JIT and Memory+ as two dots in one small
+/// capsule, green when ready and red when not. While JIT is off the capsule is a
+/// button that enables it (the library's banner offers the same).
 struct LibraryTitleText: View {
+    var enableJIT: () -> Void = {}
     @ObservedObject private var alignment = LibraryHeaderAlignment.shared
     @ObservedObject private var jitState = LibraryJITState.shared
     var body: some View {
-        let jit = jitState.enabled
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(LibraryHeaderAlignment.title).accessibilityAddTraits(.isHeader)
-            Image(systemName: jit ? "bolt.fill" : "bolt")
-                .font(.system(size: LibraryHeaderAlignment.titleFont().pointSize * 0.53, weight: .thin))
-                .foregroundStyle(jit ? Color.accentColor : Color.primary)
-                .contentTransition(.symbolEffect(.replace))
-                .alignmentGuide(.firstTextBaseline) { d in d.height / 2 + LibraryHeaderAlignment.titleFont().capHeight / 2 }
-                .accessibilityLabel(jit ? "JIT enabled" : "JIT not enabled")
+        HStack(alignment: .center, spacing: 10) {
+            Text(LibraryHeaderAlignment.title).font(Font(LibraryHeaderAlignment.titleFont()))
+                .accessibilityAddTraits(.isHeader)
+            LibraryStatusPill(jit: jitState.enabled, memory: LibraryJITState.memory, enableJIT: enableJIT)
         }
-        .font(.largeTitle.bold())
         .fixedSize()
         .offset(x: alignment.shift)
         .background(LibraryTitleAnchor())   // after the offset: marks where the text is laid out
+    }
+}
+
+/// JIT and Memory+ as two status dots in a glass capsule.
+struct LibraryStatusPill: View {
+    let jit: Bool
+    let memory: Bool
+    var enableJIT: () -> Void = {}
+    var body: some View {
+        Button { if !jit { enableJIT() } } label: {
+            HStack(spacing: 8) {
+                item("JIT", jit)
+                item("Memory+", memory)
+            }
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .disabled(jit)
+        .animation(UIAccessibility.isReduceMotionEnabled ? nil : .default, value: jit)
+        .accessibilityLabel("JIT \(jit ? "on" : "off"), Memory+ \(memory ? "on" : "off")")
+        .accessibilityHint(jit ? "" : "Enables JIT")
+    }
+    private func item(_ label: String, _ on: Bool) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(on ? Color.green : Color.red).frame(width: 7, height: 7)
+            Text(label).foregroundStyle(on ? .primary : .secondary)
+        }
     }
 }
 
@@ -966,6 +991,8 @@ struct LibraryTitleText: View {
 final class LibraryJITState: ObservableObject {
     static let shared = LibraryJITState()
     @Published private(set) var enabled = StikJITHelper.ready
+    /// Memory+ (increased-memory-limit) is an entitlement: fixed for the whole launch.
+    static let memory = EntitlementStatus.check().increasedMemory
     private var timer: Timer?
     private init() {
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
@@ -1014,9 +1041,10 @@ final class LibraryHeaderAlignment: ObservableObject {
         if abs(target - shift) > 0.01 { shift = target }
     }
 
-    /// The title's font: the large title style, bold, at the current text size.
+    /// The title's font: the title style, bold, at the current text size (the large
+    /// title crowded the header row).
     static func titleFont() -> UIFont {
-        let base = UIFontDescriptor.preferredFontDescriptor(withTextStyle: .largeTitle)
+        let base = UIFontDescriptor.preferredFontDescriptor(withTextStyle: .title1)
         return UIFont(descriptor: base.withSymbolicTraits(.traitBold) ?? base, size: 0)
     }
 
@@ -1419,6 +1447,7 @@ struct AmbientGlow: View {
     var pressed = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var scroll = LibraryScrollActivity.shared
 
     private func layer(_ angle: Double, _ mirror: Bool, frame: CGSize) -> some View {
         func art() -> some View {
@@ -1450,7 +1479,9 @@ struct AmbientGlow: View {
         // A game that is not installed throws a fainter, less vivid light.
         let strength = (dark ? 0.92 : 0.8) * (dimmed ? 0.3 : 1)
         let plain = layer(0, false, frame: frame), turned = layer(180, false, frame: frame), mirrored = layer(0, true, frame: frame)
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { context in
+        // Still while the library scrolls: each glow is six blurred draws, a shader and
+        // two masks, and redrawing every card's at 30 fps made scrolling stutter.
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || scroll.scrolling)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             let f = movie.frame(at: reduceMotion ? 0 : t)
             ZStack {
@@ -1580,9 +1611,7 @@ enum AmbientArtwork {
     }
 
     private static func fetch(_ url: URL) async -> UIImage? {
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return UIImage(data: data)
+        await ArtworkCache.image(url)   // the card's own copy: one download per cover
     }
 }
 
@@ -1607,13 +1636,14 @@ enum AmbientArtwork {
 /// second; held still with Reduce Motion. Its callers draw their previous fill when liquid
 /// metal is off (LiquidMetalSetting).
 struct LiquidMetalFill: View {
+    @ObservedObject private var scroll = LibraryScrollActivity.shared
     @Environment(\.displayScale) private var displayScale
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         GeometryReader { geometry in
-            TimelineView(.animation(minimumInterval: 1.0 / 60, paused: reduceMotion)) { context in
+            TimelineView(.animation(minimumInterval: 1.0 / 60, paused: reduceMotion || scroll.scrolling)) { context in
                 // Kept small, so the shader's float time stays precise.
                 let time = Float(context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 3600))
                 Rectangle()
@@ -1694,38 +1724,6 @@ struct LibraryBadges: View {
     }
 }
 
-/// JIT and Memory+ at the top of Settings, each with a green check or a red cross (the
-/// developer interface's badges), and "Ready to play" beside them once both are there.
-/// Checked every 2 s.
-struct LibraryStatus: View {
-    @State private var jit = false
-    @State private var memory = false
-    let ticks = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-    var body: some View {
-        HStack(spacing: 8) {
-            badge("JIT", jit)
-            badge("Memory+", memory)
-            if jit && memory {
-                Text("Ready to play").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
-                    .padding(.leading, 4)
-            }
-        }
-        .onAppear { update() }.onReceive(ticks) { _ in update() }
-    }
-    private func badge(_ label: String, _ enabled: Bool) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: enabled ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .foregroundStyle(enabled ? Color.green : Color.red)
-            Text(label).foregroundStyle(enabled ? .primary : .secondary)
-        }
-        .font(.footnote)
-        .padding(.horizontal, 8).padding(.vertical, 4)
-        .background((enabled ? Color.green : Color.red).opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
-        .accessibilityElement(children: .ignore).accessibilityLabel("\(label): \(enabled ? "enabled" : "unavailable")")
-    }
-    private func update() { jit = StikJITHelper.ready; memory = EntitlementStatus.check().increasedMemory }
-}
-
 /// A section title with a count; with `collapsed` set, tapping the title
 /// collapses or expands the section (the state is the caller's, persisted).
 struct LibrarySectionHeader<Trailing: View>: View {
@@ -1776,8 +1774,10 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
         } else {
             let compact = layout == "compact"
             let width = max(1, min(self.width, 1100) - 32)
-            let count = max(1, Int((width + 12) / (compact ? 110 : 154)))
-            let cardWidth = min(compact ? 115.0 : 164.0, (width - CGFloat(count - 1) * 12) / CGFloat(count))
+            // Three cards a row on a phone (two felt cramped), four or five compact ones;
+            // wider screens add columns at the same card size.
+            let count = max(1, Int((width + 12) / (compact ? 86 : 118)))
+            let cardWidth = min(compact ? 96.0 : 132.0, (width - CGFloat(count - 1) * 12) / CGFloat(count))
             // The width the cards leave goes into the gaps (up to 34 pt), so the grid
             // nearly spans the margins and each card's ambient light keeps to its own space.
             let gap = count > 1 ? max(12, min(34, (width - CGFloat(count) * cardWidth) / CGFloat(count - 1))) : 12
@@ -1812,6 +1812,7 @@ struct LibraryView: View {
     // The interface the next start uses (FrontendChoice).
     @State private var developerUI = !FrontendChoice.preferNew
     @State private var restartNotice = false
+    @State private var creditsOpen = false
     @State private var settingsSheet: SettingsSheet?
     @State private var settingsRefresh = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
@@ -1857,7 +1858,7 @@ struct LibraryView: View {
         // which iOS 26 draws as a Liquid Glass morph between the two.
         .navigationTitle("")
         .toolbar {
-            LibraryLargeTitle()
+            LibraryLargeTitle(enableJIT: enableJIT)
             if tab == 0 { libraryToolbar } else { settingsToolbar }
         }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
@@ -1894,14 +1895,15 @@ struct LibraryView: View {
         ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
     }
     @ToolbarContentBuilder private var settingsToolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
-            Button(action: enableJIT) {
-                HStack(spacing: 6) {
-                    Text("Enable JIT")
-                    Image(systemName: "bolt.fill").accessibilityHidden(true)
+        if !jitState.enabled {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: enableJIT) {
+                    HStack(spacing: 6) {
+                        Text("Enable JIT")
+                        Image(systemName: "bolt.fill").accessibilityHidden(true)
+                    }
                 }
             }
-            .disabled(jitState.enabled)
         }
     }
     private func switchTab(to newTab: Int) {
@@ -1915,57 +1917,49 @@ struct LibraryView: View {
     }
     private var settings: some View {
         Form {
-            // The status sits on the page, not in a card; JIT is enabled from the
-            // toolbar's Enable JIT button.
-            if settingsShow("ready to play", "JIT", "Memory+", "StikDebug", "status") {
-                Section { LibraryStatus().listRowBackground(Color.clear) }
+            // JIT and Memory+ show in the header's status capsule on every tab.
+            if settingsShow("controls", "pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
+                Section("Controls") { LibraryPointerSettings() }
             }
-            if settingsShow("diagnostics", "extended logging", "logging", "log") {
+            if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
-                    Toggle("Extended logging", isOn: $input.diagnostics)
-                } header: { Text("Diagnostics") }
+                    Toggle("Liquid metal", isOn: $liquidMetal.on)
+                } header: { Text("Appearance") }
             }
-            if settingsShow("pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
-                Section("Pointer") { LibraryPointerSettings() }
+            // Steam: set up once, after the everyday options.
+            if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
+                SteamSettingsSection(open: { settingsSheet = $0 })
             }
+            // Technical: refresh-rate hold, then memory and synchronisation.
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
                 if settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
                 if settingsShow("memory", "JIT pool", "pool", "video memory", "VRAM", "swap", "coverage", "madsync", "sync", "eco", "all settings") {
                     RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
                 }
             }
-            if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
-                SteamSettingsSection(open: { settingsSheet = $0 })
-            }
-            if settingsShow("appearance", "liquid metal", "metal", "glass") {
+            // For debugging Madeira itself: logging and the original diagnostic screen.
+            if settingsShow("advanced", "diagnostics", "extended logging", "logging", "log", "interface", "developer") {
                 Section {
-                    Toggle("Liquid metal", isOn: $liquidMetal.on)
-                } header: { Text("Appearance") } footer: {
-                    Text("Flowing chrome on the bars and the Desktop button. Off, they use the system's Liquid Glass.")
-                }
-            }
-            if settingsShow("interface", "developer") {
-                Section {
-                    Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
+                    Toggle("Extended logging", isOn: $input.diagnostics)
+                    Toggle("Developer interface", isOn: Binding(get: { developerUI }, set: { on in
                         developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
                     }))
-                } header: { Text("Interface") } footer: {
-                    Text("The developer interface is Madeira's original diagnostic screen. The change applies after Madeira restarts.")
-                }
+                } header: { Text("Advanced") }
             }
             // Search: the matching options of All settings, editable here.
             if !settingsSearch.trimmingCharacters(in: .whitespaces).isEmpty {
                 SettingsSearchResults(query: settingsSearch.trimmingCharacters(in: .whitespaces), refresh: settingsRefresh)
             }
-            // Credits, last on the Settings page.
-            if settingsShow("credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin") {
+            // Credits, last, folded away unless searched for.
+            if settingsShow("about", "credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin") {
                 Section {
-                    MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
-                    MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
-                    MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
-                } header: { Text("Credits") } footer: {
-                    Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, and StikDebug for enabling JIT. Thank you to everyone who contributes to these projects.")
-                }
+                    DisclosureGroup("Credits", isExpanded: Binding(get: { creditsOpen || !settingsSearch.isEmpty },
+                                                                    set: { creditsOpen = $0 })) {
+                        MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
+                        MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
+                        MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
+                    }
+                } header: { Text("About") }
             }
         }
         .alert("Restart Madeira", isPresented: $restartNotice) {
@@ -1989,6 +1983,11 @@ struct LibraryView: View {
         ScrollViewReader { reader in
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                // Until JIT is on nothing can start: say so where the games are.
+                if !jitState.enabled {
+                    LibraryJITBanner(enableJIT: enableJIT)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
                 HStack {
                     Button { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry } label: {
                         if liquidMetal.on {
@@ -2015,16 +2014,22 @@ struct LibraryView: View {
                 // Steam games start through Madeira Dock (SteamGames.swift); an installed one
                 // opens its Game details page like any library game. Without the Steam
                 // section the games you added are one grid.
-                // Installed Steam games first, then the games you added, then the
-                // account's Not installed games. With nothing installed (or
-                // downloading) the games you added are the top section and the
-                // whole Steam section, sign-in included, follows them.
+                // Installed Steam games first, then the account's Not installed games,
+                // then the games you added, at the bottom. With nothing installed (or
+                // downloading) the whole Steam section, sign-in included, comes first.
                 let steamFirst = MadeiraDock.enabled && SteamGamesSection.hasInstalled
                 if steamFirst {
                     SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
                                       part: .installed, open: { selected = $0 })
                 }
                 if SteamGamesSection.shown {
+                    // Steam's remaining part (Not installed, or the whole section with
+                    // sign-in when nothing is installed) comes before the games you
+                    // added, which close the page.
+                    if MadeiraDock.enabled {
+                        SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
+                                          part: steamFirst ? .notInstalled : .all, open: { selected = $0 })
+                    }
                     VStack(alignment: .leading, spacing: 14) {
                         // Games are added with the + in the navigation bar.
                         LibrarySectionHeader(title: "Other games", count: entries.count,
@@ -2033,19 +2038,15 @@ struct LibraryView: View {
                             EmptyView()
                         } else if entries.isEmpty {
                             Text(search.isEmpty
-                                 ? "Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."
+                                 ? "Copy a game's folder into Madeira › wine › drive_c in Files, then tap +."
                                  : "No other games match your search.")
                                 .foregroundStyle(.secondary)
                         } else {
                             cells(entries, width: viewport.size.width)
                         }
                     }
-                    if MadeiraDock.enabled {
-                        SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
-                                          part: steamFirst ? .notInstalled : .all, open: { selected = $0 })
-                    }
                 } else if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil }).isEmpty {
-                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
+                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c in Files, then tap +."))
                 } else {
                     cells(entries, width: viewport.size.width)
                 }
@@ -2055,6 +2056,8 @@ struct LibraryView: View {
             .padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
         .refreshable { await SteamGamesSection.refresh() }
+        .libraryHardTopEdge()
+        .libraryScrollTracking()
         .onReceive(controller.commands) { command in
             guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
             let items = entries
@@ -2130,11 +2133,11 @@ struct LibraryView: View {
                     }.padding(10).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
-                        LibraryArtwork(entry: entry).aspectRatio(2.0 / 3.0, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 12))
+                        LibraryArtwork(entry: entry).aspectRatio(2.0 / 3.0, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 10))
                             .modifier(LibraryCardArtworkPress { pressed, bounds in
                                 AmbientGlowItem(id: "entry-\(entry.id)", seed: entry.id.hashValue, art: .library(entry), pressed: pressed, bounds: bounds)
                             })
-                        Text(entry.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                        Text(entry.title).font(.footnote.weight(.semibold)).lineLimit(2)
                         LibraryBadges(entry: entry).foregroundStyle(.secondary)
                     }.padding(4)
                 }
@@ -2275,15 +2278,16 @@ struct LibraryDetail: View {
                                 }.clipped()
                         )
                 }
-                if entry.desktop != true { Section("Library details") {
-                    TextField("Title", text: $entry.title)
-                    Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
-                    Button("Choose cover image", systemImage: "photo") { importCover = true }
-                    if entry.coverFile != nil { Button((entry.steamAppID ?? entry.steamID) != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
-                } }
-                // How a Steam game starts sits under its library details (SteamGames.swift).
-                if entry.steamAppID != nil {
-                    SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
+                Section("On screen") {
+                    Toggle("Performance overlay", isOn: $entry.performance)
+                    Toggle("Live logs", isOn: $entry.liveLogs)
+                    Toggle("Touch controls", isOn: $entry.touchControls)
+                    LabeledContent("Control opacity") {
+                        Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
+                    }
+                    LabeledContent("Control size") {
+                        Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
+                    }
                 }
                 Section("Display") {
                     // The Windows screen the game renders for (and the Desktop's size).
@@ -2299,6 +2303,16 @@ struct LibraryDetail: View {
                         ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                     }
                     FPSChoice(mode: $entry.fpsMode)
+                }
+                if entry.desktop != true { Section("Library details") {
+                    TextField("Title", text: $entry.title)
+                    Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
+                    Button("Choose cover image", systemImage: "photo") { importCover = true }
+                    if entry.coverFile != nil { Button((entry.steamAppID ?? entry.steamID) != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
+                } }
+                // How a Steam game starts sits under its library details (SteamGames.swift).
+                if entry.steamAppID != nil {
+                    SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
                 }
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
@@ -2319,40 +2333,18 @@ struct LibraryDetail: View {
                                isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
                     }
                     .disabled(syncEngine != .fastsync)
-                    if syncEngine != .fastsync {
-                        Text("Fast synchronization and fast semaphore waits are Fastsync options. Choose Fastsync in Settings › Memory & sync to use them.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
                     // A Steam game starts with Steam's own launch option through Madeira Dock.
                     if entry.desktop != true && entry.steamAppID == nil {
                         TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
                     }
-                } header: { Text("Compatibility & performance") } footer: {
-                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
-                }
-                Section("On screen") {
-                    Toggle("Performance overlay", isOn: $entry.performance)
-                    Toggle("Live logs", isOn: $entry.liveLogs)
-                    Toggle("Touch controls", isOn: $entry.touchControls)
-                    LabeledContent("Control opacity") {
-                        Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
-                    }
-                    LabeledContent("Control size") {
-                        Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
-                    }
-                    Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
-                }
+                } header: { Text("Compatibility & performance") }
                 if entry.steamAppID != nil {
                     Section {
                         Text(entry.launchWindowsPath).font(.caption.monospaced()).textSelection(.enabled)
                         if entry.startsSteamGameDirectly, !entry.launchArguments.isEmpty {
                             Text(entry.launchArguments).font(.caption.monospaced()).textSelection(.enabled)
                         }
-                    } header: { Text("Executable") } footer: {
-                        Text(entry.startsSteamGameDirectly
-                             ? "The game starts this program directly, without Steam."
-                             : "Valve's client starts the game's default Steam launch option from this folder.")
-                    }
+                    } header: { Text("Executable") }
                 } else if entry.desktop != true {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                     Section { Button("Remove from library", role: .destructive) { remove = true } }
@@ -2457,9 +2449,7 @@ struct DisplayRateSettings: View {
                 MadeiraConfig.set("env.MADEIRA_PROMOTE", on ? "1" : nil)
                 LogStore.shared.log("[runtime-settings] promote=\(on ? 1 : 0)")
             }))
-        } header: { Text("Display") } footer: {
-            Text("Off by default. On a 120 Hz display, keeps the panel at 120 Hz during a game's 60 FPS limit so a frame that misses one refresh waits 8 ms instead of 17 ms. Uses more power.")
-        }
+        } header: { Text("Display") }
     }
 }
 
@@ -2605,16 +2595,7 @@ struct RuntimeMemorySyncSettings: View {
             Button { open(.allSettings) } label: {
                 Label("All settings (\(ConfigCatalog.generated.count - Self.featuredKeys.count) more)", systemImage: "slider.horizontal.3")
             }
-        } header: { Text("Memory & sync") } footer: {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("JIT pool is the memory reserved at launch for translated x86 code (256 to 1152 MB).")
-                Text("Video memory is how much graphics memory games are told they have. Automatic sizes it from the memory free at launch. Too high can get Madeira closed for using too much memory; too low makes games keep reloading textures.")
-                Text("Swap tier moves game data to a file on this device's storage when memory runs short, up to the chosen size, at some speed cost. Coverage decides which allocations it moves: large ones only (8 MB and up, the default), every allocation of 1 MB and up, or those plus allocations that overflow the game's address range. Wider coverage saves more memory but can slow a game down.")
-                Text("Sync engine: Fastsync (the default) handles events and semaphores in-process; its per-game options are in each game's details. Madsync is the older in-process engine. Wine standard sync uses neither. Only one engine runs at a time.")
-                Text("Eco mode starts every game with its threads at a low priority, which saves power but makes games run slower. Off by default. It is meant for loading screens: the ECO pill in the performance overlay turns it on and off while a game runs.")
-                if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
-            }
-        }
+        } header: { Text("Memory & sync") }
         .onChange(of: refresh) { _, _ in
             poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb")
             coverage = Self.currentCoverage(); engine = SyncEngine.current
@@ -2636,9 +2617,6 @@ struct LibraryPointerSettings: View {
         Picker("Pointer mode", selection: mode) {
             Text("Absolute").tag("absolute"); Text("Relative").tag("relative"); Text("Touch").tag("touch")
         }.pickerStyle(.segmented)
-        Text(input.touchMode ? "Tap the screen to position and click. Hold and move to drag. Two fingers: right click or scroll."
-             : (input.relative ? "Drag to send relative mouse movement for mouse-look. Tap to click." : "Drag the pointer like a trackpad. Tap to click."))
-            .font(.caption).foregroundStyle(.secondary)
         LabeledContent("Touch sensitivity") {
             Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8)
         }
@@ -2934,7 +2912,6 @@ struct LibraryHUD: View {
                 Button(role: .destructive) { model.requestQuit() } label: {
                     Label("Quit game", systemImage: "stop.circle").foregroundStyle(.red)
                 }.tint(.red)
-                Text("Closes the running session. Unsaved progress will be lost.").font(.caption).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
                 .foregroundStyle(.primary)
         }
@@ -3097,5 +3074,123 @@ enum EndedSessionSurface {
         hiddenByUs = false
         _ = winios_compositor_set_hidden(0)
         LogStore.shared.log("[library-surface] desktop shown for the new session")
+    }
+}
+
+extension View {
+    /// A hard top scroll edge under the library's title and search field (iOS 26+). The
+    /// soft default left scrolled card titles legible behind "Madeira" and the field.
+    @ViewBuilder func libraryHardTopEdge() -> some View {
+        if #available(iOS 26.0, *) {
+            self.scrollEdgeEffectStyle(.hard, for: .top)
+        } else {
+            self
+        }
+    }
+}
+
+/// The library's top card while JIT is off: what is missing and the button that fixes it.
+/// It goes away by itself once the debugger attaches (LibraryJITState, every 2 s).
+struct LibraryJITBanner: View {
+    var enableJIT: () -> Void
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "bolt.slash.fill")
+                .font(.title2).foregroundStyle(.yellow)
+                .frame(width: 32)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("JIT is off").font(.headline)
+                Text("Games need JIT to start.").font(.subheadline).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button(action: enableJIT) {
+                Label("Enable", systemImage: "bolt.fill").font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+        }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Whether the library is scrolling: the ambient light and liquid metal hold still
+/// meanwhile and resume when it settles (iOS 18+; earlier systems keep animating).
+final class LibraryScrollActivity: ObservableObject {
+    static let shared = LibraryScrollActivity()
+    @Published private(set) var scrolling = false
+    func set(_ on: Bool) { if on != scrolling { scrolling = on } }
+}
+
+extension View {
+    @ViewBuilder func libraryScrollTracking() -> some View {
+        if #available(iOS 18.0, *) {
+            self.onScrollPhaseChange { _, phase in LibraryScrollActivity.shared.set(phase != .idle) }
+        } else {
+            self
+        }
+    }
+}
+
+
+/// Library artwork, decoded once in the background at card size and kept in memory.
+/// AsyncImage kept nothing: a card scrolled away and back fetched and decoded the full
+/// Steam poster again, which made the library stutter. A not-downloaded card's blur
+/// spot is a blurred copy made once here, not three live blurs per card.
+enum ArtworkCache {
+    /// Longest side of a decoded card image, in pixels (a 132 pt card at 3x is ~400).
+    static let maxPixel: CGFloat = 480
+    private static let images = NSCache<NSURL, UIImage>()
+    private static let blurred = NSCache<NSURL, UIImage>()
+    private static let context = CIContext(options: [.useSoftwareRenderer: false])
+
+    static func cached(_ url: URL) -> UIImage? { images.object(forKey: url as NSURL) }
+    static func cachedBlur(_ url: URL) -> UIImage? { blurred.object(forKey: url as NSURL) }
+
+    /// The image at `url` (a web or file URL), downsized; nil when it cannot be had.
+    static func image(_ url: URL) async -> UIImage? {
+        if let hit = cached(url) { return hit }
+        let data: Data
+        if url.isFileURL {
+            guard let d = try? Data(contentsOf: url) else { return nil }
+            data = d
+        } else {
+            guard let (d, response) = try? await URLSession.shared.data(from: url),
+                  (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            data = d
+        }
+        let image = await Task.detached(priority: .utility) { downsample(data) }.value
+        if let image { images.setObject(image, forKey: url as NSURL) }
+        return image
+    }
+
+    /// A blurred copy of the cached image at `url`, for a not-downloaded card's spot.
+    /// `fraction`: the blur's sigma as a fraction of the image's shorter side.
+    static func blur(_ url: URL, fraction: CGFloat) async -> UIImage? {
+        if let hit = cachedBlur(url) { return hit }
+        guard let base = await image(url), let cg = base.cgImage else { return nil }
+        let sigma = Double(min(cg.width, cg.height)) * Double(fraction)
+        let result = await Task.detached(priority: .utility) { () -> UIImage? in
+            let input = CIImage(cgImage: cg).clampedToExtent()
+            guard let out = input.applyingGaussianBlur(sigma: sigma).cropped(to: CIImage(cgImage: cg).extent) as CIImage?,
+                  let rendered = context.createCGImage(out, from: out.extent) else { return nil }
+            return UIImage(cgImage: rendered)
+        }.value
+        if let result { blurred.setObject(result, forKey: url as NSURL) }
+        return result
+    }
+
+    private static func downsample(_ data: Data) -> UIImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,      // decode now, off the main thread
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return UIImage(cgImage: cg)
     }
 }

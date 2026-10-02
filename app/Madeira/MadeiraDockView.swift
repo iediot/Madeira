@@ -134,10 +134,6 @@ struct MadeiraDockView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    Text("Madeira Dock starts an installed Steam game through Valve's own Steam client, without the Steam desktop window. Valve's client signs in with your account and decides whether the game may run.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
                 Section("Steam account") {
                     if let name = signIn.accountName {
                         LabeledContent("Signed in", value: name)
@@ -153,9 +149,7 @@ struct MadeiraDockView: View {
                     } else {
                         Button("Download Valve's client components (about 73 MB)") { dock.prepareClient() }
                     }
-                } header: { Text("Steam client") } footer: {
-                    Text("Downloaded from Valve's update servers and checked against pinned SHA-256 sums. Existing Steam files are kept.")
-                }
+                } header: { Text("Steam client") }
                 Section {
                     if dock.games.isEmpty {
                         Text("No installed Steam games were found in the Steam library in drive_c.").foregroundStyle(.secondary)
@@ -171,9 +165,7 @@ struct MadeiraDockView: View {
                         .disabled(!game.installed || !dock.clientInstalled || !signIn.signedIn)
                     }
                     Toggle("Smaller JIT pool (512 MB) for this launch", isOn: $dock.compactPool)
-                } header: { Text("Installed games") } footer: {
-                    Text("Games Steam's client has installed in this prefix. Only Steam's default launch option is used.")
-                }
+                } header: { Text("Installed games") }
                 if !dock.installPrograms.isEmpty {
                     Section {
                         ForEach(dock.games.filter { dock.installPrograms[$0.id] != nil }) { game in
@@ -184,9 +176,7 @@ struct MadeiraDockView: View {
                             }
                             .pickerStyle(.menu)
                         }
-                    } header: { Text("One-time installs") } footer: {
-                        Text("Programs from a game's Steam install script, such as runtime setups, that Steam's desktop client runs before a first start. A Dock start runs the ones not yet recorded as done before Valve's client starts; the choice then changes to Skip.")
-                    }
+                    } header: { Text("One-time installs") }
                 }
                 if let status = dock.status {
                     Section("Dock status") { Text(status) }

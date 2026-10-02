@@ -17,8 +17,7 @@ if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
     if [ -f "$APP_LIB" ]; then
         cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
     else
-        echo "ERROR: No base libwineserver.a found"
-        exit 1
+        NEED_BASE=1
     fi
 fi
 
@@ -57,6 +56,26 @@ compile_one() {
         return 1
     fi
 }
+
+# A fresh checkout has no base archive (it is gitignored, and used to exist only
+# on the development machine). Build one from the submodule's server sources;
+# the patched files below then replace their objects in it as usual.
+if [ -n "${NEED_BASE:-}" ]; then
+    echo "=== Building base libwineserver.a from $WINE_SRC/server ==="
+    BASE_DIR="$OBJ_DIR/base"
+    rm -rf "$BASE_DIR" && mkdir -p "$BASE_DIR"
+    for src in $(sed -n '/^SOURCES/,/^$/p' "$WINE_SRC/server/Makefile.in" | tr -d '\\' | tr -s ' \t' '\n' | grep '\.c$'); do
+        printf "  %s... " "${src%.c}"
+        if xcrun -sdk iphoneos clang "${CC_FLAGS[@]}" -c "$WINE_SRC/server/$src" -o "$BASE_DIR/${src%.c}.o" 2>"$BASE_DIR/err-${src%.c}.txt"; then
+            echo "OK"
+        else
+            echo "FAILED (see $BASE_DIR/err-${src%.c}.txt)"
+            cat "$BASE_DIR/err-${src%.c}.txt"
+            exit 1
+        fi
+    done
+    ar rcs "$OBJ_DIR/libwineserver.a" "$BASE_DIR"/*.o
+fi
 
 # Patched files: name:source_file:replaces_in_archive
 PATCHED_FILES=(
@@ -201,6 +220,7 @@ echo "=== Renaming colliding symbols in every .o (objcopy sweep) ==="
 # resolve. Externals (win32u, etc.) only see the ws_-prefixed names.
 OBJCOPY=$(command -v llvm-objcopy || echo /opt/homebrew/opt/llvm/bin/llvm-objcopy)
 [ -x "$OBJCOPY" ] || OBJCOPY=/opt/homebrew/Cellar/llvm/22.1.0/bin/llvm-objcopy
+[ -x "$OBJCOPY" ] || OBJCOPY="$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/llvm-objcopy"
 COLLISIONS=(
     alloc_user_handle free_user_handle get_virtual_screen_rect
     destroy_thread_windows get_window_thread is_desktop_class

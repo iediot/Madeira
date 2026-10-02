@@ -4166,18 +4166,15 @@ struct MappingPanel: View {
 
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Controller controls feed XInput player 1. LS and RS are analogue sticks; "
-                 + "LT and RT are full-press triggers. Touch and physical controls can be used together.")
-                .font(.system(size: 11))
-                .foregroundStyle(.orange.opacity(0.95))
-                .fixedSize(horizontal: false, vertical: true)
+            // Sticks first: on a landscape phone a fourth section sits below the
+            // fold, and the sticks are the controls most layouts need.
+            section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
+                               ("L3", .pad("L3")), ("R3", .pad("R3"))])
             section("Face", [("A", .pad("A")), ("B", .pad("B")), ("X", .pad("X")), ("Y", .pad("Y"))])
             section("D-pad", [("D↑", .pad("D↑")), ("D↓", .pad("D↓")),
                               ("D←", .pad("D←")), ("D→", .pad("D→"))])
             section("Bumpers & triggers", [("LB", .pad("LB")), ("RB", .pad("RB")),
                                            ("LT", .pad("LT")), ("RT", .pad("RT"))])
-            section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
-                               ("L3", .pad("L3")), ("R3", .pad("R3"))])
             // Start and Select are XInput's Menu and View; the layout keeps the
             // XInput names, the chips and the buttons read Start/Select.
             section("System", [("Start", .pad("Menu")), ("Select", .pad("View")),

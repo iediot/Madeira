@@ -4180,9 +4180,23 @@ void server_init_process_done(void)
          * ios_thread_sampler_main() above. */
         if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
         {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
+            /* ml2105: the two samplers that thread_suspend other threads and then
+             * symbolize with dladdr are opt-in (madeira.cfg env.MADEIRA_THREAD_SAMPLE = 1).
+             * A 32-bit Unity title died in _os_unfair_lock_corruption_abort under
+             * dyld's withLoadersReadLock, reached from this sampler's dladdr: calling
+             * into dyld while threads are suspended is unsafe when one of them was
+             * stopped inside it, and a WoW64 game loading hundreds of DLLs makes that
+             * likely. They are profiling tools; the [xp] probe (counters only, no
+             * suspension) stays on. */
+            const char *ts = getenv( "MADEIRA_THREAD_SAMPLE" );
+            const int sample = ts && *ts && *ts != '0';
+            if (sample)
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
+            if (sample)
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
+            else
+                wine_log_write( "[thread-sample] ml2105 thread-suspending samplers off (env.MADEIRA_THREAD_SAMPLE = 1 arms them)" );
         }
         if (!getenv("MADEIRA_QUIET"))
         {

@@ -95,9 +95,7 @@ struct AllSettingsView: View {
                                                                  category: "", note: "", choices: [], sources: []),
                                             value: binding(key))
                         }
-                    } header: { Text("Other entries in madeira.cfg") } footer: {
-                        Text("Set in your madeira.cfg but not read by name in Madeira's code, for example FEX options passed as env.FEX_*.")
-                    }
+                    } header: { Text("Other entries in madeira.cfg") }
                 }
                 Section {
                     TextField("key, or env.NAME", text: $newKey)
@@ -111,9 +109,7 @@ struct AllSettingsView: View {
                         newKey = ""; newValue = ""
                     }
                     .disabled(newKey.trimmingCharacters(in: .whitespaces).isEmpty)
-                } header: { Text("Add an entry") } footer: {
-                    Text("For anything not listed, such as env.FEX_TSOENABLED = 1.")
-                }
+                } header: { Text("Add an entry") }
             }
             .searchable(text: $search, prompt: "Search options")
             .navigationTitle("All settings")
@@ -218,12 +214,6 @@ struct SettingsSearchResults: View {
             ForEach(hits.prefix(Self.limit)) { ConfigOptionRow(option: $0, value: binding($0.key)) }
         } header: {
             Text(hits.isEmpty ? "Options" : "Options (\(hits.count))")
-        } footer: {
-            if hits.count > Self.limit {
-                Text("Showing \(Self.limit) of \(hits.count). Refine the search, or open All settings.")
-            } else if !hits.isEmpty {
-                Text("Most options are read when Madeira starts: close it from the app switcher after a change.")
-            }
         }
         .onChange(of: refresh) { _, _ in values = MadeiraConfig.all() }
     }
