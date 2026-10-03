@@ -9,7 +9,8 @@ import UIKit
 // own layouts ("Custom Layout 1", "Custom Layout 2", ...) are kept app-wide in
 // Documents/madeira-control-presets.json, beside madeira-controls.json, so a
 // device backup carries them. Built-ins ship in code and can be loaded but
-// never changed: there is one, a full XInput layout named "Xbox controller".
+// never changed: "Controller preset" (a full XInput layout) and "Keyboard
+// preset" (WASD, mouse buttons and the usual first-person keys).
 //
 // madeira-controls.json stays the working copy the overlay draws; it records
 // which layout it was loaded from (`TouchControlsModel.layoutID`) so edits made
@@ -62,7 +63,71 @@ struct ControlPresetScreen: Equatable {
 
 enum ControlPresetLayout {
     static let xboxID = "builtin.xbox"
-    static let xboxName = "Xbox controller"
+    static let xboxName = "Controller preset"
+    static let keyboardID = "builtin.keyboard"
+    static let keyboardName = "Keyboard preset"
+
+    /// A built-in laid out for `screen`, or nil for a user layout.
+    static func builtIn(_ id: String, for screen: ControlPresetScreen) -> [TouchControl]? {
+        switch id {
+        case xboxID: return xbox(for: screen)
+        case keyboardID: return keyboard(for: screen)
+        default: return nil
+        }
+    }
+
+    /// The built-in keyboard-and-mouse layout, for PC games without controller
+    /// support (first-person games in particular):
+    ///
+    ///   Esc (top left)                                      F  Q   (top right)
+    ///   ⇧                                                 E   R
+    ///   WASD stick  Ctl                     R click  ␣
+    ///                                          L click (bottom right)
+    ///
+    /// Looking around is a drag on the empty screen in the Relative pointer
+    /// mode; the layout only holds buttons. Same placement rules as xbox(for:).
+    static func keyboard(for screen: ControlPresetScreen) -> [TouchControl] {
+        let s = screen.landscape
+        let W = s.width, H = s.height
+        guard W > 0, H > 0 else { return [] }
+        let k = min(max(H / 400, 1.0), 1.3)
+        let (L, R, T, B) = margins(s)
+        var out: [TouchControl] = []
+        func add(_ action: ControlAction, _ scale: Double, _ x: Double, _ y: Double) {
+            var c = TouchControl()
+            c.action = action
+            c.scale = scale
+            c.nx = x / W
+            c.ny = y / H
+            out.append(c)
+        }
+        func d(_ scale: Double) -> Double { baseDiameter * scale }
+
+        // Left: the WASD stick in the corner, sprint above it, crouch inboard of it.
+        let stickScale = 1.45 * k, stick = d(stickScale)
+        let stickX = L + 76 * k, stickY = H - B - 12 * k - stick / 2
+        add(.joystickWASD, stickScale, stickX, stickY)
+        let small = 0.78 * k, sm = d(small)
+        add(.key(0x10), small, stickX, stickY - stick / 2 - 16 * k - sm / 2)            // Shift
+        add(.key(0x11), small, stickX + stick / 2 + 22 * k + sm / 2, stickY + stick / 2 - sm / 2)   // Ctrl
+        add(.key(0x1B), 0.7 * k, L + d(0.7 * k) / 2 + 6 * k, T + d(0.7 * k) / 2 + 6 * k) // Esc
+
+        // Right: primary fire in the corner, secondary and jump around it, then the
+        // action keys above, clear of the top band.
+        let fireScale = 1.2 * k, fire = d(fireScale)
+        let fireX = W - R - 20 * k - fire / 2, fireY = H - B - 12 * k - fire / 2
+        add(.mouseLeft, fireScale, fireX, fireY)
+        let mid = 0.95 * k, md = d(mid)
+        add(.mouseRight, mid, fireX - fire / 2 - 18 * k - md / 2, fireY + fire / 2 - md / 2)
+        add(.key(0x20), mid, fireX - fire / 2 - 6 * k - md / 2, fireY - fire / 2 - 14 * k - md / 2)   // Space
+        let act = 0.8 * k, ad = d(act)
+        let actY = fireY - fire / 2 - 14 * k - md - 18 * k - ad / 2
+        add(.key(0x45), act, fireX - ad / 2 - 20 * k, actY)                               // E
+        add(.key(0x52), act, fireX + ad / 2 + 4 * k, actY)                                 // R
+        add(.key(0x46), 0.7 * k, fireX - d(0.7 * k) / 2 - 20 * k, max(T + d(0.7 * k) / 2 + 6 * k, actY - ad - 14 * k))   // F
+        add(.key(0x51), 0.7 * k, fireX + d(0.7 * k) / 2 + 4 * k, max(T + d(0.7 * k) / 2 + 6 * k, actY - ad - 14 * k))    // Q
+        return out
+    }
     /// Mirrors `TouchControlsModel.baseDiameter`.
     static let baseDiameter = 64.0
 
@@ -187,6 +252,8 @@ struct ControlPresetStore: Equatable {
     static let builtIns: [ControlPreset] = [
         ControlPreset(id: ControlPresetLayout.xboxID, name: ControlPresetLayout.xboxName,
                       controls: ControlPresetLayout.xbox(for: .referencePhone)),
+        ControlPreset(id: ControlPresetLayout.keyboardID, name: ControlPresetLayout.keyboardName,
+                      controls: ControlPresetLayout.keyboard(for: .referencePhone)),
     ]
     static let maxNameLength = 40
 
@@ -284,9 +351,8 @@ struct ControlPresetStore: Equatable {
     /// loaded on.
     static func layout(of p: ControlPreset, screen: ControlPresetScreen?) -> [TouchControl] {
         var controls = p.controls
-        if p.id == ControlPresetLayout.xboxID, let screen {
-            let fitted = ControlPresetLayout.xbox(for: screen)
-            if !fitted.isEmpty { controls = fitted }
+        if let screen, let fitted = ControlPresetLayout.builtIn(p.id, for: screen), !fitted.isEmpty {
+            controls = fitted
         }
         return controls.map { c in
             var c = c

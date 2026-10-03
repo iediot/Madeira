@@ -1813,6 +1813,9 @@ struct LibraryView: View {
     @State private var developerUI = !FrontendChoice.preferNew
     @State private var restartNotice = false
     @State private var creditsOpen = false
+    /// Settings › Enable JIT automatically: open StikDebug by itself when Madeira
+    /// starts or returns without JIT.
+    @AppStorage("madeira.autoEnableJIT") private var autoEnableJIT = false
     @State private var settingsSheet: SettingsSheet?
     @State private var settingsRefresh = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
@@ -1863,6 +1866,7 @@ struct LibraryView: View {
         }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
         .onAppear {
+            autoEnableJITIfNeeded()
             // An ended desktop session's surface never stays over the library.
             EndedSessionSurface.install(); EndedSessionSurface.hide(reason: "library-appeared")
             // First-run setup opens once on a new install.
@@ -1888,6 +1892,34 @@ struct LibraryView: View {
             .disabled(jitState.enabled)
         }
     }
+    /// Once per launch: with Enable JIT automatically on and JIT off, do what the Enable
+    /// JIT button does as soon as the app is active. Nothing when JIT is already on.
+    private static var autoJITHandled = false
+    private func autoEnableJITIfNeeded() {
+        guard autoEnableJIT, !Self.autoJITHandled, !onboarding.presented else { return }
+        if StikJITHelper.ready { Self.autoJITHandled = true; return }
+        autoEnableJITWhenActive(tries: 0)
+    }
+    /// A URL hand-off is refused until the app is active, which at a cold start can take a
+    /// moment: retry every 0.25 s for up to 5 s.
+    private func autoEnableJITWhenActive(tries: Int) {
+        guard !Self.autoJITHandled else { return }
+        guard UIApplication.shared.applicationState == .active else {
+            if tries < 20 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { autoEnableJITWhenActive(tries: tries + 1) }
+            }
+            return
+        }
+        Self.autoJITHandled = true
+        if StikJITHelper.ready { return }
+        // A StikDebug that cannot attach and relaunches Madeira must not bounce the two
+        // apps forever: at most one automatic hand-off every 30 s, across launches.
+        let key = "madeira.autoEnableJIT.last"
+        let now = Date().timeIntervalSince1970
+        guard now - UserDefaults.standard.double(forKey: key) > 30 else { return }
+        UserDefaults.standard.set(now, forKey: key)
+        enableJIT()
+    }
     private func switchTab(to newTab: Int) {
         guard newTab != tab else { return }
         withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) { tab = newTab }
@@ -1900,6 +1932,12 @@ struct LibraryView: View {
     private var settings: some View {
         Form {
             // JIT and Memory+ show in the header's status capsule on every tab.
+            if settingsShow("JIT", "automatically", "StikDebug", "start") {
+                Section {
+                    Toggle("Enable JIT automatically", isOn: $autoEnableJIT)
+                        .onChange(of: autoEnableJIT) { _, on in if on, !jitState.enabled { enableJIT() } }
+                }
+            }
             if settingsShow("controls", "pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
                 Section("Controls") { LibraryPointerSettings() }
             }
@@ -2889,7 +2927,7 @@ struct LibraryHUD: View {
                 HStack { Label("Session", systemImage: "gamecontroller.fill").font(.title2.bold()); Spacer(); Button("Done") { model.menu = false }.buttonStyle(.bordered) }
                 // The controls come first, the easiest to reach; the overlay settings last.
                 Toggle("Touch controls", isOn: $controls.visible)
-                // The named layouts (Xbox controller, custom ones) live here in a session: this
+                // The named layouts (Controller preset, Keyboard preset, custom ones) live here in a session: this
                 // menu replaces the overlay's top bar, where the same menu sits outside the library.
                 if controls.visible && ControlPresetsModel.enabled {
                     ControlLayoutMenu(style: .row) { openedEditor in
