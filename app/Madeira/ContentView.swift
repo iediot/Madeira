@@ -1178,6 +1178,7 @@ struct ContentView: View {
     }
     @State private var devSheet: SettingsSheet?
     @StateObject private var logStore = LogStore.shared
+    @StateObject private var jitCoordinator = JITCoordinator.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
@@ -1214,7 +1215,7 @@ struct ContentView: View {
                 if library.enabled && library.current != nil {
                     sessionBody
                 } else if library.enabled {
-                    LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug,
+                    LibraryView(play: launchLibraryEntry, enableJIT: enableJIT,
                                 startDock: { startDock($0, compactPool: $1) })
                 } else if vSizeClass == .compact {
                     landscapeBody
@@ -1247,9 +1248,31 @@ struct ContentView: View {
             // CS_DEBUGGED without a debugger (JIT enabled outside Madeira): offer Madeira's own request.
             .alert("Enable JIT", isPresented: Binding(get: { library.jitNotice != nil },
                                                       set: { if !$0 { library.jitNotice = nil } })) {
-                Button("Enable JIT") { library.jitNotice = nil; enableJITViaStikDebug() }
+                Button("Enable JIT") { library.jitNotice = nil; enableJIT() }
                 Button("Later", role: .cancel) { library.jitNotice = nil }
             } message: { Text(library.jitNotice ?? "") }
+            .sheet(isPresented: $jitCoordinator.showSetup) { JITSetupView() }
+            // A Steam game's saves may not be the latest (cloudClear).
+            .alert(library.cloudNotice?.title ?? "Steam Cloud", isPresented: Binding(get: { library.cloudNotice != nil },
+                                                                                     set: { if !$0 { library.cloudNotice = nil } })) {
+                if let notice = library.cloudNotice {
+                    switch notice.kind {
+                    case .syncing: Button("Wait and sync") { library.cloudNotice = nil; cloudWait(notice.appID) }
+                    case .unchecked: Button("Try again") { library.cloudNotice = nil; cloudWait(notice.appID) }
+                    case .conflict:
+                        Button("Choose") {
+                            library.cloudNotice = nil; library.cloudRetry = nil
+                            library.showDetail = library.entries.first { $0.steamAppID == notice.appID }?.id
+                        }
+                    }
+                    Button("Launch anyway") {
+                        LogStore.shared.log("[steam-cloud] app=\(notice.appID) before-play: launched anyway")
+                        library.cloudNotice = nil; library.cloudBypass = notice.appID
+                        let retry = library.cloudRetry; library.cloudRetry = nil; retry?()
+                    }
+                    Button("Cancel", role: .cancel) { library.cloudNotice = nil; library.cloudRetry = nil }
+                }
+            } message: { Text(library.cloudNotice?.message ?? "") }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 library.refreshFlag()
                 if library.enabled && library.current == nil { MetalHostView.shared.isHidden = true }
@@ -1552,7 +1575,7 @@ struct ContentView: View {
                 Button("All settings") { devSheet = .allSettings }
                     .buttonStyle(.bordered)
                 Button("Enable JIT") {
-                    enableJITViaStikDebug()
+                    enableJIT()
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -2232,7 +2255,7 @@ struct ContentView: View {
         }
     }
 
-    private func enableJITViaStikDebug() {
+    private func enableJIT() {
         // Explains why JIT cannot be enabled on a copy signed without get-task-allow; 0 opens StikDebug regardless.
         // A debugger can attach only to a process whose signature carries
         // get-task-allow (a development signature). A copy signed with a
@@ -2247,15 +2270,22 @@ struct ContentView: View {
             return
         }
         jitStatus = .testing
-        logStore.log("Requesting JIT via StikDebug URL scheme...")
+        logStore.log("Requesting JIT with \(jitCoordinator.resolvedMethod.title)...")
 
-        StikJITHelper.enableJIT { success in
-            if success {
+        jitCoordinator.enable { result in
+            switch result {
+            case .success:
                 jitStatus = .available
                 logStore.log("JIT enabled! Debugger attached.", level: .success)
-            } else {
+            case .failure(let failure):
+                if let coordinatorError = failure as? JITCoordinator.CoordinatorError,
+                   case .setupRequired = coordinatorError {
+                    jitStatus = .unknown
+                    return
+                }
                 jitStatus = .unavailable
-                logStore.log("Failed to enable JIT via StikDebug", level: .error)
+                logStore.log("Failed to enable JIT: \(failure.localizedDescription)", level: .error)
+                if library.enabled { library.error = failure.localizedDescription }
             }
         }
     }
@@ -2277,6 +2307,50 @@ struct ContentView: View {
         return false
     }
 
+    /// Whether a Steam game may start as far as its Steam Cloud saves go. If a sync
+    /// is running, the last check failed or never ran, or saves wait for a choice,
+    /// an alert asks first; `retry` starts the game again from there. A check that
+    /// is only old is repeated first, without asking.
+    private func cloudClear(_ appID: Int, name: String, retry: @escaping () -> Void) -> Bool {
+        guard library.enabled else { return true }
+        if library.cloudBypass == appID { library.cloudBypass = nil; return true }
+        guard let hold = SteamOwnedLibrary.shared.cloudHold(appID) else { return true }
+        library.cloudRetry = retry
+        if hold == .stale { cloudWait(appID); return false }
+        LogStore.shared.log("[steam-cloud] app=\(appID) before-play: held \(hold)")
+        library.cloudNotice = cloudNotice(appID, name: name, hold: hold)
+        return false
+    }
+
+    private func cloudNotice(_ appID: Int, name: String, hold: SteamOwnedLibrary.CloudHold) -> LibraryModel.CloudNotice {
+        switch hold {
+        case .syncing, .stale:
+            return .init(appID: appID, kind: .syncing, title: "Steam Cloud is still syncing",
+                         message: "\(name)'s saves are still being checked or downloaded. Starting now may leave you on older saves.")
+        case .unchecked(let why):
+            return .init(appID: appID, kind: .unchecked, title: "Steam Cloud could not be checked",
+                         message: "Madeira does not know whether \(name)'s saves on this device are the latest."
+                            + (why.map { " (\($0))" } ?? "") + " If another device has newer saves, starting now means choosing between them later.")
+        case .conflict(let count):
+            return .init(appID: appID, kind: .conflict, title: "Saves differ from Steam Cloud",
+                         message: "\(count) of \(name)'s save\(count == 1 ? "" : "s") differ\(count == 1 ? "s" : "") between this device and Steam Cloud. Choose which to keep on the game's page, or start with this device's saves.")
+        }
+    }
+
+    /// Syncs the game's saves, then starts it; if the saves are still not settled, asks again.
+    private func cloudWait(_ appID: Int) {
+        guard SteamOwnedLibrary.shared.cloudWaitingFor == nil else { return }
+        let name = MadeiraDock.games(drive: MadeiraDock.drive).first { $0.id == appID }?.name ?? "This game"
+        Task { @MainActor in
+            let hold = await SteamOwnedLibrary.shared.settleCloud(appID)
+            if let hold {
+                library.cloudNotice = cloudNotice(appID, name: name, hold: hold)
+            } else {
+                let retry = library.cloudRetry; library.cloudRetry = nil; retry?()
+            }
+        }
+    }
+
     /// Play in the library (Library.swift): checks that a session can start,
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
@@ -2293,6 +2367,7 @@ struct ContentView: View {
             return
         }
         if let appID = entry.steamAppID {
+            guard cloudClear(appID, name: entry.title, retry: { launchLibraryEntry(entry) }) else { return }
             guard entry.steamProgram?.isEmpty == false else {
                 library.error = "Choose the program to start in Game details › Steam › Program."; return
             }
@@ -2475,6 +2550,15 @@ struct ContentView: View {
                 setenv("MADEIRA_DOCK_SESSION", "1", 1)
             } else {
                 unsetenv("MADEIRA_DOCK_SESSION")
+            }
+            // A Dock session runs Valve's client headless, with no Chromium, so
+            // nothing claims the 8 GB V8 cage holdback (virtual_ios.c). Let ntdll
+            // hand it to the allocator when the guest band runs out. madeira.cfg
+            // env.MADEIRA_CAGE_RELEASE, exported later, wins.
+            if dockLaunch.dock {
+                setenv("MADEIRA_CAGE_RELEASE", "1", 1)
+            } else {
+                unsetenv("MADEIRA_CAGE_RELEASE")
             }
             var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
             if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
@@ -2855,8 +2939,20 @@ struct ContentView: View {
             self.startWineserver()
             winios_phase("wineserver-up")
 
-            // Step 3: Start Wine (debugger still attached for PE loading BRK calls)
-            Thread.sleep(forTimeInterval: 2.0)
+            // Step 3: Start Wine.
+
+            // Wine starts as soon as the wineserver has finished starting up (its registry
+            // is loaded), normally within tens of milliseconds, instead of after a fixed
+            // 2 s pause. 0 restores the fixed pause.
+            if MadeiraConfig.flag("MADEIRA_FAST_SERVER_START") {
+                let waitStart = CFAbsoluteTimeGetCurrent()
+                while wineserver_is_ready() == 0, wineserver_is_running() != 0, CFAbsoluteTimeGetCurrent() - waitStart < 2.0 {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                logStore.log(String(format: "[launch] wineserver ready after %.0f ms", (CFAbsoluteTimeGetCurrent() - waitStart) * 1000))
+            } else {
+                Thread.sleep(forTimeInterval: 2.0)
+            }
             winios_phase("wine-start")
             self.startWineProcess()
 
@@ -2957,6 +3053,7 @@ struct ContentView: View {
     private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
         guard jitReadyForLaunch(inLibrary: inLibrary) else { return }
+        guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
             if inLibrary { library.error = "A session is already running." }
@@ -3405,6 +3502,11 @@ struct TouchControl: Codable, Identifiable, Equatable {
     var ny: Double = 0.5
     var scale: Double = 1.0
     var action: ControlAction = .mouseLeft   // usable the moment it is created
+    /// A physical controller input that also performs this control's key or
+    /// mouse action when the game runs in keyboard-and-mouse controller mode
+    /// (PadKeyboardMouse): "A", "RT", "D↑", ...; "LS"/"RS" for a key stick.
+    /// Optional, so layouts saved before it existed still decode.
+    var padBinding: String?
 }
 
 final class TouchControlsModel: ObservableObject {
@@ -4136,6 +4238,9 @@ struct MappingPanel: View {
 
     private var keyboardTab: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if GamepadInput.keyboardMouseAvailable, !control.action.isPad, control.action != .none, control.action != .keyboardToggle {
+                bindingSection
+            }
             section("Pointer, sticks & special", [
                 ("L click", .mouseLeft), ("R click", .mouseRight),
                 ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
@@ -4179,6 +4284,34 @@ struct MappingPanel: View {
             // XInput names, the chips and the buttons read Start/Select.
             section("System", [("Start", .pad("Menu")), ("Select", .pad("View")),
                                ("Guide", .pad("Guide"))])
+        }
+    }
+
+    /// Keyboard-and-mouse controller mode: which physical input performs this
+    /// control's action. A key stick binds to a stick; everything else to a
+    /// button or trigger. The chosen chip is highlighted; tapping it again clears.
+    private var bindingSection: some View {
+        let names = control.action.stickKeys != nil ? PadBindings.stickNames : PadBindings.buttonNames
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Controller button for this action (keyboard & mouse mode)")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
+                ForEach(names, id: \.self) { name in
+                    let on = control.padBinding == name
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        if let i = m.index(of: control.id) { m.controls[i].padBinding = on ? nil : name }
+                    } label: {
+                        Text(name == "Menu" ? "Start" : name == "View" ? "Select" : name)
+                            .font(.system(size: 12, weight: .medium)).lineLimit(1).minimumScaleFactor(0.55)
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, minHeight: 30)
+                            .background(RoundedRectangle(cornerRadius: 7).fill(on ? Color.accentColor.opacity(0.6) : .white.opacity(0.12)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
     }
 
