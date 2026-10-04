@@ -761,7 +761,10 @@ final class SteamOwnedLibrary: ObservableObject {
         case .failed(let message): return message == Self.cloudNoFolders ? nil : .unchecked(message)
         case .ready: break
         }
-        if let problem = state.problem { return .unchecked(problem) }
+        // A failed UPLOAD leaves the cloud no newer than this device (it only had files the
+        // cloud lacked), so starting with this device's saves loses nothing: say so in the
+        // log and do not hold Play. A failed check or download still holds it.
+        if let problem = state.problem, !problem.hasPrefix("Steam Cloud upload stopped") { return .unchecked(problem) }
         if !state.conflicts.isEmpty { return .conflict(state.conflicts.count) }
         if Date().timeIntervalSince(state.checked ?? .distantPast) > Self.cloudFresh { return .stale }
         return nil

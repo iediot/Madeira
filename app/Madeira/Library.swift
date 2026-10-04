@@ -1081,6 +1081,11 @@ final class LibraryJITState: ObservableObject {
     func refresh() {
         let now = StikJITHelper.ready
         guard now != enabled else { return }
+        // A drop with no session running is almost always StikDebug being suspended or
+        // killed in the background, which ends its debugger connection.
+        LogStore.shared.log("[jit-state] \(now ? "on" : "off") debugger-attached=\(isDebuggerAttached() ? 1 : 0) "
+            + "session=\(wine_process_is_running() != 0 ? 1 : 0) app-state=\(UIApplication.shared.applicationState.rawValue)",
+            level: now ? .info : .error)
         withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) { enabled = now }
     }
 }
@@ -1879,11 +1884,6 @@ struct LibraryView: View {
     var startDock: (DockGame, Bool) -> Void = { _, _ in }
     /// First-run setup (Onboarding.swift).
     @ObservedObject private var onboarding = OnboardingModel.shared
-    @ObservedObject private var jit = JITCoordinator.shared
-    /// The library's error is a JIT connection problem with a fix to offer.
-    private var jitProblem: JITCoordinator.ConnectionProblem? {
-        jit.connectionProblem.flatMap { model.error == $0.message ? $0 : nil }
-    }
     @State private var browser = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
@@ -1951,9 +1951,8 @@ struct LibraryView: View {
         // On the tab view, not inside one tab's page: an alert attached to the Library
         // page cannot present while Settings is showing, so an error raised there (its
         // Enable JIT, for one) waited until the Library tab came back.
-        .alert(jitProblem == nil ? "Library" : "Couldn't Enable JIT",
+        .alert("Library",
                isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
-            if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
@@ -2024,8 +2023,8 @@ struct LibraryView: View {
     private var settings: some View {
         Form {
             // JIT and Memory+ show in the header's status capsule on every tab. How JIT is
-            // enabled (built in, pairing, StikDebug) comes first: nothing runs without it.
-            if settingsShow("JIT", "StikDebug", "built-in", "pairing", "LocalDevVPN") {
+            // enabled (StikDebug) comes first: nothing runs without it.
+            if settingsShow("JIT", "StikDebug", "LocalDevVPN") {
                 JITSettingsSection()
             }
             if settingsShow("JIT", "automatically", "StikDebug", "start") {
@@ -2362,19 +2361,43 @@ struct LibraryDetail: View {
     /// The presets, plus a stored size that is none of them (a screen shape
     /// chosen on another device), so the picker never shows a blank choice.
     static func resolutions(keeping current: String) -> [String] {
-        presetResolutions.contains(current) || current == screenShapeResolution ? presetResolutions : presetResolutions + [current]
+        presetResolutions.contains(current) || screenShapeResolutions.contains(current) ? presetResolutions : presetResolutions + [current]
     }
     /// "WxH" matching this screen's landscape aspect at 720 lines (width
     /// rounded to a multiple of 8), or nil when it equals a preset or
     /// MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
-    static var screenShapeResolution: String? {
+    static var screenShapeResolution: String? { screenShape(lines: 720) }
+    /// The screen's shape from its native pixel size down to 360 lines: lower ones cost
+    /// less GPU time (and heat, which throttles the CPU) and still fill the screen
+    /// without bars. Native first, then descending.
+    static var screenShapeResolutions: [String] {
+        var sizes: [String] = []
+        if let native = nativeResolution { sizes.append(native) }
+        for lines in [1080, 900, 810, 720, 648, 540, 480, 432, 360] {
+            if let size = screenShape(lines: lines), !sizes.contains(size) { sizes.append(size) }
+        }
+        return sizes
+    }
+    /// This screen's own pixels in landscape (UIScreen.nativeBounds), e.g. 2796x1290.
+    static var nativeResolution: String? {
+        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
+        let px = UIScreen.main.nativeBounds.size
+        let long = Int(max(px.width, px.height)), short = Int(min(px.width, px.height))
+        guard short > 0, long <= 4096 else { return nil }
+        return "\(long)x\(short)"
+    }
+    static func screenShape(lines: Int) -> String? {
         guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
         let bounds = UIScreen.main.bounds
         let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
         guard short > 0 else { return nil }
-        let width = Int((720 * long / short / 8).rounded()) * 8
-        guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
-        return "\(width)x720"
+        let width = Int((CGFloat(lines) * long / short / 8).rounded()) * 8
+        let size = "\(width)x\(lines)"
+        // Only sizes below the native height: above it the screen just scales back down.
+        let nativeShort = Int(min(UIScreen.main.nativeBounds.width, UIScreen.main.nativeBounds.height))
+        guard (640...4096).contains(width), nativeShort == 0 || lines < nativeShort,
+              !presetResolutions.contains(size) else { return nil }
+        return size
     }
     private func start() {
         guard !leaving else { return }
@@ -2433,6 +2456,21 @@ struct LibraryDetail: View {
                                 }.clipped()
                         )
                 }
+                Section("Display") {   // first after Play: the setting changed most often
+                    // The Windows screen the game renders for (and the Desktop's size).
+                    Picker("Resolution", selection: $entry.resolution) {
+                        ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { Text($0.replacingOccurrences(of: "x", with: "×")).tag($0) }
+                        // This device's own aspect ratio at 720 lines, so the game
+                        // fills the screen without bars or stretching.
+                        ForEach(Self.screenShapeResolutions, id: \.self) { shape in
+                            Text("\(shape == Self.nativeResolution ? "Native" : "Screen shape") (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        }
+                    }
+                    Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
+                        ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+                    }
+                    FPSChoice(mode: $entry.fpsMode)
+                }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
                     Toggle("Live logs", isOn: $entry.liveLogs)
@@ -2456,21 +2494,6 @@ struct LibraryDetail: View {
                     LabeledContent("Control size") {
                         Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
                     }
-                }
-                Section("Display") {
-                    // The Windows screen the game renders for (and the Desktop's size).
-                    Picker("Resolution", selection: $entry.resolution) {
-                        ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { Text($0.replacingOccurrences(of: "x", with: "×")).tag($0) }
-                        // This device's own aspect ratio at 720 lines, so the game
-                        // fills the screen without bars or stretching.
-                        if let shape = Self.screenShapeResolution {
-                            Text("Screen shape (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
-                        }
-                    }
-                    Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
-                        ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
-                    }
-                    FPSChoice(mode: $entry.fpsMode)
                 }
                 if entry.desktop != true { Section("Library details") {
                     TextField("Title", text: $entry.title)

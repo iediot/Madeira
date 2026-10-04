@@ -87,7 +87,11 @@ actor CMServerList {
 
     /// Fetch WebSocket CM server list from Steam Web API
     private func fetchServerList() async throws -> [CMServer] {
-        let urlString = "https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cellid=0&cmtype=websockets"
+        // cellid 0 is "anywhere": the list it returns is not ordered by distance, and the
+        // first entry was São Paulo for a European user. The cell the last logon reported
+        // orders the list nearest first.
+        let cell = UserDefaults.standard.integer(forKey: "madeira.steam.cellID")
+        let urlString = "https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cellid=\(cell)&cmtype=websockets"
         guard let url = URL(string: urlString) else {
             throw SteamError.connectionFailed("Invalid CM directory URL")
         }

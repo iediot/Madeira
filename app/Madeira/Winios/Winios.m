@@ -1014,9 +1014,14 @@ static void winios_ensure_compositor(void) {
     }
     /* Wedged-thread triage: sample every thread's stack every 20s from
      * an app-side timer — keeps firing even when all wine threads are
-     * stuck (unlike the tree dump, which rides wine's event drain). */
+     * stuck (unlike the tree dump, which rides wine's event drain).
+     * Opt-in, like the ml2105 samplers (env.MADEIRA_THREAD_SAMPLE = 1): each
+     * pass interrupts all ~90 threads and symbolizes every frame with dladdr
+     * under the dyld lock, and gameplay windows holding a pass had 2.6x the
+     * frame spikes of the others. */
     static dispatch_source_t stack_timer;
-    if (!stack_timer) {
+    const char *sample = getenv("MADEIRA_THREAD_SAMPLE");
+    if (!stack_timer && sample && *sample == '1') {
         stack_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
         dispatch_source_set_timer(stack_timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),

@@ -8530,20 +8530,8 @@ static void ios_init_stub_tables(void)
  * winemetal_unix.c to avoid collision with our own ntdll table). */
 extern const void *dxmt_winemetal_unix_call_funcs[];
 
-/* DXMT's winemetal_unix.c, linked into the same image, reports per-frame
- * statistics into a "[frame]" instrument through the symbols below.  That
- * instrument is a diagnostic and is not part of this port, so this is its off
- * state: ios_frame_stats_on stays 0, which winemetal checks before any
- * per-frame hook, and the entry points it calls unconditionally do nothing.
- * Nothing here allocates, logs or takes a lock. */
-int ios_frame_stats_on = 0;
-void ios_frame_game_tick(void) { }
-void ios_frame_encode_present( int skipped ) { }
-void ios_frame_drawable_wait( unsigned long long ns ) { }
-void ios_frame_gpu( unsigned long long gpu_ns, unsigned long long inflight ) { }
-void ios_frame_note_display( int panel_hz, int intent_hz, int mode ) { }
-void ios_frame_limiter( unsigned long long ns ) { }
-void ios_frame_pass( unsigned kind, unsigned loads, unsigned stores, unsigned clears ) { }
+/* The [frame] hooks winemetal_unix.c calls (ios_frame_*) live in perf_ios.c,
+ * behind env.MADEIRA_PERF. */
 
 /* iOS-Madeira 2026-05-13: null audio driver unix table. Implements the 37
  * mmdevapi audio funcs to provide a fake "iOS Null" render endpoint with
@@ -11636,6 +11624,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     pthread_t warm;
                     if (!pthread_create( &warm, NULL, ios_pool_warmer_thread, NULL ))
                         pthread_detach( warm );
+                }
+                {
+                    extern void ios_perf_init( void );
+                    ios_perf_init();   /* [perf] profile, env.MADEIRA_PERF = 1 */
                 }
 
                 /* Write TEB restore trampoline at start of JIT pool.
@@ -21503,6 +21495,18 @@ void ios_reserve_fex_arena(void)
      * giving up -- the failure mode that matters is reserving NOTHING.
      * The VM's ceiling is 63GiB, so nothing above that can ever succeed. */
     static const struct { ULONG_PTR lo, hi; SIZE_T size; const char *what; } plan[] = {
+        /* ml2114: Madeira Dock sessions only (MADEIRA_DOCK_SESSION=1, see the loop).
+         * The FEX band holds every guest thread's rpmalloc heap (16MB spans,
+         * ~48MB+ a thread) and its 16MB call-return stack, so a Unity title's
+         * ~80 live threads plus Valve's client exhausted 16GB mid-game in Stick
+         * It to the Stickman ([alloc-fail] ml798 at bytes=0x18000, then a
+         * redelivery storm and termination). A Dock session runs Valve's client
+         * headless -- no CEF -- so the upper half of CEF's PartitionAlloc pools
+         * [0x7400000000,0x7c00000000) is free (the pa band measured 255MB dirty,
+         * all at 0x7400000000-0x7410000000). Doubling the band below FEX's own
+         * 16GB keeps it contiguous. Any other session skips this row, and a
+         * failed placement falls through to the 16GB row as before. */
+        { 0x7800000000ull, 0x7fffffffffull, 0x800000000ull, "dock high band 32GB"     },
         { 0x7c00000000ull, 0x7fffffffffull, 0x400000000ull, "hardware high band 16GB"  },
         { 0x0800000000ull, 0x0fffffffffull, 0x200000000ull, "constrained 8GB"          },
         { 0x0400000000ull, 0x07ffffffffull, 0x200000000ull, "8GB @16-32G"              },
@@ -21659,6 +21663,11 @@ void ios_reserve_fex_arena(void)
 
     for (i = 0; i < ARRAY_SIZE(plan); i++)
     {
+        if (i == 0)   /* ml2114: the 32GB row is for Dock sessions; MADEIRA_FEX_ARENA_32G=0 skips it */
+        {
+            const char *dock = getenv( "MADEIRA_DOCK_SESSION" ), *big = getenv( "MADEIRA_FEX_ARENA_32G" );
+            if (!dock || dock[0] != '1' || (big && big[0] == '0')) continue;
+        }
         if (arena_size_cap && (unsigned long long)plan[i].size > arena_size_cap)
         {
             dprintf( 2, "[fex-arena] ml995 SKIP %s (%llu MB) -- over the %llu MB cap\n",

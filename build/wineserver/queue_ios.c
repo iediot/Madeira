@@ -4358,6 +4358,13 @@ void ios_dump_stuck_waits(void)
     struct timespec now;
     unsigned long long now_ns;
     int i;
+    /* MADEIRA ml2112: diagnostics only (Settings' Diagnostics toggle, ml649). It
+     * runs on the server thread every game thread waits on, any wait past 5 s
+     * counts as "stuck" -- an idle worker's normal wait -- and each report adds
+     * [evt-*] history dumps: ~13 lines/s through gameplay in Stick It to the
+     * Stickman, every one written by the server thread. */
+    extern int madeira_get_diag_enabled( void );
+    if (!madeira_get_diag_enabled()) return;
 
     if (thresh_s < 0)
     {

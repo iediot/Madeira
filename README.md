@@ -50,9 +50,7 @@ Wine's server runs as a thread instead of a separate program.
 - An iPhone on **iOS 26 or later**, the only version Madeira currently runs
   on reliably. Development happens on recent Pro iPhones.
 - **JIT**, which iOS only allows while a debugger is attached. Madeira can use
-  [StikDebug](https://github.com/StikDebug/StikDebug) or its built-in StikJIT
-  helper. On iOS 27 the built-in helper can pair the iPhone itself, without a
-  computer.
+  [StikDebug](https://github.com/StikDebug/StikDebug).
 - An **Apple ID** to sideload the app. A free account works; its signing
   expires after 7 days, so the app needs refreshing weekly. Your games and
   saves are kept across reinstalls.
@@ -160,8 +158,7 @@ proposing anything to it.
 Madeira is built on [Wine](https://www.winehq.org/), [FEX-Emu](https://github.com/FEX-Emu/FEX),
 [DXMT](https://github.com/3Shain/DXMT) by Feifan He (3Shain) with the Direct3D 9
 frontend by David Acevedo (dacevedo12), [rpmalloc](https://github.com/mjansson/rpmalloc)
-by Mattias Jansson, [StikDebug](https://github.com/StikDebug/StikDebug), and
-[StikJIT](https://github.com/StikDebug/StikJIT)
+by Mattias Jansson, and [StikDebug](https://github.com/StikDebug/StikDebug)
 for enabling JIT. Thank you to everyone who contributes to them.
 
 <p align="center">

@@ -679,8 +679,64 @@ enum StikJITHelper {
         return (rx: rxPtr, rw: rwPtr, size: poolSize)
     }
 
+    /// The pool taken right after StikDebug attached (preparePoolNow), waiting for
+    /// the launch; nil once a launch has taken it.
+    private static var preparedPool: (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)?
+    private static var detached = false
+
+    /// The JIT pool size in MB for a standard launch: 896, or madeira.cfg pool
+    /// (256 to 1152), the same rule the launch sequence applies.
+    static var standardPoolMB: Int {
+        if let txt = MadeiraConfig.get("pool"),
+           let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)), mb >= 256, mb <= 1152 {
+            return mb
+        }
+        return 896
+    }
+
+    /// StikDebug only lives a minute or two in the background (iOS suspends it, or
+    /// kills it at its CPU limit), and a pool request it cannot answer froze the app
+    /// for ~20 s and then killed it (BAD POOL). So the pool is taken the moment the
+    /// debugger attaches, while StikDebug is certainly alive, and the debugger is
+    /// detached at once; Play then uses this pool and needs no debugger at all.
+    /// env.MADEIRA_JIT_EARLY_POOL = 0 takes the pool at Play, as before.
+    static func preparePoolNow(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard MadeiraConfig.flag("MADEIRA_JIT_EARLY_POOL"), !poolTaken, isDebuggerAttached() else {
+            completion(.success(())); return
+        }
+        let mb = standardPoolMB
+        LogStore.shared.log("[jit-early-pool] taking the \(mb)MB JIT pool now, while StikDebug is attached")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let pool = allocatePool(poolSize: mb * 1024 * 1024)
+            let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            if let pool {
+                preparedPool = pool
+                detachDebugger()
+                LogStore.shared.log(String(format: "[jit-early-pool] ready in %.0f ms, debugger detached: StikDebug is no longer needed this run", ms),
+                                    level: .success)
+            }
+            DispatchQueue.main.async {
+                if pool != nil { completion(.success(())) }
+                else {
+                    completion(.failure(NSError(domain: "MadeiraJIT", code: 20, userInfo: [NSLocalizedDescriptionKey:
+                        poolFailure ?? "Madeira could not set up its JIT memory. Restart Madeira and enable JIT again."])))
+                }
+            }
+        }
+    }
+
+    /// The pool preparePoolNow took, handed to the launch exactly once.
+    static func takePreparedPool() -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+        defer { preparedPool = nil }
+        return preparedPool
+    }
+
     /// Detach the debugger. Call this after Wine is done loading PE DLLs.
+    /// A second call does nothing: with no debugger left, its BRK has nobody to answer it.
     static func detachDebugger() {
+        guard !detached else { return }
+        detached = true
         LogStore.shared.log("Detaching debugger...")
         jit26_detach()
         // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED

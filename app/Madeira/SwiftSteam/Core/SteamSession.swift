@@ -155,17 +155,21 @@ class SteamSession {
             resetIdleTimer()
             return
         }
-        guard connectionState != .connecting else {
+        // A reconnect already scheduled after a lost connection counts as connecting:
+        // a second logon running beside it would race it.
+        let reconnectPending = connectionState == .reconnecting && reconnectTask != nil
+        if connectionState == .connecting || reconnectPending {
             // Already connecting — wait briefly for it to finish
             for _ in 0..<40 {
                 try await Task.sleep(nanoseconds: 500_000_000)
                 if connectionState == .authenticated { return }
                 if connectionState == .disconnected { break }
             }
-            if connectionState != .authenticated {
-                throw SteamError.connectionTimeout
+            // That attempt gave up (state back to disconnected): make a fresh one below.
+            guard connectionState == .disconnected else {
+                if connectionState != .authenticated { throw SteamError.connectionTimeout }
+                return
             }
-            return
         }
         try await connectAndLogin()
         resetIdleTimer()
@@ -352,6 +356,8 @@ class SteamSession {
                 self.sessionID = message.header.clientSessionid
                 self.heartbeatInterval = heartbeatSecs
                 self.cellID = outCellID
+                // The CM directory sorts servers for this cell (CMServerList).
+                if outCellID != 0 { UserDefaults.standard.set(Int(outCellID), forKey: "madeira.steam.cellID") }
                 self.connectionState = .authenticated
                 self.reconnectAttempts = 0
                 SteamLog.trace("Authenticated")
@@ -538,11 +544,26 @@ class SteamSession {
         }
     }
 
-    /// Send a service method call and wait for response
+    /// Send a service method call and wait for response. A call cut off by a lost
+    /// connection is sent once more after reconnecting.
     func callServiceMethod(
         method: SteamServiceMethod,
         body: Data,
         timeout: TimeInterval = 10
+    ) async throws -> Data {
+        do {
+            return try await callServiceMethodOnce(method: method, body: body, timeout: timeout)
+        } catch SteamError.disconnected where !isSuspended {
+            SteamLog.trace("\(method.rawValue): connection lost, reconnecting and retrying once")
+            try await ensureConnected()
+            return try await callServiceMethodOnce(method: method, body: body, timeout: timeout)
+        }
+    }
+
+    private func callServiceMethodOnce(
+        method: SteamServiceMethod,
+        body: Data,
+        timeout: TimeInterval
     ) async throws -> Data {
         resetIdleTimer()
         let jobID = nextJobID()
@@ -759,6 +780,19 @@ class SteamSession {
         heartbeatTask?.cancel()
 
         SteamLog.trace("Connection lost\(error.map { ": \($0.localizedDescription)" } ?? "")")
+
+        // Nothing sent on the lost socket can be answered: fail its waiters now rather
+        // than at their timeouts (30 s for a cloud call), so callServiceMethod retries on
+        // a fresh connection. iOS drops the socket whenever Madeira goes to the
+        // background, which the StikDebug hand-off for JIT does at every start.
+        for (_, continuation) in pendingJobs {
+            continuation.resume(throwing: SteamError.disconnected)
+        }
+        pendingJobs.removeAll()
+        for (_, acc) in pendingPICSJobs {
+            acc.continuation.resume(throwing: SteamError.disconnected)
+        }
+        pendingPICSJobs.removeAll()
 
         if wasAuthenticated && reconnectAttempts < maxReconnectAttempts {
             attemptReconnect()

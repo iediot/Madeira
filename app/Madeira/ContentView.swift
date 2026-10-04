@@ -2270,7 +2270,7 @@ struct ContentView: View {
             return
         }
         jitStatus = .testing
-        logStore.log("Requesting JIT with \(jitCoordinator.resolvedMethod.title)...")
+        logStore.log("Requesting JIT with StikDebug...")
 
         jitCoordinator.enable { result in
             switch result {
@@ -2294,8 +2294,33 @@ struct ContentView: View {
     /// attached (JIT enabled from StikDebug's own list, which attaches and leaves) the
     /// library offers Madeira's Enable JIT instead of starting a launch that cannot
     /// get its pool.
-    private func jitReadyForLaunch(inLibrary: Bool) -> Bool {
+    private func jitReadyForLaunch(inLibrary: Bool, retry: (() -> Void)? = nil) -> Bool {
         if StikJITHelper.ready { return true }
+        // JIT is only needed for the pool at launch (the debugger detaches right after),
+        // and StikDebug rarely survives long in the background. So Play asks StikDebug
+        // itself and starts the game once it is attached, instead of making the user
+        // tap Enable JIT and then Play again.
+        if inLibrary, let retry, SigningStatus.current.debuggable, StikJITHelper.isAvailable,
+           !jitCoordinator.busy {
+            logStore.log("[jit-launch] JIT is off at Play: requesting it, the game starts once it is attached")
+            jitStatus = .testing
+            jitCoordinator.enable { result in
+                switch result {
+                case .success:
+                    jitStatus = .available
+                    logStore.log("[jit-launch] JIT attached: starting the game", level: .success)
+                    // Let Madeira come back to the foreground before the launch.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        if StikJITHelper.ready { retry() }
+                    }
+                case .failure(let failure):
+                    jitStatus = .unavailable
+                    logStore.log("[jit-launch] JIT request failed: \(failure.localizedDescription)", level: .error)
+                    library.error = failure.localizedDescription
+                }
+            }
+            return false
+        }
         if StikJITHelper.flaggedWithoutDebugger {
             logStore.log("[jit-debugger] launch held: CS_DEBUGGED is set but no debugger is attached; "
                          + "JIT has to be enabled again from Madeira", level: .error)
@@ -2384,7 +2409,7 @@ struct ContentView: View {
         }
         // The same precondition runWineFullSequence checks: the JIT pool is
         // taken at launch, through the debugger.
-        guard jitReadyForLaunch(inLibrary: true) else { return }
+        guard jitReadyForLaunch(inLibrary: true, retry: { launchLibraryEntry(entry) }) else { return }
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
             library.error = error.localizedDescription
@@ -2711,7 +2736,10 @@ struct ContentView: View {
             winios_phase("pool-alloc-begin")
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
-            let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+            // Normally taken already, when StikDebug attached (StikJITHelper.preparePoolNow).
+            let early = StikJITHelper.takePreparedPool()
+            if let early { logStore.log("[jit-early-pool] using the \(early.size / 1024 / 1024)MB pool taken at Enable JIT") }
+            let pool = early ?? StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             winios_phase("pool-ready")
             logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
@@ -3052,7 +3080,8 @@ struct ContentView: View {
     /// session then takes that entry's display, performance and on-screen settings.
     private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
-        guard jitReadyForLaunch(inLibrary: inLibrary) else { return }
+        guard jitReadyForLaunch(inLibrary: inLibrary,
+                                retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)

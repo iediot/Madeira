@@ -461,7 +461,12 @@ bool jit_check_debugged(void) {
         return false;
     }
     bool debugged = (flags & CS_DEBUGGED) != 0;
-    jit_log("CS_DEBUGGED flag: %s (flags=0x%x)", debugged ? "SET" : "NOT SET", flags);
+    /* Polled every 2 s by the library's JIT status: log only a change. */
+    static int last = -1;
+    if (last != (int)debugged) {
+        last = debugged;
+        jit_log("CS_DEBUGGED flag: %s (flags=0x%x)", debugged ? "SET" : "NOT SET", flags);
+    }
     return debugged;
 }
 

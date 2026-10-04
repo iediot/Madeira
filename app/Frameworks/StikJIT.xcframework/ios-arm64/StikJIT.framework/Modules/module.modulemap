@@ -1,3 +1,0 @@
-framework module StikJIT {
-  header "StikJIT-Swift.h"
-}

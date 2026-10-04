@@ -4,7 +4,6 @@
 
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
 
 // First-run setup for JIT, Steam sign-in and Madeira Dock (docs/LIBRARY.md).
 // On a new install (no `madeiraOnboardingDone` in UserDefaults, which iOS
@@ -13,10 +12,7 @@ import UniformTypeIdentifiers
 // available), done. Every step can be skipped. Settings › JIT or Settings ›
 // Steam can reopen it. env.MADEIRA_ONBOARDING = 0 never opens it.
 //
-// The JIT page offers three ways in (on-device pairing on iOS 27, a pairing
-// file from a computer, StikDebug), each with its own numbered steps. It stores
-// only the chosen method and, when selected, pairs on this device through
-// OnDevicePairing or imports the pairing file through JITCoordinator.
+// The JIT page explains StikDebug, the only JIT method in this fork.
 // Sign-in goes through SteamSignIn (the
 // token stays in its Keychain store) and the components through
 // MadeiraDockModel.prepareClient(), which downloads and verifies files without
@@ -143,16 +139,9 @@ enum OnboardingRules {
 
 struct OnboardingView: View {
     @ObservedObject private var model = OnboardingModel.shared
-    @ObservedObject private var jit = JITCoordinator.shared
-    @ObservedObject private var pairing = OnDevicePairing.shared
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
     @State private var showSignIn = false
-    @State private var importingPairingFile = false
-    @State private var pairingImportError: String?
-    @State private var jitPath: JITSetupPath?
-
-    enum JITSetupPath: String { case onDevice = "on-device", pairingFile = "pairing-file", stikDebug = "stikdebug" }
 
     private var device: String { UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone" }
 
@@ -173,30 +162,12 @@ struct OnboardingView: View {
                     }
                 }
                 .padding(24).frame(maxWidth: 560, alignment: .leading).frame(maxWidth: .infinity)
-                .animation(.default, value: jitPath)
-                .animation(.default, value: pairing.phase)
             }
             .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         }
         .interactiveDismissDisabled()
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
-        .fileImporter(isPresented: $importingPairingFile,
-                      allowedContentTypes: [.propertyList, .data]) { result in
-            switch result {
-            case .success(let url):
-                jit.importPairingFile(url)
-                if jit.pairingImported {
-                    jit.method = .builtIn
-                    pairingImportError = nil
-                    LogStore.shared.log("[onboarding] JIT method=built-in pairing=imported")
-                }
-            case .failure(let failure):
-                pairingImportError = failure.localizedDescription
-                LogStore.shared.log("[onboarding] pairing import failed")
-            }
-        }
         .onAppear {
-            jit.refreshPairingStatus()
             signIn.refresh()
             dock.refresh()
         }
@@ -247,7 +218,7 @@ struct OnboardingView: View {
                 .font(.title3)
             Text("A few optional steps get you ready:").foregroundStyle(.secondary)
             let pages = model.steps
-            point(1, "Choose how Madeira enables JIT.")
+            point(1, "Set up JIT with StikDebug.")
             if pages.contains(.signIn) { point(2, "Sign in to Steam in Madeira.") }
             if pages.contains(.dockClient) {
                 point(3, "Download Valve's Steam client components for Madeira Dock.")
@@ -257,171 +228,23 @@ struct OnboardingView: View {
         }
     }
 
-    // JIT: pick one of three ways in, then follow its numbered steps.
+    // JIT: StikDebug's numbered steps.
 
-    private var pairedOnDevice: Bool { jit.pairingImported && jit.pairingSource == .onDevice }
-    private var fileImported: Bool { jit.pairingImported && jit.pairingSource == .imported }
-
-    @ViewBuilder private var jitPage: some View {
-        switch jitPath {
-        case nil: jitChoices
-        case .onDevice: onDeviceGuide
-        case .pairingFile: pairingFileGuide
-        case .stikDebug: stikDebugGuide
-        }
-    }
-
-    private var jitChoices: some View {
+    private var jitPage: some View {
         VStack(alignment: .leading, spacing: 18) {
             header("Set up JIT", symbol: "bolt.fill")
-            Text("JIT lets Madeira run Windows code. Choose how your \(device) gets it.")
-            VStack(spacing: 12) {
-                jitChoice("On-device", symbol: "iphone.radiowaves.left.and.right",
-                          detail: !OnDevicePairing.isSupported ? "Needs iOS 27 or later."
-                              : pairedOnDevice ? "Paired on this \(device)."
-                              : "Pair this \(device) with Madeira in Settings. No computer needed.",
-                          done: pairedOnDevice, enabled: OnDevicePairing.isSupported) { choose(.onDevice) }
-                jitChoice("On-device with pairing file", symbol: "doc.badge.plus",
-                          detail: fileImported ? "Pairing file imported." : "Use a pairing file made on a computer.",
-                          done: fileImported) { choose(.pairingFile) }
-                jitChoice("StikDebug", symbol: "ant",
-                          detail: "Enable JIT with the StikDebug app.",
-                          done: jit.method == .stikDebug) { choose(.stikDebug) }
-            }
-            secondary("I'll do this later") { model.next() }
-        }
-    }
-
-    private var onDeviceGuide: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header("Pair on this \(device)", symbol: "iphone.radiowaves.left.and.right")
-            VStack(alignment: .leading, spacing: 14) {
-                point(1, "Turn on Wi-Fi, then tap **Start pairing** and allow Local Network access.",
-                      done: pairing.phase != .idle || pairedOnDevice)
-                point(2, "Open Settings › Privacy & Security › Developer Mode, scroll down and tap **Pair with \(OnDevicePairing.hostName)**.",
-                      done: pairing.isShowingPin || pairedOnDevice)
-                point(3, "Enter the code Madeira shows. It's also in the banner at the top of the screen and in a notification.",
-                      done: pairedOnDevice)
-            }
-            if pairedOnDevice {
-                Label("Paired on this \(device)", systemImage: "checkmark.circle.fill")
-                    .font(.headline).foregroundStyle(.green)
-                vpnNote
-                primary("Continue", symbol: "arrow.right") { useBuiltIn() }
-                secondary("Pair again") { startPairing() }
-            } else {
-                primary("Start pairing", symbol: "dot.radiowaves.left.and.right") { startPairing() }
-                    .disabled(pairing.active)
-                OnDevicePairingPanel()
-            }
-            secondary("Back to options") { leaveGuide() }
-        }
-    }
-
-    private var pairingFileGuide: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header("Use a pairing file", symbol: "doc.badge.plus")
-            VStack(alignment: .leading, spacing: 14) {
-                point(1, "On a computer, make this \(device)'s pairing file with the [StikDebug pairing-file guide](https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md).",
-                      done: fileImported)
-                point(2, "Save it to Files or AirDrop it to this \(device).", done: fileImported)
-                point(3, "Tap **Choose pairing file** and pick it.", done: fileImported)
-            }
-            Label("The pairing file stays in Madeira's Documents folder.", systemImage: "lock.fill")
-                .font(.subheadline).foregroundStyle(.secondary)
-            if fileImported {
-                Label("Pairing file imported", systemImage: "checkmark.circle.fill")
-                    .font(.headline).foregroundStyle(.green)
-                vpnNote
-                primary("Continue", symbol: "arrow.right") { useBuiltIn() }
-                secondary("Choose another pairing file") { importPairingFile() }
-            } else {
-                primary("Choose pairing file", symbol: "folder") { importPairingFile() }
-            }
-            if let error = pairingImportError ?? jit.error {
-                Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
-            }
-            secondary("Back to options") { leaveGuide() }
-        }
-    }
-
-    private var stikDebugGuide: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header("Use StikDebug", symbol: "ant")
+            Text("JIT lets Madeira run Windows code. Your \(device) gets it through StikDebug.")
             VStack(alignment: .leading, spacing: 14) {
                 point(1, "Install [StikDebug](https://github.com/StikDebug/StikDebug/releases/latest) and import this \(device)'s pairing file into it.")
                 point(2, "Install and connect [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044).")
                 point(3, "When you play, Madeira opens StikDebug to enable JIT, then comes back.")
             }
-            primary("Use StikDebug", symbol: "arrow.right") {
-                jit.method = .stikDebug
-                LogStore.shared.log("[onboarding] JIT method=StikDebug")
+            primary("Continue", symbol: "arrow.right") {
+                LogStore.shared.log("[onboarding] JIT StikDebug")
                 model.next()
             }
-            secondary("Back to options") { leaveGuide() }
+            secondary("I'll do this later") { model.next() }
         }
-    }
-
-    private var vpnNote: some View {
-        Label {
-            Text("Before you play, connect [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044). Madeira enables JIT through it.")
-        } icon: {
-            Image(systemName: "network")
-        }
-        .font(.subheadline).foregroundStyle(.secondary)
-    }
-
-    private func jitChoice(_ title: String, symbol: String, detail: String, done: Bool, enabled: Bool = true,
-                           action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 14) {
-                Image(systemName: symbol).font(.title2).foregroundStyle(.tint).frame(width: 36)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(.headline).foregroundStyle(.primary)
-                    Text(detail).font(.subheadline).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 8)
-                if done {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                } else {
-                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                }
-            }
-            .padding(14).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(uiColor: .secondarySystemGroupedBackground),
-                        in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        }
-        .buttonStyle(.plain).disabled(!enabled).opacity(enabled ? 1 : 0.5)
-    }
-
-    private func choose(_ way: JITSetupPath) {
-        pairingImportError = nil
-        LogStore.shared.log("[onboarding] JIT way=\(way.rawValue)")
-        jitPath = way
-    }
-
-    private func leaveGuide() {
-        if pairing.active { pairing.cancel() }
-        jitPath = nil
-    }
-
-    private func startPairing() {
-        pairingImportError = nil
-        LogStore.shared.log("[onboarding] JIT on-device pairing started")
-        pairing.start()
-    }
-
-    private func importPairingFile() {
-        pairingImportError = nil
-        importingPairingFile = true
-    }
-
-    private func useBuiltIn() {
-        jit.method = .builtIn
-        LogStore.shared.log("[onboarding] JIT method=built-in")
-        model.next()
     }
 
     private var signInPage: some View {
@@ -479,7 +302,6 @@ struct OnboardingView: View {
     private var donePage: some View {
         VStack(alignment: .leading, spacing: 18) {
             header("You're all set", symbol: "checkmark.seal.fill")
-            Text("You can change the JIT method or import a pairing file from Settings › JIT.")
             if model.steps.contains(.dockClient) {
                 Text("Settings › Steam › Madeira Dock lists the Steam games installed in Madeira's drive_c and starts them.")
             }
