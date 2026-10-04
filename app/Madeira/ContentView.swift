@@ -482,6 +482,17 @@ final class MetalBackedView: UIView {
     private let F_RDOWN: UInt32 = 0x8, F_RUP: UInt32 = 0x10
     private let F_WHEEL: UInt32 = 0x800, F_ABS: UInt32 = 0x8000
 
+    /// The trackpad below (a tap clicks on lift, a hold drags) is for the Wine desktop
+    /// itself: the library's Desktop entry, or the developer interface. A game, Madeira
+    /// Dock's included (its Steam client puts it on the desktop too), gets direct touch:
+    /// the button goes down where the finger lands, the moment it lands. On the trackpad
+    /// Geometry Dash jumped only when the finger lifted, a delay on every click.
+    private var desktopTrackpad: Bool {
+        guard desktopMode else { return false }
+        let library = LibraryModel.shared
+        return library.current == nil || library.activeEntry?.desktop == true
+    }
+
     private var desktopMode: Bool {
         guard let v = getenv("MADEIRA_DESKTOP") else { return false }
         return v.pointee == 49  // '1'
@@ -503,10 +514,29 @@ final class MetalBackedView: UIView {
         (event?.allTouches ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
     }
 
+    /// Portrait: the game sits at the top and the space below it belongs to the
+    /// touch controls. A finger that lands there is not the game's: it would click
+    /// the game's bottom edge. Such touches are ignored until they lift.
+    private var outsideGameTouches = Set<ObjectIdentifier>()
+    private func dropOutsideGame(_ touches: Set<UITouch>, began: Bool) -> Set<UITouch> {
+        guard !desktopMode else { return touches }
+        if began, bounds.height > bounds.width {
+            let game = GameSurfaceLayout.rect(guest: guestSize(), aspect: drawableAspect(),
+                                              bounds: bounds, mode: effectiveDisplayMode())
+            for t in touches where !game.contains(t.location(in: self)) { outsideGameTouches.insert(ObjectIdentifier(t)) }
+        }
+        return touches.filter { !outsideGameTouches.contains(ObjectIdentifier($0)) }
+    }
+    private func forgetOutsideGame(_ touches: Set<UITouch>) {
+        for t in touches { outsideGameTouches.remove(ObjectIdentifier(t)) }
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .began) { return }
+        let touches = dropOutsideGame(touches, began: true)
+        guard !touches.isEmpty else { return }
         if touchPointerMode { touchModeBegan(touches); return }
-        guard desktopMode else {
+        guard desktopTrackpad else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_down(x, y)
@@ -551,8 +581,10 @@ final class MetalBackedView: UIView {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .moved) { return }
+        let touches = dropOutsideGame(touches, began: false)
+        guard !touches.isEmpty else { return }
         if touchPointerMode { touchModeMoved(touches, event); return }
-        guard desktopMode else {
+        guard desktopTrackpad else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_move(x, y)
@@ -632,8 +664,11 @@ final class MetalBackedView: UIView {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .ended) { return }
+        let all = touches, touches = dropOutsideGame(touches, began: false)
+        forgetOutsideGame(all)
+        guard !touches.isEmpty else { return }
         if touchPointerMode { touchModeEnded(touches, event); return }
-        guard desktopMode else {
+        guard desktopTrackpad else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
@@ -675,8 +710,11 @@ final class MetalBackedView: UIView {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .cancelled) { return }
+        let all = touches, touches = dropOutsideGame(touches, began: false)
+        forgetOutsideGame(all)
+        guard !touches.isEmpty else { return }
         if touchPointerMode { touchModeCancelled(touches); return }
-        guard desktopMode else {
+        guard desktopTrackpad else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
@@ -3212,7 +3250,7 @@ struct ContentView: View {
                 if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
             }
             // A Steam game's own Resolution (validated above) sizes its Dock desktop.
-            if let size = profile?.resolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
+            if let size = profile?.pixelResolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
                 width = size[0]; height = size[1]
             }
             setenv("MADEIRA_EXE", "explorer.exe", 1)
@@ -3610,7 +3648,11 @@ final class TouchControlsModel: ObservableObject {
         didSet {
             // ml1970: an ended edit is written back to the custom layout it came from.
             if !oldValue && editing { editBaseline = controls }
-            if oldValue && !editing { ControlPresetsModel.shared.editingEnded(baseline: editBaseline) }
+            if oldValue && !editing {
+                ControlPresetsModel.shared.editingEnded(baseline: editBaseline)
+                // Edited during a game: the game's profile keeps the new layout at once.
+                if LibraryModel.shared.current != nil { LibraryModel.shared.saveCurrentProfile() }
+            }
         }
     }
     @Published var selected: UUID?              // transient
@@ -3698,11 +3740,50 @@ final class TouchControlsModel: ObservableObject {
         guard visible else { return false }
         for c in controls {
             let r = Self.diameter(c) / 2
-            let cx = CGFloat(c.nx) * bounds.width
-            let cy = CGFloat(c.ny) * bounds.height
-            if hypot(p.x - cx, p.y - cy) <= r { return true }
+            let centre = center(of: c, in: bounds.size)
+            if hypot(p.x - centre.x, p.y - centre.y) <= r { return true }
         }
         return false
+    }
+
+    /// Where control `c` is drawn on `screen`. The layout is made for landscape
+    /// (nx, ny are fractions of a landscape screen). During a game in portrait the
+    /// game sits at the top (GameSurfaceLayout) and the controls go in the space
+    /// below it: each keeps its distance from its own side (left-hand controls from
+    /// the left edge, right-hand ones from the right, the middle ones from the
+    /// centre) and from the bottom, all shrunk by one factor when needed so the two
+    /// sides never meet and nothing climbs into the game. Editing uses the plain
+    /// layout, so drags map as before.
+    func center(of c: TouchControl, in screen: CGSize) -> CGPoint {
+        let plain = CGPoint(x: CGFloat(c.nx) * screen.width, y: CGFloat(c.ny) * screen.height)
+        guard screen.height > screen.width, !editing, LibraryModel.shared.current != nil,
+              let layout = portraitLayout(screen) else { return plain }
+        let lw = screen.height, lh = screen.width          // the landscape screen the layout was made on
+        let lx = CGFloat(c.nx) * lw, ly = CGFloat(c.ny) * lh
+        let x: CGFloat
+        if c.nx < 0.4 { x = lx * layout.kx }
+        else if c.nx > 0.6 { x = screen.width - (lw - lx) * layout.kx }
+        else { x = screen.width / 2 + (lx - lw / 2) * layout.kx }
+        let y = layout.bottom - (lh - ly) * layout.ky
+        return CGPoint(x: x, y: max(y, layout.top + Self.diameter(c) / 2))
+    }
+
+    /// The controls' area below the game and the shrink factors for this screen.
+    private func portraitLayout(_ screen: CGSize) -> (top: CGFloat, bottom: CGFloat, kx: CGFloat, ky: CGFloat)? {
+        let game = GameSurfaceLayout.portraitGameRect(screen: screen, mode: LibraryModel.shared.displayMode)
+        let top = min(game.maxY, screen.height * 0.6) + 8
+        let bottom = screen.height - 28                    // above the home indicator
+        guard bottom - top > 80 else { return nil }
+        let lw = screen.height, lh = screen.width
+        var kx: CGFloat = 1, ky: CGFloat = 1
+        for c in controls {
+            let r = Self.diameter(c) / 2
+            let lx = CGFloat(c.nx) * lw, fromBottom = lh - CGFloat(c.ny) * lh
+            let fromSide = c.nx < 0.4 ? lx : c.nx > 0.6 ? lw - lx : 0
+            if fromSide > 0 { kx = min(kx, max(0.2, (screen.width / 2 - r - 6) / fromSide)) }
+            if fromBottom > 0 { ky = min(ky, max(0.2, (bottom - top - r) / fromBottom)) }
+        }
+        return (top: top, bottom: bottom, kx: kx, ky: ky)
     }
 }
 
@@ -4136,8 +4217,7 @@ struct TouchControlButton: View {
         .onChange(of: control.action) { old, new in
             if old.isPad || new.isPad { padVector = .zero; isDown = false }
         }
-        .position(x: CGFloat(control.nx) * screen.width,
-                  y: CGFloat(control.ny) * screen.height)
+        .position(m.center(of: control, in: screen))
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in

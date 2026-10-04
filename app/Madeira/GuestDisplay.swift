@@ -1,3 +1,4 @@
+import UIKit
 import Foundation
 
 // The guest's virtual monitor and how it is laid out on the device's screen.
@@ -71,9 +72,29 @@ enum GameSurfaceLayout {
         let sx = bounds.width / shape.width, sy = bounds.height / shape.height
         let scale = mode == .fill ? max(sx, sy) : min(sx, sy)
         let w = shape.width * scale, h = shape.height * scale
+        // Portrait: the game sits at the top, under the status bar, and the space
+        // below it is the touch controls' (TouchControlsModel.center). Fill covers
+        // the screen as before.
+        let top = bounds.height > bounds.width && mode != .fill
+            ? min(portraitTopInset, max(0, bounds.height - h)) : (bounds.height - h) / 2
         return CGRect(x: bounds.minX + (bounds.width - w) / 2,
-                      y: bounds.minY + (bounds.height - h) / 2,
+                      y: bounds.minY + top,
                       width: w, height: h)
+    }
+
+    /// The status bar's height in portrait, which the game is placed below.
+    static var portraitTopInset: CGFloat {
+        let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows).first { $0.isKeyWindow }
+        return window?.safeAreaInsets.top ?? 0
+    }
+
+    /// Where the running game appears on a portrait screen of `size` (its Resolution
+    /// fitted to the width, at the top), for laying the touch controls out below it.
+    static func portraitGameRect(screen size: CGSize, mode: DisplayMode) -> CGRect {
+        let w = Double(getenv("MADEIRA_SCREEN_W").map { String(cString: $0) } ?? "") ?? 1280
+        let h = Double(getenv("MADEIRA_SCREEN_H").map { String(cString: $0) } ?? "") ?? 720
+        return rect(guest: CGSize(width: w, height: h), bounds: CGRect(origin: .zero, size: size), mode: mode)
     }
 
     /// A point in `bounds`'s coordinate space (a touch) in guest pixels for

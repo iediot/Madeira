@@ -21,6 +21,168 @@ index 90b5aa66..a5bdc930 100644
  
  The LGPL permits combining this library with proprietary components (such
  as Apple's Metal Shader Converter) subject to LGPL-2.1 section 6; see the
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index e617138e..ea201969 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -905,6 +905,7 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
+  * Caveat kept from ml590: TLS 1.3 puts EncryptedExtensions/Certificate/
+  * CertificateVerify/Finished/NewSessionTicket ALL under record type 0x17, so the tail
+  * read is "post-handshake", not provably application data. */
++#include <arpa/inet.h>   /* inet_ntop, for the peer address in host= */
+ #define IOS_TL_SLOTS 128
+ struct ios_tl_ent
+ {
+@@ -916,7 +917,41 @@ struct ios_tl_ent
+     unsigned long      b_send, b_recv;
+     int                post_len;
+     unsigned char      post5[5];
++    char               host[64];    /* TLS SNI from the ClientHello, or the peer IP */
+ };
++
++/* The server name a TLS ClientHello asks for (the SNI extension, plain text), so
++ * a connection's line names who it talks to. 0 when absent or truncated. */
++static int ios_tl_sni( const unsigned char *b, long n, char *out, size_t outsz )
++{
++    long p = 43, end, ext_end;
++    if (n < 44 || b[0] != 0x16 || b[5] != 0x01) return 0;
++    p += 1 + b[43];                                           /* session id */
++    if (p + 2 > n) return 0;
++    p += 2 + ((b[p] << 8) | b[p + 1]);                        /* cipher suites */
++    if (p + 1 > n) return 0;
++    p += 1 + b[p];                                            /* compression */
++    if (p + 2 > n) return 0;
++    ext_end = p + 2 + ((b[p] << 8) | b[p + 1]);
++    p += 2;
++    end = ext_end < n ? ext_end : n;
++    while (p + 4 <= end)
++    {
++        unsigned type = (b[p] << 8) | b[p + 1], len = (b[p + 2] << 8) | b[p + 3];
++        p += 4;
++        if (type == 0 && p + 5 <= end)
++        {
++            unsigned nl = (b[p + 3] << 8) | b[p + 4];
++            if (b[p + 2] != 0 || p + 5 + nl > end) return 0;
++            if (nl >= outsz) nl = outsz - 1;
++            memcpy( out, b + p + 5, nl );
++            out[nl] = 0;
++            return 1;
++        }
++        p += len;
++    }
++    return 0;
++}
+ static struct ios_tl_ent ios_tl_tab[IOS_TL_SLOTS];
+ static unsigned int ios_tl_gen;
+ 
+@@ -945,12 +980,13 @@ static void ios_tl_flush( struct ios_tl_ent *e, const char *fate )
+ 
+     dprintf( 2, "[sock-tl] fd=%d gen=%u port=%u open->CH=%.1f CH->flight=%.1f "
+                 "flight->fin=%.1f fin->tail=%.1f tail->post=%.1f total=%.1fms "
+-                "tx=%u/%luB rx=%u/%luB alerts=%u post=%s fate=%s rev=ml591\n",
++                "tx=%u/%luB rx=%u/%luB alerts=%u post=%s fate=%s host=%s rev=ml591\n",
+              e->fd, e->gen, e->port,
+              ios_tl_d( e->t0, e->t_ch ), ios_tl_d( e->t_ch, e->t_flight ),
+              ios_tl_d( e->t_flight, e->t_fin ), ios_tl_d( e->t_fin, e->t_tail ),
+              ios_tl_d( e->t_tail, e->t_post ), ios_tl_d( e->t0, e->t_last ),
+-             e->n_send, e->b_send, e->n_recv, e->b_recv, e->alerts, post, fate );
++             e->n_send, e->b_send, e->n_recv, e->b_recv, e->alerts, post, fate,
++             e->host[0] ? e->host : "?" );
+     e->fd = -1;
+ }
+ 
+@@ -1026,6 +1062,10 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
+         e = &ios_tl_tab[freeslot];
+         memset( e, 0, sizeof(*e) );
+         e->fd = fd; e->port = port; e->gen = ++ios_tl_gen; e->t0 = now;
++        if (pa.ss_family == AF_INET)
++            inet_ntop( AF_INET, &((const struct sockaddr_in *)&pa)->sin_addr, e->host, sizeof(e->host) );
++        else
++            inet_ntop( AF_INET6, &((const struct sockaddr_in6 *)&pa)->sin6_addr, e->host, sizeof(e->host) );
+     }
+ 
+     e->t_last = now;
+@@ -1035,7 +1075,11 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
+ 
+     if (is_send)
+     {
+-        if (rec == 0x16 && !e->t_ch) e->t_ch = now;
++        if (rec == 0x16 && !e->t_ch)
++        {
++            e->t_ch = now;
++            ios_tl_sni( b, ret_bytes, e->host, sizeof(e->host) );
++        }
+         else if (rec == 0x14 && !e->t_fin) e->t_fin = now;
+         else if (e->t_tail && !e->t_post)
+         {
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 4d0fd0e1..f4f1697c 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2194,13 +2194,62 @@ static void ios_eco_init(void)
+     __atomic_store_n( &ios_eco_on, madeira_cfg_bool( "eco", 0 ) ? 1 : 0, __ATOMIC_RELEASE );
+ }
+ 
++/* Madeira Dock: once the game is running, Valve's client (dockhost.exe, the
++ * same iOS process as the game) only has to stay connected. Its HTTP thread
++ * alone kept 20-30 % of a core busy for the whole session (a fresh TLS
++ * connection to api.steampowered.com about twice a second), at the game's own
++ * QoS, so the scheduler gave it performance-core time the game's main thread
++ * was short of. From the game's spawn its threads run at utility QoS: efficiency
++ * cores first, the game keeps the fast ones. env.MADEIRA_DOCK_LOW_QOS = 0 keeps
++ * the client at full priority. */
++static volatile int ios_dock_game_running;
++static __thread int ios_thread_in_dock = -1;   /* -1 = not checked yet */
++
++static int ios_thread_is_dock(void)
++{
++    if (ios_thread_in_dock < 0)
++    {
++        static const WCHAR name[] = {'d','o','c','k','h','o','s','t','.','e','x','e'};
++        const RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb() && NtCurrentTeb()->Peb ?
++            NtCurrentTeb()->Peb->ProcessParameters : NULL;
++        int in = 0;
++        if (!pp || !pp->ImagePathName.Buffer) return 0;   /* not known yet: ask again next time */
++        {
++            int len = pp->ImagePathName.Length / sizeof(WCHAR), n = ARRAY_SIZE(name), i;
++            if (len >= n)
++            {
++                in = 1;
++                for (i = 0; i < n && in; i++)
++                {
++                    WCHAR c = pp->ImagePathName.Buffer[len - n + i];
++                    if (c >= 'A' && c <= 'Z') c += 32;
++                    if (c != name[i]) in = 0;
++                }
++            }
++        }
++        ios_thread_in_dock = in;
++    }
++    return ios_thread_in_dock;
++}
++
++void madeira_dock_game_started(void)
++{
++    const char *dock = getenv( "MADEIRA_DOCK_SESSION" ), *off = getenv( "MADEIRA_DOCK_LOW_QOS" );
++    if (!dock || dock[0] != '1' || (off && off[0] == '0') || ios_dock_game_running) return;
++    ios_dock_game_running = 1;
++    __atomic_add_fetch( &ios_eco_gen, 1, __ATOMIC_RELEASE );
++    fprintf( stderr, "[dock-qos] the game is running: Valve's client (dockhost.exe) threads -> utility QoS\n" );
++}
++
+ /* Called by every guest thread when it starts (thread_ios.c) and from the
+  * wait/sleep/yield entry points below when the generation moved. */
+ void ios_eco_apply_self(void)
+ {
+     ios_eco_init();
+     ios_eco_seen = __atomic_load_n( &ios_eco_gen, __ATOMIC_ACQUIRE );
+-    pthread_set_qos_class_self_np( ios_eco_on > 0 ? ios_eco_class : QOS_CLASS_USER_INTERACTIVE, 0 );
++    pthread_set_qos_class_self_np( ios_eco_on > 0 ? ios_eco_class
++                                   : ios_dock_game_running && ios_thread_is_dock() ? QOS_CLASS_UTILITY
++                                   : QOS_CLASS_USER_INTERACTIVE, 0 );
+ }
+ #define IOS_ECO_POLL() do { if (__builtin_expect( ios_eco_seen != ios_eco_gen, 0 )) ios_eco_apply_self(); } while (0)
+ 
 diff --git a/dlls/opengl32/Makefile.in b/dlls/opengl32/Makefile.in
 index 66ce5d28..0128f9cb 100644
 --- a/dlls/opengl32/Makefile.in

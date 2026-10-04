@@ -1018,6 +1018,11 @@ static void madeira_steam_session_log( const UNICODE_STRING *image )
         for (i = 0; i <= n; i++) lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
         for (i = 0; i < sizeof(helpers) / sizeof(helpers[0]); i++) if (strstr( lower, helpers[i] )) return;
     }
+    {
+        /* The game itself: Valve's client can step back (sync.c, utility QoS). */
+        extern void madeira_dock_game_started(void);
+        madeira_dock_game_started();
+    }
     pthread_mutex_lock( &done_lock );
     for (i = 0; i < ndone && !seen; i++) if (!strcmp( done[i], name )) seen = 1;
     /* A full table counts as seen: otherwise every later spawn would link again. */

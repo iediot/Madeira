@@ -166,11 +166,46 @@ struct LibraryEntry: Codable, Identifiable {
     /// starting screen's background, when no cover file is chosen.
     var steamID: Int?
     var arguments = ""
-    /// The virtual monitor's size ("WxH"): the session default a game renders
-    /// for (GuestDisplay.configureSessionDefault), and the Desktop entry's
-    /// desktop size. New entries default to 1408x648, a wide shape near the
-    /// phone's landscape aspect that most games render quickly.
-    var resolution = "1408x648"
+    /// The virtual monitor's size: "native" (this screen's own pixels), a share of
+    /// them ("75%"), always in the screen's own shape so a game fills it, or a fixed
+    /// "WxH" (older entries, the Desktop). Relative sizes are worked out on the device
+    /// that runs the game (pixelResolution), so a library moved to another device
+    /// keeps filling its screen. New entries are native.
+    var resolution = "native"
+    /// `resolution` as "WxH" pixels for this device.
+    var pixelResolution: String { Self.pixelSize(resolution) }
+
+    /// The relative sizes the Resolution picker offers, largest first.
+    static let screenScales = [100, 75, 67, 50, 33, 25]
+    /// Shapes for playing in portrait, where the game sits at the top with the
+    /// controls below: as wide as the screen is in portrait, square or 4:3.
+    static let portraitShapes = ["square", "square@50", "4:3", "4:3@50"]
+
+    /// "native" or "NN%" as this screen's landscape pixels scaled (each side rounded
+    /// to an even number, so the shape stays within a fraction of a percent);
+    /// "square" / "4:3" (optionally "@NN" percent) as that shape on the screen's
+    /// short side; "WxH" as it is.
+    static func pixelSize(_ value: String) -> String {
+        let percent: Int?
+        var shape: Double? = nil                           // width / height; nil = the screen's own
+        let parts = value.split(separator: "@", maxSplits: 1).map(String.init)
+        if value == "native" { percent = 100 }
+        else if value.hasSuffix("%") { percent = Int(value.dropLast()) }
+        else if parts.first == "square" || parts.first == "4:3" {
+            shape = parts.first == "square" ? 1 : 4.0 / 3.0
+            percent = parts.count == 2 ? Int(parts[1]) : 100
+        }
+        else { percent = nil }
+        guard let percent, (10...100).contains(percent) else { return value }
+        let px = UIScreen.main.nativeBounds.size
+        var long = Double(max(px.width, px.height)), short = Double(min(px.width, px.height))
+        guard short > 0 else { return "1408x648" }
+        if let shape { long = short * shape }
+        // Monitors past 4096 wide are refused (validate): keep the shape, shrink to fit.
+        if long > 4096 { short = short * 4096 / long; long = 4096 }
+        let even = { (v: Double) in max(2, Int((v * Double(percent) / 100 / 2).rounded()) * 2) }
+        return "\(even(long))x\(even(short))"
+    }
     /// How the monitor is scaled to the screen (DisplayMode raw value; nil = Fit).
     var display: String?
     /// FPS limit: 1 = 60, 3 = 30, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
@@ -276,7 +311,7 @@ struct LibraryEntry: Codable, Identifiable {
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
     var launchArguments: String {
-        if desktop == true { return "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" }
+        if desktop == true { return "/desktop=shell,\(pixelResolution) C:\\windows\\system32\\services.exe" }
         return launchCommand.args
     }
 
@@ -374,7 +409,7 @@ struct LibraryEntry: Codable, Identifiable {
         if servicesScript != nil { path = servicesScriptPath; extra = ""; batch = true }
         func withExtra(_ s: String) -> String { extra.isEmpty ? s : s + " " + extra }
         if runsInDesktop {
-            return ("explorer.exe", "/desktop=shell,\(resolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : quoted(path)))
+            return ("explorer.exe", "/desktop=shell,\(pixelResolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : quoted(path)))
         }
         if batch { return ("C:\\windows\\system32\\cmd.exe", withExtra("/c \(quoted(path))")) }
         return (path, programArguments)   // upstream's direct launch, arguments verbatim
@@ -421,7 +456,7 @@ struct LibraryEntry: Codable, Identifiable {
     var effectiveFPSMode: Int32 { fpsMode == 3 && !ProMotionIntent.has30Cap ? 1 : Int32(fpsMode) }
 
     func validate() throws {
-        let size = resolution.split(separator: "x").compactMap { Int($0) }
+        let size = pixelResolution.split(separator: "x").compactMap { Int($0) }
         guard size.count == 2, (320...4096).contains(size[0]), (240...4096).contains(size[1]),
               (0...3).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
               !launchArguments.contains("\0"), !launchWindowsPath.contains("\0"),
@@ -516,7 +551,7 @@ struct LibraryEntry: Codable, Identifiable {
         if usesLaunchOptions {
             fputs("[library] ml1163 start=\(runsInDesktop ? "desktop" : "direct") batch=\(isBatch ? 1 : 0) services=\(servicesScript != nil ? 1 : 0) cwd=\(launchDirectory)\n", stderr)
         }
-        LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
+        LogStore.shared.log("[display-shape] resolution=\(resolution) (\(pixelResolution)) mode=\(displayMode.rawValue)")
     }
 
     /// What the bridge starts. Set on the main thread before the session begins.
@@ -529,7 +564,7 @@ struct LibraryEntry: Codable, Identifiable {
             // the virtual monitor follows this entry's Resolution, as below. "The game" starts
             // its own program below, like any library game.
             if !startsSteamGameDirectly {
-                GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
+                GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: pixelResolution)
                 return
             }
         }
@@ -553,7 +588,7 @@ struct LibraryEntry: Codable, Identifiable {
         // Every session's virtual monitor takes this entry's Resolution
         // (MADEIRA_SCREEN_W/H, source "knob"); for the Desktop entry it is the
         // same size as its /desktop= argument.
-        GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
+        GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: pixelResolution)
     }
 }
 
@@ -565,7 +600,10 @@ final class LibraryModel: ObservableObject {
     @Published var entries: [LibraryEntry] = []
     @Published var current: UUID?
     @Published var activeEntry: LibraryEntry?
-    @Published var menu = false
+    /// Closing the in-game menu saves what was changed in it to the game's profile.
+    @Published var menu = false {
+        didSet { if oldValue && !menu && current != nil { saveCurrentProfile() } }
+    }
     @Published var performance = false
     @Published var liveLogs = false
     @Published var fpsMode = 1
@@ -632,6 +670,16 @@ final class LibraryModel: ObservableObject {
 
     private init() {
         refreshFlag()
+        // The session's settings used to be written only when it ended (finish), and
+        // closing Madeira from the app switcher ends the process without that: every
+        // change made during the game was lost. Leaving the app saves them too.
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                               object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                let model = LibraryModel.shared
+                if model.current != nil { model.saveCurrentProfile() }
+            }
+        }
         guard FileManager.default.fileExists(atPath: file.path) else { return }
         do {
             let doc = try JSONDecoder().decode(Document.self, from: Data(contentsOf: file))
@@ -2589,51 +2637,6 @@ struct LibraryDetail: View {
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
-    static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
-    /// Only sizes that fill this screen (native first, then smaller), plus a stored
-    /// size that is none of them (an old preset, or a shape chosen on another
-    /// device) so the picker never shows a blank choice. The fixed presets come
-    /// back only with MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
-    static func resolutions(keeping current: String) -> [String] {
-        let fill = screenShapeResolutions
-        let list = fill.isEmpty ? presetResolutions : fill
-        return list.contains(current) ? list : list + [current]
-    }
-    /// "WxH" matching this screen's landscape aspect at 720 lines (width
-    /// rounded to a multiple of 8), or nil when it equals a preset or
-    /// MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
-    static var screenShapeResolution: String? { screenShape(lines: 720) }
-    /// The screen's shape from its native pixel size down to 360 lines: lower ones cost
-    /// less GPU time (and heat, which throttles the CPU) and still fill the screen
-    /// without bars. Native first, then descending.
-    static var screenShapeResolutions: [String] {
-        var sizes: [String] = []
-        if let native = nativeResolution { sizes.append(native) }
-        for lines in [1080, 900, 810, 720, 648, 540, 480, 432, 360] {
-            if let size = screenShape(lines: lines), !sizes.contains(size) { sizes.append(size) }
-        }
-        return sizes
-    }
-    /// This screen's own pixels in landscape (UIScreen.nativeBounds), e.g. 2796x1290.
-    static var nativeResolution: String? {
-        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
-        let px = UIScreen.main.nativeBounds.size
-        let long = Int(max(px.width, px.height)), short = Int(min(px.width, px.height))
-        guard short > 0, long <= 4096 else { return nil }
-        return "\(long)x\(short)"
-    }
-    static func screenShape(lines: Int) -> String? {
-        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
-        let bounds = UIScreen.main.bounds
-        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
-        guard short > 0 else { return nil }
-        let width = Int((CGFloat(lines) * long / short / 8).rounded()) * 8
-        let size = "\(width)x\(lines)"
-        // Only sizes below the native height: above it the screen just scales back down.
-        let nativeShort = Int(min(UIScreen.main.nativeBounds.width, UIScreen.main.nativeBounds.height))
-        guard (640...4096).contains(width), nativeShort == 0 || lines < nativeShort else { return nil }
-        return size
-    }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
         let count = MadeiraConfig.parse(config ?? "").count
@@ -2709,9 +2712,20 @@ struct LibraryDetail: View {
                 Section("Display") {   // first after Play: the setting changed most often
                     // The Windows screen the game renders for (and the Desktop's size).
                     Picker("Resolution", selection: $entry.resolution) {
-                        // Sizes in this screen's own shape: the game fills it without bars or stretching.
-                        ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { size in
-                            Text(size.replacingOccurrences(of: "x", with: "×") + (size == Self.nativeResolution ? " (native)" : "")).tag(size)
+                        // Shares of this screen's own pixels, in its own shape: the game fills it.
+                        ForEach(LibraryEntry.screenScales, id: \.self) { percent in
+                            let value = percent == 100 ? "native" : "\(percent)%"
+                            Text((percent == 100 ? "Native" : "\(percent)%") + " · " + LibraryEntry.pixelSize(value).replacingOccurrences(of: "x", with: "×")).tag(value)
+                        }
+                        // For portrait play: the game at the top, the controls below it.
+                        ForEach(LibraryEntry.portraitShapes, id: \.self) { value in
+                            let parts = value.split(separator: "@")
+                            Text((parts[0] == "square" ? "Square" : "4:3") + (parts.count == 2 ? " \(parts[1])%" : "") + " · "
+                                 + LibraryEntry.pixelSize(value).replacingOccurrences(of: "x", with: "×")).tag(value)
+                        }
+                        // A fixed size from before (or the Desktop's), kept so the picker is never blank.
+                        if entry.resolution != "native" && !entry.resolution.hasSuffix("%") && !LibraryEntry.portraitShapes.contains(entry.resolution) {
+                            Text(entry.resolution.replacingOccurrences(of: "x", with: "×")).tag(entry.resolution)
                         }
                     }
                     Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {

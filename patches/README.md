@@ -24,3 +24,8 @@ file, so add it with `git -C dxmt add -N` before `git -C dxmt diff`.
   then rebuild `build/ntdll-unix/build.sh` (opengl32's unix side) and
   `make -C wine/build-arm64ec dlls/opengl32/arm64ec-windows/opengl32.dll`
   (Homebrew bison first in PATH), strip it, copy to app/Madeira/arm64ec-windows/.
+  The same patch also carries Madeira's own Wine edits: the `[sock-tl]` connection
+  log names each TLS connection's server (SNI) in `host=` (dlls/ntdll/unix/socket.c).
+  And in a Madeira Dock session, once the game is running, Valve's client
+  (dockhost.exe) threads drop to utility QoS (dlls/ntdll/unix/sync.c,
+  env.MADEIRA_DOCK_LOW_QOS = 0 turns it off).
