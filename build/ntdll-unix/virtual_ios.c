@@ -9501,6 +9501,32 @@ unsigned char ios_reclaim_page_vprot( unsigned long long va )
     return get_page_vprot( (const void *)(uintptr_t)va );
 }
 
+/* For the Mach store emulator (signal_arm64_ios.c, case 4): is `va` in a 32-bit
+ * guest window on a committed page whose Windows protection does not allow a
+ * write? The emulator then leaves the fault to the normal delivery path instead
+ * of completing the store through the JIT-pool RW alias. FEX's WoW64 frontend
+ * tracks guest code it has translated from RWX memory by taking the write away
+ * (PAGE_EXECUTE_READ); the guest's first write after that must reach FEX, which
+ * drops the stale translation and gives the write back ("Handled self-modifying
+ * code"), so that the retried store finds the page writable and is emulated.
+ * Completing it here instead kept FEX's old translation of code the guest had
+ * just rewritten (a JIT patching its own code). Lock-free reads, as above;
+ * MADEIRA_WOW_SMC_DEFER=0 emulates as before. */
+int ios_wow_store_needs_guest_fault( unsigned long long va )
+{
+    static int enabled = -1;
+    BYTE vprot;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_WOW_SMC_DEFER" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || !ios_wow_addr_in_any_window( (const void *)(uintptr_t)va )) return 0;
+    vprot = get_page_vprot( (const void *)(uintptr_t)va );
+    return (vprot & VPROT_COMMITTED) && !(vprot & (VPROT_WRITE | VPROT_WRITECOPY));
+}
+
 
 /***********************************************************************
  *           get_host_page_vprot

@@ -3062,6 +3062,29 @@ static void *ios_mach_exception_thread( void *arg )
                 } else {
                     rw_addr = ios_jit_anon_alias_lookup(fault_addr);
                 }
+                /* A 32-bit guest page whose Windows protection has no write (FEX's
+                 * WoW64 SMC tracking took it away after translating code there): the
+                 * guest's write must reach FEX, which drops the stale translation and
+                 * restores the write; the retried store is then emulated below. See
+                 * ios_wow_store_needs_guest_fault (virtual_ios.c). Left 4 Dead's
+                 * libcef (V8) died on a null+0xf read in code it had just patched. */
+                int smc_defer = 0;
+                if (rw_addr && !in_jit)
+                {
+                    extern int ios_wow_store_needs_guest_fault( unsigned long long va );
+                    if (ios_wow_store_needs_guest_fault( (unsigned long long)fault_addr ))
+                    {
+                        static int smc_defer_n;
+                        smc_defer = 1;
+                        if (smc_defer_n < 8 || !(smc_defer_n & 1023))
+                            dprintf(STDERR_FILENO,
+                                "[store-smc-defer] #%d pc=0x%llx addr=0x%llx: guest page not writable, "
+                                "leaving the fault to FEX's SMC handler\n",
+                                smc_defer_n + 1, (unsigned long long)fault_pc,
+                                (unsigned long long)fault_addr);
+                        smc_defer_n++;
+                    }
+                }
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
                  * decode, and the two need opposite fixes. Without this the
@@ -3102,7 +3125,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 (unsigned long long)fault_pc);
                     }
                 }
-                if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
+                if (rw_addr && !smc_defer && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
                     int emulated = 0;
@@ -3510,6 +3533,38 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
+                    }
+                    /* SIMD/FP STR (register offset): size 111 1 00 opc 1 Rm option S 10 Rn Rt
+                     *   (mask 0x3f600c00, val 0x3c200800: V=1, L=0, register-offset form).
+                     *   opc<1>=1 with size=00 is Q (16 bytes); otherwise 1 << size bytes
+                     *   (B, H, S, D). Left 4 Dead (32-bit, FEX-translated SSE copy) stores
+                     *   `str q16, [x19, w11, uxtw]` (0x3cab4a70) into its RWX buffer right
+                     *   after the intro; undecoded, the write never completed and the
+                     *   process was terminated after 2000 identical redeliveries.
+                     *   fault_addr is the final address; there is no writeback. The whole
+                     *   store must land in the same alias, as for the Q-pair stores. */
+                    else if ((insn & 0x3f600c00) == 0x3c200800)
+                    {
+                        int rt = insn & 0x1f;
+                        int size = (insn >> 30) & 3;
+                        int nbytes = ((insn >> 23) & 1) ? (size == 0 ? 16 : 0) : (1 << size);
+                        uintptr_t rw_last = 0;
+                        if (nbytes)
+                            rw_last = in_jit ? (uintptr_t)(rw + ((fault_addr + nbytes - 1) - rx))
+                                             : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + nbytes - 1 );
+                        if (have_neon && nbytes && rw_last == (uintptr_t)rw_addr + nbytes - 1)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], nbytes);
+                            emulated = 1;
+                            {
+                                static int strreg_n;
+                                if (strreg_n < 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[str-simd-reg] #%d insn=0x%08x bytes=%d addr=0x%llx rw=0x%llx\n",
+                                        ++strreg_n, insn, nbytes, (unsigned long long)fault_addr,
+                                        (unsigned long long)rw_addr);
+                            }
+                        }
                     }
                     
 
@@ -6921,6 +6976,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                                                          EXCEPTION_RECORD *rec, TEB *teb );
     extern const struct ios_ntdll_funcs *ios_ntdll_funcs_for_peb( void *peb_id );
     extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+    extern BOOL ios_peb_is_dead_child( void *peb );
 
     uint64_t pc = arm_thread_state64_get_pc( *state );
     uintptr_t rxb = (uintptr_t)ios_jit_rx_base_global;
@@ -7545,6 +7601,26 @@ dispatch:
         else if (++redeliv[rslot].n == 256)
             dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",
                      (unsigned long long)pc, (unsigned long long)fault_addr );
+        else if (redeliv[rslot].n >= 2000 && !ios_redeliv_terminating &&
+                 thread_teb > 0x10000 && ios_peb_is_dead_child( *(void **)(thread_teb + 0x60) ))
+        {
+            /* A laggard thread of a pseudo-process that has already exited:
+             * process_exit_wrapper reclaimed its module copies, so it faults
+             * on code that no longer exists and can never make progress.
+             * Seen after steamwebhelper aborted on a PartitionAlloc CHECK
+             * (int3, 0x80000003): Wine terminated the process, one thread kept
+             * executing the freed ntdll copy ([xlate-exec] copy pe=0x0), and
+             * the task_terminate below took Steam and the whole app with it.
+             * The process is gone either way; stop only this thread so the
+             * rest (steam.exe, which respawns its webhelper) survives. */
+            dprintf( 2, "[redeliv] 2000 identical redeliveries pc=0x%llx on a thread of EXITED pseudo-process peb=%p -- "
+                        "terminating that thread only, not the app\n",
+                     (unsigned long long)pc, *(void **)(thread_teb + 0x60) );
+            redeliv[rslot].key = 0;
+            redeliv[rslot].n = 0;
+            thread_terminate( thread );
+            return 1;  /* the caller's set_state/reply on the dead thread just fails */
+        }
         else if (redeliv[rslot].n >= 2000 && !ios_redeliv_terminating)
         {
             /* ml463: was `== 2000` + exit(76) — one shot, and exit() on iOS is

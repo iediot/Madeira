@@ -215,6 +215,32 @@ BOOL *ios_process_exiting_ptr(void)
     return (i >= 0) ? &ios_proc_sockets[i].exiting : &process_exiting;
 }
 
+/* PEBs of child pseudo-processes that have exited (process_exit_wrapper
+ * cleared their slot). A thread still running under one of these is a
+ * laggard of a dead process: its module copies have been reclaimed, so a
+ * fault storm on it can be ended by stopping that thread alone rather than
+ * the whole app (see the [redeliv] storm handler). A PEB reused by a new
+ * child is dropped from the ring when that child registers. */
+#define IOS_DEAD_PEBS 32
+static void *ios_dead_pebs[IOS_DEAD_PEBS];
+static unsigned int ios_dead_peb_next;
+
+static void ios_forget_dead_peb( void *peb )
+{
+    int i;
+    for (i = 0; i < IOS_DEAD_PEBS; i++)
+        if (ios_dead_pebs[i] == peb) ios_dead_pebs[i] = NULL;
+}
+
+BOOL ios_peb_is_dead_child( void *peb )
+{
+    int i;
+    if (!peb) return FALSE;
+    for (i = 0; i < IOS_DEAD_PEBS; i++)
+        if (ios_dead_pebs[i] == peb) return TRUE;
+    return FALSE;
+}
+
 /* ─── ml586 fd-ownership trace ────────────────────────────────────────────
  * Root-cause instrumentation for the 0060-family kills: some pseudo-process
  * teardown closes wineserver-comm fds it doesn't own (broken runs ml579/580/
@@ -320,6 +346,7 @@ static void ios_register_proc_socket(void *peb_id, int fd)
     ios_fdt_reg( fd, FDT_MASTER, peb_id );
     ios_proc_sockets[idx].fd = fd;
     ios_proc_sockets[idx].exiting = FALSE;
+    ios_forget_dead_peb( peb_id );
     __sync_synchronize();
     ios_proc_sockets[idx].peb = peb_id;
 }
@@ -3604,6 +3631,7 @@ void process_exit_wrapper( int status )
         ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
         close( ios_proc_sockets[i].fd );
         ios_proc_sockets[i].peb = NULL;
+        ios_dead_pebs[__sync_fetch_and_add( &ios_dead_peb_next, 1 ) % IOS_DEAD_PEBS] = dead_peb;
         /* ml571: drop this pseudo-process's fd cache and close what it held.
          * Must happen on the SAME identity used to key it, and before the JIT
          * reclaim below reuses anything. */

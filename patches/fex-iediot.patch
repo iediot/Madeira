@@ -393,6 +393,42 @@ index b2eca70..20f05fb 100644
  }
  
  static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
+index 5e07b36..b2d8b9e 100644
+--- a/Source/Windows/ARM64EC/IosJitAlias.cpp
++++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
+@@ -32,7 +32,15 @@ struct IosAliasEntry {
+   uint64_t Size;
+   uint64_t _Padding;  // Keeps the struct 32-byte to make array stride a power of 2.
+ };
+-constexpr int kMaxEntries = 256;
++/* iOS-Madeira ml1201: 256 -> 2048. FEX is ONE module shared by every x64
++ * pseudo-process, and nothing retires an entry when its process exits (only an
++ * overlapping re-registration does), so steam.exe + steamwebhelper (libcef and
++ * its ~100 dependencies) + a game filled all 256 slots. The table then refused
++ * the game's next image (shlwapi.dll) and the game died a few calls later:
++ * "[jit-alias] ml1106 IosAliasEntries FULL" at the same load in every launch.
++ * Module.S and the C++ walks bound on IosAliasCount, not on this size, so a
++ * larger array costs 64KB of .bss and nothing per call. */
++constexpr int kMaxEntries = 2048;
+ 
+ // extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
+ // can reach the table via adrp/:lo12: — it translates the branch target
+@@ -363,6 +371,14 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+ 
+   int count = g_EntryCount;
+ 
++  {
++    static int announced = 0;
++    if (!announced) {
++      announced = 1;
++      LogMan::Msg::EFmt("[jit-alias] ml1201 alias table capacity {} entries", kMaxEntries);
++    }
++  }
++
+   // Identical re-registration: nothing to do.
+   for (int i = 0; i < count; i++) {
+     if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {
 diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
 index 96f6fa6..ab5dd48 100644
 --- a/Source/Windows/Common/InvalidationTracker.cpp

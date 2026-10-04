@@ -7,7 +7,9 @@ changes to them are kept here and applied on top (`git -C FEX apply --3way
 `build/dxmt-pe/build.sh d3d11` and `build/dxmt-ios/build.sh`.
 
 - `fex-iediot.patch`: folded L1 lookup index (ml2111), `[lookup-stats]` (ml2110,
-  `env.MADEIRA_FEX_LOOKUP_STATS = 1`), iOS host build guards.
+  `env.MADEIRA_FEX_LOOKUP_STATS = 1`), iOS host build guards, and the ARM64EC
+  JIT alias table grown from 256 to 2048 entries (ml1201, from vcvkk's fork:
+  steam.exe + webhelper + a game filled 256 and the game crashed at load).
 - `dxmt-iediot.patch`: single-level texture halving for BC1/BC3, RGBA8 and R8/A8
   at any size (ml2100/2101/2113), texture census, Metal 4 atomic fix.
 
