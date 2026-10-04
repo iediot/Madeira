@@ -1180,6 +1180,8 @@ struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
     @StateObject private var jitCoordinator = JITCoordinator.shared
     @State private var jitStatus: JITStatus = .unknown
+    /// Play without JIT: the start that waits for Enable JIT (jitReadyForLaunch).
+    @State private var launchAfterJIT: (() -> Void)?
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
@@ -1291,6 +1293,10 @@ struct ContentView: View {
             .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in
                 if !SteamSignIn.isSignedIn { MadeiraDock.cleanup() }
             }
+            // A Home Screen shortcut (madeira://play?exe=...) starts its library entry,
+            // now or, from a cold start, once the library is up.
+            .onReceive(ShortcutRouter.shared.$pendingExe) { _ in launchPendingShortcut() }
+            .onChange(of: library.enabled) { _, _ in launchPendingShortcut() }
         }
     }
 
@@ -2267,6 +2273,7 @@ struct ContentView: View {
                                 + "so JIT cannot be enabled. Reinstall Madeira with a development certificate.",
                                 SigningStatus.current.flags), level: .error)
             if library.enabled { library.error = SigningStatus.notDebuggableMessage }
+            launchAfterJITEnded(started: false)
             return
         }
         jitStatus = .testing
@@ -2277,7 +2284,9 @@ struct ContentView: View {
             case .success:
                 jitStatus = .available
                 logStore.log("JIT enabled! Debugger attached.", level: .success)
+                launchAfterJITEnded(started: true)
             case .failure(let failure):
+                launchAfterJITEnded(started: false)
                 if let coordinatorError = failure as? JITCoordinator.CoordinatorError,
                    case .setupRequired = coordinatorError {
                     jitStatus = .unknown
@@ -2290,35 +2299,36 @@ struct ContentView: View {
         }
     }
 
-    /// Whether a launch may ask for the JIT pool. With CS_DEBUGGED set but no debugger
-    /// attached (JIT enabled from StikDebug's own list, which attaches and leaves) the
-    /// library offers Madeira's Enable JIT instead of starting a launch that cannot
-    /// get its pool.
-    private func jitReadyForLaunch(inLibrary: Bool, retry: (() -> Void)? = nil) -> Bool {
+    /// Enable JIT finished: a Play that waited for it starts its game, only when the
+    /// debugger is attached (so the start cannot ask for JIT again) and nothing else
+    /// started meanwhile. A failure drops it: a later Enable JIT starts no game.
+    private func launchAfterJITEnded(started: Bool) {
+        guard let launch = launchAfterJIT else { return }
+        launchAfterJIT = nil
+        library.startingJIT = nil
+        guard started, StikJITHelper.ready, library.current == nil, wine_process_is_running() == 0 else {
+            logStore.log("[jit-on-play] JIT did not come on: the game was not started")
+            // A failure has its own error; this one closes the details page as well.
+            if started, library.current == nil { library.error = "JIT is on, but the game could not start. Tap Play again." }
+            return
+        }
+        logStore.log("[jit-on-play] JIT is on: starting the game")
+        launch()
+    }
+
+    /// Whether a launch may ask for the JIT pool. In the library, `then` makes Play
+    /// enable JIT itself (the same flow as Enable JIT, LocalDevVPN and the Madeira JIT
+    /// shortcut included) and start the game once the debugger is attached; that also
+    /// covers CS_DEBUGGED set with no debugger attached (JIT enabled from StikDebug's
+    /// own list, which attaches and leaves). Without `then`, the library offers
+    /// Madeira's Enable JIT instead of starting a launch that cannot get its pool.
+    private func jitReadyForLaunch(inLibrary: Bool, entry: UUID? = nil, then launch: (() -> Void)? = nil) -> Bool {
         if StikJITHelper.ready { return true }
-        // JIT is only needed for the pool at launch (the debugger detaches right after),
-        // and StikDebug rarely survives long in the background. So Play asks StikDebug
-        // itself and starts the game once it is attached, instead of making the user
-        // tap Enable JIT and then Play again.
-        if inLibrary, let retry, SigningStatus.current.debuggable, StikJITHelper.isAvailable,
-           !jitCoordinator.busy {
-            logStore.log("[jit-launch] JIT is off at Play: requesting it, the game starts once it is attached")
-            jitStatus = .testing
-            jitCoordinator.enable { result in
-                switch result {
-                case .success:
-                    jitStatus = .available
-                    logStore.log("[jit-launch] JIT attached: starting the game", level: .success)
-                    // Let Madeira come back to the foreground before the launch.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        if StikJITHelper.ready { retry() }
-                    }
-                case .failure(let failure):
-                    jitStatus = .unavailable
-                    logStore.log("[jit-launch] JIT request failed: \(failure.localizedDescription)", level: .error)
-                    library.error = failure.localizedDescription
-                }
-            }
+        if inLibrary, let launch {
+            logStore.log("[jit-on-play] JIT is not on: enabling it, then starting the game")
+            launchAfterJIT = launch
+            library.startingJIT = entry
+            if jitStatus != .testing { enableJIT() }   // a second Play while it runs only replaces the game
             return false
         }
         if StikJITHelper.flaggedWithoutDebugger {
@@ -2376,6 +2386,26 @@ struct ContentView: View {
         }
     }
 
+    /// A Home Screen shortcut waiting for the library (a link opened at a cold start
+    /// arrives before the library is up).
+    private func launchPendingShortcut() {
+        guard library.enabled, library.current == nil, let exe = ShortcutRouter.shared.pendingExe else { return }
+        ShortcutRouter.shared.pendingExe = nil
+        launchShortcut(exe)
+    }
+
+    /// A Home Screen shortcut starts a game that is in the library, by its Windows
+    /// path. A link names any path, so one for a program not in the library starts
+    /// nothing: add it to the library first.
+    private func launchShortcut(_ exe: String) {
+        let key = exe.lowercased()
+        if let entry = library.entries.first(where: { $0.desktop != true && $0.windowsPath.lowercased() == key }) {
+            launchLibraryEntry(entry); return
+        }
+        LogStore.shared.log("[shortcut] \(exe) is not in the library: not started", level: .error)
+        library.error = "This shortcut's game is not in the library. Add it to the library, then use the shortcut again."
+    }
+
     /// Play in the library (Library.swift): checks that a session can start,
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
@@ -2408,8 +2438,14 @@ struct ContentView: View {
             library.restartNotice = LibraryModel.restartMessage; return
         }
         // The same precondition runWineFullSequence checks: the JIT pool is
-        // taken at launch, through the debugger.
-        guard jitReadyForLaunch(inLibrary: true, retry: { launchLibraryEntry(entry) }) else { return }
+        // taken at launch, through the debugger. Without it, Play enables JIT and
+        // continues from here once it is on.
+        guard jitReadyForLaunch(inLibrary: true, entry: entry.id, then: { startLibraryEntry(entry) }) else { return }
+        startLibraryEntry(entry)
+    }
+
+    /// The rest of Play, with JIT on: checks the entry's launch profile and starts it.
+    private func startLibraryEntry(_ entry: LibraryEntry) {
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
             library.error = error.localizedDescription
@@ -2420,6 +2456,11 @@ struct ContentView: View {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
+        // This run's log under the program's name too (Documents/logs). A Steam game started
+        // through Madeira Dock above gets its own from ntdll, once Valve's client starts it.
+        let program = entry.desktop == true ? "explorer.exe"
+            : entry.launchWindowsPath.split(separator: "\\").last.map(String.init) ?? entry.launchWindowsPath
+        LogStore.shared.startSessionLog(program: program)
         library.begin(entry)
         runWineFullSequence(profile: entry)
     }
@@ -2440,6 +2481,8 @@ struct ContentView: View {
         /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
         MadeiraConfig.migrateLegacy { self.logStore.log($0) }
         MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
+        /* ml2100: XInput (default) or the HID controller; before the wineserver starts. */
+        GamepadInput.shared.beginPadSession()
         /* ml1990: player 1 exists before the game enumerates XInput. */
         GamepadInput.shared.reserveSessionSlot(touchControls: TouchControlsModel.shared.offersControllerInput)
         if MadeiraConfig.present {
@@ -2473,6 +2516,8 @@ struct ContentView: View {
             if let profile {
                 profile.applyEnvironment()
                 logStore.log("[launch-route] library profile applied")
+            } else {
+                _ = try? MadeiraConfig.applyGame(nil)   // no library game: no game's own lines
             }
 
             // Step 1: Allocate JIT pool (BRK suspends entire process)
@@ -2641,13 +2686,19 @@ struct ContentView: View {
             // d3d11.mipClampBC=N is the one that matters for memory: this GPU cannot
             // sample BC, so those textures are expanded to uncompressed and cost 2-8x
             // their shipped size.
-            if let txt = MadeiraConfig.get("dxmt") {
-                let v = txt.replacingOccurrences(of: ";", with: "\n").trimmingCharacters(in: .whitespacesAndNewlines)   /* ml1095: "a=b;c=d" on one line */
-                if !v.isEmpty {
-                    setenv("DXMT_CONFIG", v, 1)
-                    logStore.log("DXMT config: \(v) via madeira.cfg dxmt")
+            // DXMT splits DXMT_CONFIG on ";" only and a newline is not whitespace to
+            // its line parser, so the options are joined with ";" (ml1095: "a=b;c=d"
+            // on one line). A library game's own dxmt options come after madeira.cfg's.
+            var dxmtOptions: [String] = []
+            for (source, txt) in [("madeira.cfg dxmt", MadeiraConfig.get("dxmt")), ("the game's config", MadeiraConfig.gameValue("dxmt"))] {
+                let parts = (txt ?? "").split(whereSeparator: { $0 == ";" || $0.isNewline })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                if !parts.isEmpty {
+                    dxmtOptions += parts
+                    logStore.log("DXMT config: \(parts.joined(separator: ";")) via \(source)")
                 }
             }
+            if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) }
 
             // D3D9 frontend for 32-bit programs. The i386 d3d9.dll is DXMT's thin
             // shim; unset (the default) or "emulated", it forwards every export to
@@ -3080,8 +3131,8 @@ struct ContentView: View {
     /// session then takes that entry's display, performance and on-screen settings.
     private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
-        guard jitReadyForLaunch(inLibrary: inLibrary,
-                                retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
+        guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id,
+                                then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)

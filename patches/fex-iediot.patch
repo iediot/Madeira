@@ -1,0 +1,479 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index be54311..fc8216a 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -121,6 +121,160 @@ static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
+ static volatile uint64_t g_cb_total = 0;
+ static volatile uint64_t g_cb_real_compiles = 0;
+ 
++#ifdef FEX_IOS_HOST
++/* ml2110: [lookup-stats] -- what the dispatcher's L1 misses cost, per thread.
++ *
++ * The generated code probes only the L1 cache (L2 is off on iOS, ml606); every
++ * miss enters CompileBlock in C++, which takes two locks and searches the shared
++ * map. [CB_SUMMARY] showed ~26.7M such entries in one Stickman run with 98% of
++ * them finding an existing block, i.e. L1 misses, not compiles. This measures,
++ * for each guest thread, how many entries there are, how long they take, what
++ * share of the thread's wall time that is, and why L1 missed:
++ *   conflict -- the slot holds another block (direct-mapped collision)
++ *   empty    -- the slot is empty or invalidated
++ *   had-it   -- the slot already holds this block: the generated probe should
++ *               have hit, so it read a different pointer/mask, or the block was
++ *               published between the probe and this call
++ *   ptr-diff -- the frame's L1 pointer differs from the LookupCache's own
++ * plus a few conflicting (rip, evictor) pairs, to see whether the collisions
++ * are module alignment (equal low bits in different images).
++ *
++ * Off unless MADEIRA_FEX_LOOKUP_STATS=1; with it off CompileBlock pays one
++ * load and branch. Slots are claimed per FEXCore thread and written only by
++ * their owner, so the counters are plain stores; no TLS (x18 is not the TEB
++ * on this host). */
++namespace {
++struct IosLookupSlot {
++  std::atomic<uintptr_t> Owner {0};
++  uint64_t Calls, Hits, Compiles, HitTicks, CompileTicks;
++  uint64_t Conflict, Empty, HadIt, PtrDiff;
++  uint64_t WindowStart, Reports;
++  uint64_t Sample[4][2];
++  uint32_t NSamples;
++};
++IosLookupSlot g_IosLookup[128];
++int g_IosLookupOn = -1;
++
++inline uint64_t IosTicks() {
++  uint64_t V;
++  __asm volatile("isb; mrs %0, cntvct_el0" : "=r"(V));
++  return V;
++}
++inline uint64_t IosTickFreq() {
++  uint64_t V;
++  __asm volatile("mrs %0, cntfrq_el0" : "=r"(V));
++  return V ? V : 24000000;
++}
++
++IosLookupSlot* IosLookupSlotFor(const void* Thread) {
++  const uintptr_t Key = reinterpret_cast<uintptr_t>(Thread);
++  size_t H = (Key >> 6) % 128;
++  for (size_t i = 0; i < 128; ++i, H = (H + 1) % 128) {
++    uintptr_t Cur = g_IosLookup[H].Owner.load(std::memory_order_relaxed);
++    if (Cur == Key) {
++      return &g_IosLookup[H];
++    }
++    if (Cur == 0 && g_IosLookup[H].Owner.compare_exchange_strong(Cur, Key, std::memory_order_relaxed)) {
++      return &g_IosLookup[H];
++    }
++  }
++  return nullptr; // more than 128 live FEX threads: stop counting the extra ones
++}
++
++void IosLookupReport(IosLookupSlot* S, uint64_t Now) {
++  const double Freq = double(IosTickFreq());
++  const double WallS = double(Now - S->WindowStart) / Freq;
++  const double SlowS = double(S->HitTicks + S->CompileTicks) / Freq;
++  LogMan::Msg::EFmt("[lookup-stats] ml2110 thr={:#x} #{} {:.1f}s: entries={} ({:.0f}/s) slow-path={:.1f}% of wall | "
++                    "found={} avg={:.2f}us | compiled={} avg={:.1f}us | l1 miss: conflict={} empty={} had-it={} ptr-diff={}",
++                    S->Owner.load(std::memory_order_relaxed), S->Reports, WallS, S->Calls, double(S->Calls) / WallS,
++                    100.0 * SlowS / WallS, S->Hits, S->Hits ? 1e6 * double(S->HitTicks) / Freq / double(S->Hits) : 0.0,
++                    S->Compiles, S->Compiles ? 1e6 * double(S->CompileTicks) / Freq / double(S->Compiles) : 0.0,
++                    S->Conflict, S->Empty, S->HadIt, S->PtrDiff);
++  for (uint32_t i = 0; i < S->NSamples; ++i) {
++    LogMan::Msg::EFmt("[lookup-stats]   conflict rip={:#x} evicted-by={:#x} xor={:#x}", S->Sample[i][0], S->Sample[i][1],
++                      S->Sample[i][0] ^ S->Sample[i][1]);
++  }
++  S->Calls = S->Hits = S->Compiles = S->HitTicks = S->CompileTicks = 0;
++  S->Conflict = S->Empty = S->HadIt = S->PtrDiff = 0;
++  S->NSamples = 0;
++  S->WindowStart = Now;
++  S->Reports++;
++}
++
++class IosLookupGuard {
++public:
++  IosLookupGuard(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
++    if (g_IosLookupOn < 0) {
++      const char* E = getenv("MADEIRA_FEX_LOOKUP_STATS");
++      g_IosLookupOn = (E && E[0] == '1') ? 1 : 0;
++      if (g_IosLookupOn) {
++        LogMan::Msg::EFmt("[lookup-stats] ml2110 on: a report per FEX thread every 5 s (tick {} Hz)", IosTickFreq());
++      }
++    }
++    if (!g_IosLookupOn || !Frame || !Thread) {
++      return;
++    }
++    S = IosLookupSlotFor(Thread);
++    if (!S) {
++      return;
++    }
++    T0 = IosTicks();
++    if (!S->WindowStart) {
++      S->WindowStart = T0;
++    }
++    S->Calls++;
++    // Read the L1 slot exactly as the dispatcher does: L1Pointer + ((L1Index(RIP) << 4) & pre-scaled L1Mask).
++    const uint64_t L1P = Frame->State.L1Pointer;
++    const uint64_t L1M = Frame->State.L1Mask;
++    if (Thread->LookupCache && Thread->LookupCache->GetL1Pointer() != L1P) {
++      S->PtrDiff++;
++    }
++    if (L1P) {
++      const auto* E = reinterpret_cast<const uintptr_t*>(L1P + ((FEXCore::LookupCache::L1Index(GuestRIP) << 4) & L1M));
++      const uintptr_t Host = E[0], Guest = E[1];
++      if (Guest == GuestRIP && Host) {
++        S->HadIt++;
++      } else if (Guest == 0) {
++        S->Empty++;
++      } else {
++        S->Conflict++;
++        if (S->NSamples < 4 && (S->Conflict & 0xfff) == 1) {
++          S->Sample[S->NSamples][0] = GuestRIP;
++          S->Sample[S->NSamples][1] = Guest;
++          S->NSamples++;
++        }
++      }
++    }
++  }
++  ~IosLookupGuard() {
++    if (!S) {
++      return;
++    }
++    const uint64_t Now = IosTicks();
++    if (Compiled) {
++      S->Compiles++;
++      S->CompileTicks += Now - T0;
++    } else {
++      S->Hits++;
++      S->HitTicks += Now - T0;
++    }
++    if ((S->Calls & 0x3ff) == 0 && Now - S->WindowStart >= 5 * IosTickFreq()) {
++      IosLookupReport(S, Now);
++    }
++  }
++  void MarkCompiled() {
++    Compiled = true;
++  }
++
++private:
++  IosLookupSlot* S {};
++  uint64_t T0 {};
++  bool Compiled {};
++};
++} // namespace
++#endif
++
+ #if defined(FEX_IOS_HOST) && defined(_WIN32)
+ /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
+  * frontend (Module.cpp) which owns the thread registry. extern "C" so the
+@@ -1439,6 +1593,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   auto Thread = Frame->Thread;
+   FEXCORE_PROFILE_SCOPED("CompileBlock");
+   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
++#ifdef FEX_IOS_HOST
++  IosLookupGuard IosLookupTimer(Frame, Thread, GuestRIP);   // ml2110 [lookup-stats]
++#endif
+ 
+ #ifdef FEX_IOS_HOST
+   /* ml648: consume any pending Mono-backpatcher event.
+@@ -1464,6 +1621,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   }
+ #endif
+ 
++#ifdef FEX_IOS_HOST
+   /* iOS-Madeira ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.
+    *
+    * ml302 proved the JITCallback prologue writes the bad State.rip, and ml303 added an LR witness --
+@@ -1514,6 +1672,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+                         IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);
+     }
+   }
++#endif
+ 
+   /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
+    * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
+@@ -1966,6 +2125,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+        * automatically healthy contention — it can equally be page reuse or a
+        * foreign writer, so check block_index/list_size against block_count before
+        * concluding anything. */
++#ifndef __APPLE__
++      /* rpmalloc is only linked into the Windows modules; FEX's CMake disables it on Apple hosts. */
+       {
+         rpm_cas_snapshot Snap;
+         if (rpm_cas_snapshot_take(&Snap)) {
+@@ -1979,6 +2140,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+                             Snap.fail_changed, Snap.fail_unchanged, Snap.fail_invalid);
+         }
+       }
++#endif
+     }
+   }
+ 
+@@ -2148,6 +2310,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+ 
+   // iOS-Madeira: cache miss reached — count as true compile.
+   __sync_add_and_fetch(&g_cb_real_compiles, 1);
++#ifdef FEX_IOS_HOST
++  IosLookupTimer.MarkCompiled();
++#endif
+ 
+   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+@@ -2435,6 +2600,27 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
+ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
+   auto Thread = Frame->Thread;
+   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
++  if (CTX->GetGuestBase()) {
++    /* MADEIRA ml2108: under a guest window (the WoW64 module) store WITHOUT the invalidation lock.
++     *
++     * The patched page is usually SMC write-trapped. Its fault goes through the Windows exception
++     * path to InvalidationTracker::HandleRWXAccessViolation, which takes CodeInvalidationMutex to
++     * invalidate and untrap. Holding that mutex here made the fault wait on this very thread: a
++     * 32-bit Unity Mono title's main thread self-deadlocked on its 14th SMC fault (the other 13,
++     * from translated code, were untrapped normally) and the game never left its loading screen.
++     * Unlocked, the store faults, is untrapped and retried like any guest write; the range is
++     * invalidated below as before. */
++    const uint64_t Dest = Address + CTX->GetGuestBase();
++    if (Size == 8) {
++      *reinterpret_cast<uint64_t*>(Dest) = Value;
++    } else if (Size == 4) {
++      *reinterpret_cast<uint32_t*>(Dest) = Value;
++    } else {
++      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
++    }
++    CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, Address, Size);
++    return;
++  }
+   {
+     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
+ 
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 032a62b..53dc4c5 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -277,7 +277,16 @@ void Dispatcher::EmitDispatcher() {
+     ARMEmitter::ForwardLabel L1Miss;
+     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+     // Entry address = L1Pointer + ((RIP << ilog2(entry size)) & pre-scaled mask)
++#ifdef FEX_IOS_HOST
++    // MADEIRA ml2111: slot = ((RIP ^ (RIP >> 17)) << 4) & mask = ((RIP << 4) & mask) ^ ((RIP >> 13) & mask),
++    // the scaled mask having its low 4 bits clear. Same function as LookupCache::L1Index.
++    and_(ARMEmitter::Size::i64Bit, TMP4, TMP2, RipReg, ARMEmitter::ShiftType::LSR,
++         LookupCache::L1IndexFoldShift - FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
++    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
++    eor(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4);
++#else
+     and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
++#endif
+     add(TMP1, TMP1, TMP2);
+     ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
+     sub(TMP2, TMP2, RipReg);
+@@ -338,10 +347,17 @@ void Dispatcher::EmitDispatcher() {
+ 
+         // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+         // L1Mask is pre-shifted.
++#ifdef FEX_IOS_HOST
++        // MADEIRA ml2111: no L1 refill here. The slot is LookupCache::L1Index, which needs a third
++        // scratch register and TMP3 (RipReg) / TMP4 (the host code) are both live. CompileBlock's
++        // FindBlock refills L1 on the next miss instead; L2 is off on iOS (DisableL2Cache), so this
++        // path is not emitted there in the first place.
++#else
+         and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+         add(TMP1, TMP1, TMP2);
+ 
+         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
++#endif
+ 
+         // Jump to the block
+         br(TMP4);
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index f231071..583d655 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -316,12 +316,25 @@ DEF_OP(ExitFunction) {
+ #endif // !FEX_CALLRET_STACK_UNUSED
+ 
+     // L1 Cache
++#ifdef FEX_IOS_HOST
++    // MADEIRA ml2111: the folded slot, LookupCache::L1Index:
++    // ((RIP ^ (RIP >> 17)) << 4) & mask = ((RIP << 4) & mask) ^ ((RIP >> 13) & mask), the scaled mask
++    // having its low 4 bits clear. Only TMP1/TMP2 are free here, so mask and pointer load separately.
++    ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
++    and_(ARMEmitter::Size::i64Bit, TMP1, TMP2, RipReg, ARMEmitter::ShiftType::LSR,
++         LookupCache::L1IndexFoldShift - FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
++    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
++    eor(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1);
++    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
++    add(TMP1, TMP1, TMP2);
++#else
+     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+ 
+     // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+     // L1Mask is pre-shifted.
+     and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+     add(TMP1, TMP1, TMP2);
++#endif
+ 
+     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+ 
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index ffa2709..2e901f7 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -199,7 +199,7 @@ public:
+ 
+   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+     // Try L1, no lock needed
+-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
++    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
+     if (L1Entry.GuestCode == Address) {
+       return L1Entry.HostCode;
+     }
+@@ -348,7 +348,7 @@ public:
+   // Invalidates L1/L2 for a given guest block
+   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
+     // Do L1
+-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
++    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
+     if (L1Entry.GuestCode == Address) {
+       L1Entry.GuestCode = 0;
+       // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
+@@ -405,6 +405,25 @@ public:
+   uintptr_t GetL1Pointer() const {
+     return L1Pointer;
+   }
++
++  /* MADEIRA ml2111: the L1 slot of a guest address. The L1 is direct-mapped and
++   * was indexed by the address's low bits alone, so blocks in different images
++   * whose low 17 bits match evicted each other: [lookup-stats] (ml2110) measured
++   * ~100K L1 misses/s on Stick It to the Stickman's main thread, 99.5% of them
++   * such conflicts, ~1 us each in CompileBlock = 10-16% of the thread. XOR-folding
++   * the bits above the largest L1 (2^17 entries on iOS) into the index spreads
++   * them. The generated probes (Dispatcher.cpp loop top and L2 path,
++   * BranchOps.cpp indirect branch) compute the same function, and every C++
++   * site (find, insert, invalidate) goes through here, so an entry is always
++   * looked up and invalidated in the slot it was written to. */
++  static constexpr unsigned L1IndexFoldShift = 17;
++  static uint64_t L1Index(uint64_t Address) {
++#ifdef FEX_IOS_HOST
++    return Address ^ (Address >> L1IndexFoldShift);
++#else
++    return Address;
++#endif
++  }
+   uintptr_t GetScaledL1PointerMask() const {
+     return L1PointerMask << FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry));
+   }
+@@ -437,7 +456,7 @@ private:
+     }
+ 
+     // Do L1
+-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
++    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
+     L1Entry.GuestCode = Address;
+     L1Entry.HostCode = Entry.HostCode;
+ 
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+index b2eca70..20f05fb 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -704,6 +704,7 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
+    * which we DUAL-MAP (RW alias + RX alias). Aliased mappings are exactly where atomics
+    * can fault despite correct alignment. Report what the region actually is, so "guest
+    * data in a dual-mapped pool page" is distinguishable from ordinary private memory. */
++#ifdef _WIN32
+   MEMORY_BASIC_INFORMATION mbi {};
+   const char* type = "?";
+   if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+@@ -714,6 +715,10 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
+                     Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                     (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                     mbi.Protect, type, mbi.State);
++#else
++  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={}",
++                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15);
++#endif
+ }
+ 
+ static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 96f6fa6..ab5dd48 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -106,6 +106,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+     const bool EagerDEP = DEPDisabled && !GuestBase;
+     const bool EffectiveExec = HasExec || (EagerDEP && ProtIsReadable(Prot));
+     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
++    if (GuestBase && AlignedBase >= GuestBase && AlignedBase - GuestBase < (1ULL << 32) && (HasExec || XIntervals.Intersect(ProtInterval))) {
++      // MADEIRA ml2107: every executable-relevant protection change in the window.
++      static std::atomic<uint32_t> NotifyLogs {0};
++      if (NotifyLogs.fetch_add(1, std::memory_order_relaxed) < 200) {
++        LogMan::Msg::EFmt("[smc-notify] ml2107 guest {:#x}+{:#x} prot {:#x}: exec={} rwx={}", AlignedBase - GuestBase,
++                          AlignedSize, Prot, EffectiveExec, EffectiveRWX);
++      }
++    }
+ 
+     if (EffectiveExec) {
+       XIntervals.Insert(ProtInterval);
+@@ -488,6 +496,26 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
+     std::shared_lock Lock(IntervalsLock);
+     if (!RWXIntervals.Query(Address).Enclosed) {
++#if !defined(ARCHITECTURE_arm64ec)
++      /* MADEIRA ml2107: a write fault in the guest window that is NOT a tracked RWX page. A
++       * 32-bit Unity title kept faulting on writes to a page the host had read-only ("exec-
++       * downgraded page that never got W") and every one went to the guest as an access
++       * violation. Say what this tracker and the memory map know about the page. */
++      if (GuestBase && Address >= GuestBase && Address - GuestBase < (1ULL << 32)) {
++        static std::atomic<uint32_t> MissLogs {0};
++        if (MissLogs.fetch_add(1, std::memory_order_relaxed) < 48) {
++          MEMORY_BASIC_INFORMATION Info {};
++          const bool HaveInfo = VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info));
++          const auto RWX = RWXIntervals.Query(Address);
++          LogMan::Msg::EFmt("[smc-miss] ml2107 guest {:#x} hostpc {:#x}: X={} DEPpromoted={} nextRWX+{:#x} | "
++                            "vq={} base={:#x} size={:#x} prot={:#x} alloc_prot={:#x} state={:#x} type={:#x}",
++                            Address - GuestBase, HostPc, XIntervals.Query(Address).Enclosed,
++                            DEPPromotedIntervals.Query(Address).Enclosed, RWX.Size, HaveInfo,
++                            reinterpret_cast<uint64_t>(Info.BaseAddress) - GuestBase, Info.RegionSize, Info.Protect,
++                            Info.AllocationProtect, Info.State, Info.Type);
++        }
++      }
++#endif
+       return {false, 0};
+     }
+     return {true, GetUntrapProt(Address)};
+@@ -504,7 +532,16 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+       ULONG TmpProt;
+       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+       SIZE_T TmpSize = 1;
+-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
++      const NTSTATUS UntrapStatus = NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
++#if !defined(ARCHITECTURE_arm64ec)
++      if (GuestBase && FaultAddress >= GuestBase && FaultAddress - GuestBase < (1ULL << 32)) {
++        static std::atomic<uint32_t> UntrapLogs {0};
++        if (UntrapStatus || UntrapLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
++          LogMan::Msg::EFmt("[smc-untrap] ml2107 guest {:#x} -> prot {:#x}: status {:#x} (was {:#x})",
++                            FaultAddress - GuestBase, UntrapProt, static_cast<uint32_t>(UntrapStatus), TmpProt);
++        }
++      }
++#endif
+     }
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+@@ -783,7 +820,18 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+       void* TmpAddress = reinterpret_cast<void*>(Address);
+       SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
+       ULONG TmpProt;
+-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
++      const ULONG NewProt = ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address);
++      const NTSTATUS ProtStatus = NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, NewProt, &TmpProt);
++#if !defined(ARCHITECTURE_arm64ec)
++      if (GuestBase && Address >= GuestBase && Address - GuestBase < (1ULL << 32)) {
++        static std::atomic<uint32_t> TrapLogs {0};
++        if (ProtStatus || TrapLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
++          LogMan::Msg::EFmt("[smc-{}] ml2107 guest {:#x}+{:#x} -> prot {:#x}: status {:#x} (was {:#x})",
++                            ForWriteLocked ? "untrap" : "trap", Address - GuestBase, TmpSize, NewProt,
++                            static_cast<uint32_t>(ProtStatus), TmpProt);
++        }
++      }
++#endif
+     } else if (!Query.Size) {
+       // No more regions past `Address` in the interval list
+       break;

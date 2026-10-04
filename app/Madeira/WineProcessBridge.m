@@ -1085,6 +1085,9 @@ static void *wine_process_thread(void *arg) {
             /* ml519: start the freeze detector as soon as logging works, so
              * every launch (Thumper as well as Steam) yields a measurement. */
             { extern void winios_freeze_watch_start(void); winios_freeze_watch_start(); }
+            /* a game session starts with no game-mode overlay windows and
+             * no known Metal windows (Winios.m) */
+            { extern void winios_session_reset(void); winios_session_reset(); }
             LOG("Wine log file: %{public}s", logPath.UTF8String);
             /* Expose the app Documents dir to Wine code (e.g. for fex-jit-dump.bin) */
             setenv("MADEIRA_DOCS_DIR", docs.UTF8String, 1);
@@ -1153,6 +1156,24 @@ static void *wine_process_thread(void *arg) {
                     setenv(k.UTF8String, v.UTF8String, 1);
                     LOG("madeira.cfg env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] ml1062 %s=%s\n", k.UTF8String, v.UTF8String);
+                }
+                /* The library game's own lines ($MADEIRA_CFG_GAME, written by
+                 * LibraryEntry.applyEnvironment): its env.NAME lines come after
+                 * madeira.cfg's and win, the rule madeira_cfg_get applies to keys. */
+                const char *gameCfg = getenv("MADEIRA_CFG_GAME");
+                NSString *gameText = (gameCfg && *gameCfg)
+                    ? [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:gameCfg] encoding:NSUTF8StringEncoding error:nil]
+                    : nil;
+                for (NSString *raw in [gameText componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+                    NSString *line = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSRange eq = [line rangeOfString:@"="];
+                    if (![line hasPrefix:@"env."] || eq.location == NSNotFound) continue;
+                    NSString *k = [[line substringWithRange:NSMakeRange(4, eq.location - 4)] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSString *v = [[line substringFromIndex:eq.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    if (!k.length) continue;
+                    setenv(k.UTF8String, v.UTF8String, 1);
+                    LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
+                    fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
                 /* Fastsync is the default sync engine: with neither inproc-sync nor
                  * env.MADEIRA_FASTSYNC in madeira.cfg, Wine gets MADEIRA_FASTSYNC=auto,
@@ -1571,6 +1592,40 @@ static void *wine_process_thread(void *arg) {
             dprintf(STDERR_FILENO, "[WineProc] Wine exited with code %d (caught by longjmp)\n", wine_ios_exit_code);
         }
 
+        /* A launcher stub that starts the game and exits at once (GTA V
+         * Enhanced: PlayGTAV.exe -> GTA5_Enhanced.exe) must not end the
+         * session -- stopping the wineserver here killed the game while it
+         * loaded. If a child process that is not a crash reporter / helper was
+         * started in the last 60 s and still runs, the session goes on until
+         * no such child is left (process_ios.c, madeira_live_game_children).
+         * A game that exits normally long after starting its helpers is not
+         * affected. Opt-in, MADEIRA_WAIT_CHILDREN=1 (madeira.cfg, or a game's
+         * own config): a child that ends from a worker thread never releases its
+         * slot (process_ios.c), and the session would then wait forever. */
+        {
+            extern int madeira_live_game_children(char *buf, int len, double max_age);
+            const char *wc = getenv("MADEIRA_WAIT_CHILDREN");
+            char names[256];
+            int n = madeira_live_game_children(names, sizeof names, 60.0);
+            if (n > 0 && !(wc && wc[0] == '1')) {
+                dprintf(STDERR_FILENO, "[WineProc] the main process exited while %d child process(es) it started "
+                        "still run (%s); the session ends with it (MADEIRA_WAIT_CHILDREN=1 keeps it while they run)\n",
+                        n, names);
+            } else if (n > 0) {
+                dprintf(STDERR_FILENO, "[WineProc] the main process exited but %d child process(es) "
+                        "it started still run (%s) -- a launcher started the game; the session goes on until "
+                        "they exit (MADEIRA_WAIT_CHILDREN=1)\n", n, names);
+                unsigned ticks = 0;
+                while ((n = madeira_live_game_children(names, sizeof names, -1.0)) > 0) {
+                    usleep(200 * 1000);
+                    if ((++ticks % 300) == 0)
+                        dprintf(STDERR_FILENO, "[WineProc] still running: %d child process(es) (%s), %u s\n",
+                                n, names, ticks / 5);
+                }
+                dprintf(STDERR_FILENO, "[WineProc] the last child process exited after %u s\n", ticks / 5);
+            }
+        }
+
         g_wine_running = 0;
 
         // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
@@ -1628,11 +1683,15 @@ int wine_process_start(const char *prefix_path) {
     // Inject wineserver side — the event loop will pick this up
     wineserver_inject_client_fd(pair[0]);
 
-    // Lower priority so Wine init doesn't starve the main thread
+    /* The guest main thread runs on this pthread. Give it its QoS class
+     * through the attribute, as wineserver_start does for the server thread:
+     * a thread created with pthread_attr_setschedparam has a fixed priority,
+     * and Darwin then refuses pthread_set_qos_class_self_np (EPERM), so the
+     * USER_INTERACTIVE promotion in wine_process_thread never took effect and
+     * the game's main thread ran at priority 20 on the efficiency cores. */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    struct sched_param sched = { .sched_priority = 20 };  // lower than default (31)
-    pthread_attr_setschedparam(&attr, &sched);
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
 
     int ret = pthread_create(&g_wine_thread, &attr, wine_process_thread, NULL);
     pthread_attr_destroy(&attr);

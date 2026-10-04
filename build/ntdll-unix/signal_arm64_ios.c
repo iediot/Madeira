@@ -1369,6 +1369,35 @@ static int ios_fault_read_insn( uint64_t fault_pc, uint32_t *out )
     return 1;
 }
 
+/* x18-derived base register.
+ *
+ * Wine's EC kernelbase TlsGetValue is `add x8, x18, w0, uxtw #3;
+ * ldr x0, [x8, #0x1480]`: the TEB address is copied into another register one
+ * instruction before the access, so when iOS has zeroed x18 the fault's base
+ * register is x8, not x18, and the x18 emulation in the Mach handler declines
+ * (Crysis Remastered worker thread: fault at 0x1570 = TLS slot 30, then the
+ * process died). When the instruction right before the fault is an ADD/MOV
+ * that wrote exactly this base register from x18, the base holds
+ * (0 + offset) and fault_addr is the TEB offset, so the same TEB-relative
+ * emulation is correct. Only ADD (extended/shifted register or immediate) and
+ * MOV Xd,X18; the other operand must not be the destination (it still holds
+ * the value the ADD used). */
+static int ios_x18_derived_base( uint64_t fault_pc, int rn )
+{
+    uint32_t p;
+    int rd, pn, pm;
+
+    if (rn == 18 || rn >= 29 || !ios_fault_read_insn( fault_pc - 4, &p )) return 0;
+    rd = p & 31; pn = (p >> 5) & 31; pm = (p >> 16) & 31;
+    if (rd != rn) return 0;
+    if ((p & 0xffe00000u) == 0x8b200000u) return pn == 18 && pm != rd;           /* ADD Xd, X18, Wm/Xm, ext */
+    if ((p & 0xff200000u) == 0x8b000000u) return (pn == 18 && pm != rd) ||       /* ADD Xd, X18, Xm, shift */
+                                                 (pm == 18 && pn != rd && !((p >> 10) & 0x3f));
+    if ((p & 0xff800000u) == 0x91000000u) return pn == 18;                       /* ADD Xd, X18, #imm */
+    if ((p & 0xffffffe0u) == (0xaa0003e0u | (18u << 16))) return 1;              /* MOV Xd, X18 */
+    return 0;
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -2300,7 +2329,18 @@ static void *ios_mach_exception_thread( void *arg )
                      *  - base reg VALUE vs fault_addr: equal => the register
                      *    literally held the small offset.
                      * Capped at 4 reports so a fault storm can't flood. */
-                    if (rn != 18)
+                    /* A base register computed from x18 one instruction earlier */
+                    int x18_derived = ios_x18_derived_base( fault_pc, rn );
+                    if (x18_derived)
+                    {
+                        static int ios_x18_derived_reports;
+                        if (ios_x18_derived_reports++ < 8)
+                            ERR( "[x18-derived] #%d pc=%p insn=%08x base x%d from x18 -> "
+                                 "TEB+0x%lx emulated\n", ios_x18_derived_reports, (void *)(uintptr_t)fault_pc,
+                                 insn, rn, (unsigned long)fault_addr );
+                    }
+
+                    if (rn != 18 && !x18_derived)
                     {
                         static int ios_x18_decline_reports;
                         if (ios_x18_decline_reports < 4)
@@ -2329,7 +2369,7 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                     }
 
-                    if (rn == 18)
+                    if (rn == 18 || x18_derived)
                     {
                         uintptr_t ea = thread_teb + fault_addr;
                         int rt = insn & 0x1f;
@@ -6365,6 +6405,73 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 }
 
 
+/* A CROSS-THREAD CONTEXT WITHOUT ITS CONTROL REGISTERS.
+ *
+ * When the server has no native capture of the target it answers with the
+ * integer registers only, and the ARM64EC wrapper hands an x64 caller
+ * Rip = Rsp = 0 with no CONTEXT_CONTROL. Ghost of Tsushima's loading screen
+ * froze on exactly that: one thread called GetThreadContext on another
+ * thousands of times, getting rip 0 each time, while holding a critical
+ * section the main thread waited on.
+ *
+ * The target's last x64 state is in its CPU area (ChpeV2CpuAreaInfo->
+ * ContextAmd64, saved whenever it left emulated code). Its control registers
+ * (Pc, Sp, Fp, Lr) are returned in the ARM64EC register mapping, which the
+ * wrapper's context_arm_to_x64() turns back into x64 registers; X23/X28 are
+ * cleared so the wrapper does not replace Pc/Sp with an emulator frame's. The
+ * integer registers stay the server's. Threads of this process only: the TEB
+ * pointer is read in this address space, through mach_vm_read_overwrite, so a
+ * target that exits meanwhile cannot fault this thread.
+ *
+ * Opt-in, MADEIRA_CTX_CPU_AREA=1 (madeira.cfg env., or a game's own config):
+ * the snapshot is the thread's last exit from emulated code, not where it is
+ * now, so a caller that writes the context back (SetThreadContext, as a .NET
+ * runtime redirecting a thread does) would move the thread back there. */
+static int ctx_peek( void *dst, const void *src, size_t size )
+{
+    mach_vm_size_t got = 0;
+    return src && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)src, size,
+                                          (mach_vm_address_t)(uintptr_t)dst, &got ) == KERN_SUCCESS && got == size;
+}
+
+static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD needed )
+{
+    static int on = -1;
+    THREAD_BASIC_INFORMATION tbi;
+    const TEB *teb;
+    const CHPE_V2_CPU_AREA_INFO *cpu = NULL;
+    const ARM64EC_NT_CONTEXT *ecp = NULL;
+    ARM64EC_NT_CONTEXT ec;
+    static LONG said;
+
+    if (on < 0)
+    {
+        /* 1: a cross-thread GetThreadContext without control registers gets the target's
+         * saved x64 Pc/Sp/Fp/Lr (default off; a context written back would rewind it). */
+        const char *env = getenv( "MADEIRA_CTX_CPU_AREA" );
+        on = env && env[0] == '1';
+    }
+    if (!on) return 0;
+    if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL )) return 0;
+    if (tbi.ClientId.UniqueProcess != NtCurrentTeb()->ClientId.UniqueProcess) return 0;
+    if (!(teb = tbi.TebBaseAddress)) return 0;
+    if (!ctx_peek( &cpu, &teb->ChpeV2CpuAreaInfo, sizeof(cpu) ) || !cpu) return 0;
+    if (!ctx_peek( &ecp, &cpu->ContextAmd64, sizeof(ecp) ) || !ecp) return 0;
+    if (!ctx_peek( &ec, ecp, sizeof(ec) )) return 0;
+    if (!ec.Pc || !ec.Sp) return 0;
+    context->X[23] = context->X[28] = 0;
+    context->Fp = ec.Fp;
+    context->Lr = ec.Lr;
+    context->Sp = ec.Sp;
+    context->Pc = ec.Pc;
+    context->ContextFlags |= CONTEXT_CONTROL;
+    if (InterlockedIncrement( &said ) <= 8)
+        ERR( "[ctx] get handle=%p: no control registers from the server; "
+             "returning the target's saved x64 Pc/Sp/Fp/Lr rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA)\n",
+             handle, (void *)ec.Pc, (void *)ec.Sp );
+    return 1;
+}
+
 /***********************************************************************
  *              NtGetContextThread  (NTDLL.@)
  *              ZwGetContextThread  (NTDLL.@)
@@ -6378,6 +6485,9 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
     if (!self)
     {
         NTSTATUS ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_ARM64 );
+        if (!ret && !self && (needed_flags & CONTEXT_CONTROL & ~CONTEXT_ARM64) &&
+            (!(context->ContextFlags & CONTEXT_CONTROL & ~CONTEXT_ARM64) || !context->Pc))
+            get_context_from_amd64_area( handle, context, needed_flags );
         if (ret || !self) return ret;
     }
 

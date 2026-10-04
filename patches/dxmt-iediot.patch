@@ -1,0 +1,655 @@
+diff --git a/src/airconv/shaders/air_tessellation.metal b/src/airconv/shaders/air_tessellation.metal
+index 56ba86e..fa086b5 100644
+--- a/src/airconv/shaders/air_tessellation.metal
++++ b/src/airconv/shaders/air_tessellation.metal
+@@ -150,7 +150,12 @@ struct TessMeshWorkload {
+ 
+ int
+ get_next_index(threadgroup int *out_count) {
++#ifdef __METAL_MEMORY_FLAGS_NONE__
++  // Metal 4 toolchains (Xcode 27) take a fifth memory-flags argument.
++  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__, __METAL_MEMORY_FLAGS_NONE__);
++#else
+   return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__);
++#endif
+ }
+ 
+ template <partitioning partition>
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index 701e163..50d72ba 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -608,6 +608,15 @@ inline std::atomic<uint32_t> g_bc_stream_fail{0};
+  * clamp is enabled means no clamped texture was ever streamed to. */
+ inline std::atomic<uint32_t> g_bc_clamp_xlated{0};
+ inline std::atomic<uint32_t> g_bc_clamp_dropped{0};
++/* ml2100: runtime writes and copies that touch a downscaled texture are
++ * dropped (their regions are in logical texels). Logged on the 1st, then every
++ * 64th, so a title that does stream into one is visible in the log. */
++inline std::atomic<uint32_t> g_downscale_dropped{0};
++inline void NoteDownscaledOpDropped(const char *what) {
++  const uint32_t n = g_downscale_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n == 1 || n % 64 == 0)
++    ERR("[bc-downscale] ml2100 dropped ", what, " on a downscaled texture (", n, " so far)");
++}
+ /* ml746: COPY-PATH clamp accounting. CopySubresourceRegion never translated mip
+  * indices, so every copy touching a clamped texture landed on the wrong level --
+  * invisible in the menu (0 copies) and severe in gameplay (1,860). Classified by
+@@ -3639,6 +3648,13 @@ public:
+      * so they take bias 0, which is what we want. Drop only when a requested
+      * logical level sits below its own texture's bias -- it does not exist. */
+     {
++      {
++        auto ts = GetTexture(cmd.pSrc), td = GetTexture(cmd.pDst);
++        if ((ts && ts->downscaled()) || (td && td->downscaled())) {   /* ml2100 */
++          NoteDownscaledOpDropped("copy");
++          return;
++        }
++      }
+       uint32_t src_bias = 0, dst_bias = 0;
+       if (auto t = GetTexture(cmd.pSrc)) src_bias = t->mipBias();
+       if (auto t = GetTexture(cmd.pDst)) dst_bias = t->mipBias();
+@@ -4049,6 +4065,13 @@ public:
+        *
+        * Without this every streamed update would land on the wrong mip, which is
+        * worse than not clamping at all. */
++      /* ml2100: a downscaled texture is half the logical size, so a region in
++       * logical texels does not fit it. Its contents came from the initial
++       * data; keep them. */
++      if (dst->downscaled()) {
++        NoteDownscaledOpDropped("UpdateSubresource");
++        return;
++      }
+       const uint32_t mip_bias = dst->mipBias();
+       if (mip_bias) {
+         if (cmd.Dst.MipLevel < mip_bias) {
+@@ -4175,6 +4198,13 @@ public:
+        *
+        * Without this every streamed update would land on the wrong mip, which is
+        * worse than not clamping at all. */
++      /* ml2100: a downscaled texture is half the logical size, so a region in
++       * logical texels does not fit it. Its contents came from the initial
++       * data; keep them. */
++      if (dst->downscaled()) {
++        NoteDownscaledOpDropped("UpdateSubresource");
++        return;
++      }
+       const uint32_t mip_bias = dst->mipBias();
+       if (mip_bias) {
+         if (cmd.Dst.MipLevel < mip_bias) {
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index dfc927b..8867ff7 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -9,6 +9,9 @@
+ #include "util_win32_compat.h"
+ #include "config/config.hpp"   /* ml675: d3d11.mipClampBC */
+ #include "d3d11_mip_clamp_policy.hpp"   /* ml2000: d3d11.mipClampAuto */
++#include "dxmt_bcn_downscale.hpp"       /* ml2100: single-level BC downscale */
++#include <vector>
++#include <algorithm>
+ #include "util_env.hpp"
+ #include "util_madeira_switch.hpp"
+ #include "winemetal.h"
+@@ -430,6 +433,115 @@ static inline bool IsBCFormatForClamp(uint32_t f) {
+          (f >= 94 && f <= 99);      /* BC6H, BC7 */
+ }
+ 
++/* ml2101: 4-byte, 8-bit-channel formats the clamp and the downscale also
++ * take: R8G8B8A8 (27-29) and B8G8R8A8 / B8G8R8X8 (87, 88, 90-93). Uncompressed
++ * sprite art is commonly stored this way, at 4 bytes a texel. */
++static inline bool IsRGBA8ForClamp(uint32_t f) {
++  return (f >= 27 && f <= 29) || f == 87 || f == 88 || (f >= 90 && f <= 93);
++}
++
++/* ---- ml2101: texture census, every format --------------------------------
++ *
++ * The BC census (d3d11_device.cpp) cannot see uncompressed textures, so a
++ * title whose memory goes to RGBA sprites or render targets showed a Metal
++ * total nobody could account for. This counts every Texture2D by DXGI format,
++ * with its logical and physical bytes, how much of it the clamp and the
++ * downscale took, and how much was ineligible, and logs the top formats by
++ * physical bytes every 512 textures. Byte counts are estimates from the
++ * descriptor (texel/block size x extents x mips x slices). */
++static inline uint64_t
++EstimateTextureBytes(uint32_t f, uint32_t w, uint32_t h, uint32_t mips, uint32_t slices) {
++  uint32_t bpb = 4, block = 1;   /* bytes per block, block edge in texels */
++  if ((f >= 70 && f <= 72) || (f >= 79 && f <= 81)) { bpb = 8; block = 4; }       /* BC1, BC4 */
++  else if (IsBCFormatForClamp(f)) { bpb = 16; block = 4; }                          /* BC2/3/5/6H/7 */
++  else if (f >= 1 && f <= 4) bpb = 16;                                              /* R32G32B32A32 */
++  else if (f >= 5 && f <= 8) bpb = 12;                                              /* R32G32B32 */
++  else if (f >= 9 && f <= 22) bpb = 8;                                              /* 64-bit */
++  else if (f >= 48 && f <= 59) bpb = 2;                                             /* R8G8, R16 */
++  else if ((f >= 60 && f <= 65) || f == 85 || f == 86 || f == 115) bpb = 1;         /* R8, A8 */
++  uint64_t total = 0;
++  for (uint32_t m = 0; m < std::max(1u, mips); m++) {
++    uint64_t bw = (std::max(1u, w >> m) + block - 1) / block, bh = (std::max(1u, h >> m) + block - 1) / block;
++    total += bw * bh * bpb;
++  }
++  return total * std::max(1u, slices);
++}
++
++struct TexCensusEntry {
++  std::atomic<uint64_t> n{0}, logical{0}, physical{0}, clamped{0}, downscaled{0};
++  /* 1 MB+ textures neither saving applied to, by why: rendered to / written by
++   * the GPU (never shrinkable), single-level without initial data, other. */
++  std::atomic<uint64_t> big_rt{0}, big_nodata{0}, big_other{0};
++};
++static TexCensusEntry g_tex_census[192];
++static std::atomic<uint64_t> g_tex_census_n{0};
++/* ml2113: the 1 MB+ "other" bytes by the reason the clamp and the downscale
++ * passed them over (bitmask, see TexSkipReason). ml2101 showed 544 MB of
++ * R8G8B8A8_SRGB in Stick It to the Stickman under "other" with no way to tell
++ * which eligibility rule excluded it. */
++static std::atomic<uint64_t> g_tex_skip_bytes[256];
++static std::atomic<uint64_t> g_tex_skip_n[256];
++
++static void
++TexCensusRecord(uint32_t f, uint64_t logical, uint64_t physical, uint32_t mip_bias, bool downscaled,
++                bool srv_only, bool single_level, bool has_data, uint32_t skip_reason = 0) {
++  if (f >= 192) f = 0;
++  auto &e = g_tex_census[f];
++  e.n.fetch_add(1, std::memory_order_relaxed);
++  e.logical.fetch_add(logical, std::memory_order_relaxed);
++  e.physical.fetch_add(physical, std::memory_order_relaxed);
++  if (mip_bias) e.clamped.fetch_add(logical - physical, std::memory_order_relaxed);
++  if (downscaled) e.downscaled.fetch_add(logical - physical, std::memory_order_relaxed);
++  /* "Big and untouched": 1 MB or more that neither saving applied to. */
++  if (!mip_bias && !downscaled && logical >= (1u << 20)) {
++    if (!srv_only) e.big_rt.fetch_add(logical, std::memory_order_relaxed);
++    else if (single_level && !has_data) e.big_nodata.fetch_add(logical, std::memory_order_relaxed);
++    else {
++      e.big_other.fetch_add(logical, std::memory_order_relaxed);
++      g_tex_skip_bytes[skip_reason & 255].fetch_add(logical, std::memory_order_relaxed);
++      g_tex_skip_n[skip_reason & 255].fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++  const uint64_t n = g_tex_census_n.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n % 512)
++    return;
++  uint32_t order[192];
++  for (uint32_t i = 0; i < 192; i++) order[i] = i;
++  std::sort(order, order + 192, [](uint32_t a, uint32_t b) {
++    return g_tex_census[a].physical.load(std::memory_order_relaxed) > g_tex_census[b].physical.load(std::memory_order_relaxed);
++  });
++  uint64_t all = 0;
++  for (auto &c : g_tex_census) all += c.physical.load(std::memory_order_relaxed);
++  ERR("[tex-census] ml2101 after ", n, " textures: physical ", all >> 20, " MB in total; top formats:");
++  for (uint32_t i = 0; i < 8; i++) {
++    auto &c = g_tex_census[order[i]];
++    if (!c.physical.load(std::memory_order_relaxed)) break;
++    ERR("[tex-census]   fmt=", order[i], " n=", c.n.load(std::memory_order_relaxed),
++        " logical=", c.logical.load(std::memory_order_relaxed) >> 20, "MB physical=",
++        c.physical.load(std::memory_order_relaxed) >> 20, "MB clamp-saved=",
++        c.clamped.load(std::memory_order_relaxed) >> 20, "MB downscale-saved=",
++        c.downscaled.load(std::memory_order_relaxed) >> 20, "MB | big untouched: rendered-to=",
++        c.big_rt.load(std::memory_order_relaxed) >> 20, "MB no-initial-data=",
++        c.big_nodata.load(std::memory_order_relaxed) >> 20, "MB other=",
++        c.big_other.load(std::memory_order_relaxed) >> 20, "MB");
++  }
++  /* ml2113: why "other" was skipped. Bits: 1 single-level, 2 usage not
++   * DEFAULT/IMMUTABLE, 4 CPU access, 8 misc flags beyond cube/resource-clamp,
++   * 16 array, 32 odd width or height, 64 no initial data, 128 cube or under
++   * 256 px (downscale size floor). */
++  uint32_t ro[256];
++  for (uint32_t i = 0; i < 256; i++) ro[i] = i;
++  std::sort(ro, ro + 256, [](uint32_t a, uint32_t b) {
++    return g_tex_skip_bytes[a].load(std::memory_order_relaxed) > g_tex_skip_bytes[b].load(std::memory_order_relaxed);
++  });
++  for (uint32_t i = 0; i < 5; i++) {
++    const uint64_t bytes = g_tex_skip_bytes[ro[i]].load(std::memory_order_relaxed);
++    if (!bytes) break;
++    ERR("[tex-census]   other skipped by reason=0x", std::hex, ro[i], std::dec, ": ", bytes >> 20, "MB in ",
++        g_tex_skip_n[ro[i]].load(std::memory_order_relaxed), " textures (ml2113)");
++  }
++}
++
+ /* ---- ml2000: memory-pressure-aware automatic clamp (d3d11.mipClampAuto) ----
+  *
+  * A D3D11 scene load created ~500 SRV-only BC textures (mostly 2048/4096
+@@ -492,16 +604,10 @@ static std::atomic<int64_t> g_auto_headroom_mb{mip_clamp::kHeadroomUnknown};
+ static std::atomic<int64_t> g_auto_footprint_mb{0};
+ static std::atomic<bool> g_auto_pressure_logged{false};
+ 
+-/* Bias for an auto candidate already known to pass the mipClampBC filter. */
+-static uint32_t
+-MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
+-  const MipClampAutoConfig &cfg = GetMipClampAutoConfig();
+-  if (!cfg.enabled || !cfg.threshold_mb || !mip_clamp::AutoSizeEligible(width, height))
+-    return 0;
+-  const uint32_t bias = mip_clamp::ClampBias(1, width, height, mip_levels, true);
+-  if (!bias)
+-    return 0;
+-
++/* Is the process within the auto threshold of its memory limit? Counts one
++ * auto candidate; re-reads the headroom on the ShouldRequery cadence. */
++static bool
++MipClampAutoUnderPressure(const MipClampAutoConfig &cfg) {
+   const uint64_t n = g_auto_candidates.fetch_add(1, std::memory_order_relaxed) + 1;
+   int64_t headroom = g_auto_headroom_mb.load(std::memory_order_relaxed);
+   if (mip_clamp::ShouldRequery(n, headroom, cfg.threshold_mb)) {
+@@ -522,8 +628,21 @@ MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
+         g_auto_footprint_mb.load(std::memory_order_relaxed), " MB -> ", pressure ? "clamping" : "not clamping",
+         " large BC textures (threshold ", cfg.threshold_mb, " MB) clamped=",
+         g_auto_clamped.load(std::memory_order_relaxed));
+-  if (!pressure)
++  return pressure;
++}
++
++/* Bias for an auto candidate already known to pass the mipClampBC filter. */
++static uint32_t
++MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
++  const MipClampAutoConfig &cfg = GetMipClampAutoConfig();
++  if (!cfg.enabled || !cfg.threshold_mb || !mip_clamp::AutoSizeEligible(width, height))
++    return 0;
++  const uint32_t bias = mip_clamp::ClampBias(1, width, height, mip_levels, true);
++  if (!bias)
+     return 0;
++  if (!MipClampAutoUnderPressure(cfg))
++    return 0;
++  const int64_t headroom = g_auto_headroom_mb.load(std::memory_order_relaxed);
+ 
+   const uint64_t clamped = g_auto_clamped.fetch_add(1, std::memory_order_relaxed) + 1;
+   if (mip_clamp::ShouldLogClamp(clamped))
+@@ -557,6 +676,9 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+    * descriptor; only `info` and the upload loop see reduced numbers. */
+   uint32_t mip_bias = 0;
+   typename tag::DESC1 physDesc = finalDesc;
++  bool downscaled = false;                  /* ml2100 */
++  std::vector<uint8_t> downscaled_pixels;   /* ml2100: outlives initialize() below */
++  D3D11_SUBRESOURCE_DATA downscaled_init = {};
+   if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
+     static int cached_clamp = -1;
+     if (cached_clamp < 0)
+@@ -568,7 +690,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+      * LOGICAL mip indices, which UpdateTexture now translates through the bias,
+      * dropping levels that no longer exist physically. */
+     const bool eligible =
+-        IsBCFormatForClamp((uint32_t)finalDesc.Format) &&
++        (IsBCFormatForClamp((uint32_t)finalDesc.Format) || IsRGBA8ForClamp((uint32_t)finalDesc.Format)) &&
+         (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
+         finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
+         finalDesc.MipLevels >= 2 && finalDesc.SampleDesc.Count <= 1 &&
+@@ -604,6 +726,80 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+       info.height             = physDesc.Height;
+       info.mipmap_level_count = physDesc.MipLevels;
+     }
++
++    /* ---- ml2100: halve single-level BC1/BC3 textures ----------------------
++     *
++     * A texture with one level has nothing for the clamp to drop, and those are
++     * often the largest ones (full-screen 2D art). Halve them instead, in the
++     * compressed domain (dxmt_bcn_downscale.hpp): a quarter of the memory, and
++     * normalised sampling is unchanged. Only with initial data -- that is the
++     * only content we can halve -- and only for textures the application can
++     * write solely through the runtime ops that the context drops for these.
++     *
++     * Applies when d3d11.downscaleBC=1; with it unset, whenever the clamp would
++     * (an explicit mipClampBC, or the auto clamp under memory pressure);
++     * d3d11.downscaleBC=0 turns it off. */
++    /* ml2101: 8 = uncompressed 8-bit RGBA/BGRA (IsRGBA8ForClamp), plain box filter. */
++    const int bc_kind = (finalDesc.Format >= 70 && finalDesc.Format <= 72) ? 1
++                      : (finalDesc.Format >= 76 && finalDesc.Format <= 78) ? 3
++                      : IsRGBA8ForClamp((uint32_t)finalDesc.Format) ? 8
++                      /* ml2113: 1-byte UNORM texels, R8_UNORM (61) and A8_UNORM (65) */
++                      : (finalDesc.Format == 61 || finalDesc.Format == 65) ? 9 : 0;
++    const bool texel_kind = bc_kind == 8 || bc_kind == 9;   /* uncompressed: any size (ml2113) */
++    if (!mip_bias && bc_kind && pInitialData && pInitialData[0].pSysMem && finalDesc.MipLevels == 1 &&
++        finalDesc.ArraySize == 1 && auto_misc_ok && !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) &&
++        (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
++        finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
++        finalDesc.SampleDesc.Count <= 1 && (texel_kind || (!(finalDesc.Width & 7) && !(finalDesc.Height & 7))) &&
++        /* ml2102: an explicit clamp is a request to save memory, so it also takes
++         * mid-sized textures (256+); the auto clamp keeps its 1024 cutoff. A 2D
++         * title kept 650 MB of 512-1000 px sprites out of reach of the 1024 one. */
++        (cached_clamp > 0 ? std::max(finalDesc.Width, finalDesc.Height) >= 256
++                          : mip_clamp::AutoSizeEligible(finalDesc.Width, finalDesc.Height))) {
++      static int downscale_opt = -2;
++      if (downscale_opt == -2)
++        downscale_opt = Config::getInstance().getOption<int>("d3d11.downscaleBC", -1);
++      const MipClampAutoConfig &cfg = GetMipClampAutoConfig();
++      const bool want = downscale_opt > 0 ||
++                        (downscale_opt < 0 && (cached_clamp > 0 ||
++                                               (cfg.enabled && cfg.threshold_mb && MipClampAutoUnderPressure(cfg))));
++      if (want) {
++        const bool rgba = texel_kind;
++        const uint32_t bpp = bc_kind == 9 ? 1u : 4u;
++        const uint32_t blk = bc_kind == 1 ? 8u : 16u;
++        /* Pitch of the half-size image: BC rows are rows of 4x4 blocks. */
++        /* ml2113: uncompressed texels halve to ceil(w/2) x ceil(h/2), so odd sizes qualify. */
++        const uint32_t half_w = rgba ? (finalDesc.Width + 1) / 2 : finalDesc.Width / 2;
++        const uint32_t half_h = rgba ? (finalDesc.Height + 1) / 2 : finalDesc.Height / 2;
++        const size_t dst_pitch = rgba ? (size_t)half_w * bpp : (size_t)(finalDesc.Width / 8) * blk;
++        downscaled_pixels.resize(dst_pitch * (rgba ? half_h : finalDesc.Height / 8));
++        const auto *src = (const uint8_t *)pInitialData[0].pSysMem;
++        const bool ok = rgba ? texel8_downscale_half(bpp, src, pInitialData[0].SysMemPitch, finalDesc.Width,
++                                                     finalDesc.Height, downscaled_pixels.data(), dst_pitch)
++                             : bcn_downscale_half(bc_kind, src, pInitialData[0].SysMemPitch, finalDesc.Width,
++                                                  finalDesc.Height, downscaled_pixels.data(), dst_pitch);
++        if (ok) {
++          downscaled = true;
++          downscaled_init.pSysMem = downscaled_pixels.data();
++          downscaled_init.SysMemPitch = (UINT)dst_pitch;
++          downscaled_init.SysMemSlicePitch = (UINT)downscaled_pixels.size();
++          pInitialData = &downscaled_init;
++          physDesc.Width  = half_w;
++          physDesc.Height = half_h;
++          info.width  = physDesc.Width;
++          info.height = physDesc.Height;
++          static std::atomic<uint64_t> downscale_n{0};
++          static std::atomic<uint64_t> downscale_saved_kb{0};
++          const uint64_t n = downscale_n.fetch_add(1, std::memory_order_relaxed) + 1;
++          const uint64_t saved =
++              downscale_saved_kb.fetch_add(downscaled_pixels.size() * 3 / 1024, std::memory_order_relaxed) +
++              downscaled_pixels.size() * 3 / 1024;
++          if (mip_clamp::ShouldLogClamp(n))
++            ERR("[bc-downscale] ml2100 #", n, rgba ? (bpp == 1 ? " R8 " : " RGBA8 ") : (bc_kind == 1 ? " BC1 " : " BC3 "), finalDesc.Width, "x", finalDesc.Height,
++                " -> ", physDesc.Width, "x", physDesc.Height, " saved ", saved / 1024, " MB in total");
++        }
++      }
++    }
+   }
+   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
+                             !(physDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
+@@ -611,6 +807,25 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+   /* ml745: the immediate context resolves streamed uploads through the dxmt
+    * Texture, not the D3D wrapper, so the bias must be visible there too. */
+   texture->setMipBias(mip_bias);
++  texture->setDownscaled(downscaled);
++  if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
++    TexCensusRecord((uint32_t)finalDesc.Format,
++                    EstimateTextureBytes((uint32_t)finalDesc.Format, finalDesc.Width, finalDesc.Height,
++                                         finalDesc.MipLevels, finalDesc.ArraySize),
++                    EstimateTextureBytes((uint32_t)finalDesc.Format, physDesc.Width, physDesc.Height,
++                                         physDesc.MipLevels, physDesc.ArraySize),
++                    mip_bias, downscaled, finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE,
++                    finalDesc.MipLevels == 1, pInitialData != nullptr,
++                    (finalDesc.MipLevels == 1 ? 1u : 0u) |
++                    ((finalDesc.Usage != D3D11_USAGE_DEFAULT && finalDesc.Usage != D3D11_USAGE_IMMUTABLE) ? 2u : 0u) |
++                    (finalDesc.CPUAccessFlags ? 4u : 0u) |
++                    ((finalDesc.MiscFlags & ~(UINT)(D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_RESOURCE_CLAMP)) ? 8u : 0u) |
++                    (finalDesc.ArraySize > 1 ? 16u : 0u) |
++                    (((finalDesc.Width | finalDesc.Height) & 1) ? 32u : 0u) |
++                    (pInitialData == nullptr ? 64u : 0u) |
++                    (((finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) ||
++                      std::max(finalDesc.Width, finalDesc.Height) < 256) ? 128u : 0u));
++  }
+ 
+   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
+ 
+diff --git a/src/dxmt/dxmt_bcn_downscale.hpp b/src/dxmt/dxmt_bcn_downscale.hpp
+new file mode 100644
+index 0000000..718dc30
+--- /dev/null
++++ b/src/dxmt/dxmt_bcn_downscale.hpp
+@@ -0,0 +1,244 @@
++#pragma once
++/* ============================================================================
++ * ml2100 -- halve a BC1/BC3 image in the compressed domain.
++ *
++ * The mip clamp (ml675/ml2000) saves memory by dropping top mip levels, so it
++ * cannot touch a texture that HAS no lower level. A Unity 2D title created ~150
++ * single-level BC1/BC3 textures up to 4096x2304 (full-screen art) next to
++ * ~5,000 mipmapped ones, and the clamp, even at mipClampBC=1, could not keep the
++ * scene load under the jetsam limit.
++ *
++ * For those textures the PHYSICAL Metal texture is created at half width and
++ * half height and filled from this function: decode each 2x2 group of source
++ * blocks (8x8 texels), box-filter to 4x4, re-encode one block. Sampling with
++ * normalised coordinates is unaffected; the D3D descriptor stays LOGICAL.
++ *
++ * The encoder is a fast bounding-box one (diagonal chosen from the colour
++ * covariance, palette indices picked by exact error against the palette the
++ * decoder in dxmt_bcn.hpp will produce), which is plenty for content that is
++ * being halved anyway. Averaging happens on the stored values, so sRGB content
++ * is filtered in gamma space -- slightly darker edges than a linear filter,
++ * not visible at half resolution.
++ *
++ * Pure C++, no Windows/Metal types, so it can be tested on the host.
++ * ==========================================================================*/
++#include "dxmt_bcn.hpp"
++#include <cstddef>
++#include <cstdint>
++
++namespace dxmt {
++
++/* Palette exactly as bcn_bc1_block() decodes it. */
++static inline void bcn_enc_bc1_palette(uint16_t c0, uint16_t c1, bool three_colour, int p[4][3]) {
++  uint8_t a[3], b[3];
++  bcn_rgb565(c0, a);
++  bcn_rgb565(c1, b);
++  for (int i = 0; i < 3; i++) {
++    p[0][i] = a[i];
++    p[1][i] = b[i];
++    if (three_colour) {
++      p[2][i] = (a[i] + b[i] + 1) / 2;
++      p[3][i] = 0;
++    } else {
++      p[2][i] = (2 * a[i] + b[i] + 1) / 3;
++      p[3][i] = (a[i] + 2 * b[i] + 1) / 3;
++    }
++  }
++}
++
++static inline uint16_t bcn_enc_565(int r, int g, int b) {
++  r = r < 0 ? 0 : r > 255 ? 255 : r;
++  g = g < 0 ? 0 : g > 255 ? 255 : g;
++  b = b < 0 ? 0 : b > 255 ? 255 : b;
++  return (uint16_t)((((r * 31 + 127) / 255) << 11) | (((g * 63 + 127) / 255) << 5) | ((b * 31 + 127) / 255));
++}
++
++/* Encode 16 RGBA texels into an 8-byte BC1 colour block. With allow_alpha, a
++ * texel whose alpha is below 128 selects 3-colour mode and index 3 (transparent
++ * black), matching BC1's punch-through rule. BC3's colour half passes false:
++ * D3D decodes it in 4-colour mode whatever the endpoint order. */
++static inline void bcn_enc_bc1_block(const uint8_t px[64], uint8_t *blk, bool allow_alpha) {
++  bool transparent[16];
++  bool any_transparent = false;
++  int lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0}, sum[3] = {0, 0, 0}, n = 0;
++  for (int t = 0; t < 16; t++) {
++    transparent[t] = allow_alpha && px[t * 4 + 3] < 128;
++    any_transparent |= transparent[t];
++    if (transparent[t]) continue;
++    for (int i = 0; i < 3; i++) {
++      int v = px[t * 4 + i];
++      lo[i] = v < lo[i] ? v : lo[i];
++      hi[i] = v > hi[i] ? v : hi[i];
++      sum[i] += v;
++    }
++    n++;
++  }
++  if (!n) {   /* fully transparent block */
++    blk[0] = blk[1] = blk[2] = blk[3] = 0;
++    blk[4] = blk[5] = blk[6] = blk[7] = 0xFF;
++    return;
++  }
++
++  /* Pick the box diagonal that follows the colour trend: flip red and blue
++   * against green when they are anti-correlated with it. */
++  int cov_rg = 0, cov_bg = 0;
++  for (int t = 0; t < 16; t++) {
++    if (transparent[t]) continue;
++    int dg = px[t * 4 + 1] * n - sum[1];
++    cov_rg += (px[t * 4 + 0] * n - sum[0]) / 16 * dg / 16;
++    cov_bg += (px[t * 4 + 2] * n - sum[2]) / 16 * dg / 16;
++  }
++  int e0[3] = {hi[0], hi[1], hi[2]}, e1[3] = {lo[0], lo[1], lo[2]};
++  if (cov_rg < 0) { e0[0] = lo[0]; e1[0] = hi[0]; }
++  if (cov_bg < 0) { e0[2] = lo[2]; e1[2] = hi[2]; }
++  /* Inset by 1/16 of the range, as most fast encoders do, so the endpoints
++   * are not wasted on the extremes. */
++  for (int i = 0; i < 3; i++) {
++    int inset = (e0[i] - e1[i]) / 16;
++    e0[i] -= inset;
++    e1[i] += inset;
++  }
++  uint16_t c0 = bcn_enc_565(e0[0], e0[1], e0[2]);
++  uint16_t c1 = bcn_enc_565(e1[0], e1[1], e1[2]);
++
++  /* 4-colour mode needs c0 > c1, 3-colour mode c0 <= c1. */
++  bool three = any_transparent;
++  if (three ? c0 > c1 : c0 < c1) { uint16_t s = c0; c0 = c1; c1 = s; }
++  if (!three && c0 == c1) {
++    /* Equal endpoints: index 0 is c0 in either mode, so write all zeros. */
++    blk[0] = (uint8_t)c0; blk[1] = (uint8_t)(c0 >> 8);
++    blk[2] = (uint8_t)c1; blk[3] = (uint8_t)(c1 >> 8);
++    blk[4] = blk[5] = blk[6] = blk[7] = 0;
++    return;
++  }
++
++  int pal[4][3];
++  bcn_enc_bc1_palette(c0, c1, three, pal);
++  uint32_t idx = 0;
++  for (int t = 0; t < 16; t++) {
++    uint32_t best = 3;
++    if (!transparent[t]) {
++      int best_err = 1 << 30;
++      for (int k = 0; k < (three ? 3 : 4); k++) {
++        int dr = px[t * 4 + 0] - pal[k][0], dg = px[t * 4 + 1] - pal[k][1], db = px[t * 4 + 2] - pal[k][2];
++        int err = dr * dr + dg * dg + db * db;
++        if (err < best_err) { best_err = err; best = (uint32_t)k; }
++      }
++    }
++    idx |= best << (t * 2);
++  }
++  blk[0] = (uint8_t)c0; blk[1] = (uint8_t)(c0 >> 8);
++  blk[2] = (uint8_t)c1; blk[3] = (uint8_t)(c1 >> 8);
++  blk[4] = (uint8_t)idx; blk[5] = (uint8_t)(idx >> 8);
++  blk[6] = (uint8_t)(idx >> 16); blk[7] = (uint8_t)(idx >> 24);
++}
++
++/* Encode the 16 alpha values of `px` into BC3's 8-byte alpha block, in the
++ * 8-interpolant mode (a0 > a1) that bcn_scalar_block() decodes. */
++static inline void bcn_enc_bc3_alpha(const uint8_t px[64], uint8_t *blk) {
++  int lo = 255, hi = 0;
++  for (int t = 0; t < 16; t++) {
++    int a = px[t * 4 + 3];
++    lo = a < lo ? a : lo;
++    hi = a > hi ? a : hi;
++  }
++  blk[0] = (uint8_t)hi;
++  blk[1] = (uint8_t)lo;
++  uint64_t bits = 0;
++  if (hi != lo) {   /* equal: every index 0 decodes to a0 in either mode */
++    int pal[8];
++    pal[0] = hi;
++    pal[1] = lo;
++    for (int k = 1; k <= 6; k++) pal[k + 1] = ((7 - k) * hi + k * lo + 3) / 7;
++    for (int t = 0; t < 16; t++) {
++      int a = px[t * 4 + 3], best = 0, best_err = 1 << 30;
++      for (int k = 0; k < 8; k++) {
++        int d = a - pal[k];
++        if (d * d < best_err) { best_err = d * d; best = k; }
++      }
++      bits |= (uint64_t)best << (t * 3);
++    }
++  }
++  for (int i = 0; i < 6; i++) blk[2 + i] = (uint8_t)(bits >> (8 * i));
++}
++
++/* Halve a BC1 (kind 1) or BC3 (kind 3) image. width and height are in texels
++ * and must be multiples of 8; pitches are bytes per row of BLOCKS. Returns
++ * false, writing nothing, for any other kind or size. */
++static inline bool bcn_downscale_half(int kind, const uint8_t *src, size_t src_pitch, uint32_t width,
++                                      uint32_t height, uint8_t *dst, size_t dst_pitch) {
++  if ((kind != 1 && kind != 3) || (width & 7) || (height & 7) || !width || !height)
++    return false;
++  const uint32_t blk_bytes = kind == 1 ? 8u : 16u;
++  const uint32_t out_bw = width / 8, out_bh = height / 8;
++  uint8_t in[4][64], out[64];
++  for (uint32_t by = 0; by < out_bh; by++) {
++    for (uint32_t bx = 0; bx < out_bw; bx++) {
++      /* The 2x2 source blocks behind output block (bx, by). */
++      for (int q = 0; q < 4; q++) {
++        const uint8_t *sblk = src + (size_t)(by * 2 + (q >> 1)) * src_pitch + (size_t)(bx * 2 + (q & 1)) * blk_bytes;
++        if (kind == 1)
++          bcn_bc1_block(sblk, in[q], true);
++        else
++          bcn_bc3_block(sblk, in[q]);
++      }
++      /* Box filter: output texel (ox, oy) averages source texels 2ox..2ox+1,
++       * 2oy..2oy+1 of the 8x8 square, which all sit in one source block. */
++      for (int oy = 0; oy < 4; oy++) {
++        for (int ox = 0; ox < 4; ox++) {
++          const uint8_t *s = in[(oy >> 1) * 2 + (ox >> 1)];
++          int sx = (ox & 1) * 2, sy = (oy & 1) * 2;
++          for (int c = 0; c < 4; c++) {
++            int v = s[((sy) * 4 + sx) * 4 + c] + s[((sy) * 4 + sx + 1) * 4 + c] +
++                    s[((sy + 1) * 4 + sx) * 4 + c] + s[((sy + 1) * 4 + sx + 1) * 4 + c];
++            out[(oy * 4 + ox) * 4 + c] = (uint8_t)((v + 2) / 4);
++          }
++        }
++      }
++      uint8_t *dblk = dst + (size_t)by * dst_pitch + (size_t)bx * blk_bytes;
++      if (kind == 1) {
++        bcn_enc_bc1_block(out, dblk, true);
++      } else {
++        bcn_enc_bc3_alpha(out, dblk);
++        bcn_enc_bc1_block(out, dblk + 8, false);
++      }
++    }
++  }
++  return true;
++}
++
++/* ml2101: the same halving for uncompressed texels with 8-bit channels, a
++ * plain 2x2 box filter per byte, which is channel-order agnostic. bpp is the
++ * bytes per texel: 4 for R8G8B8A8 / B8G8R8A8 / B8G8R8X8 (UNORM, SRGB and
++ * TYPELESS forms), 1 for R8_UNORM / A8_UNORM (ml2113).
++ *
++ * ml2113: odd sizes too. The result is ceil(w/2) x ceil(h/2); a last column or
++ * row with no partner averages the texels that exist. 547 MB of single-level
++ * R8G8B8A8_SRGB art in Stick It to the Stickman was skipped only for an odd
++ * width or height. Normalised sampling maps the half-size image onto the same
++ * 0..1 range, off by at most half a source texel at the far edge. pitches are
++ * bytes per row of texels. */
++static inline bool texel8_downscale_half(uint32_t bpp, const uint8_t *src, size_t src_pitch, uint32_t width,
++                                         uint32_t height, uint8_t *dst, size_t dst_pitch) {
++  if (!width || !height || (bpp != 1 && bpp != 4))
++    return false;
++  const uint32_t ow = (width + 1) / 2, oh = (height + 1) / 2;
++  for (uint32_t y = 0; y < oh; y++) {
++    const uint32_t y0 = 2 * y, y1 = (2 * y + 1 < height) ? 2 * y + 1 : 2 * y;
++    const uint8_t *r0 = src + (size_t)y0 * src_pitch, *r1 = src + (size_t)y1 * src_pitch;
++    uint8_t *d = dst + (size_t)y * dst_pitch;
++    for (uint32_t x = 0; x < ow; x++) {
++      const uint32_t x0 = 2 * x, x1 = (2 * x + 1 < width) ? 2 * x + 1 : 2 * x;
++      for (uint32_t c = 0; c < bpp; c++)
++        d[x * bpp + c] = (uint8_t)((r0[x0 * bpp + c] + r0[x1 * bpp + c] + r1[x0 * bpp + c] + r1[x1 * bpp + c] + 2) / 4);
++    }
++  }
++  return true;
++}
++
++static inline bool rgba8_downscale_half(const uint8_t *src, size_t src_pitch, uint32_t width, uint32_t height,
++                                        uint8_t *dst, size_t dst_pitch) {
++  return texel8_downscale_half(4, src, src_pitch, width, height, dst, dst_pitch);
++}
++
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index c88ff4d..71a5dad 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -187,6 +187,13 @@ public:
+   uint32_t mipBias() const { return mip_bias_; }
+   void setMipBias(uint32_t bias) { mip_bias_ = bias; }
+ 
++  /* ml2100: the physical texture is the logical one at half width and height
++   * (a single-level BC texture halved in the compressed domain, see
++   * dxmt_bcn_downscale.hpp). Its contents came from the initial data; runtime
++   * writes and copies, whose regions are in logical texels, are dropped. */
++  bool downscaled() const { return downscaled_; }
++  void setDownscaled(bool d) { downscaled_ = d; }
++
+   WMTTextureType
+   textureType(TextureViewKey view) {
+     std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+@@ -290,6 +297,7 @@ private:
+ 
+   WMTTextureInfo info_;
+   uint32_t mip_bias_ = 0;          /* ml745, see mipBias() */
++  bool downscaled_ = false;        /* ml2100, see downscaled() */
+   unsigned bytes_per_image_ = 0;
+   unsigned bytes_per_row_ = 0;
+ 
