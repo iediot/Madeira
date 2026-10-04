@@ -1916,6 +1916,7 @@ struct LibraryView: View {
     var startDock: (DockGame, Bool) -> Void = { _, _ in }
     /// First-run setup (Onboarding.swift).
     @ObservedObject private var onboarding = OnboardingModel.shared
+    @ObservedObject private var jit = JITCoordinator.shared
     @State private var browser = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
