@@ -170,8 +170,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// them ("75%"), always in the screen's own shape so a game fills it, or a fixed
     /// "WxH" (older entries, the Desktop). Relative sizes are worked out on the device
     /// that runs the game (pixelResolution), so a library moved to another device
-    /// keeps filling its screen. New entries are native.
-    var resolution = "native"
+    /// keeps filling its screen. New entries get half the screen's pixels in each
+    /// direction: native (4 MP on an 11-inch iPad) kept the GPU busy enough that the
+    /// shared heat budget cut the CPU to 1.3 GHz and then parked its fast cores,
+    /// while the CPU-bound games that need it most gain nothing from the pixels.
+    var resolution = "50%"
     /// `resolution` as "WxH" pixels for this device.
     var pixelResolution: String { Self.pixelSize(resolution) }
 

@@ -63,7 +63,9 @@ for m in "$@"; do
         */*|.*|"") echo "$m: name a module directory under wine/dlls" >&2; exit 1 ;;
     esac
     [ -f "$R/wine/dlls/$m/Makefile.in" ] || { echo "$m: no wine/dlls/$m/Makefile.in" >&2; exit 1; }
-    case "$m" in *.*) f="$m" ;; *) f="$m.dll" ;; esac
+    # Only a real file extension names the file (winecoreaudio.drv); a dotted DLL
+    # name (windows.gaming.input) still gets .dll.
+    case "$m" in *.drv|*.exe|*.ocx|*.sys|*.acm|*.cpl|*.ds|*.tlb) f="$m" ;; *) f="$m.dll" ;; esac
     targets+=("dlls/$m/arm64ec-windows/$f")
 done
 

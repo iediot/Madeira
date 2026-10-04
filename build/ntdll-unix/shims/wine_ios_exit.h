@@ -26,3 +26,10 @@ static inline __attribute__((noreturn)) void wine_ios_exit(int status) {
 
 #define exit(x) wine_ios_exit(x)
 #endif
+
+/* config.h comes from wine/build-macos, configured on a macOS 27 host, so it has
+ * HAVE_PIPE2. pipe2() is iOS 27 only (SDK: __API_AVAILABLE(ios(27.0))): the app
+ * targets iOS 17 and weak-links it, so on iPadOS 26.6 it is NULL and the first
+ * server_pipe() of every Wine session called address 0 (two crash reports, an
+ * M5 iPad, 2026-10-04). Wine's pipe() + FD_CLOEXEC fallback works everywhere. */
+#undef HAVE_PIPE2

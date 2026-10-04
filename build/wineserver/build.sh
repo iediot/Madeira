@@ -100,6 +100,8 @@ PATCHED_FILES=(
     "handle:$WINE_SRC/server/handle.c:handle.o"
     # ml575: async.c carries the free_async_queue UAF fix.
     "async:$WINE_SRC/server/async.c:async.o"
+    # Madeira: console writes are copied into the session log (madeira_console_tee).
+    "console:$WINE_SRC/server/console.c:console.o"
     "process_ios:$WINE_SRC/server/process.c:process.o"
     # Files needing rebuild only because the -Dws_* renames must apply
     # to both definers and callers — fixes 10 symbol collisions with win32u.
@@ -197,6 +199,7 @@ REPLACEMENTS=(
     "sock.o:sock.o"
     "object.o:object.o"
     "async.o:async.o"
+    "console.o:console.o"
     # ml805: BOTH lists matter. PATCHED_FILES only compiles; REPLACEMENTS is what
     # actually swaps the object into the archive. Adding to one and not the other
     # compiles cleanly, ships the OLD object, and fails at link with an undefined

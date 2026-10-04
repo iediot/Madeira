@@ -34,7 +34,7 @@
 		A100060E /* SwiftSteam/Install/AppManifestWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060E /* AppManifestWriter.swift */; };
 		A100060F /* SwiftSteam/chunk_zip.c in Sources */ = {isa = PBXBuildFile; fileRef = A200060F /* chunk_zip.c */; };
 		A1000610 /* SwiftSteam/lzma_shim.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000610 /* lzma_shim.c */; };
-		A1000611 /* SwiftSteam/zstd_edu.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000611 /* zstd_edu.c */; };
+		A1000611 /* SwiftSteam/zstd_edu.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000611 /* zstd_edu.c */; settings = {COMPILER_FLAGS = "-O3"; }; };
 		A1000603 /* SwiftSteam/Core/CMServerList.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000603 /* CMServerList.swift */; };
 		A1000604 /* SwiftSteam/Core/LicenseListBox.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000604 /* LicenseListBox.swift */; };
 		A1000605 /* SwiftSteam/Core/SteamConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000605 /* SteamConnection.swift */; };

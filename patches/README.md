@@ -11,6 +11,9 @@ changes to them are kept here and applied on top (`git -C FEX apply --3way
   JIT alias table grown from 256 to 2048 entries (ml1201, from vcvkk's fork, without
   its log line, which crashed when called from native code without a TEB:
   steam.exe + webhelper + a game filled 256 and the game crashed at load).
+  - Big L1 for the hottest threads (LookupCache.h GrantBigL1): a thread at the 128K-entry
+    L1 ceiling still missing 20,000+ times a second gets a 512K-entry L1, at most 4 threads
+    (env.MADEIRA_FEX_BIG_L1 = 0 turns it off).
 - `dxmt-iediot.patch`: single-level texture halving for BC1/BC3, RGBA8 and R8/A8
   at any size (ml2100/2101/2113), texture census, Metal 4 atomic fix.
 
@@ -29,3 +32,7 @@ file, so add it with `git -C dxmt add -N` before `git -C dxmt diff`.
   And in a Madeira Dock session, once the game is running, Valve's client
   (dockhost.exe) threads drop to utility QoS (dlls/ntdll/unix/sync.c,
   env.MADEIRA_DOCK_LOW_QOS = 0 turns it off).
+  windows.gaming.input does not wait for its monitor thread when the caller holds the
+  loader lock (dlls/windows.gaming.input/main.c): Party Animals deadlocked at start-up.
+  The wine server copies every console write into the session log as `[console <pid>]`
+  lines (server/console.c, built by build/wineserver/build.sh; MADEIRA_CONSOLE_LOG=0 off).

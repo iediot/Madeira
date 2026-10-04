@@ -15454,3 +15454,115 @@ index 00dfd96a..3264a844 100644
          .max_formats = params32->max_formats,
      };
      NTSTATUS status;
+diff --git a/dlls/windows.gaming.input/main.c b/dlls/windows.gaming.input/main.c
+index 39c0540a..bab12b1b 100644
+--- a/dlls/windows.gaming.input/main.c
++++ b/dlls/windows.gaming.input/main.c
+@@ -26,6 +26,7 @@
+ #include "winreg.h"
+ #include "winuser.h"
+ 
++#include "winternl.h"
+ #include "dbt.h"
+ #include "ddk/hidclass.h"
+ #include "ddk/hidsdi.h"
+@@ -142,6 +143,14 @@ static DWORD WINAPI monitor_thread_proc( void *param )
+     return 0;
+ }
+ 
++/* Whether this thread holds the loader lock (it is inside a DllMain or a TLS
++ * callback, for instance a native plugin's static constructor). */
++static BOOL loader_lock_held(void)
++{
++    RTL_CRITICAL_SECTION *cs = NtCurrentTeb()->Peb->LoaderLock;
++    return cs && cs->OwningThread == ULongToHandle( GetCurrentThreadId() );
++}
++
+ static BOOL WINAPI start_monitor_thread( INIT_ONCE *once, void *param, void **context )
+ {
+     HANDLE thread, start_event;
+@@ -151,6 +160,18 @@ static BOOL WINAPI start_monitor_thread( INIT_ONCE *once, void *param, void **co
+ 
+     thread = CreateThread( NULL, 0, monitor_thread_proc, start_event, 0, NULL );
+     if (!thread) ERR( "Failed to create monitor thread, error %lu\n", GetLastError() );
++    else if (loader_lock_held())
++    {
++        /* A new thread takes the loader lock to start, so waiting for it here never
++         * ends: Party Animals asks for Windows.Gaming.Input.Gamepad with the lock held
++         * and hung at start-up (three threads blocked on loader_section owned by the
++         * main thread). Let it start once the lock is released; controllers it finds
++         * arrive as GamepadAdded/RawGameControllerAdded, as hot-plugged ones do. The
++         * event stays open: the thread still signals it. */
++        WARN( "loader lock held: not waiting for the monitor thread\n" );
++        CloseHandle( thread );
++        return TRUE;
++    }
+     else
+     {
+         WaitForSingleObject( start_event, INFINITE );
+diff --git a/server/console.c b/server/console.c
+index 0ee1110b..1122ff2a 100644
+--- a/server/console.c
++++ b/server/console.c
+@@ -573,11 +573,61 @@ static void console_host_ioctl_terminate( struct console_host_ioctl *call, unsig
+     free( call );
+ }
+ 
++#ifdef WINE_IOS
++/* Madeira: copy every line written to a console into the session log. The
++ * window conhost draws (Madeira Dock's dockhost.exe console) showed the lines
++ * that explained a failed Party Animals start -- FEX's "HOST MAP FAILED", Steam's
++ * "Thread failed to initialize" -- and none of them reached any log. Each write
++ * is cut into lines, prefixed with the writing process, and printed to stderr,
++ * which is the session log. MADEIRA_CONSOLE_LOG=0 turns it off. */
++static void madeira_console_tee( unsigned int code, struct async *async )
++{
++    static int enabled = -1;
++    static char line[1024];
++    static unsigned int len, pid;
++    struct iosb *iosb;
++    data_size_t i, n;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "MADEIRA_CONSOLE_LOG" );
++        enabled = !(e && e[0] == '0');
++    }
++    if (!enabled || !async) return;
++    if (code != IOCTL_CONDRV_WRITE_FILE && code != IOCTL_CONDRV_WRITE_CONSOLE) return;
++    if (!(iosb = async_get_iosb( async ))) return;
++    if (current && current->process && current->process->id != pid)
++    {
++        if (len) { fprintf( stderr, "[console %04x] %.*s\n", pid, (int)len, line ); len = 0; }
++        pid = current->process->id;
++    }
++    n = code == IOCTL_CONDRV_WRITE_CONSOLE ? iosb->in_size / sizeof(WCHAR) : iosb->in_size;
++    for (i = 0; i < n; i++)
++    {
++        unsigned int c = code == IOCTL_CONDRV_WRITE_CONSOLE ? ((const WCHAR *)iosb->in_data)[i]
++                                                           : ((const unsigned char *)iosb->in_data)[i];
++        if (c == '\n' || len == sizeof(line))
++        {
++            fprintf( stderr, "[console %04x] %.*s\n", pid, (int)len, line );
++            len = 0;
++            if (c == '\n') continue;
++        }
++        if (c == '\r') continue;
++        line[len++] = (c >= 0x20 && c < 0x7f) || c == '\t' ? (char)c : '?';
++    }
++    release_object( iosb );
++}
++#endif
++
+ static int queue_host_ioctl( struct console_server *server, unsigned int code, unsigned int output,
+                              struct async *async, struct async_queue *queue )
+ {
+     struct console_host_ioctl *ioctl;
+ 
++#ifdef WINE_IOS
++    madeira_console_tee( code, async );
++#endif
++
+     if (!(ioctl = mem_alloc( sizeof(*ioctl) ))) return 0;
+     ioctl->code   = code;
+     ioctl->output = output;

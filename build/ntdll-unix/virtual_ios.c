@@ -12162,20 +12162,50 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
     void *cov_rw = NULL, *cov_rx = NULL;
     uintptr_t b = (uintptr_t)base, e = b + size, a, rx = (uintptr_t)ios_jit_rx_base_global;
     int any = 0;
+    const char *why = NULL;
+    struct file_view *bad = NULL;
 
-    if (!ios_guest_rwx_data_enabled() || ios_alloc_ec_code || !arm64ec_view) return 0;
-    if (e <= b) return 0;
-    if (rx && e > rx && b < rx + ios_jit_pool_size_global) return 0;
-    if (ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx )) return 0;
-    for (a = b; a < e; )
+    if (!ios_guest_rwx_data_enabled()) why = "MADEIRA_GUEST_RWX_DATA=0";
+    else if (ios_alloc_ec_code) why = "EC code request";
+    else if (!arm64ec_view) why = "no ARM64EC map yet";
+    else if (e <= b) return 0;
+    else if (rx && e > rx && b < rx + ios_jit_pool_size_global) why = "inside the JIT pool";
+    else if (ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx )) why = "already has a pool alias";
+    else
     {
-        struct file_view *view = find_view( (const void *)a, 1 );
-        if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
-        if (!ios_guest_anon_rwx_view_ok( view )) return 0;
-        any = 1;
-        a = (uintptr_t)view->base + view->size;
+        for (a = b; a < e; )
+        {
+            struct file_view *view = find_view( (const void *)a, 1 );
+            if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
+            if (!ios_guest_anon_rwx_view_ok( view )) { bad = view; why = "view test"; break; }
+            any = 1;
+            a = (uintptr_t)view->base + view->size;
+        }
+        if (!why) return any;
     }
-    return any;
+    /* Say why writable+executable guest memory stays on the store emulator:
+     * Stick It to the Stickman's Mono heap took ~7,800 emulated stores a second
+     * (30,000 while loading) on its main thread with no [guest-rwx] line. */
+    /* Not before the EC map exists: start-up images alone used up the budget
+     * before the game was even spawned. */
+    if (size >= 0x10000 && !ios_in_mach_exc && arm64ec_view)
+    {
+        static unsigned n;
+        if (++n <= 60)
+        {
+            if (bad)
+                dprintf( 2, "[guest-rwx-skip] %p+0x%lx: view %p+0x%lx protect=0x%x valloc=%d image=%d ec=%d sys=%d "
+                            "alloc-rwx=%d size%%64K=0x%lx -> store emulator\n",
+                         base, (unsigned long)size, bad->base, (unsigned long)bad->size, bad->protect,
+                         is_view_valloc( bad ), !!(bad->protect & SEC_IMAGE), !!(bad->protect & VPROT_ARM64EC),
+                         !!(bad->protect & VPROT_SYSTEM),
+                         (bad->protect & (VPROT_WRITE | VPROT_EXEC)) == (VPROT_WRITE | VPROT_EXEC),
+                         (unsigned long)(bad->size & 0xffff) );
+            else
+                dprintf( 2, "[guest-rwx-skip] %p+0x%lx: %s -> store emulator\n", base, (unsigned long)size, why );
+        }
+    }
+    return 0;
 #else
     return 0;
 #endif
@@ -22847,6 +22877,14 @@ void ios_reserve_fex_arena(void)
          * failed placement falls through to the 16GB row as before. */
         { 0x7800000000ull, 0x7fffffffffull, 0x800000000ull, "dock high band 32GB"     },
         { 0x7c00000000ull, 0x7fffffffffull, 0x400000000ull, "hardware high band 16GB"  },
+        /* Madeira: a device whose address map stops at 63 GB (iPadOS 26 gives apps
+         * [0x100000000, 0xfc0000000)) skips both rows above and used to land on 8GB.
+         * Valve's client plus Party Animals on an M5 iPad exhausted it at start-up:
+         * "[va-profile] ml706 HOST MAP FAILED size=0x1000000 band=0xb40000000", then
+         * Steam's "Thread failed to initialize" and the game never got a window. The
+         * same 32-63 GB region can usually hold more; take the largest that fits. */
+        { 0x0800000000ull, 0x0fbfffffffull, 0x400000000ull, "constrained 16GB"         },
+        { 0x0800000000ull, 0x0fbfffffffull, 0x300000000ull, "constrained 12GB"         },
         { 0x0800000000ull, 0x0fffffffffull, 0x200000000ull, "constrained 8GB"          },
         { 0x0400000000ull, 0x07ffffffffull, 0x200000000ull, "8GB @16-32G"              },
         { 0x0200000000ull, 0x03ffffffffull, 0x200000000ull, "8GB @8-16G"               },
