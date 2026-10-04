@@ -31,6 +31,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **Madeira Dock (`madeira-dock`, built into `arm64ec-windows/dockhost.exe`)** | original work, Copyright 2026 125hz | GPL-3.0-or-later + Converter Exception | Headless host for Valve's Steam client, a separate Windows program started in the Wine session. Built from the submodule by `build/madeira-dock/build.sh`; not committed as a binary. Its statically linked LLVM/MinGW-w64 runtime notices ship in `dock-notices.txt`. Valve's client files are downloaded by the user from Valve and are not covered by Madeira's licence. See `docs/MADEIRA_DOCK.md`. |
 | **Mesa** 25.0.7 (OSMesa, Zink, softpipe) | MIT (+ permissive, see `docs/license.rst`) | Patched (`build/mesa-ios/patches`). Separate dylib `gl/libOSMesa.dylib`, desktop OpenGL backend. |
 | **MoltenVK** 1.4.2 | Apache-2.0 | Unmodified. Separate dylib `gl/libMoltenVK.dylib`; contains SPIRV-Cross, SPIRV-Tools (Apache-2.0) and cereal (BSD-3-Clause). |
+| **libxml2** 2.12.10 and **libxslt** 1.1.45 | MIT (Daniel Veillard and contributors) | Unmodified, statically linked into Wine's `msxml3.dll` (`arm64ec-windows`) | Wine's bundled copies (`wine/libs/xml2`, `wine/libs/xslt`), built with the module by `build/wine-pe/build-modules.sh`. Licence texts in `LICENSES/MIT-libxml2.txt` and `LICENSES/MIT-libxslt.txt`. |
 
 ## Why GPL-3.0-or-later
 

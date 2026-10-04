@@ -678,15 +678,33 @@ static struct {
     pthread_mutex_t lock;
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
+static int winios_ev_is_move_only(const winios_input_event_t *e) {
+    return e->type == WINIOS_EV_MOUSE && !(e->flags & ~(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
+}
+
 static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
+    winios_input_event_t ev = {type, x, y, flags, data};
     pthread_mutex_lock(&g_input_q.lock);
     unsigned int next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
-    if (next != g_input_q.tail) {
-        g_input_q.buf[g_input_q.head] = (winios_input_event_t){type, x, y, flags, data};
-        g_input_q.head = next;
+    if (next == g_input_q.tail) {
+        /* Full: nobody has drained for a while (a loading game). Never block
+         * the UI thread, and never lose a button or key edge: a dropped
+         * release is a button stuck down. A new pure move is dropped; any
+         * other event makes room by removing the oldest pure move, or failing
+         * that the oldest event. */
+        if (winios_ev_is_move_only(&ev)) { pthread_mutex_unlock(&g_input_q.lock); return; }
+        unsigned int i = g_input_q.tail;
+        while (i != g_input_q.head && !winios_ev_is_move_only(&g_input_q.buf[i])) i = (i + 1) % WINIOS_RING_SIZE;
+        if (i == g_input_q.head) i = g_input_q.tail;
+        for (unsigned int j = i; j != g_input_q.tail; ) {
+            unsigned int prev = (j + WINIOS_RING_SIZE - 1) % WINIOS_RING_SIZE;
+            g_input_q.buf[j] = g_input_q.buf[prev];
+            j = prev;
+        }
+        g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
     }
-    /* If buffer is full we drop the oldest event by simply not advancing —
-     * better than blocking the UI thread on a Wine event drain. */
+    g_input_q.buf[g_input_q.head] = ev;
+    g_input_q.head = next;
     pthread_mutex_unlock(&g_input_q.lock);
 }
 
@@ -748,6 +766,13 @@ BOOL winios_pProcessEvents(DWORD mask) {
             winios_dump_window_tree();
         }
     }
+    /* A tap arrives as a button down and up posted together, so the game got
+     * both in one message pump with no time between them. Geometry Dash reads
+     * that as a press that never ends (the cube keeps jumping). Each mouse
+     * button now stays down for at least kMinClick: its up waits in the
+     * queue, with everything behind it, until that long after its down. */
+    static const double kMinClick = 0.05;
+    static double button_down_at[3];
     BOOL drained = FALSE;
     for (;;) {
         winios_input_event_t e;
@@ -757,6 +782,17 @@ BOOL winios_pProcessEvents(DWORD mask) {
             break;
         }
         e = g_input_q.buf[g_input_q.tail];
+        if (e.type == WINIOS_EV_MOUSE) {
+            int up = (e.flags & MOUSEEVENTF_LEFTUP) ? 0 : (e.flags & MOUSEEVENTF_RIGHTUP) ? 1
+                   : (e.flags & 0x0040 /* MIDDLEUP */) ? 2 : -1;
+            if (up >= 0 && CACurrentMediaTime() - button_down_at[up] < kMinClick) {
+                pthread_mutex_unlock(&g_input_q.lock);
+                break;
+            }
+            int down = (e.flags & MOUSEEVENTF_LEFTDOWN) ? 0 : (e.flags & MOUSEEVENTF_RIGHTDOWN) ? 1
+                     : (e.flags & 0x0020 /* MIDDLEDOWN */) ? 2 : -1;
+            if (down >= 0) button_down_at[down] = CACurrentMediaTime();
+        }
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
         pthread_mutex_unlock(&g_input_q.lock);
 

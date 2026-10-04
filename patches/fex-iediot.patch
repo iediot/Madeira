@@ -394,7 +394,7 @@ index b2eca70..20f05fb 100644
  
  static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
 diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
-index 5e07b36..bfa0f52 100644
+index 61d7a23..57acf04 100644
 --- a/Source/Windows/ARM64EC/IosJitAlias.cpp
 +++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
 @@ -32,7 +32,15 @@ struct IosAliasEntry {
@@ -414,7 +414,7 @@ index 5e07b36..bfa0f52 100644
  
  // extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
  // can reach the table via adrp/:lo12: — it translates the branch target
-@@ -363,6 +371,10 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+@@ -375,6 +383,10 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
  
    int count = g_EntryCount;
  
@@ -426,10 +426,10 @@ index 5e07b36..bfa0f52 100644
    for (int i = 0; i < count; i++) {
      if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {
 diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
-index 96f6fa6..ab5dd48 100644
+index 081d7cb..37bedd6 100644
 --- a/Source/Windows/Common/InvalidationTracker.cpp
 +++ b/Source/Windows/Common/InvalidationTracker.cpp
-@@ -106,6 +106,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+@@ -109,6 +109,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
      const bool EagerDEP = DEPDisabled && !GuestBase;
      const bool EffectiveExec = HasExec || (EagerDEP && ProtIsReadable(Prot));
      const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
@@ -444,7 +444,7 @@ index 96f6fa6..ab5dd48 100644
  
      if (EffectiveExec) {
        XIntervals.Insert(ProtInterval);
-@@ -488,6 +496,26 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+@@ -491,6 +499,26 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
    const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
      std::shared_lock Lock(IntervalsLock);
      if (!RWXIntervals.Query(Address).Enclosed) {
@@ -471,7 +471,7 @@ index 96f6fa6..ab5dd48 100644
        return {false, 0};
      }
      return {true, GetUntrapProt(Address)};
-@@ -504,7 +532,16 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+@@ -507,7 +535,16 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
        ULONG TmpProt;
        void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
        SIZE_T TmpSize = 1;
@@ -489,7 +489,7 @@ index 96f6fa6..ab5dd48 100644
      }
      DetectMonoBackpatcherBlock(Thread, HostPc);
      return true;
-@@ -783,7 +820,18 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+@@ -819,7 +856,18 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
        void* TmpAddress = reinterpret_cast<void*>(Address);
        SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
        ULONG TmpProt;

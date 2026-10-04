@@ -1316,8 +1316,9 @@ static int ios_mach_emulate_cas(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[2
 /* ml938/ml939: defined far below, next to the store emulator they reuse.
  * Declared here because the Mach exception thread is the primary caller and
  * sits earlier in the file. */
-static uintptr_t ios_subfloor_translate( uint64_t addr );
-static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via );
+static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb );
+extern void *ios_jit_current_peb(void);   /* virtual_ios.c */
+static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 
 /* ml974: is the ucontext's NEON state real?
  *
@@ -1396,6 +1397,57 @@ static int ios_x18_derived_base( uint64_t fault_pc, int rn )
     if ((p & 0xff800000u) == 0x91000000u) return pn == 18;                       /* ADD Xd, X18, #imm */
     if ((p & 0xffffffe0u) == (0xaa0003e0u | (18u << 16))) return 1;              /* MOV Xd, X18 */
     return 0;
+}
+
+/* ml1242: the JIT-pool dump is sparse, and MADEIRA_JIT_DUMP=0 turns it off.
+ *
+ * Both one-shot dumps used to write the whole 896MB RW alias. The production
+ * pool is not NO_FOOTPRINT (see jit_make_region_no_footprint), and a read fault
+ * on an untouched page of it materialises a real zero page, so the dump alone
+ * charged ~600MB to phys_footprint: Hollow Knight went 2169 -> 2755MB while it
+ * ran and hit the 4096MB jetsam limit four seconds later. Pages mincore()
+ * reports neither resident nor paged out were never written; they stay holes,
+ * so file offsets still equal pool offsets (head copies and tail CodeBuffers). */
+static void ios_dump_jit_pool( const char *why )
+{
+    extern void *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    const size_t chunk = 0x100000;
+    size_t ps = vm_page_size, total = ios_jit_pool_size_global, written = 0, off, i;
+    const char *docs;
+    char path[512], vec[256];   /* one byte per page of a 1MB chunk, down to 4KB pages */
+    int fd;
+
+    const char *jd = getenv( "MADEIRA_JIT_DUMP" );
+    /* 0: no Documents/fex-jit-dump.bin; by default the JIT pool is written (sparse) on the
+     * first mach UNHANDLED / SIGILL, and pulled with the log (ml1242) */
+    if ((jd && jd[0] == '0') || !ios_jit_rw_base_global || !total) return;
+    docs = getenv( "MADEIRA_DOCS_DIR" );
+    snprintf( path, sizeof(path), "%s/fex-jit-dump.bin", docs ? docs : "/tmp" );
+    if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 )) < 0)
+    {
+        dprintf( 2, "[jit-dump] ml1242 %s: open failed errno=%d path=%s\n", why, errno, path );
+        return;
+    }
+    for (off = 0; off < total; off += chunk)
+    {
+        size_t len = total - off < chunk ? total - off : chunk;
+        char *base = (char *)ios_jit_rw_base_global + off;
+        int have_vec = len / ps <= sizeof(vec) && !mincore( base, len, vec );
+
+        for (i = 0; i < len; i += ps)
+        {
+            size_t n = len - i < ps ? len - i : ps;
+            if (have_vec && !(vec[i / ps] & (MINCORE_INCORE | MINCORE_PAGED_OUT))) continue;
+            if (pwrite( fd, base + i, n, off + i ) != (ssize_t)n) goto done;
+            written += n;
+        }
+    }
+done:
+    ftruncate( fd, total );
+    close( fd );
+    dprintf( 2, "[jit-dump] ml1242 %s: wrote %zu of %zu pool bytes to %s (untouched pages left as holes)\n",
+             why, written, total, path );
 }
 
 static void *ios_mach_exception_thread( void *arg )
@@ -1954,7 +2006,9 @@ static void *ios_mach_exception_thread( void *arg )
              * current ordering. */
             if (!handled && req->exception == EXC_BAD_ACCESS)
             {
-                uintptr_t sf_real = ios_subfloor_translate( (uint64_t)fault_addr );
+                /* ml1205: the faulting thread's own process decides the window */
+                void *sf_peb = thread_teb ? ((TEB *)thread_teb)->Peb : NULL;
+                uintptr_t sf_real = ios_subfloor_translate( (uint64_t)fault_addr, sf_peb );
                 /* ml970: the gate has to admit low ALIASES too, not just image
                  * windows. ml969 registered the alias correctly (rdr34: 12
                  * registered, 0 refused, 2 retired) and the fault address
@@ -2009,7 +2063,7 @@ static void *ios_mach_exception_thread( void *arg )
                                      (unsigned long long)fault_addr );
                     }
 
-                    if (ios_subfloor_service( &sf_uc, (void *)fault_addr, "mach" ))
+                    if (ios_subfloor_service( &sf_uc, (void *)fault_addr, "mach", sf_peb ))
                     {
                         uint64_t sf_pc;
 
@@ -3312,6 +3366,21 @@ static void *ios_mach_exception_thread( void *arg )
                     {
                         int rt = insn & 0x1f;
                         __atomic_store_n((uint8_t *)rw_addr, (uint8_t)IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* ml1231: STLURB/STLURH/STLUR (FEAT_LRCPC2, store-release with an
+                     * unscaled 9-bit offset), what FEX emits for guest stores once the
+                     * host reports LRCPC2:
+                     *   ss01 1001 000i iiii iiii 00nn nnnt tttt   (mask 0x3fe00c00, val 0x19000000)
+                     * fault_addr already includes the offset. A guest store can be
+                     * misaligned, so the bytes are copied after a release fence rather
+                     * than with an atomic store that could itself alignment-fault. */
+                    else if ((insn & 0x3fe00c00) == 0x19000000)
+                    {
+                        int rt = insn & 0x1f;
+                        uint64_t v = IOS_STORE_SRC(rt);
+                        __atomic_thread_fence(__ATOMIC_RELEASE);
+                        memcpy((void *)rw_addr, &v, 1u << (insn >> 30));
                         emulated = 1;
                     }
                     /* STR (register, 32-bit): 1011 1000 001 Rm option S 10 Rn Rt */
@@ -5370,41 +5439,7 @@ skip_reclaim_band: ;
                      * to verify codegen correctness independently. */
                     static volatile int dumped = 0;
                     if (cnt == 1 && __sync_bool_compare_and_swap(&dumped, 0, 1))
-                    {
-                        extern void *ios_jit_rw_base_global;
-                        extern size_t ios_jit_pool_size_global;
-                        if (ios_jit_rw_base_global && ios_jit_pool_size_global)
-                        {
-                            const char *docs = getenv("MADEIRA_DOCS_DIR");
-                            char path[512];
-                            if (docs)
-                                snprintf(path, sizeof(path), "%s/fex-jit-dump.bin", docs);
-                            else
-                                snprintf(path, sizeof(path), "/tmp/fex-jit-dump.bin");
-                            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                            if (fd >= 0)
-                            {
-                                /* Dump the entire JIT pool RW alias. ~128MB but
-                                 * mostly zero. Compresses well; helpful to scan
-                                 * any populated region. */
-                                ssize_t off = 0;
-                                size_t total = ios_jit_pool_size_global;
-                                while ((size_t)off < total)
-                                {
-                                    ssize_t n = write(fd, (char*)ios_jit_rw_base_global + off,
-                                                       total - off > 0x10000 ? 0x10000 : total - off);
-                                    if (n <= 0) break;
-                                    off += n;
-                                }
-                                close(fd);
-                                dprintf(STDERR_FILENO, "[mach_exc] DUMPED JIT pool RW alias (%zd bytes) to %s rev=ml347\n", off, path);
-                            }
-                            else
-                            {
-                                dprintf(STDERR_FILENO, "[mach_exc] DUMP open failed errno=%d path=%s\n", errno, path);
-                            }
-                        }
-                    }
+                        ios_dump_jit_pool( "mach UNHANDLED" );
                     /* Diagnostic: query the kernel for what VM region the fault PC lives in.
                      * Helps identify mystery regions (e.g. JIT pool guard zone, wineserver heap). */
                     if (cnt <= 3)
@@ -8872,7 +8907,7 @@ static int ios_tlswatch_fault( const void *addr, const void *pc, const char *whi
 
 #ifdef WINE_IOS
 /* ml938: defined below next to the store emulator it reuses. */
-static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via );
+static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 #endif
 
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
@@ -10109,7 +10144,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * corruption -- measured in ml938. Those come through the Mach handler
          * instead, which sets thread state directly. */
         if (!(sg_rx && sg_pc >= sg_rx && sg_pc < sg_rx + sg_sz) &&
-            ios_subfloor_service( context, siginfo->si_addr, "segv" ))
+            ios_subfloor_service( context, siginfo->si_addr, "segv", ios_jit_current_peb() ))
         {
             PC_sig(context) = PC_sig(context) + 4;
             ios_fixup_x18_for_return( context );
@@ -10296,29 +10331,8 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * fire for ILL since we deliver via setup_exception). One-shot. */
         {
             static volatile int ill_dumped = 0;
-            if (__sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {
-                extern void *ios_jit_rw_base_global;
-                extern size_t ios_jit_pool_size_global;
-                if (ios_jit_rw_base_global && ios_jit_pool_size_global) {
-                    const char *docs = getenv("MADEIRA_DOCS_DIR");
-                    char path[512];
-                    if (docs) snprintf(path, sizeof(path), "%s/fex-jit-dump.bin", docs);
-                    else      snprintf(path, sizeof(path), "/tmp/fex-jit-dump.bin");
-                    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                    if (fd >= 0) {
-                        ssize_t off = 0;
-                        size_t total = ios_jit_pool_size_global;
-                        while ((size_t)off < total) {
-                            ssize_t n = write(fd, (char*)ios_jit_rw_base_global + off,
-                                              total - off > 0x10000 ? 0x10000 : total - off);
-                            if (n <= 0) break;
-                            off += n;
-                        }
-                        close(fd);
-                        ERR("ILL diag: DUMPED JIT pool RW alias (%zd bytes) to %s\n", off, path);
-                    }
-                }
-            }
+            if (__sync_bool_compare_and_swap(&ill_dumped, 0, 1))
+                ios_dump_jit_pool( "ILL diag" );
         }
     }
 #endif
@@ -10454,6 +10468,44 @@ static int ios_emulate_store(ucontext_t *ctx, uint32_t insn, uintptr_t rw_addr)
         if (cas_log++ < 8)
             ERR("[cas-emu] CAS%s insn=0x%08x rw=%p rs=%d rt=%d -> emulated on RW alias\n",
                 sz64 ? "64" : "32", insn, (void *)rw_addr, rs, rt);
+        return 1;
+    }
+
+    /* ml1208: CASB/CASH and their A/L/AL forms (0x08A07C00 / 0x48A07C00), which
+     * FEX emits for `lock cmpxchg byte/word`. A 64-bit program with a fixed base
+     * below 4 GB did one on its .bss at 0x741310 (`ml939 UNHANDLED encoding
+     * 0x08ebff66` = casalb w11, w6, [x27]): SEGV, c0000005. Same contract as the
+     * CAS branch above. An unaligned halfword cannot go through the hardware CAS,
+     * so it is done non-atomically. */
+    if ((insn & 0xBFA07C00) == 0x08A07C00)
+    {
+        int rs = (insn >> 16) & 0x1F;
+        static int casbh_log;
+        if (insn & 0x40000000)
+        {
+            uint16_t exp = (uint16_t)ios_get_reg(ctx, rs);
+            if (rw_addr & 1)
+            {
+                uint16_t cur;
+                memcpy( &cur, (void *)rw_addr, 2 );
+                if (cur == exp) { uint16_t v = (uint16_t)rt_val; memcpy( (void *)rw_addr, &v, 2 ); }
+                exp = cur;
+            }
+            else
+                __atomic_compare_exchange_n((uint16_t *)rw_addr, &exp, (uint16_t)rt_val,
+                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            if (rs != 31) REGn_sig(rs, ctx) = exp;
+        }
+        else
+        {
+            uint8_t exp = (uint8_t)ios_get_reg(ctx, rs);
+            __atomic_compare_exchange_n((uint8_t *)rw_addr, &exp, (uint8_t)rt_val,
+                                        0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            if (rs != 31) REGn_sig(rs, ctx) = exp;
+        }
+        if (casbh_log++ < 8)
+            ERR("[cas-emu] ml1208 CAS%s insn=0x%08x rw=%p rs=%d rt=%d -> emulated\n",
+                (insn & 0x40000000) ? "H" : "B", insn, (void *)rw_addr, rs, rt);
         return 1;
     }
 
@@ -10718,97 +10770,163 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
  * low-address redirect on the ~25 GenerateMemOperand/GetReg(Op->Addr) sites),
  * which costs nothing outside those blocks. Measure before building that.
  */
-#define IOS_SUBFLOOR_MAX 8
+/* ml1205: windows belong to the pseudo-process that mapped the image. All
+ * pseudo-processes share one address space, so a session-wide table could hold
+ * only one image per low base: a program with a fixed base of 0x400000 started
+ * another one with the same base, the child's window replaced the parent's and
+ * the parent ran the child's bytes. A lookup now takes the PEB of the faulting
+ * or calling thread; an owner of NULL (KUSER_SHARED_DATA) serves every process,
+ * and a lookup without a known PEB falls back to any matching window (the old
+ * behaviour). A process's windows are released when it exits
+ * (ios_subfloor_release_owner). */
+#define IOS_SUBFLOOR_MAX 32
 #define IOS_SUBFLOOR_FLOOR 0x100000000ull
 
 struct ios_subfloor_window
 {
     uint64_t pref_base;   /* preferred base, below the floor: what the guest uses */
-    uint64_t size;        /* SizeOfImage */
+    uint64_t size;        /* SizeOfImage; 0 = free slot */
     uint64_t real_base;   /* where the loader actually mapped it */
+    void    *owner_peb;   /* ml1205: the pseudo-process that mapped it, NULL = all */
 };
 static struct ios_subfloor_window ios_subfloor[IOS_SUBFLOOR_MAX];
 static int ios_subfloor_count;
+static pthread_mutex_t ios_subfloor_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long long ios_subfloor_hits;
 static unsigned long long ios_subfloor_unknown;
 static unsigned long long ios_subfloor_refused;   /* ml956: backing inaccessible */
 
 void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
-                                  unsigned long long real_base );
+                                  unsigned long long real_base, void *owner );
 void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
-                                  unsigned long long real_base )
+                                  unsigned long long real_base, void *owner )
+{
+    extern void ios_push_subfloor_window( unsigned long long, unsigned long long,
+                                          unsigned long long, void * );
+    int i, slot = -1;
+
+    if (!pref_base || !size || pref_base >= IOS_SUBFLOOR_FLOOR) return;
+    pthread_mutex_lock( &ios_subfloor_lock );
+    for (i = 0; i < ios_subfloor_count; i++)
+    {
+        if (!ios_subfloor[i].size)
+        {
+            if (slot < 0) slot = i;
+            continue;
+        }
+        if (ios_subfloor[i].pref_base == pref_base && ios_subfloor[i].owner_peb == owner)
+        {
+            /* Re-registration within one process (the ml1204 check keeps a
+             * relocatable image from getting here over a stripped one). */
+            if (ios_subfloor[i].real_base != real_base)
+                dprintf( 2, "[subfloor] ml938 window %#llx RE-POINTED %#llx -> %#llx "
+                         "(owner %p)\n",
+                         pref_base, (unsigned long long)ios_subfloor[i].real_base, real_base, owner );
+            ios_subfloor[i].size = 0;
+            __sync_synchronize();
+            ios_subfloor[i].real_base = real_base;
+            __sync_synchronize();
+            ios_subfloor[i].size = size;
+            pthread_mutex_unlock( &ios_subfloor_lock );
+            /* ml951: FEX's copy must follow the re-point. */
+            ios_push_subfloor_window( pref_base, real_base, size, owner );
+            return;
+        }
+    }
+    if (slot < 0)
+    {
+        if (ios_subfloor_count >= IOS_SUBFLOOR_MAX)
+        {
+            pthread_mutex_unlock( &ios_subfloor_lock );
+            dprintf( 2, "[subfloor] ml938 window table FULL, dropping %#llx\n", pref_base );
+            return;
+        }
+        slot = ios_subfloor_count;
+    }
+    i = slot;
+    ios_subfloor[i].size      = 0;
+    __sync_synchronize();
+    ios_subfloor[i].pref_base = pref_base;
+    ios_subfloor[i].real_base = real_base;
+    ios_subfloor[i].owner_peb = owner;
+    __sync_synchronize();
+    ios_subfloor[i].size      = size;
+    if (i == ios_subfloor_count)
+    {
+        __sync_synchronize();
+        ios_subfloor_count = i + 1;
+    }
+    pthread_mutex_unlock( &ios_subfloor_lock );
+    dprintf( 2, "[subfloor] ml938 window #%d: guest [%#llx,%#llx) -> real %#llx (%llu KB) owner %p\n",
+             i, pref_base, pref_base + size, real_base, size / 1024, owner );
+    /* ml951: FEX needs this too, so its executable-range query can answer for
+     * the low window instead of refusing the entry block. */
+    ios_push_subfloor_window( pref_base, real_base, size, owner );
+}
+
+/* ml1205: the pseudo-process is gone; free its windows. */
+void ios_subfloor_release_owner( void *owner );
+void ios_subfloor_release_owner( void *owner )
 {
     int i;
 
-    if (!pref_base || !size || pref_base >= IOS_SUBFLOOR_FLOOR) return;
+    if (!owner) return;
+    pthread_mutex_lock( &ios_subfloor_lock );
     for (i = 0; i < ios_subfloor_count; i++)
-        if (ios_subfloor[i].pref_base == pref_base)
-        {
-            /* Re-registration: a second pseudo-process loaded the same image.
-             * Last writer wins -- each process maps it at its own address and
-             * only one of them can be serviced by a global table. Logged so a
-             * two-process case is visible rather than silently wrong. */
-            if (ios_subfloor[i].real_base != real_base)
-                dprintf( 2, "[subfloor] ml938 window %#llx RE-POINTED %#llx -> %#llx "
-                         "(second loader of the same sub-floor image)\n",
-                         pref_base, (unsigned long long)ios_subfloor[i].real_base, real_base );
-            ios_subfloor[i].real_base = real_base;
-            ios_subfloor[i].size = size;
-            {   /* ml951: FEX's copy must follow the re-point, or its query would
-                 * translate into the dead loader's mapping. */
-                extern void ios_push_subfloor_window( unsigned long long, unsigned long long,
-                                                      unsigned long long );
-                ios_push_subfloor_window( pref_base, real_base, size );
-            }
-            return;
-        }
-    if (ios_subfloor_count >= IOS_SUBFLOOR_MAX)
     {
-        dprintf( 2, "[subfloor] ml938 window table FULL, dropping %#llx\n", pref_base );
-        return;
+        if (!ios_subfloor[i].size || ios_subfloor[i].owner_peb != owner) continue;
+        dprintf( 2, "[subfloor] ml1205 window #%d %#llx -> %#llx released with its process %p\n",
+                 i, (unsigned long long)ios_subfloor[i].pref_base,
+                 (unsigned long long)ios_subfloor[i].real_base, owner );
+        ios_subfloor[i].size = 0;
+        __sync_synchronize();
     }
-    i = ios_subfloor_count;
-    ios_subfloor[i].pref_base = pref_base;
-    ios_subfloor[i].size      = size;
-    ios_subfloor[i].real_base = real_base;
-    __sync_synchronize();
-    ios_subfloor_count = i + 1;
-    dprintf( 2, "[subfloor] ml938 window #%d: guest [%#llx,%#llx) -> real %#llx (%llu KB)\n",
-             i, pref_base, pref_base + size, real_base, size / 1024 );
-    /* ml951: FEX needs this too, so its executable-range query can answer for
-     * the low window instead of refusing the entry block. */
-    {
-        extern void ios_push_subfloor_window( unsigned long long, unsigned long long,
-                                              unsigned long long );
-        ios_push_subfloor_window( pref_base, real_base, size );
-    }
+    pthread_mutex_unlock( &ios_subfloor_lock );
 }
 
 /* ml951: enumerate registered windows so virtual_ios.c can push any that were
  * registered before xtajit64's callback existed. Returns 0 when idx is past
  * the end. */
 int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real,
-                       unsigned long long *size );
+                       unsigned long long *size, void **owner );
 int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real,
-                       unsigned long long *size )
+                       unsigned long long *size, void **owner )
 {
+    uint64_t sz;
+
     if (idx < 0 || idx >= ios_subfloor_count) return 0;
-    if (low)  *low  = ios_subfloor[idx].pref_base;
-    if (real) *real = ios_subfloor[idx].real_base;
-    if (size) *size = ios_subfloor[idx].size;
+    sz = ios_subfloor[idx].size;       /* 0 = free slot; read first, see register */
+    __sync_synchronize();
+    if (low)   *low   = ios_subfloor[idx].pref_base;
+    if (real)  *real  = ios_subfloor[idx].real_base;
+    if (owner) *owner = ios_subfloor[idx].owner_peb;
+    if (size)  *size  = sz;
     return 1;
 }
 
-static uintptr_t ios_subfloor_translate( uint64_t addr )
+/* ml1205: the window `peb` sees at addr. Exact owner or a shared (NULL-owner)
+ * window wins; with no known peb, the last matching window answers. */
+static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
 {
     int i, n = ios_subfloor_count;
+    uintptr_t any = 0;
 
     if (addr >= IOS_SUBFLOOR_FLOOR) return 0;   /* fast reject: the common case */
     for (i = 0; i < n; i++)
-        if (addr >= ios_subfloor[i].pref_base &&
-            addr <  ios_subfloor[i].pref_base + ios_subfloor[i].size)
-            return (uintptr_t)(ios_subfloor[i].real_base + (addr - ios_subfloor[i].pref_base));
-    return 0;
+    {
+        uint64_t sz = ios_subfloor[i].size, lo, re;
+        void *own;
+
+        if (!sz) continue;
+        __sync_synchronize();
+        lo = ios_subfloor[i].pref_base;
+        re = ios_subfloor[i].real_base;
+        own = ios_subfloor[i].owner_peb;
+        if (addr < lo || addr >= lo + sz) continue;
+        if (!own || own == peb) return (uintptr_t)(re + (addr - lo));
+        if (!peb) any = (uintptr_t)(re + (addr - lo));
+    }
+    return any;
 }
 
 /* Read `size` bytes at `a` with the opc-implied extension. memcpy, not a cast
@@ -10867,6 +10985,18 @@ static int ios_emulate_load( ucontext_t *ctx, uint32_t insn, uintptr_t rd_addr )
     if ((insn & 0x3FFFFC00) == 0x38BFC000)
     {
         ios_ld_setreg( ctx, rt, ios_ld_extend( rd_addr, size, 1 ) );
+        return 1;
+    }
+
+    /* ml1231: LDAPUR / LDAPURB / LDAPURH / LDAPURS* (FEAT_LRCPC2) --
+     * size 011001 opc 0 imm9 00 Rn Rt. FEX emits these for guest loads once
+     * the host reports LRCPC2. opc 01 zero-extends, 10 sign-extends to 64 and
+     * 11 to 32, the same convention ios_ld_extend takes; opc 00 is STLUR. */
+    if ((insn & 0x3F200C00) == 0x19000000)
+    {
+        if (opc == 0) return 0;                        /* STLUR* -- not ours */
+        if ((size == 3 && opc >= 2) || (size == 2 && opc == 3)) return 0;   /* unallocated */
+        ios_ld_setreg( ctx, rt, ios_ld_extend( rd_addr, size, opc ) );
         return 1;
     }
 
@@ -10978,7 +11108,8 @@ static int ios_emulate_store_rel( ucontext_t *ctx, uint32_t insn, uintptr_t addr
      * Rs and Rt2 are both 11111 here, which is what separates these from the
      * store-exclusive encodings below. */
     if ((insn & 0x3FFFFC00) == 0x089FFC00 ||     /* STLR*  (o0=1) */
-        (insn & 0x3FFFFC00) == 0x089F7C00)       /* STLLR* (o0=0) */
+        (insn & 0x3FFFFC00) == 0x089F7C00 ||     /* STLLR* (o0=0) */
+        (insn & 0x3FE00C00) == 0x19000000)       /* ml1231: STLUR* (LRCPC2, imm9) */
     {
         uint64_t v = ios_get_reg( ctx, rt );
         memcpy( (void *)addr, &v, nbytes );
@@ -11148,6 +11279,8 @@ static int ios_subfloor_classify( uint32_t insn, unsigned *bytes, int *is_write 
 
     /* ---- ios_emulate_load: pure loads (tried first, so it wins ties) ---- */
     if ((insn & 0x3FFFFC00) == 0x38BFC000) return 1;                /* LDAPR*  */
+    if ((insn & 0x3F200C00) == 0x19000000 && opc != 0)              /* ml1231: LDAPUR* */
+        return !((size == 3 && opc >= 2) || (size == 2 && opc == 3));
     if ((insn & 0x3FFFFC00) == 0x08DFFC00 ||                        /* LDAR    */
         (insn & 0x3FFFFC00) == 0x085FFC00 ||                        /* LDAXR   */
         (insn & 0x3FFFFC00) == 0x085F7C00) return 1;                /* LDXR    */
@@ -11174,6 +11307,7 @@ static int ios_subfloor_classify( uint32_t insn, unsigned *bytes, int *is_write 
     /* ---- ios_emulate_store_rel: release / exclusive / LSE ---- */
     if ((insn & 0x3FFFFC00) == 0x089FFC00 ||                        /* STLR*   */
         (insn & 0x3FFFFC00) == 0x089F7C00 ||                        /* STLLR*  */
+        (insn & 0x3FE00C00) == 0x19000000 ||                        /* ml1231: STLUR* */
         (insn & 0x3FE0FC00) == 0x0800FC00 ||                        /* STLXR   */
         (insn & 0x3FE0FC00) == 0x08007C00)                          /* STXR    */
     {
@@ -11219,6 +11353,12 @@ static int ios_subfloor_classify( uint32_t insn, unsigned *bytes, int *is_write 
     {
         *bytes    = ((insn >> 30) & 1) ? 8u : 4u;
         *is_write = 1;                                              /* RMW      */
+        return 1;
+    }
+    if ((insn & 0xBFA07C00) == 0x08A07C00)                          /* CASB/CASH (ml1208) */
+    {
+        *bytes    = ((insn >> 30) & 1) ? 2u : 1u;
+        *is_write = 1;
         return 1;
     }
     if ((insn & 0xFFA00C00) == 0x3C800000)                          /* SIMD st  */
@@ -11287,10 +11427,10 @@ static int ios_subfloor_backing_probe( uintptr_t real, unsigned bytes, int need_
     return 1;
 }
 
-static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via )
+static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb )
 {
     uint64_t addr = (uint64_t)(uintptr_t)fault_addr;
-    uintptr_t real = ios_subfloor_translate( addr );
+    uintptr_t real = ios_subfloor_translate( addr, peb );
     uint32_t insn = 0;
     unsigned bytes = 0, span = 8;
     int is_write = 0, ok, cls = 0;

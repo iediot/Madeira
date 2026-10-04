@@ -293,13 +293,26 @@ static MadeiraGLPresenter *presenter_get(void **state, void *hwnd) {
     return p;
 }
 
+// The [perf] report's frame hooks (build/ntdll-unix/perf_ios.c), the same ones
+// DXMT calls, so GL games report fps and frame times too.
+extern int ios_frame_stats_on;
+extern void ios_frame_game_tick(void);
+extern void ios_frame_encode_present(int skipped);
+extern void ios_frame_drawable_wait(unsigned long long ns);
+
 // Draw slot `s` (its IOSurface, rows bottom-up) onto the presenter's layer.
 static BOOL present_slot(MadeiraGLPresenter *p, GLSlot *s, void *hwnd) {
     CAMetalLayer *layer = p->layer;
     CGSize want = CGSizeMake(p->width, p->height);
     if (!CGSizeEqualToSize(layer.drawableSize, want)) layer.drawableSize = want;
     if (!pipeline_ensure(p, layer.pixelFormat)) return NO;
+    uint64_t wait_from = ios_frame_stats_on ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     id<CAMetalDrawable> drawable = [layer nextDrawable];
+    if (ios_frame_stats_on) {
+        ios_frame_drawable_wait(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - wait_from);
+        ios_frame_game_tick();
+        ios_frame_encode_present(drawable == nil);
+    }
     if (!drawable) return NO;
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];

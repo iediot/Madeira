@@ -1,11 +1,11 @@
 diff --git a/LICENSE-MADEIRA.md b/LICENSE-MADEIRA.md
-index 664b2fc2..258f4ed3 100644
+index 90b5aa66..a5bdc930 100644
 --- a/LICENSE-MADEIRA.md
 +++ b/LICENSE-MADEIRA.md
-@@ -42,6 +42,18 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
-     fastsync for events and semaphores, pull request #16); `d770df01ae7`
-     (ntdll ARM64EC: opt-in guard against a self-deadlock in the loader's
-     image-map notification, pull request #17).
+@@ -48,6 +48,18 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
+     QueryInterruptTime from the performance counter, pull request #23);
+     `f4bbccf9499` (ntdll ARM64EC: unwind data for x64 code running at a fixed
+     base below 4 GB, pull request #24).
 +  - opengl32: OpenGL ES contexts for Madeira's winios WGL driver
 +    (`dlls/opengl32/unix_wgl.c`) and the fixed low image base limited to x86
 +    builds (`dlls/opengl32/Makefile.in`). Author: Connor Gow, written with AI

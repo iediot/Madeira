@@ -198,6 +198,21 @@ struct LibraryEntry: Codable, Identifiable {
     /// nil = 1) in this game's sessions.
     var controlOpacity: Double?
     var controlSize: Double?
+    // ml1163: how a game starts. All optional, so older library files decode and
+    // entries that never set them start as before.
+    /// "desktop": the program runs inside the Wine desktop, as explorer.exe's
+    /// first child (explorer.exe /desktop=shell,<resolution> "<exe>" args), so
+    /// every window shows. nil or "direct": the program is Wine's first process,
+    /// with no desktop; only its small windows (launchers, message boxes) are
+    /// drawn over the game.
+    var launchMode: String?
+    /// The working directory, a C:\ path (exported as MADEIRA_WORKDIR); nil or
+    /// empty = the program's own folder (Steam's for "The game").
+    var workingDirectory: String?
+    /// Start services.exe (the SCM, and through it rpcss: out-of-process COM,
+    /// which Steam-style launchers need) before the program, from a generated
+    /// C:\madeira-games\<id>.bat (servicesScript).
+    var startServices: Bool?
     /// How a physical controller reaches this game: nil, the game's own support
     /// (XInput, as before); "dinput", XInput and a DirectInput joystick of the same
     /// pad (for games older than XInput; a game reading both APIs sees two
@@ -262,8 +277,119 @@ struct LibraryEntry: Codable, Identifiable {
 
     var launchArguments: String {
         if desktop == true { return "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" }
-        if startsSteamGameDirectly { return steamProgramArguments ?? "" }
-        return arguments
+        return launchCommand.args
+    }
+
+    /// ml1163: a .bat or .cmd target runs through cmd.exe. For "The game" (a Steam
+    /// game started as its own program) the target is that program.
+    var isBatch: Bool {
+        let path = launchRelativePath.lowercased()
+        return path.hasSuffix(".bat") || path.hasSuffix(".cmd")
+    }
+    /// ml1163's launch options apply to what the library starts itself: a game you
+    /// added, or a Steam game's "The game". A Steam game started through Madeira
+    /// Dock has Dock's own desktop and command (ContentView.startDock).
+    var usesLaunchOptions: Bool { desktop != true && (steamAppID == nil || startsSteamGameDirectly) }
+    /// ml1163: a game (not the Desktop entry) started inside the Wine desktop.
+    var runsInDesktop: Bool { usesLaunchOptions && launchMode == "desktop" }
+    /// The program's own arguments: Steam's launch configuration for "The game",
+    /// else the entry's Launch arguments.
+    var programArguments: String { startsSteamGameDirectly ? (steamProgramArguments ?? "") : arguments }
+    /// ml1163: the directory the program starts in (MADEIRA_WORKDIR): the chosen
+    /// working folder, else Steam's for "The game", else the program's own folder.
+    /// A desktop-mode game inherits explorer's directory and a .bat runs as
+    /// cmd.exe, whose own folder is system32, so configureLaunch exports it
+    /// whenever what starts lives elsewhere.
+    var launchDirectory: String {
+        let chosen = (workingDirectory ?? "").trimmingCharacters(in: .whitespaces)
+        if !chosen.isEmpty { return chosen }
+        return steamWorkingWindowsPath ?? Self.folder(of: launchWindowsPath)
+    }
+    /// C:\a\b\x.exe -> C:\a\b (C:\ for a file in the root).
+    static func folder(of windowsPath: String) -> String {
+        guard let i = windowsPath.lastIndex(of: "\\") else { return "C:\\" }
+        let dir = String(windowsPath[..<i])
+        return dir.count <= 2 ? dir + "\\" : dir
+    }
+    /// drive_c on the host. LibraryModel.drive is the same folder; this struct
+    /// stands alone so the host tests can compile it.
+    static var hostDrive: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("wine/drive_c", isDirectory: true)
+    }
+    /// C:\a\b -> <prefix>/drive_c/a/b; nil for another drive or a ".." element.
+    static func hostURL(ofWindowsPath path: String) -> URL? {
+        let p = path.trimmingCharacters(in: .whitespaces)
+        guard p.count >= 3, p.prefix(3).uppercased() == "C:\\" else { return nil }
+        let parts = p.dropFirst(3).split(separator: "\\").map(String.init)
+        guard !parts.contains("..") else { return nil }
+        return parts.reduce(hostDrive) { $0.appendingPathComponent($1) }
+    }
+    /// ml1163: where startServices writes its batch file, one per entry.
+    var servicesScriptPath: String { "C:\\madeira-games\\\(id.uuidString).bat" }
+    /// ml1163: the services batch, CRLF. services.exe is STARTed; then a .bat is
+    /// CALLed so it runs in this console, and an exe is STARTed so cmd exits and
+    /// its console closes straight away (the pattern of Steam's batch). nil
+    /// unless startServices.
+    var servicesScript: String? {
+        guard usesLaunchOptions, startServices == true else { return nil }
+        func quoted(_ s: String) -> String { "\"\(s)\"" }
+        // Text put into the batch keeps one line each (a line break in the arguments
+        // or the title would start another command), and its '%' is doubled once per
+        // expansion: cmd expands '%' in a batch file, so C:\Games\100% Juice became
+        // C:\Games\100 Juice and "%~" in a title was a syntax error that stopped the
+        // whole batch; CALL expands its line a second time.
+        func batchText(_ s: String, expansions: Int = 1) -> String {
+            var text = s.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
+            for _ in 0..<expansions { text = text.replacingOccurrences(of: "%", with: "%%") }
+            return text
+        }
+        let expansions = isBatch ? 2 : 1   // the program's line: CALL for a .bat
+        let extra = batchText(programArguments.trimmingCharacters(in: .whitespaces), expansions: expansions)
+        let target = quoted(batchText(launchWindowsPath, expansions: expansions))
+        let run = isBatch ? "call \(target)" : "start \"\" \(target)"
+        return [
+            "@echo off",
+            "rem Generated by Madeira (ml1163) for \(batchText(title)); rewritten at every launch.",
+            "start \"\" \"C:\\windows\\system32\\services.exe\"",
+            "cd /d \(quoted(batchText(launchDirectory)))",
+            extra.isEmpty ? run : run + " " + extra,
+        ].joined(separator: "\r\n") + "\r\n"
+    }
+
+    /// ml1163: what a game starts (the Desktop entry keeps its own command
+    /// above). MADEIRA_ARGS goes through
+    /// WineProcessBridge's quote-aware tokenizer; Wine re-quotes an argument
+    /// with spaces.
+    ///   Wine desktop: explorer.exe /desktop=shell,WxH "<exe>" args, or cmd /c "x.bat" args
+    ///   direct:       the exe with its arguments, or cmd.exe /c "x.bat" args
+    /// With startServices the target is the services batch, which carries the
+    /// arguments itself. The exe is launchWindowsPath: "The game"'s program for
+    /// a Steam game started as its own program.
+    private var launchCommand: (exe: String, args: String) {
+        func quoted(_ s: String) -> String { "\"\(s)\"" }
+        var path = launchWindowsPath
+        var extra = programArguments.trimmingCharacters(in: .whitespaces)
+        var batch = isBatch
+        if servicesScript != nil { path = servicesScriptPath; extra = ""; batch = true }
+        func withExtra(_ s: String) -> String { extra.isEmpty ? s : s + " " + extra }
+        if runsInDesktop {
+            return ("explorer.exe", "/desktop=shell,\(resolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : quoted(path)))
+        }
+        if batch { return ("C:\\windows\\system32\\cmd.exe", withExtra("/c \(quoted(path))")) }
+        return (path, programArguments)   // upstream's direct launch, arguments verbatim
+    }
+    /// The details page's "command that runs" line: the program's file name and
+    /// its arguments, as upstream shows a direct start; ml1163: what starts it
+    /// otherwise (explorer.exe or cmd.exe with its whole command), and with the
+    /// services batch also what that batch starts.
+    var commandPreview: String {
+        func name(_ path: String) -> String { path.split(separator: "\\").last.map(String.init) ?? path }
+        let command = launchCommand
+        let program = ([name(launchWindowsPath)] + (programArguments.isEmpty ? [] : [programArguments])).joined(separator: " ")
+        if command.exe == launchWindowsPath { return program }
+        let line = name(command.exe) + " " + command.args
+        return servicesScript == nil ? line : line + "\n(the batch starts services.exe, then " + program + ")"
     }
 
     /// A Steam game that starts as its own program ("Start with: The game").
@@ -315,6 +441,33 @@ struct LibraryEntry: Codable, Identifiable {
         guard (config?.utf8.count ?? 0) < 60_000, config?.contains("\0") != true else {
             throw LibraryError.message("This game's config is too long.")
         }
+        // ml1163: the launch options.
+        guard launchMode == nil || launchMode == "desktop" || launchMode == "direct" else {
+            throw LibraryError.message("The saved launch profile contains an invalid launch mode.")
+        }
+        if usesLaunchOptions, let chosen = workingDirectory?.trimmingCharacters(in: .whitespaces), !chosen.isEmpty {
+            // WineProcessBridge maps MADEIRA_WORKDIR onto drive_c (C:\ only), and the
+            // services batch quotes it, so only an existing C:\ folder without
+            // quotes is accepted.
+            var isFolder: ObjCBool = false
+            guard !chosen.contains("\""), !chosen.contains("\0"), chosen.utf8.count < 500,
+                  let url = Self.hostURL(ofWindowsPath: chosen),
+                  FileManager.default.fileExists(atPath: url.path, isDirectory: &isFolder), isFolder.boolValue else {
+                throw LibraryError.message("The working folder must be an existing folder on drive C:, such as C:\\Games\\Some Game.")
+            }
+        }
+        // validate() is the last step of a launch that can refuse it
+        // (ContentView.launchLibraryEntry), so the services batch is written
+        // here: a batch that cannot be written stops the launch with a message.
+        if let script = servicesScript {
+            guard let url = Self.hostURL(ofWindowsPath: servicesScriptPath) else { return }
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try script.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                throw LibraryError.message("Could not write \(servicesScriptPath): \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Runs on the launch worker, before the JIT pool is taken.
@@ -324,13 +477,19 @@ struct LibraryEntry: Codable, Identifiable {
         if reducedX87 { setenv("FEX_X87REDUCEDPRECISION", "1", 1) } else { unsetenv("FEX_X87REDUCEDPRECISION") }
         // Exported only when chosen: unset keeps the engine's own default (and any
         // madeira.cfg setting), as before these choices existed.
+        // Unset otherwise, so a previous game's choice (a launch that died before the
+        // session-end unset) never beats madeira.cfg for this one.
         if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT", String(cpuCount), 1) }
+        else { unsetenv("MADEIRA_CPU_COUNT") }
         // "dinput": the host pad also as a DirectInput joystick (wine/dlls/dinput/joystick_ios.c,
         // off by default because a game reading both APIs would see two controllers).
-        // Exported only for that choice; madeira.cfg's own MADEIRA_DINPUT_PAD still applies otherwise.
+        // Exported only for that choice, and it wins over madeira.cfg's MADEIRA_DINPUT_PAD
+        // (ml1240: in ml1184's per-launch list, unset when the session ends); the cfg's
+        // own value still applies to the other choices.
         if GamepadInput.keyboardMouseAvailable, controllerMode == "dinput" { setenv("MADEIRA_DINPUT_PAD", "1", 1) }
         else if MadeiraConfig.get("env.MADEIRA_DINPUT_PAD") == nil { unsetenv("MADEIRA_DINPUT_PAD") }
         if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
+        else { unsetenv("DXMT_D9_ANISO_LIMIT") }
         // Set or unset, so a previous session's choice never stays.
         if avx == true { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if frameGeneration == true { setenv("MADEIRA_FRAMEGEN", "1", 1) } else { unsetenv("MADEIRA_FRAMEGEN") }
@@ -339,7 +498,9 @@ struct LibraryEntry: Codable, Identifiable {
         if SyncEngine.current == .fastsync {
             let mode = MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "auto"
             setenv("MADEIRA_FASTSYNC", fastSync == false ? "0" : mode, 1)
-            setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)
+            // Only a game's own choice; otherwise madeira.cfg's env.MADEIRA_FASTSYNC_SEM applies.
+            if let sem = semaphoreFastPath { setenv("MADEIRA_FASTSYNC_SEM", sem ? "1" : "0", 1) }
+            else { unsetenv("MADEIRA_FASTSYNC_SEM") }
         }
         madeira_set_vsync_locked(effectiveFPSMode)
         // This game's own lines; a launch without any unsets the previous game's.
@@ -352,13 +513,16 @@ struct LibraryEntry: Codable, Identifiable {
             LogStore.shared.log("[game-cfg] this game's config could not be written: \(error.localizedDescription)")
         }
         fputs("[frontend] launch profile applied\n", stderr)
+        if usesLaunchOptions {
+            fputs("[library] ml1163 start=\(runsInDesktop ? "desktop" : "direct") batch=\(isBatch ? 1 : 0) services=\(servicesScript != nil ? 1 : 0) cwd=\(launchDirectory)\n", stderr)
+        }
         LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
     }
 
     /// What the bridge starts. Set on the main thread before the session begins.
     func configureLaunch() {
-        // "The game"'s identity and working folder for this launch only (the bridge
-        // reads and clears them); every other launch starts without them.
+        // "The game"'s identity and the launch's working folder, for this launch only
+        // (the bridge reads and clears them); every other launch starts without them.
         unsetenv("MADEIRA_STEAM_APPID"); unsetenv("MADEIRA_STEAM_APPPATH"); unsetenv("MADEIRA_WORKDIR")
         if steamAppID != nil {
             // A Steam game through Madeira Dock: Dock has set what starts (ContentView.startDock);
@@ -369,15 +533,22 @@ struct LibraryEntry: Codable, Identifiable {
                 return
             }
         }
-        setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : launchWindowsPath, 1)
-        setenv("MADEIRA_ARGS", launchArguments, 1)
-        if desktop == true { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand
+        setenv("MADEIRA_EXE", command.exe, 1)
+        setenv("MADEIRA_ARGS", command.args, 1)
+        if desktop == true || runsInDesktop { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
         if startsSteamGameDirectly, let steamAppID {
             // The game's own Steam identity (SteamAppId, SteamGameId, SteamAppPath = its install
-            // folder) instead of the bridge's fixed one, and Steam's working folder when it names one.
+            // folder) instead of the bridge's fixed one.
             setenv("MADEIRA_STEAM_APPID", String(steamAppID), 1)
             setenv("MADEIRA_STEAM_APPPATH", windowsPath, 1)
-            if let folder = steamWorkingWindowsPath { setenv("MADEIRA_WORKDIR", folder, 1) }
+        }
+        // ml1163: a game starts in launchDirectory (a chosen folder, Steam's for "The game",
+        // else the program's own). It is exported when the bridge's default, the folder of
+        // what it starts, differs: explorer.exe (desktop mode) and cmd.exe (a .bat, the
+        // services batch) live elsewhere. The Desktop entry keeps explorer's default.
+        if desktop != true, launchDirectory != Self.folder(of: command.exe) {
+            setenv("MADEIRA_WORKDIR", launchDirectory, 1)
         }
         // Every session's virtual monitor takes this entry's Resolution
         // (MADEIRA_SCREEN_W/H, source "knob"); for the Desktop entry it is the
@@ -606,17 +777,27 @@ final class LibraryModel: ObservableObject {
         LogStore.shared.log("[steam-games] metadata app=\(game.id) bits=\(updated.bits) api=\(api ?? "unknown")")
     }
 
+    /// What an entry can start: an executable, or (ml1163) a batch file run through cmd.exe.
+    static let programExtensions: Set<String> = ["exe", "bat", "cmd"]
     static func executable(_ relative: String) throws -> URL {
         let url = drive.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
-        guard url.path.hasPrefix(drive.path + "/"), url.pathExtension.lowercased() == "exe",
+        guard url.path.hasPrefix(drive.path + "/"), programExtensions.contains(url.pathExtension.lowercased()),
               FileManager.default.fileExists(atPath: url.path) else {
-            throw LibraryError.message("Choose an executable inside drive_c.")
+            throw LibraryError.message("Choose an executable (.exe, .bat or .cmd) inside drive_c.")
         }
         return url
     }
     static func inspect(_ url: URL) throws -> LibraryEntry {
         guard url.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/") else {
             throw LibraryError.message("The executable must be inside drive_c.")
+        }
+        if ["bat", "cmd"].contains(url.pathExtension.lowercased()) {
+            // ml1163: a batch file has no PE header. Like every entry it starts
+            // directly by default, as upstream starts every game; the details page
+            // warns that Wine then stops when cmd.exe, its first process, exits.
+            let relative = String(url.resolvingSymlinksInPath().path.dropFirst(drive.path.count + 1))
+            return LibraryEntry(title: url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " "),
+                                relativePath: relative, bits: 0)
         }
         let h = try FileHandle(forReadingFrom: url); defer { try? h.close() }
         let dos = try h.read(upToCount: 64) ?? Data()
@@ -1609,7 +1790,8 @@ struct AmbientGlow: View {
             .hueRotation(.degrees(f.hue))
             // In the dark the light adds to the page (plusLighter): a very bright artwork's
             // light is brought down at the top (AmbientGlow.metal) so it does not glare.
-            .colorEffect(ShaderLibrary.ambientKnee(.float(dark ? 0.3 : 0)))
+            // ml1219: off on a light page, where a knee of 0 left every pixel as it was.
+            .colorEffect(ShaderLibrary.ambientKnee(.float(0.3)), isEnabled: dark)
             .mask { AmbientMovie.mask(f.light) }
             .mask {
                 let turn = reduceMotion ? 0 : 1.2 * sin(t * 0.12 + Double(seed % 97))
@@ -1826,6 +2008,7 @@ struct LibraryBadges: View {
     private var format: some View {
         HStack(spacing: 4) {
             if entry.bits == 32 || entry.bits == 64 { badge("\(entry.bits)-bit") }
+            if entry.isBatch { badge("Batch") }   // ml1163
             if let api = LibraryRendererBadge.compact(entry.graphicsAPI) { badge(api) }
             if let note { badge(note) }
         }
@@ -1999,6 +2182,12 @@ struct LibraryView: View {
         .onAppear {
             LogStore.shared.log("[library-sections] native-steam=\(SteamOwnedLibrary.enabled ? 1 : 0) sections=\(SteamGamesSection.shown ? 1 : 0) collapse=\(SteamGamesSection.collapsible ? 1 : 0)")
         }
+        // ml1216: a session replaces the library (ContentView), and the skin's run-loop
+        // observer, display link and view walks kept running on the main thread through
+        // the whole game. Stop with the library; it starts again when the library returns
+        // on either tab (start() does nothing while liquid metal is off).
+        .onAppear { GlassSkin.shared.start() }
+        .onDisappear { GlassSkin.shared.stop() }
         .onReceive(controller.commands) { command in
             if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
         }
@@ -2100,7 +2289,7 @@ struct LibraryView: View {
                 SettingsSearchResults(query: settingsSearch.trimmingCharacters(in: .whitespaces), refresh: settingsRefresh)
             }
             // Credits, last, folded away unless searched for.
-            if settingsShow("about", "credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "bahacan16") {
+            if settingsShow("about", "credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "bahacan16", "spitefulowl") {
                 Section {
                     DisclosureGroup("Credits", isExpanded: Binding(get: { creditsOpen || !settingsSearch.isEmpty },
                                                                     set: { creditsOpen = $0 })) {
@@ -2109,6 +2298,7 @@ struct LibraryView: View {
                         MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
                         MadeiraCredit(name: "Jesse", handle: "JesseLovelace", role: "Steam Cloud saves, faster game launches, and fixes that let more games run")
                         MadeiraCredit(name: "bahacan16", handle: "bahacan16", role: "Direct3D 12 and DXMT fixes, game launcher windows, per-game settings, PlayStation controllers, and save backups")
+                        MadeiraCredit(name: "spitefulowl", handle: "spitefulowl", role: "Wine and FEX runtime fixes, DXMT texture and memory fixes, audio, the swap tier, and library launch options")
                     }
                 } header: { Text("About") }
             }
@@ -2357,7 +2547,7 @@ struct ExecutableBrowser: View {
                     NavigationLink { ExecutableBrowser(folder: file, select: select) } label: { Label(file.lastPathComponent, systemImage: "folder") }
                 } else {
                     Button { do { select(try LibraryModel.inspect(file)) } catch { self.error = error.localizedDescription } } label: {
-                        Label(file.lastPathComponent, systemImage: "app.dashed")
+                        Label(file.lastPathComponent, systemImage: file.pathExtension.lowercased() == "exe" ? "app.dashed" : "terminal")
                     }
                 }
             }
@@ -2366,8 +2556,9 @@ struct ExecutableBrowser: View {
         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         .task {
             do {
+                // ml1163: .bat and .cmd files are listed too (they run through cmd.exe).
                 files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles)
-                    .filter { ($0.hasDirectoryPath || $0.pathExtension.lowercased() == "exe") && $0.resolvingSymlinksInPath().path.hasPrefix(LibraryModel.drive.path + "/") }
+                    .filter { ($0.hasDirectoryPath || LibraryModel.programExtensions.contains($0.pathExtension.lowercased())) && $0.resolvingSymlinksInPath().path.hasPrefix(LibraryModel.drive.path + "/") }
                     .sorted { if $0.hasDirectoryPath != $1.hasDirectoryPath { return $0.hasDirectoryPath }; return $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             } catch { self.error = error.localizedDescription }
         }
@@ -2399,10 +2590,14 @@ struct LibraryDetail: View {
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
     static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
-    /// The presets, plus a stored size that is none of them (a screen shape
-    /// chosen on another device), so the picker never shows a blank choice.
+    /// Only sizes that fill this screen (native first, then smaller), plus a stored
+    /// size that is none of them (an old preset, or a shape chosen on another
+    /// device) so the picker never shows a blank choice. The fixed presets come
+    /// back only with MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
     static func resolutions(keeping current: String) -> [String] {
-        presetResolutions.contains(current) || screenShapeResolutions.contains(current) ? presetResolutions : presetResolutions + [current]
+        let fill = screenShapeResolutions
+        let list = fill.isEmpty ? presetResolutions : fill
+        return list.contains(current) ? list : list + [current]
     }
     /// "WxH" matching this screen's landscape aspect at 720 lines (width
     /// rounded to a multiple of 8), or nil when it equals a preset or
@@ -2436,8 +2631,7 @@ struct LibraryDetail: View {
         let size = "\(width)x\(lines)"
         // Only sizes below the native height: above it the screen just scales back down.
         let nativeShort = Int(min(UIScreen.main.nativeBounds.width, UIScreen.main.nativeBounds.height))
-        guard (640...4096).contains(width), nativeShort == 0 || lines < nativeShort,
-              !presetResolutions.contains(size) else { return nil }
+        guard (640...4096).contains(width), nativeShort == 0 || lines < nativeShort else { return nil }
         return size
     }
     /// "None", or how many keys this game's own config sets.
@@ -2515,11 +2709,9 @@ struct LibraryDetail: View {
                 Section("Display") {   // first after Play: the setting changed most often
                     // The Windows screen the game renders for (and the Desktop's size).
                     Picker("Resolution", selection: $entry.resolution) {
-                        ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { Text($0.replacingOccurrences(of: "x", with: "×")).tag($0) }
-                        // This device's own aspect ratio at 720 lines, so the game
-                        // fills the screen without bars or stretching.
-                        ForEach(Self.screenShapeResolutions, id: \.self) { shape in
-                            Text("\(shape == Self.nativeResolution ? "Native" : "Screen shape") (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        // Sizes in this screen's own shape: the game fills it without bars or stretching.
+                        ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { size in
+                            Text(size.replacingOccurrences(of: "x", with: "×") + (size == Self.nativeResolution ? " (native)" : "")).tag(size)
                         }
                     }
                     Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
@@ -2530,6 +2722,35 @@ struct LibraryDetail: View {
                     // launch exports the switch like a game's (applyEnvironment).
                     Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
                 }
+                // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam
+                // game started through Madeira Dock, whose desktop and command are Dock's:
+                // there these choices would do nothing.
+                if entry.usesLaunchOptions {
+                    Section {
+                        Picker("Start", selection: Binding(get: { entry.runsInDesktop ? "desktop" : "direct" }, set: {
+                            entry.launchMode = $0 == "desktop" ? "desktop" : nil
+                        })) {
+                            Text("Directly").tag("direct")
+                            Text("In the Wine desktop").tag("desktop")
+                        }
+                        TextField("Working folder (default: the program's folder)", text: Binding(get: { entry.workingDirectory ?? "" }, set: {
+                            entry.workingDirectory = $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
+                        })).autocorrectionDisabled().textInputAutocapitalization(.never).font(.body.monospaced())
+                        Toggle("Start Windows services first", isOn: Binding(get: { entry.startServices == true }, set: {
+                            entry.startServices = $0 ? true : nil
+                        }))
+                    } header: { Text("Launch") } footer: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Directly: the game is Wine's first program, with no desktop; small windows such as launchers and message boxes are drawn over the game, a window drawn without DirectX that fills the screen is not. In the Wine desktop: the game starts inside the Wine desktop at the Resolution above, where every window shows.")
+                            Text("The working folder is a C:\\ path, for example C:\\Games\\Some Game. Start Windows services first is for launchers that need them (Steam-style COM); Madeira writes a batch file for it in C:\\madeira-games.")
+                            if !entry.runsInDesktop && (entry.isBatch || entry.startServices == true) {
+                                // Wine stops with its first process (the ml1163 open risk).
+                                Text("Started directly, Wine stops when its first program exits, so a batch file that starts the game and exits closes the game too. Start it in the Wine desktop instead.")
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                }
                 // A Steam game starts with Steam's own launch option through Madeira Dock.
                 if entry.desktop != true && entry.steamAppID == nil {
                     Section {
@@ -2537,8 +2758,9 @@ struct LibraryDetail: View {
                             .font(.body.monospaced()).lineLimit(1...4)
                             .autocorrectionDisabled().textInputAutocapitalization(.never)
                         LaunchFlagChips(arguments: $entry.arguments)
-                        // What the next start runs.
-                        Text(([(entry.relativePath as NSString).lastPathComponent] + (entry.arguments.isEmpty ? [] : [entry.arguments])).joined(separator: " "))
+                        // What the next start runs (ml1163: in the Wine desktop, a batch file or
+                        // the services batch, what starts the program).
+                        Text(entry.commandPreview)
                             .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                     } header: { Text("Launch arguments") }
                 }
@@ -3050,12 +3272,16 @@ struct RuntimeMemorySyncSettings: View {
     /// The keys this section owns; All settings leaves them out.
     static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync",
                                             "env.MADEIRA_FASTSYNC", "eco"]
-    static let poolChoices = [0, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
-    static let vramChoices = [0, 1536, 2048, 3072, 4096, 4352, 4608, 5120, 6144]   // 0 = automatic
+    // ml1241: 256 (the launch's lower bound) for the pool, 512 and 1024 for video memory
+    // (winemetal accepts vram-mb >= 256), at the user's request.
+    static let poolChoices = [0, 256, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
+    static let vramChoices = [0, 512, 1024, 1536, 2048, 3072, 4096, 4352, 4608, 5120, 6144]   // 0 = automatic
     static let swapChoices = [0, 1024, 2048, 3072, 4096]
-    /// The stored value "" (no key) and "classic" are the same rules.
+    /// The stored value "" (no key) and "classic" are the same rules, unless
+    /// madeira.cfg has swap-mode = 2 (then no key means broad, ml1257).
     static let coverageChoices: [(String, String)] = [
         ("", "Large allocations (8 MB+)"), ("blocks", "All allocations of 1 MB+"), ("wide", "1 MB+ and overflow"),
+        ("broad", "Whole reservations 4 MB+ (broad)"),
     ]
     @State private var poolMB = Self.intKey("pool")
     @State private var vramMB = Self.intKey("vram-mb")
@@ -3069,8 +3295,12 @@ struct RuntimeMemorySyncSettings: View {
     static func intKey(_ key: String) -> Int { Int(MadeiraConfig.get(key) ?? "") ?? 0 }
     static func currentCoverage() -> String {
         let v = (MadeiraConfig.get("env.MADEIRA_SWAP_COVERAGE") ?? "").lowercased()
+        if v.isEmpty { return swapModeBroad ? "broad" : "" }
         return v == "classic" ? "" : v
     }
+    /// ml1257: madeira.cfg swap-mode = 2 selects broad coverage when
+    /// env.MADEIRA_SWAP_COVERAGE is unset (virtual_ios.c ios_swap_config).
+    static var swapModeBroad: Bool { (Int(MadeiraConfig.get("swap-mode") ?? "") ?? 1) >= 2 }
     static func gb(_ mb: Int) -> String {
         String(format: "%g GB", Double(mb) / 1024)   // 1.5, 4, 4.25 ...
     }
@@ -3097,7 +3327,8 @@ struct RuntimeMemorySyncSettings: View {
                      zero: "Off", label: Self.gb)
             Picker("Swap coverage", selection: Binding(get: { coverage }, set: { mode in
                 coverage = mode; changed = true
-                MadeiraConfig.set("env.MADEIRA_SWAP_COVERAGE", mode.isEmpty ? nil : mode)
+                // With swap-mode = 2 no key means broad, so classic is written out.
+                MadeiraConfig.set("env.MADEIRA_SWAP_COVERAGE", mode.isEmpty ? (Self.swapModeBroad ? "classic" : nil) : mode)
                 LogStore.shared.log("[runtime-settings] swap-coverage=\(mode.isEmpty ? "classic" : mode)")
             })) {
                 ForEach(Self.coverageChoices, id: \.0) { Text($0.1).tag($0.0) }
@@ -3447,6 +3678,10 @@ struct LibraryHUD: View {
                     ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
                     if model.controllerMode == "keys" {
                         Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
+                    } else if model.controllerMode == "dinput" {
+                        // ml1240: the DirectInput device exists only from the launch on.
+                        Text("XInput and DirectInput applies to the next launch.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
@@ -3473,7 +3708,7 @@ struct LibraryHUD: View {
                 Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "RAM", "Battery", "Thermal"], id: \.self) { field in
+                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Battery", "Thermal"], id: \.self) { field in
                         Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
@@ -3550,16 +3785,27 @@ struct LibraryMetrics: View {
     /// iOS lowers clocks from .serious on, so a frame rate that sags after a few
     /// minutes can be told apart from one the game or the runtime caused.
     @State private var thermal = ProcessInfo.processInfo.thermalState
+    @State private var cpuMeter = CPUMeter()
+    @State private var cpu: (total: Double, top: Double)?
+    @State private var lastGPUBusy = 0.0
+    @State private var lastGPUBuffers: UInt64 = 0
+    @State private var gpu = -1.0
+    @State private var gpuFrameMs = 0.0
     private let ticks = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     var body: some View {
         Text(parts.joined(separator: "  ·  "))
             .font(.caption.monospacedDigit().weight(.medium)).padding(.horizontal, 12).padding(.vertical, 8)
             .background(.black.opacity(0.8), in: Capsule()).foregroundStyle(.white)
-            .onAppear { lastCount = madeira_get_present_count(); lastTime = Date(); UIDevice.current.isBatteryMonitoringEnabled = true }
-            .onDisappear { UIDevice.current.isBatteryMonitoringEnabled = false }
+            .onAppear {
+                lastCount = madeira_get_present_count(); lastTime = Date(); UIDevice.current.isBatteryMonitoringEnabled = true
+                applyGPUMeter()
+            }
+            .onDisappear { UIDevice.current.isBatteryMonitoringEnabled = false; madeira_gpu_meter_enable(0) }
+            .onChange(of: model.overlayFields) { _, _ in applyGPUMeter() }
             .onReceive(ticks) { now in
                 let count = madeira_get_present_count(); let dt = now.timeIntervalSince(lastTime)
-                fps = count >= lastCount ? Double(count - lastCount) / max(0.001, dt) : 0; lastCount = count; lastTime = now
+                let frames = count >= lastCount ? count - lastCount : 0
+                fps = Double(frames) / max(0.001, dt); lastCount = count; lastTime = now
                 var info = task_vm_info_data_t(); var size = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
                 let result = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &size) } }
                 if result == KERN_SUCCESS { memory = Int(info.phys_footprint / 1048576) }
@@ -3569,12 +3815,33 @@ struct LibraryMetrics: View {
                     LogStore.shared.log("[thermal] \(DeviceLoadDiagnostics.thermalName(thermal)) -> \(DeviceLoadDiagnostics.thermalName(state)) at \(String(format: "%.0f", fps)) FPS")
                     thermal = state
                 }
+                if model.overlayFields.contains("CPU") { cpu = cpuMeter.sample() }
+                if model.overlayFields.contains("GPU") {
+                    let busy = madeira_gpu_meter_busy_seconds(), buffers = madeira_gpu_meter_cmdbufs()
+                    let used = max(0, busy - lastGPUBusy)
+                    gpu = buffers > lastGPUBuffers ? min(100, used / max(0.001, dt) * 100) : -1
+                    gpuFrameMs = frames > 0 ? used * 1000 / Double(frames) : 0
+                    lastGPUBusy = busy; lastGPUBuffers = buffers
+                }
             }
+    }
+    /// ml1174: command buffers get a GPU-time handler only while GPU is shown.
+    private func applyGPUMeter() {
+        madeira_gpu_meter_enable(model.overlayFields.contains("GPU") ? 1 : 0)
+        lastGPUBusy = madeira_gpu_meter_busy_seconds(); lastGPUBuffers = madeira_gpu_meter_cmdbufs(); gpu = -1
     }
     private var parts: [String] {
         var result: [String] = []
         if model.overlayFields.contains("FPS") { result.append(String(format: "%.0f FPS", fps)) }
         if model.overlayFields.contains("Frame time") { result.append(fps > 0 ? String(format: "%.1f ms avg", 1000 / fps) : "— ms") }
+        if model.overlayFields.contains("CPU") {
+            result.append(cpu.map { String(format: "CPU %.0f%% (top %.0f%%)", $0.total, $0.top) } ?? "CPU —")
+        }
+        if model.overlayFields.contains("GPU") {
+            if gpu < 0 { result.append("GPU —") }
+            else if gpuFrameMs > 0 { result.append(String(format: "GPU %.0f%% (%.1f ms)", gpu, gpuFrameMs)) }
+            else { result.append(String(format: "GPU %.0f%%", gpu)) }
+        }
         if model.overlayFields.contains("RAM") { result.append("\(memory) MB") }
         if model.overlayFields.contains("Battery"), battery >= 0 { result.append("\(battery)%") }
         if model.overlayFields.contains("Thermal") {
@@ -3587,6 +3854,61 @@ struct LibraryMetrics: View {
             }
         }
         return result
+    }
+}
+
+/// ml1174: CPU load for the performance overlay, from the process's thread
+/// times. `total` is the CPU time since the previous sample as a share of all
+/// cores; `top` is the busiest thread's share of one core, which shows a game
+/// held back by one thread while the total stays low.
+final class CPUMeter {
+    private var last: [UInt64: Double] = [:]
+    private var lastWall = 0.0
+    private let cores = Double(max(1, ProcessInfo.processInfo.activeProcessorCount))
+
+    /// nil on the first call, and when the threads cannot be read.
+    func sample() -> (total: Double, top: Double)? {
+        var list: thread_act_array_t?
+        var count: mach_msg_type_number_t = 0
+        guard task_threads(mach_task_self_, &list, &count) == KERN_SUCCESS, let list else { return nil }
+        defer {
+            vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: list)),
+                          vm_size_t(Int(count) * MemoryLayout<thread_t>.stride))
+        }
+        let wall = CACurrentMediaTime()
+        var now: [UInt64: Double] = [:]
+        var sum = 0.0, top = 0.0
+        for i in 0..<Int(count) {
+            let thread = list[i]
+            defer { mach_port_deallocate(mach_task_self_, thread) }
+            var ident = thread_identifier_info_data_t()
+            var identCount = mach_msg_type_number_t(MemoryLayout<thread_identifier_info_data_t>.size / MemoryLayout<natural_t>.size)
+            var basic = thread_basic_info_data_t()
+            var basicCount = mach_msg_type_number_t(MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<natural_t>.size)
+            let identResult = withUnsafeMutablePointer(to: &ident) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(identCount)) {
+                    thread_info(thread, thread_flavor_t(THREAD_IDENTIFIER_INFO), $0, &identCount)
+                }
+            }
+            let basicResult = withUnsafeMutablePointer(to: &basic) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(basicCount)) {
+                    thread_info(thread, thread_flavor_t(THREAD_BASIC_INFO), $0, &basicCount)
+                }
+            }
+            guard identResult == KERN_SUCCESS, basicResult == KERN_SUCCESS else { continue }
+            let seconds = Double(basic.user_time.seconds + basic.system_time.seconds)
+                + Double(basic.user_time.microseconds + basic.system_time.microseconds) / 1e6
+            now[ident.thread_id] = seconds
+            if let before = last[ident.thread_id] {
+                let used = max(0, seconds - before)
+                sum += used; top = max(top, used)
+            }
+        }
+        let interval = wall - lastWall
+        let first = last.isEmpty
+        last = now; lastWall = wall
+        guard !first, interval > 0 else { return nil }
+        return (min(100, sum / interval / cores * 100), min(100, top / interval * 100))
     }
 }
 

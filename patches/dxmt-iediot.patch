@@ -16,10 +16,10 @@ index 56ba86e..fa086b5 100644
  
  template <partitioning partition>
 diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
-index 701e163..50d72ba 100644
+index 1e2a92f..6be6b6e 100644
 --- a/src/d3d11/d3d11_context_impl.cpp
 +++ b/src/d3d11/d3d11_context_impl.cpp
-@@ -608,6 +608,15 @@ inline std::atomic<uint32_t> g_bc_stream_fail{0};
+@@ -609,6 +609,15 @@ inline std::atomic<uint32_t> g_bc_stream_fail{0};
   * clamp is enabled means no clamped texture was ever streamed to. */
  inline std::atomic<uint32_t> g_bc_clamp_xlated{0};
  inline std::atomic<uint32_t> g_bc_clamp_dropped{0};
@@ -35,7 +35,7 @@ index 701e163..50d72ba 100644
  /* ml746: COPY-PATH clamp accounting. CopySubresourceRegion never translated mip
   * indices, so every copy touching a clamped texture landed on the wrong level --
   * invisible in the menu (0 copies) and severe in gameplay (1,860). Classified by
-@@ -3639,6 +3648,13 @@ public:
+@@ -3779,6 +3788,13 @@ public:
       * so they take bias 0, which is what we want. Drop only when a requested
       * logical level sits below its own texture's bias -- it does not exist. */
      {
@@ -49,7 +49,7 @@ index 701e163..50d72ba 100644
        uint32_t src_bias = 0, dst_bias = 0;
        if (auto t = GetTexture(cmd.pSrc)) src_bias = t->mipBias();
        if (auto t = GetTexture(cmd.pDst)) dst_bias = t->mipBias();
-@@ -4049,6 +4065,13 @@ public:
+@@ -4302,6 +4318,13 @@ public:
         *
         * Without this every streamed update would land on the wrong mip, which is
         * worse than not clamping at all. */
@@ -63,7 +63,7 @@ index 701e163..50d72ba 100644
        const uint32_t mip_bias = dst->mipBias();
        if (mip_bias) {
          if (cmd.Dst.MipLevel < mip_bias) {
-@@ -4175,6 +4198,13 @@ public:
+@@ -4496,6 +4519,13 @@ public:
         *
         * Without this every streamed update would land on the wrong mip, which is
         * worse than not clamping at all. */
@@ -628,12 +628,12 @@ index 0000000..718dc30
 +
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
-index c88ff4d..71a5dad 100644
+index 849641d..a02cc89 100644
 --- a/src/dxmt/dxmt_texture.hpp
 +++ b/src/dxmt/dxmt_texture.hpp
-@@ -187,6 +187,13 @@ public:
-   uint32_t mipBias() const { return mip_bias_; }
-   void setMipBias(uint32_t bias) { mip_bias_ = bias; }
+@@ -206,6 +206,13 @@ public:
+     return viewDescriptors_[view].firstMiplevel;
+   }
  
 +  /* ml2100: the physical texture is the logical one at half width and height
 +   * (a single-level BC texture halved in the compressed domain, see
@@ -645,10 +645,10 @@ index c88ff4d..71a5dad 100644
    WMTTextureType
    textureType(TextureViewKey view) {
      std::shared_lock<dxmt::shared_mutex> lock(mutex_);
-@@ -290,6 +297,7 @@ private:
- 
-   WMTTextureInfo info_;
+@@ -311,6 +318,7 @@ private:
    uint32_t mip_bias_ = 0;          /* ml745, see mipBias() */
+   std::atomic<uint32_t> lost_levels_{0}; /* ml1252, see lostLevels() */
+   std::atomic<uint32_t> level_gen_[16] = {}; /* ml1256, see levelGen() */
 +  bool downscaled_ = false;        /* ml2100, see downscaled() */
    unsigned bytes_per_image_ = 0;
    unsigned bytes_per_row_ = 0;

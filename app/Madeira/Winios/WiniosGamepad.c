@@ -8,6 +8,13 @@
  * covers only a 20-byte snapshot, never framework work or a Wine server call. */
 static pthread_mutex_t pad_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct winios_gamepad pads[WINIOS_GAMEPAD_MAX];
+/* The game polls this snapshot (XInputGetState), typically once a frame. A
+ * tap shorter than one frame (50 ms at 20 fps) used to press and release
+ * between two reads and never reach the game, so mashing a touch button lost
+ * most presses. `seen` is what the last read reported; a button released
+ * before any read saw it goes into `latched` and is reported held for one
+ * read. */
+static uint16_t seen[WINIOS_GAMEPAD_MAX], latched[WINIOS_GAMEPAD_MAX];
 
 void winios_gamepad_set_state(int index, const struct winios_gamepad *state)
 {
@@ -19,6 +26,8 @@ void winios_gamepad_set_state(int index, const struct winios_gamepad *state)
         memset(next.reserved, 0, sizeof(next.reserved));
     }
     pthread_mutex_lock(&pad_lock);
+    latched[index] |= pads[index].buttons & ~next.buttons & ~seen[index];
+    if (!next.connected) latched[index] = 0;
     next.packet = pads[index].packet;
     if (memcmp(&next, &pads[index], sizeof(next))) {
         next.packet++;
@@ -33,6 +42,13 @@ int winios_gamepad_get_state(int index, struct winios_gamepad *out)
     if (index >= 0 && index < WINIOS_GAMEPAD_MAX) {
         pthread_mutex_lock(&pad_lock);
         value = pads[index];
+        if (latched[index]) {
+            value.buttons |= latched[index];
+            latched[index] = 0;
+            /* The next read shows the release: give it its own packet number. */
+            pads[index].packet++;
+        }
+        seen[index] = value.buttons;
         pthread_mutex_unlock(&pad_lock);
     }
     if (out) {

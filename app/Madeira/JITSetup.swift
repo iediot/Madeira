@@ -12,10 +12,12 @@ final class JITCoordinator: ObservableObject {
 
     enum CoordinatorError: LocalizedError {
         case setupRequired(String)
+        case cancelled
 
         var errorDescription: String? {
             switch self {
             case .setupRequired(let message): return message
+            case .cancelled: return "Enabling JIT was cancelled."
             }
         }
     }
@@ -24,6 +26,25 @@ final class JITCoordinator: ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var status: String?
     @Published private(set) var error: String?
+    /// The completions of the request waiting for StikDebug; nil when none is.
+    private var pendingEnable: ((Result<Void, Error>) -> Void)?
+    /// The request in progress; cancel() moves it on so a late answer is ignored.
+    private var generation = 0
+
+    /// Still waiting for StikDebug to attach (the overlay offers Cancel then).
+    var waitingForStikDebug: Bool { busy && pendingEnable != nil && status == "Waiting for StikDebug…" }
+
+    /// Give up waiting for StikDebug (the overlay's Cancel). A debugger that
+    /// attaches later is still used: the next Play takes the pool then.
+    func cancel() {
+        guard waitingForStikDebug else { return }
+        generation += 1
+        busy = false
+        status = nil
+        let waiting = pendingEnable
+        pendingEnable = nil
+        waiting?(.failure(CoordinatorError.cancelled))
+    }
 
     private init() {}
 
@@ -37,7 +58,23 @@ final class JITCoordinator: ObservableObject {
         if StikJITHelper.ready {
             // Attached but no pool yet (JIT enabled before this build, or a retry):
             // take it now while the debugger is here.
-            StikJITHelper.preparePoolNow(completion: completion)
+            guard !StikJITHelper.poolTaken else { completion(.success(())); return }
+            busy = true
+            status = "Setting up JIT memory…"
+            StikJITHelper.preparePoolNow { [weak self] pooled in
+                self?.busy = false
+                if case .failure(let failure) = pooled { self?.error = failure.localizedDescription }
+                completion(pooled)
+            }
+            return
+        }
+        // A request is already waiting for StikDebug (Play tapped again): open
+        // StikDebug again, but wait for the same attach. Two waiters both took a
+        // JIT pool when StikDebug attached, and the second one's BAD POOL ended
+        // the game ten seconds in.
+        if let waiting = pendingEnable {
+            pendingEnable = { result in waiting(result); completion(result) }
+            StikJITHelper.enableJIT(wait: false) { _ in }
             return
         }
         error = nil
@@ -62,13 +99,23 @@ final class JITCoordinator: ObservableObject {
             if bgTask != .invalid { app.endBackgroundTask(bgTask); bgTask = .invalid }
         }
         bgTask = app.beginBackgroundTask(withName: "madeira.jit") { endBackground() }
+        pendingEnable = completion
+        generation += 1
+        let request = generation
+        let finish: (Result<Void, Error>) -> Void = { [weak self] result in
+            let waiting = self?.pendingEnable ?? completion
+            self?.pendingEnable = nil
+            waiting(result)
+        }
         StikJITHelper.enableJIT { [weak self] result in
             Task { @MainActor in
+                // Cancelled from the overlay: that already finished this request.
+                guard self?.generation == request else { endBackground(); return }
                 guard case .success = result else {
                     self?.busy = false
                     if case .failure(let failure) = result { self?.error = failure.localizedDescription }
                     endBackground()
-                    completion(result)
+                    finish(result)
                     return
                 }
                 self?.status = "Setting up JIT memory…"
@@ -79,10 +126,45 @@ final class JITCoordinator: ObservableObject {
                     case .failure(let failure): self?.error = failure.localizedDescription
                     }
                     endBackground()
-                    completion(pooled)
+                    finish(pooled)
                 }
             }
         }
+    }
+}
+
+/// Shown over the whole app from the moment JIT is requested until it is ready, so
+/// the seconds Madeira spends waiting for StikDebug and then frozen while the
+/// debugger sets up the JIT memory read as work in progress, not a hang.
+struct JITProgressOverlay: View {
+    @ObservedObject private var coordinator = JITCoordinator.shared
+
+    var body: some View {
+        ZStack {
+            if coordinator.busy { card }
+        }
+        .animation(.easeInOut(duration: 0.2), value: coordinator.busy)
+    }
+
+    private var card: some View {
+        ZStack {
+            Color.black.opacity(0.35).ignoresSafeArea()
+            VStack(spacing: 12) {
+                ProgressView().controlSize(.large)
+                Text("Enabling JIT").font(.headline)
+                if let status = coordinator.status {
+                    Text(status).font(.subheadline).foregroundStyle(.secondary)
+                }
+                if coordinator.waitingForStikDebug {
+                    Button("Cancel") { coordinator.cancel() }.padding(.top, 4)
+                }
+            }
+            .multilineTextAlignment(.center)
+            .padding(24)
+            .frame(minWidth: 220)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+        }
+        .transition(.opacity)
     }
 }
 

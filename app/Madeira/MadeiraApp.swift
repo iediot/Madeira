@@ -6,6 +6,7 @@ struct MadeiraApp: App {
         WindowGroup {
             ContentView()
                 .modifier(ClaimGamepadEvents())
+                .overlay { JITProgressOverlay() }
                 .onAppear {
                     GamepadInput.shared.start()
                     HardwareInput.shared.start()
