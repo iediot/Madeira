@@ -2476,6 +2476,19 @@ static void monitor_get_info( struct monitor *monitor, MONITORINFO *info, UINT d
     {
         char buffer[CCHDEVICENAME];
         if (monitor->source) snprintf( buffer, sizeof(buffer), "\\\\.\\DISPLAY%d", monitor->source->id + 1 );
+#ifdef WINE_IOS
+        /* iOS-Madeira 2026-09-16 (125hz, 7bea34c; MADEIRA port: virtual-monitor-name): the
+         * virtual monitor has no source, and upstream's sourceless name is "WinDisc" --
+         * Windows' name for a DISCONNECTED monitor. Everything that goes looking for a
+         * display by name gets that string from GetMonitorInfo and then asks about it:
+         * DXMT's win32 wsi does GetMonitorInfoW -> EnumDisplaySettingsW(szDevice), wined3d
+         * compares an output's name against EnumDisplayDevices', and GLFW keeps a monitor
+         * handle only when szDevice matches the adapter name (without it, a full-screen
+         * GLFW window is fitted to an empty rect: Geometry Dash got a 0x0 window). This
+         * driver advertises exactly one adapter, "\\.\DISPLAY1"; say so here too.
+         * (Comparing against &virtual_monitor: display_lock is already held here.) */
+        else if (monitor == &virtual_monitor) strcpy( buffer, "\\\\.\\DISPLAY1" );
+#endif
         else strcpy( buffer, "WinDisc" );
         asciiz_to_unicode( ((MONITORINFOEXW *)info)->szDevice, buffer );
     }

@@ -394,7 +394,7 @@ index b2eca70..20f05fb 100644
  
  static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
 diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
-index 5e07b36..b2d8b9e 100644
+index 5e07b36..bfa0f52 100644
 --- a/Source/Windows/ARM64EC/IosJitAlias.cpp
 +++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
 @@ -32,7 +32,15 @@ struct IosAliasEntry {
@@ -414,18 +414,14 @@ index 5e07b36..b2d8b9e 100644
  
  // extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
  // can reach the table via adrp/:lo12: — it translates the branch target
-@@ -363,6 +371,14 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+@@ -363,6 +371,10 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
  
    int count = g_EntryCount;
  
-+  {
-+    static int announced = 0;
-+    if (!announced) {
-+      announced = 1;
-+      LogMan::Msg::EFmt("[jit-alias] ml1201 alias table capacity {} entries", kMaxEntries);
-+    }
-+  }
-+
++  /* No logging here: this is also called from native Madeira code (ios_push_subfloor_window,
++   * the alias catch-up loop) on threads without a Windows TEB, where FEX's log output reaches
++   * Win32 file APIs with no TEB -- the "alias table capacity" line from the 2048-entry port
++   * crashed every 64-bit Dock launch in NtCreateFile (ObjectName = 3). */
    // Identical re-registration: nothing to do.
    for (int i = 0; i < count; i++) {
      if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {

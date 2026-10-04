@@ -27,16 +27,47 @@ enum MadeiraConfig {
         "jumbo-mb", "jumbo-keep-mb", "iat-noexec", "vmwatch", "no-local-read", "vsps-fill",
     ]
 
-    static var documents: URL? {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-    }
-    static var url: URL? { documents?.appendingPathComponent(fileName) }
-    static var present: Bool { url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
+    static let documents: URL? = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    static let url: URL? = documents?.appendingPathComponent(fileName, isDirectory: false)
+    static var present: Bool { snapshot().present }
 
     /// All key/value pairs of madeira.cfg (empty when the file is absent).
-    static func all() -> [String: String] {
-        guard let u = url, let text = try? String(contentsOf: u, encoding: .utf8) else { return [:] }
-        return parse(text)
+    static func all() -> [String: String] { snapshot().values }
+
+    /* The parsed file, re-checked against the disk at most once a second.
+     *
+     * Every get/flag used to stat, read and parse the file, and SwiftUI bodies call
+     * them while drawing (the Steam games list asks whether Cloud saves are on), so
+     * the main thread did file I/O on every redraw. Two crash reports were watchdog
+     * kills (0x8BADF00D "failed to terminate gracefully") with the main thread in
+     * lstat under MadeiraConfig.all(). A change made from outside (Files, a Mac) is
+     * picked up within a second; Madeira's own writes invalidate at once. */
+    private static let cacheLock = NSLock()
+    private static var cacheValues: [String: String] = [:]
+    private static var cachePresent = false
+    private static var cacheStamp: (Date?, Int)? = nil   // modification date, size
+    private static var cacheCheckedAt: TimeInterval = 0
+
+    private static func snapshot() -> (present: Bool, values: [String: String]) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - cacheCheckedAt < 1.0, cacheStamp != nil { return (cachePresent, cacheValues) }
+        cacheCheckedAt = now
+        guard let u = url, let attrs = try? FileManager.default.attributesOfItem(atPath: u.path) else {
+            cachePresent = false; cacheValues = [:]; cacheStamp = (nil, -1)
+            return (false, [:])
+        }
+        let stamp = (attrs[.modificationDate] as? Date, (attrs[.size] as? Int) ?? -1)
+        if let old = cacheStamp, old.0 == stamp.0, old.1 == stamp.1, cachePresent { return (true, cacheValues) }
+        cacheValues = (try? String(contentsOf: u, encoding: .utf8)).map(parse) ?? [:]
+        cachePresent = true
+        cacheStamp = stamp
+        return (true, cacheValues)
+    }
+
+    /// Forget the cached file: the next read goes to disk. Called after every write.
+    static func invalidate() {
+        cacheLock.lock(); cacheStamp = nil; cacheCheckedAt = 0; cacheLock.unlock()
     }
 
     /// The key/value pairs of text in madeira.cfg's syntax, the last line winning.
@@ -96,6 +127,7 @@ enum MadeiraConfig {
         }
         try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
         try (text.hasSuffix("\n") ? text : text + "\n").write(to: u, atomically: true, encoding: .utf8)
+        invalidate()
         setenv("MADEIRA_CFG_GAME", u.path, 1)
         return pairs
     }
@@ -124,6 +156,7 @@ enum MadeiraConfig {
         }
         if let value { lines.append("\(key) = \(value)") }
         let out = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
+        defer { invalidate() }
         do { try out.write(to: u, atomically: true, encoding: .utf8); return true } catch { return false }
     }
 
@@ -170,6 +203,7 @@ enum MadeiraConfig {
         guard !migrated.isEmpty else { return [] }
         do {
             try (lines.joined(separator: "\n") + "\n").write(to: u, atomically: true, encoding: .utf8)
+            invalidate()
             log("madeira.cfg written from legacy files (\(migrated.joined(separator: ", "))); the madeira-*.txt files are now ignored and can be deleted")
         } catch {
             log("madeira.cfg could not be written: \(error)")

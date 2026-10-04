@@ -85,8 +85,16 @@ actor SteamConnection {
         task.resume()
 
         // Verify the connection completed (WebSocket handshake + ping round-trip)
+        // URLSession can call a ping's handler a second time (with an error) when the task is
+        // cancelled after the pong; resuming a continuation twice is a fatal error, which crashed
+        // the app from the NSURLSession delegate queue. Only the first call resumes.
+        let once = LogonResumeGuard()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             task.sendPing { error in
+                guard once.claim() else {
+                    SteamLog.trace("WS ping handler called again\(error.map { ": \($0.localizedDescription)" } ?? "") -- ignored")
+                    return
+                }
                 if let error {
                     cont.resume(throwing: SteamError.connectionFailed(error.localizedDescription))
                 } else {

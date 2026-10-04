@@ -51,11 +51,23 @@ final class JITCoordinator: ObservableObject {
         }
         busy = true
         status = "Waiting for StikDebug…"
+        // Keep running while StikDebug has the screen. Without this iOS suspends Madeira the
+        // moment StikDebug opens, so the attach is only noticed -- and the JIT pool only
+        // prepared -- once the user comes back, by which time StikDebug is in the background
+        // and throttled: preparing 448 MB then took up to 8.3 s with Madeira frozen. With
+        // background time the preparation starts while StikDebug is still in front.
+        let app = UIApplication.shared
+        var bgTask = UIBackgroundTaskIdentifier.invalid
+        let endBackground = {
+            if bgTask != .invalid { app.endBackgroundTask(bgTask); bgTask = .invalid }
+        }
+        bgTask = app.beginBackgroundTask(withName: "madeira.jit") { endBackground() }
         StikJITHelper.enableJIT { [weak self] result in
             Task { @MainActor in
                 guard case .success = result else {
                     self?.busy = false
                     if case .failure(let failure) = result { self?.error = failure.localizedDescription }
+                    endBackground()
                     completion(result)
                     return
                 }
@@ -66,6 +78,7 @@ final class JITCoordinator: ObservableObject {
                     case .success: self?.status = "JIT is ready."
                     case .failure(let failure): self?.error = failure.localizedDescription
                     }
+                    endBackground()
                     completion(pooled)
                 }
             }

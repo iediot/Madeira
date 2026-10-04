@@ -236,16 +236,6 @@ class SteamSession {
     /// ClientLoggedOff, the send-error path, and the 20s timeout can each reach
     /// the continuation; without this the timeout double-resumed and crashed
     /// (CheckedContinuation traps on a second resume). Exactly one resume wins.
-    private final class LogonResumeGuard: @unchecked Sendable {
-        private let lock = NSLock()
-        private var done = false
-        func claim() -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            if done { return false }
-            done = true
-            return true
-        }
-    }
 
     func loginWithToken(accessToken: String, accountName: String) async throws {
         guard await connection.isConnected else {
@@ -587,8 +577,11 @@ class SteamSession {
                 do {
                     try await connection.send(data)
                 } catch {
-                    pendingJobs.removeValue(forKey: jobID)
-                    continuation.resume(throwing: error)
+                    // Only if nothing else (timeout, reply, lost connection) resumed it first:
+                    // a second resume is a fatal error.
+                    if pendingJobs.removeValue(forKey: jobID) != nil {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
 
@@ -890,5 +883,19 @@ extension Data {
         guard decompressedSize > 0 else { return nil }
         outputBuffer.count = decompressedSize
         return outputBuffer
+    }
+}
+
+/// A one-shot latch for completion handlers that can fire more than once (a logon
+/// response racing its timeout, a WebSocket ping handler called again on cancel):
+/// claim() is true exactly once, so a continuation is resumed at most once.
+final class LogonResumeGuard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
     }
 }

@@ -8,10 +8,19 @@ changes to them are kept here and applied on top (`git -C FEX apply --3way
 
 - `fex-iediot.patch`: folded L1 lookup index (ml2111), `[lookup-stats]` (ml2110,
   `env.MADEIRA_FEX_LOOKUP_STATS = 1`), iOS host build guards, and the ARM64EC
-  JIT alias table grown from 256 to 2048 entries (ml1201, from vcvkk's fork:
+  JIT alias table grown from 256 to 2048 entries (ml1201, from vcvkk's fork, without
+  its log line, which crashed when called from native code without a TEB:
   steam.exe + webhelper + a game filled 256 and the game crashed at load).
 - `dxmt-iediot.patch`: single-level texture halving for BC1/BC3, RGBA8 and R8/A8
   at any size (ml2100/2101/2113), texture census, Metal 4 atomic fix.
 
 Regenerate both after editing a submodule; `dxmt_bcn_downscale.hpp` is a new
 file, so add it with `git -C dxmt add -N` before `git -C dxmt diff`.
+
+- `wine-opengl-winios.patch` (from c-gow's fork): opengl32 for iOS -- 32-bit
+  guest-pointer conversion in the generated wow64 thunks, OpenGL ES context
+  handling, a GL_EXTENSIONS cap for old 32-bit games, and a normal ARM64EC
+  image base. Apply with `git -C wine apply ../patches/wine-opengl-winios.patch`,
+  then rebuild `build/ntdll-unix/build.sh` (opengl32's unix side) and
+  `make -C wine/build-arm64ec dlls/opengl32/arm64ec-windows/opengl32.dll`
+  (Homebrew bison first in PATH), strip it, copy to app/Madeira/arm64ec-windows/.

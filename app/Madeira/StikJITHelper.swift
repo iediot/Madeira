@@ -151,10 +151,17 @@ enum StikJITHelper {
         // whether a debugger is attached now. The handler cannot take a BRK away
         // from an attached debugger, which sees the exception first, so a wrong
         // reading costs nothing.
-        if !debuggerAttached && MadeiraConfig.flag("MADEIRA_JIT_TRAP_FALLBACK") {
+        // Armed whether or not a debugger looks attached. An attached debugger receives the
+        // BRK first (it holds the exception port), so the handler only runs when nobody
+        // answers -- and P_TRACED can still read "attached" while StikDebug is suspended or
+        // dying. 11 of 20 crash reports (Oct 1-3) were this BRK trapping with no handler,
+        // in jit26_prepare_region under allocatePool.
+        if MadeiraConfig.flag("MADEIRA_JIT_TRAP_FALLBACK") {
             jit_arm_trap_fallback()
-            LogStore.shared.log("[jit-debugger] no debugger is attached although CS_DEBUGGED is set: "
-                + "an unanswered pool request now fails the launch instead of crashing the app", level: .error)
+            if !debuggerAttached {
+                LogStore.shared.log("[jit-debugger] no debugger is attached although CS_DEBUGGED is set: "
+                    + "an unanswered pool request now fails the launch instead of crashing the app", level: .error)
+            }
         }
 
         // iOS-Madeira: FEX's dispatcher emit has a position-dependent encoding
