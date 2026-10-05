@@ -6,12 +6,9 @@
 
 **Windows PC games on iPhone and iPad, with no jailbreak**
 
-![iOS](https://img.shields.io/badge/iOS_26-000000?style=flat-sqircle&logo=apple&logoColor=white)
-![iPadOS](https://img.shields.io/badge/iPadOS_26-000000?style=flat-sqircle&logo=apple&logoColor=white)
 ![Swift](https://img.shields.io/badge/Swift-F05138?style=flat-sqircle&logo=swift&logoColor=white)
 ![Wine](https://img.shields.io/badge/Wine-800000?style=flat-sqircle&logo=wine&logoColor=white)
 ![Metal](https://img.shields.io/badge/Metal-555555?style=flat-sqircle&logo=apple&logoColor=white)
-[![Release](https://img.shields.io/github/v/release/iediot/Madeira?style=flat-sqircle&color=brightgreen&label=Release)](https://github.com/iediot/Madeira/releases)
 
 </div>
 
