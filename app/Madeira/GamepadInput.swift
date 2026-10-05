@@ -73,10 +73,16 @@ final class GamepadInput: @unchecked Sendable {
         unsetenv("MADEIRA_HIDPAD"); unsetenv("MADEIRA_HIDPAD_NAME")
         // An earlier session in this app run may have taken player 1 off XInput.
         queue.async { [self] in hidActive = false; hidKeepsXInput = false }
+        // XInput sessions: player 1 is always connected (at rest until the touch or
+        // physical controller publishes), for games that only look once at start.
+        // env.MADEIRA_PAD0_RESIDENT = 0 restores "connected only while publishing".
+        let resident = Self.enabled && Self.flag("MADEIRA_PAD0_RESIDENT")
         guard ["hid", "dualsense", "generic"].contains(mode.value) else {
-            LogStore.shared.log("[hid-pad] ml2100 session mode=xinput source=\(mode.source)")
+            winios_gamepad_set_resident(0, resident ? 1 : 0)
+            LogStore.shared.log("[hid-pad] ml2100 session mode=xinput source=\(mode.source) slot0-resident=\(resident ? 1 : 0)")
             return
         }
+        winios_gamepad_set_resident(0, 0)
         guard Self.enabled else {
             LogStore.shared.log("[hid-pad] ml2100 session mode=\(mode.value) ignored: MADEIRA_XINPUT=0 turns every controller off")
             return

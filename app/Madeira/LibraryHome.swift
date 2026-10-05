@@ -72,6 +72,8 @@ struct LibraryShelf<Item: Identifiable, Cell: View, Trailing: View>: View {
                 }
                 .padding(.vertical, 6)
                 .scrollTargetLayout()
+                // New cards are placed at once, never slid in (LibraryCells does the same).
+                .transaction { $0.animation = nil }
             }
             .contentMargins(.horizontal, margin, for: .scrollContent)
             .scrollTargetBehavior(.viewAligned)
@@ -447,6 +449,46 @@ private struct FoldableLabel: LabelStyle {
             configuration.icon
         } else {
             HStack(spacing: 12) { configuration.icon; configuration.title }
+        }
+    }
+}
+
+/// Games the player hid from the library (long press › Hide from library): Steam's
+/// side games (Half-Life 2: Deathmatch and the like) that are proper games to Steam,
+/// so no type filter can tell them apart. Kept in UserDefaults; the Library page's
+/// options menu shows them again.
+final class LibraryHidden: ObservableObject {
+    static let shared = LibraryHidden()
+    private static let keysKey = "madeiraLibraryHidden", showKey = "madeiraLibraryShowHidden"
+    @Published private(set) var keys: Set<String>
+    @Published var showHidden: Bool { didSet { UserDefaults.standard.set(showHidden, forKey: Self.showKey) } }
+
+    private init() {
+        keys = Set(UserDefaults.standard.stringArray(forKey: Self.keysKey) ?? [])
+        showHidden = UserDefaults.standard.bool(forKey: Self.showKey)
+    }
+
+    static func steam(_ id: Int) -> String { "steam-\(id)" }
+    static func epic(_ appName: String) -> String { "epic-\(appName)" }
+
+    func contains(_ key: String) -> Bool { keys.contains(key) }
+    /// Left out of the library (unless hidden games are shown).
+    func hides(_ key: String) -> Bool { !showHidden && keys.contains(key) }
+
+    func toggle(_ key: String) {
+        if keys.contains(key) { keys.remove(key) } else { keys.insert(key) }
+        UserDefaults.standard.set(Array(keys), forKey: Self.keysKey)
+    }
+}
+
+extension View {
+    /// The card's long-press menu: Hide from library, or Show in library for a hidden one.
+    func libraryHideMenu(_ key: String) -> some View {
+        contextMenu {
+            let hidden = LibraryHidden.shared.contains(key)
+            Button(hidden ? "Show in library" : "Hide from library", systemImage: hidden ? "eye" : "eye.slash") {
+                withAnimation(.snappy(duration: 0.25)) { LibraryHidden.shared.toggle(key) }
+            }
         }
     }
 }

@@ -331,10 +331,12 @@ struct SavesSection: View {
                 }
             }
             .disabled(busy)
+            .settingsSeparator()
             Button { importing = true } label: {
                 Label("Restore saves from a backup…", systemImage: "arrow.uturn.backward.circle")
             }
             .disabled(busy)
+            .settingsSeparator()
             if let m = message { Text(m).font(.caption).foregroundStyle(.secondary) }
         } header: {
             Text("Saves")

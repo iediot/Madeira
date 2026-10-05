@@ -36,12 +36,27 @@ void winios_gamepad_set_state(int index, const struct winios_gamepad *state)
     pthread_mutex_unlock(&pad_lock);
 }
 
+static int resident[WINIOS_GAMEPAD_MAX];
+
+void winios_gamepad_set_resident(int index, int on)
+{
+    if (index < 0 || index >= WINIOS_GAMEPAD_MAX) return;
+    pthread_mutex_lock(&pad_lock);
+    resident[index] = !!on;
+    pthread_mutex_unlock(&pad_lock);
+}
+
 int winios_gamepad_get_state(int index, struct winios_gamepad *out)
 {
     struct winios_gamepad value = {0};
     if (index >= 0 && index < WINIOS_GAMEPAD_MAX) {
         pthread_mutex_lock(&pad_lock);
         value = pads[index];
+        /* No controller publishing: a resident slot is a pad at rest. */
+        if (!value.connected && resident[index]) {
+            memset(&value, 0, sizeof(value));
+            value.connected = 1;
+        }
         if (latched[index]) {
             value.buttons |= latched[index];
             latched[index] = 0;

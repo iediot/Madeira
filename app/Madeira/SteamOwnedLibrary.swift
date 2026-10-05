@@ -317,7 +317,10 @@ final class SteamOwnedLibrary: ObservableObject {
         defer { refreshing = false }
         do {
             let apps = try await fetcher.fetchOwnedApps()
-            let games = apps.filter(\.installableOnWindows).map(SteamOwnedGame.init)
+            // Games only: demos (many no longer downloadable), tools, servers and other
+            // applications crowded the library. An installed one still shows (the
+            // install records come from the prefix, not from this list).
+            let games = apps.filter { $0.installableOnWindows && $0.type == .game }.map(SteamOwnedGame.init)
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             owned = games
             libraryUpdated = Date()

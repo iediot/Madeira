@@ -16,6 +16,13 @@ struct EpicArtwork: View {
     @State private var image: UIImage?
     @State private var blurred: UIImage?
 
+    /// The cached cover from the first frame (ArtworkCache keeps it across launches).
+    init(url: URL?, notDownloaded: Bool = false) {
+        self.url = url
+        self.notDownloaded = notDownloaded
+        _image = State(initialValue: url.flatMap { ArtworkCache.cached($0) })
+    }
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
@@ -44,7 +51,7 @@ struct LibrarySourceTag: View {
     let text: String
     var body: some View {
         Text(text)
-            .font(.caption2.weight(.semibold)).lineLimit(1)
+            .font(.caption2.weight(.medium)).lineLimit(1)
             .padding(.horizontal, 5).padding(.vertical, 4)
             .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
             .foregroundStyle(.secondary)
@@ -58,7 +65,7 @@ struct EpicGameCard: View {
     @ObservedObject private var installer = EpicInstaller.shared
 
     /// Neither installed nor downloading: the not-installed face, as Steam's cards.
-    private var notDownloaded: Bool { installer.installed[game.appName] == nil && installer.installs[game.appName] == nil }
+    private var notDownloaded: Bool { installer.installed[game.appName] == nil && !installer.isDownloading(game.appName) }
 
     var body: some View {
         Group {
@@ -111,10 +118,27 @@ struct EpicGameCard: View {
         }
     }
 
-    private var tags: some View {
-        HStack(spacing: 4) {
-            LibrarySourceTag(text: "Epic")
-            LibrarySourceTag(text: installer.installed[game.appName] == nil ? "Not installed" : "Installed")
+    /// The same pills as a Steam card: once installed the store and the format pills of
+    /// any library game (bits, graphics API, size), otherwise the store and the state.
+    @ViewBuilder private var tags: some View {
+        if !installer.isDownloading(game.appName), let entry = installer.entry(game.appName) {
+            LibraryBadges(entry: entry, store: "Epic").foregroundStyle(.secondary)
+        } else {
+            HStack(spacing: 4) {
+                LibrarySourceTag(text: state)
+                LibrarySourceTag(text: "Epic")
+            }
+        }
+    }
+
+    /// Steam's wording for the same states (SteamGamesRules.Status.badge).
+    private var state: String {
+        guard let download = installer.installs[game.appName]?.download else { return "Not installed" }
+        switch download.state {
+        case .queued: return "Waiting"
+        case .active: return "Downloading \(Int(download.progress.fraction * 100))%"
+        case .paused: return "Paused"
+        case .failed: return "Download failed"
         }
     }
 }
@@ -131,6 +155,7 @@ struct EpicGamesSection: View {
     @ObservedObject private var library = EpicLibrary.shared
     @ObservedObject private var auth = EpicAuth.shared
     @ObservedObject private var installer = EpicInstaller.shared
+    @ObservedObject private var hidden = LibraryHidden.shared
     @State private var selected: EpicGame?
 
     /// Whether the library has Epic games to show at all.
@@ -141,6 +166,7 @@ struct EpicGamesSection: View {
         let known = Set(games.map(\.appName))
         games += installer.installed.values.map(\.game).filter { !known.contains($0.appName) }
         return games.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) }
+            .filter { !hidden.hides(LibraryHidden.epic($0.appName)) }
             .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
     }
 
@@ -168,102 +194,123 @@ struct EpicGamesSection: View {
         .sheet(item: $selected) { game in EpicGameSheet(game: game, open: open) }
     }
 
+    /// An installed game opens its Game details page directly, as Steam's do; any other
+    /// opens its install page.
+    private func openOrShow(_ game: EpicGame) {
+        if !installer.isDownloading(game.appName), let entry = installer.entry(game.appName) { open(entry) }
+        else { selected = game }
+    }
+
     private func card(_ game: EpicGame, list: Bool) -> some View {
-        Button { selected = game } label: { EpicGameCard(game: game, list: list) }
+        Button { openOrShow(game) } label: { EpicGameCard(game: game, list: list) }
             .libraryCardButtonStyle(grid: !list)
+            .libraryHideMenu(LibraryHidden.epic(game.appName))
     }
 }
 
-/// An Epic game's page: the wide store art, its cover over the art's lower edge with
-/// the name beside it, and the same download status as Steam's game page.
+/// An Epic game's install page, laid out exactly as Steam's (SteamGameSheet): the cover
+/// with the name and one action (Install, Pause, Resume, Try again, Open) over the blurred
+/// art, the download, the sizes beside the free space, then the store link.
 struct EpicGameSheet: View {
     let game: EpicGame
+    /// Opens the installed game's Game details page (after this sheet closes).
     var open: (LibraryEntry) -> Void
     @ObservedObject private var installer = EpicInstaller.shared
+    @ObservedObject private var sizes = EpicSizes.shared
     @Environment(\.dismiss) private var dismiss
-    @State private var confirmUninstall = false
     @State private var confirmCancel = false
-
-    private func show(_ entry: LibraryEntry) {
-        dismiss()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { open(entry) }
-    }
-
-    @ViewBuilder private var actions: some View {
-        if let record = installer.installed[game.appName], let entry = installer.entry(game.appName) {
-            Button { show(entry) } label: {
-                Label("Play", systemImage: "play.fill").font(.headline).frame(maxWidth: .infinity, minHeight: 34)
-            }
-            .buttonStyle(LibraryPlayStyle(pending: false))
-            if !record.prereqPath.isEmpty {
-                Button("Install prerequisites", systemImage: "shippingbox") {
-                    var prerequisite = LibraryEntry(title: record.prereqName.isEmpty ? "Prerequisites" : record.prereqName,
-                                                    relativePath: record.installDir + "/" + record.prereqPath.replacingOccurrences(of: "\\", with: "/"), bits: 0)
-                    prerequisite.arguments = record.prereqArgs
-                    show(prerequisite)
-                }
-            }
-            Button("Uninstall", role: .destructive) { confirmUninstall = true }
-        } else if let download = installer.installs[game.appName]?.download {
-            SteamDownloadStatus(download: download)
-            switch download.state {
-            case .active, .queued:
-                Button("Pause", systemImage: "pause.fill") { installer.pause(game.appName) }
-            case .paused, .failed:
-                Button("Resume", systemImage: "arrow.down.circle") { installer.install(game) }
-            }
-            Button("Cancel download", role: .destructive) { confirmCancel = true }
-        } else {
-            EpicSizeRow(game: game)
-            Button { installer.install(game) } label: {
-                Label("Install", systemImage: "icloud.and.arrow.down")
-                    .font(.headline).frame(maxWidth: .infinity, minHeight: 34)
-            }
-            .buttonStyle(LibraryPlayStyle(pending: !installer.ready))
-            .disabled(!installer.ready)
-        }
-        if let error = installer.error { Text(error).font(.footnote).foregroundStyle(.red) }
-    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    VStack(alignment: .leading, spacing: 16) {
-                        EpicArtwork(url: game.heroURL ?? game.artworkURL)
-                            .frame(maxWidth: .infinity).frame(height: 200)
-                            .clipShape(RoundedRectangle(cornerRadius: 20))
-                        HStack(alignment: .top, spacing: 16) {
-                            EpicArtwork(url: game.artworkURL).frame(width: 96, height: 144)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color(uiColor: .systemGroupedBackground), lineWidth: 3))
-                                .shadow(color: .black.opacity(0.25), radius: 10, y: 5)
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(game.title).font(.title2.bold()).lineLimit(3)
-                                HStack(spacing: 4) {
-                                    LibrarySourceTag(text: "Epic Games")
-                                    LibrarySourceTag(text: installer.installed[game.appName] == nil ? "Not installed" : "Installed")
-                                }
-                            }
-                            .padding(.top, 84)
+                    HStack(spacing: 20) {
+                        EpicArtwork(url: game.artworkURL).frame(width: 120, height: 180)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text(game.title).font(.title2.bold())
+                            primaryAction
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.top, -88)
-                        actions
-                    }
-                    .padding(.bottom, 8)
+                    }.padding(.vertical, 24)
+                        .listRowBackground(
+                            EpicArtwork(url: game.heroURL ?? game.artworkURL).blur(radius: 4)
+                                .overlay(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.55))
+                                .clipped()
+                        )
                 }
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Color.clear)
+                if let download = installer.installs[game.appName]?.download {
+                    Section("Download") {
+                        SteamDownloadStatus(download: download)
+                        Button("Cancel download", role: .destructive) { confirmCancel = true }
+                        if case .failed = download.state {
+                            Text("Downloaded files are kept. Try again to continue where it stopped.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Section {
+                    // The game's sizes from its manifest, before Install, next to the free
+                    // space (red when the installed game would not fit).
+                    let installed = installer.installed[game.appName] != nil
+                    let size = sizes.sizes[game.appName]
+                    let free = Int64(clamping: EpicSizes.free)
+                    if !installed {
+                        if let size {
+                            LabeledContent("Download size", value: EpicSizeRow.format(size.download))
+                            LabeledContent("Installed size", value: EpicSizeRow.format(size.install))
+                        } else {
+                            LabeledContent("Download size") { ProgressView() }
+                        }
+                    }
+                    let tooBig = !installed && size.map { Int64(clamping: $0.install) > free } == true
+                    LabeledContent("Free space on this device") {
+                        Text(EpicSizeRow.format(UInt64(max(0, free)))).foregroundStyle(tooBig ? Color.red : Color.secondary)
+                    }
+                    Text(Self.downloadNote).font(.footnote).foregroundStyle(.secondary)
+                }
+                Section {
+                    if let url = URL(string: "https://store.epicgames.com/browse?q=" + (game.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")) {
+                        Link(destination: url) { Label("View in the Epic Games Store", systemImage: "safari") }
+                    }
+                }
+                if let error = installer.error {
+                    Section { Text(error).font(.footnote).foregroundStyle(.red) }
+                }
             }
-            .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
-            .confirmationDialog("Uninstall \(game.title)?", isPresented: $confirmUninstall, titleVisibility: .visible) {
-                Button("Uninstall", role: .destructive) { installer.uninstall(game.appName) }
-            } message: { Text("This deletes the game's install folder, including any saves stored there.") }
-            .confirmationDialog("Cancel this download?", isPresented: $confirmCancel, titleVisibility: .visible) {
-                Button("Delete downloaded files", role: .destructive) { installer.cancel(game.appName) }
-            }
+            .navigationTitle("Epic Games").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .task { sizes.load(game) }
+            .confirmationDialog("Cancel this download? Downloaded files are deleted.", isPresented: $confirmCancel, titleVisibility: .visible) {
+                Button("Cancel download", role: .destructive) { installer.cancel(game.appName) }
+                Button("Keep downloading", role: .cancel) {}
+            }
+        }
+    }
+
+    static let downloadNote = "Games download directly from Epic with your account into C:\\Program Files\\Epic Games. You can leave Madeira while it downloads: on iOS 26 and later iOS shows the download's progress and keeps it going; on earlier versions it pauses after a short while and continues when you return."
+
+    @ViewBuilder private var primaryAction: some View {
+        if installer.installed[game.appName] != nil, !installer.isDownloading(game.appName),
+           let entry = installer.entry(game.appName) {
+            // Installed: its Game details page.
+            Button { dismiss(); open(entry) } label: {
+                HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Open").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30)
+            }.buttonStyle(.borderedProminent)
+        } else if let download = installer.installs[game.appName]?.download {
+            switch download.state {
+            case .active, .queued:
+                Button { installer.pause(game.appName) } label: { steamActionLabel("Pause", symbol: "pause.fill") }
+                    .buttonStyle(.bordered)
+            case .paused:
+                Button { installer.install(game) } label: { steamActionLabel("Resume", symbol: "arrow.down.circle.fill") }
+                    .buttonStyle(.borderedProminent)
+            case .failed:
+                Button { installer.install(game) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }
+                    .buttonStyle(.borderedProminent)
+            }
+        } else {
+            Button { installer.install(game) } label: { steamActionLabel("Install", symbol: "arrow.down.circle.fill") }
+                .buttonStyle(.borderedProminent).disabled(!installer.ready)
         }
     }
 }
@@ -298,5 +345,42 @@ struct EpicSizeRow: View {
 
     static func format(_ bytes: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))), countStyle: .file)
+    }
+}
+
+/// Game details › Epic Games, for an installed Epic game (as SteamEntrySection is for
+/// Steam's): its version, its prerequisites installer, and Uninstall.
+struct EpicEntrySection: View {
+    let appName: String
+    /// Starts a program as a library session (the prerequisites installer).
+    var run: (LibraryEntry) -> Void
+    /// Closes the details page (after Uninstall).
+    var leave: () -> Void
+    @ObservedObject private var installer = EpicInstaller.shared
+    @State private var confirmUninstall = false
+
+    var body: some View {
+        if let record = installer.installed[appName] {
+            Section {
+                if !record.buildVersion.isEmpty { LabeledContent("Version", value: record.buildVersion) }
+                if !record.prereqPath.isEmpty {
+                    Button("Install prerequisites", systemImage: "shippingbox") {
+                        var prerequisite = LibraryEntry(title: record.prereqName.isEmpty ? "Prerequisites" : record.prereqName,
+                                                        relativePath: record.installDir + "/" + record.prereqPath.replacingOccurrences(of: "\\", with: "/"),
+                                                        bits: 0)
+                        prerequisite.arguments = record.prereqArgs
+                        run(prerequisite)
+                    }
+                }
+                Button("Uninstall", role: .destructive) { confirmUninstall = true }
+            } header: { Text("Epic Games") }
+            .confirmationDialog("Uninstall \(record.game.title)? Its files are deleted from this device.",
+                                isPresented: $confirmUninstall, titleVisibility: .visible) {
+                Button("Uninstall", role: .destructive) {
+                    installer.uninstall(appName)
+                    leave()
+                }
+            }
+        }
     }
 }

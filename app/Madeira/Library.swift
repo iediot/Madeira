@@ -1,4 +1,5 @@
 import SwiftUI
+import CryptoKit
 import UniformTypeIdentifiers
 import UIKit
 import Darwin
@@ -636,6 +637,9 @@ final class LibraryModel: ObservableObject {
     }
     @Published var error: String?
     @Published var sessionMessage = ""
+    /// Quit was asked for and the game is still running after a while: the session
+    /// screen offers Close Madeira (one game per app run, so nothing else ends it).
+    @Published var quitStuck = false
     @Published var launching = false
     @Published var overlayFields = ["FPS", "Frame time", "RAM", "Battery"]
     private var launchPresent: UInt64 = 0
@@ -669,7 +673,6 @@ final class LibraryModel: ObservableObject {
     private var steamMetadataInFlight = Set<Int>()
     private var savedControls: [TouchControl] = []
     private var savedLayout: String?
-    private var savedVisible = true
     private var savedSize = 1.0
     /// The session's first frame makes the drawable's shape known (Aspect).
     private var laidOutAfterFirstPresent = false
@@ -992,10 +995,10 @@ final class LibraryModel: ObservableObject {
         displayMode = entry.displayMode
         activeEntry = entry; current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
         LogStore.shared.setDisplayActive(entry.liveLogs)
-        fpsMode = entry.fpsMode; sessionMessage = "Starting…"
+        fpsMode = entry.fpsMode; sessionMessage = "Starting…"; quitStuck = false
         opacity = min(max(entry.controlOpacity ?? 0.7, 0.15), 1)
         let controls = TouchControlsModel.shared
-        savedControls = controls.controls; savedVisible = controls.visible; savedSize = controls.sizeScale
+        savedControls = controls.controls; savedSize = controls.sizeScale
         savedLayout = controls.layoutID
         if let profile = entry.controls {
             controls.controls = profile
@@ -1005,7 +1008,9 @@ final class LibraryModel: ObservableObject {
                 controls.layoutID = ControlPresetsModel.shared.store.resolvedID(entry.controlLayout)
             }
         }
-        controls.visible = entry.touchControls
+        // Whether the on-screen controls show is one setting for every game
+        // (Settings › Controls, the overlay's controller button), not per game: a new
+        // game (every Epic install) used to start with them off.
         controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
         controllerBinds = GamepadInput.keyboardMouseAvailable ? (entry.controllerBinds ?? [:]) : [:]
         padMouseVertical = GamepadInput.keyboardMouseAvailable ? (entry.padMouseVertical ?? 1) : 1
@@ -1108,13 +1113,21 @@ final class LibraryModel: ObservableObject {
     func requestQuit() {
         LibraryKeyboard.hide()
         quitRequested = true
-        // Ask the application to close (Alt+F4) through the normal input queue,
-        // so it can save; the surface stays up until the native session ends.
+        // Ask the game to close so it can save: WM_CLOSE to its windows (what their
+        // close box does; ml2211), and Alt+F4 for games that only answer that. The
+        // surface stays up until the native session ends.
+        winios_post_close()
         winios_post_key(0x12, 1); winios_post_key(0x73, 1)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             winios_post_key(0x73, 0); winios_post_key(0x12, 0)
         }
-        sessionMessage = "Close requested. Confirm any in-game exit dialog."
+        sessionMessage = "Closing… Confirm any in-game exit dialog."
+        let session = current
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, self.current != nil, self.current == session else { return }
+            self.quitStuck = true
+            fputs("[frontend] quit: still running after 8 s, offering Close Madeira\n", stderr)
+        }
         menu = false
         fputs("[frontend] graceful close requested\n", stderr)
     }
@@ -1123,7 +1136,6 @@ final class LibraryModel: ObservableObject {
         if let id = current, var entry = entries.first(where: { $0.id == id }) {
             entry.controls = controls.controls
             if ControlPresetsModel.enabled { entry.controlLayout = controls.layoutID }
-            entry.touchControls = controls.visible
             entry.fpsMode = fpsMode; entry.performance = performance
             entry.overlayFields = overlayFields
             entry.controlOpacity = opacity; entry.controlSize = controls.sizeScale
@@ -1145,9 +1157,9 @@ final class LibraryModel: ObservableObject {
         padMouseVertical = 1
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
-        controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
+        controls.controls = savedControls; controls.sizeScale = savedSize
         if ControlPresetsModel.enabled { controls.layoutID = savedLayout }
-        current = nil; activeEntry = nil; menu = false; sessionMessage = ""
+        current = nil; activeEntry = nil; menu = false; sessionMessage = ""; quitStuck = false
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
@@ -1286,7 +1298,7 @@ struct LibraryLargeTitle: ToolbarContent {
 }
 
 /// The title of an upright phone's navigation bar (a wide screen shows it in the side
-/// menu). JIT and Memory+ are in Settings › JIT; Enable JIT sits top right while JIT is off.
+/// menu). Enable JIT sits top right while JIT is off.
 struct LibraryTitleText: View {
     var enableJIT: () -> Void = {}
     @ObservedObject private var alignment = LibraryHeaderAlignment.shared
@@ -1571,6 +1583,31 @@ enum SteamCatalog {
     static func hero(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_hero.jpg") }
 }
 
+/// A web image through ArtworkCache: shown from the cache on the first frame when it
+/// is there, else fetched once; nothing while it loads.
+struct CachedArtworkImage: View {
+    let url: URL?
+    @State private var image: UIImage?
+
+    init(url: URL?) {
+        self.url = url
+        _image = State(initialValue: url.flatMap { ArtworkCache.cached($0) })
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            if let image {
+                Image(uiImage: image).resizable().scaledToFill()
+                    .frame(width: geometry.size.width, height: geometry.size.height).clipped()
+            }
+        }
+        .task(id: url) {
+            guard image == nil, let url else { return }
+            image = await ArtworkCache.image(url)
+        }
+    }
+}
+
 struct LibraryArtwork: View {
     let entry: LibraryEntry
     var backdrop = false
@@ -1586,10 +1623,10 @@ struct LibraryArtwork: View {
             } else if let url = backdrop ? (entry.epicHeroURL ?? entry.epicArtworkURL) : entry.epicArtworkURL {
                 EpicArtwork(url: url)
             } else if let id = entry.steamID ?? entry.steamAppID {   // a store match, else the Steam game itself
-                AsyncImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id)) { image in
-                    image.resizable().scaledToFill()
-                        .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
-                } placeholder: { Color.clear }
+                // Through ArtworkCache (memory and disk), not AsyncImage, which kept
+                // nothing: every launch fetched and decoded every cover again.
+                CachedArtworkImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id))
+                    .frame(width: geometry.size.width, height: geometry.size.height)
             }
         }
         .frame(width: geometry.size.width, height: geometry.size.height)
@@ -1652,7 +1689,9 @@ extension EnvironmentValues {
 /// press (LibraryCardArtworkPress).
 struct LibraryCardButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label.environment(\.libraryCardPressed, configuration.isPressed)
+        // The whole card is the button, not only its drawn parts: a tap in the gap
+        // between the cover, the title and the pills did nothing.
+        configuration.label.contentShape(Rectangle()).environment(\.libraryCardPressed, configuration.isPressed)
     }
 }
 
@@ -1682,10 +1721,12 @@ struct LibraryBadges: View {
     let entry: LibraryEntry
     /// A state pill after the format pills (a Steam game's "Update").
     var note: String? = nil
+    /// The store the game comes from ("Steam", "Epic"), as the last pill.
+    var store: String? = nil
     var body: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(spacing: 4) { format; size }
-            VStack(alignment: .leading, spacing: 4) { format; size }
+            HStack(spacing: 4) { format; size; storePill }
+            VStack(alignment: .leading, spacing: 4) { format; HStack(spacing: 4) { size; storePill } }
         }
     }
     private var format: some View {
@@ -1695,6 +1736,9 @@ struct LibraryBadges: View {
             if let api = LibraryRendererBadge.compact(entry.graphicsAPI) { badge(api) }
             if let note { badge(note) }
         }
+    }
+    @ViewBuilder private var storePill: some View {
+        if let store { badge(store) }
     }
     @ViewBuilder private var size: some View {
         if let bytes = entry.folderBytes { badge(String(format: bytes < 1_000_000_000 ? "%.2f GB" : "%.1f GB", Double(bytes) / 1_000_000_000)) }
@@ -1753,6 +1797,7 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
         if layout == "list" || layout == "compactList" {
             let dense = layout == "compactList"
             LazyVStack(spacing: dense ? 4 : 8) { ForEach(items) { item in cell(item, true, dense) } }
+                .transaction { $0.animation = nil }   // see the grid below
         } else {
             let compact = layout == "compact"
             let width = max(1, min(self.width, 1400) - 2 * LibraryLayout.margin(self.width))
@@ -1769,6 +1814,10 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
             LazyVGrid(columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: gap, alignment: .top), count: count), alignment: .center, spacing: wide ? 26 : 18) {
                 ForEach(items) { item in cell(item, false, false) }
             }.frame(maxWidth: .infinity, alignment: .center)
+                // Cards that appear (scrolled into view, or a library refresh landing during
+                // pull-to-refresh) are placed at once: inside a running animation they slid
+                // in from a default position at the right. The press spring is the card's own.
+                .transaction { $0.animation = nil }
         }
     }
 }
@@ -1781,7 +1830,7 @@ struct LibraryView: View {
     var play: (LibraryEntry) -> Void
     var enableJIT: () -> Void
     @ObservedObject private var jitState = LibraryJITState.shared
-    /// Madeira Dock's start, for Settings › Madeira Dock (Onboarding.swift).
+    /// Madeira Dock's start, for Settings › Advanced › Madeira Dock (Onboarding.swift).
     var startDock: (DockGame, Bool) -> Void = { _, _ in }
     /// First-run setup (Onboarding.swift).
     @ObservedObject private var onboarding = OnboardingModel.shared
@@ -1820,6 +1869,7 @@ struct LibraryView: View {
     // Epic Games joins the library once signed in (Epic/EpicLibraryViews.swift).
     @ObservedObject private var epicAuth = EpicAuth.shared
     @ObservedObject private var epicLibrary = EpicLibrary.shared
+    @ObservedObject private var hidden = LibraryHidden.shared
     private var entries: [LibraryEntry] {
         // Steam games are listed in their own section (SteamGames.swift).
         let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && $0.epicAppName == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
@@ -1944,7 +1994,7 @@ struct LibraryView: View {
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.refreshFlag() } }
     }
     /// Enable JIT, top right while JIT is off; once it is on the header is just the
-    /// title (Settings › JIT shows JIT and Memory+).
+    /// title.
     @ToolbarContentBuilder private var jitToolbar: some ToolbarContent {
         if !jitState.enabled {
             ToolbarItem(placement: .topBarTrailing) {
@@ -2023,9 +2073,6 @@ struct LibraryView: View {
             if SteamSettingsSection.shown, settingsShow("Accounts", "Steam", "Epic", "sign in", "sign out", "account") {
                 SteamSettingsSection(open: { settingsSheet = $0 })
             }
-            if MadeiraDock.enabled, settingsShow("Madeira Dock", "Dock", "Steam", "client") {
-                MadeiraDockSettingsSection(open: { settingsSheet = $0 })
-            }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
@@ -2033,18 +2080,27 @@ struct LibraryView: View {
             }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS"),
                settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
-            // JIT, with Enable JIT automatically as its first row; JIT setup and Run setup again.
-            if settingsShow("JIT", "automatically", "StikDebug", "LocalDevVPN", "start", "setup") {
+            // JIT: Enable JIT automatically.
+            if settingsShow("JIT", "automatically", "StikDebug", "start") {
                 JITSettingsSection(autoEnable: $autoEnableJIT)
                     .onChange(of: autoEnableJIT) { _, on in if on, !jitState.enabled { enableJIT() } }
             }
             if settingsShow("controls", "pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
-                Section("Controls") { LibraryPointerSettings() }
+                Section("Controls") {
+                    OnScreenControlsToggle()
+                    LibraryPointerSettings()
+                }
             }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             // For debugging Madeira itself: logging and the original diagnostic screen.
-            if settingsShow("advanced", "diagnostics", "extended logging", "logging", "log", "interface", "developer") {
+            if settingsShow("advanced", "diagnostics", "extended logging", "logging", "log", "interface", "developer", "setup",
+                            "Madeira Dock", "Dock", "Steam", "client") {
                 Section {
+                    // Madeira Dock's page (Valve's client components, repairs): only
+                    // needed when something is wrong, so it sits with the other fixes.
+                    if MadeiraDock.enabled { MadeiraDockRow(open: { settingsSheet = $0 }) }
+                    // First-run setup again (sign-ins, Dock components): for whoever skipped it.
+                    RunSetupAgainRow()
                     Toggle("Extended logging", isOn: $input.diagnostics)
                     Toggle("Developer interface", isOn: Binding(get: { developerUI }, set: { on in
                         developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
@@ -2226,6 +2282,8 @@ struct LibraryView: View {
                     Label("List", systemImage: "list.bullet").tag("list")
                     Label("Compact list", systemImage: "list.dash").tag("compactList")
                 }
+                // Games hidden with a long press (LibraryHidden), shown again here.
+                Toggle("Show hidden games", systemImage: "eye", isOn: $hidden.showHidden)
                 Picker("Sort by", selection: $sort) {
                     Label("Last played", systemImage: "clock").tag("played")
                     Label("Name", systemImage: "textformat.abc").tag("name")
@@ -2527,7 +2585,6 @@ struct LibraryDetail: View {
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
                     Toggle("Live logs", isOn: $entry.liveLogs)
-                    Toggle("Touch controls", isOn: $entry.touchControls)
                     if GamepadInput.keyboardMouseAvailable {
                         ControllerModeChoice(mode: $entry.controllerMode)
                         if entry.controllerMode == "keys" {
@@ -2553,6 +2610,11 @@ struct LibraryDetail: View {
                 if let appID = entry.steamAppID {
                     SteamCloudSection(appID: appID)
                     SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
+                }
+                // An installed Epic game's version, prerequisites and Uninstall (Epic/).
+                if let epic = entry.epicAppName {
+                    EpicEntrySection(appName: epic, run: { prerequisite in leaving = true; play(prerequisite) },
+                                     leave: { leaving = true; dismiss() })
                 }
                 // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam
                 // game started through Madeira Dock, whose desktop and command are Dock's:
@@ -3162,6 +3224,13 @@ struct RuntimeMemorySyncSettings: View {
     }
 }
 
+/// Every game's on-screen controls: one setting, which the overlay's controller
+/// button and the in-game menu toggle too.
+struct OnScreenControlsToggle: View {
+    @ObservedObject private var touch = TouchControlsModel.shared
+    var body: some View { Toggle("On-screen controls", isOn: $touch.visible) }
+}
+
 struct LibraryPointerSettings: View {
     @ObservedObject private var input = InputSettings.shared
     /// Absolute, Relative or Touch; `touchMode` and `relative` stay mutually exclusive.
@@ -3299,6 +3368,24 @@ struct LibraryHUD: View {
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
+                // Quit that the game did not answer: end it by closing Madeira.
+                if model.quitStuck {
+                    VStack(spacing: 10) {
+                        Text("The game didn't close.").font(.headline)
+                        Button(role: .destructive) {
+                            LogStore.shared.log("[session-once] closed by the user after a stuck quit")
+                            model.saveCurrentProfile()
+                            exit(0)
+                        } label: {
+                            Label("Close Madeira", systemImage: "xmark.circle.fill").frame(minWidth: 180, minHeight: 34)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("Keep waiting") { model.quitStuck = false }
+                    }
+                    .padding(18)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
@@ -3463,32 +3550,32 @@ struct LibraryHUD: View {
     private var menu: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                HStack { Label("Session", systemImage: "gamecontroller.fill").font(.title2.bold()); Spacer(); Button("Done") { model.menu = false }.buttonStyle(.bordered) }
-                // The controls come first, the easiest to reach; the overlay settings last.
-                Toggle("Touch controls", isOn: $controls.visible)
-                // The named layouts (Controller preset, Keyboard preset, custom ones) live here in a session: this
-                // menu replaces the overlay's top bar, where the same menu sits outside the library.
+                HStack {
+                    Text(model.activeEntry?.title ?? "Session").font(.title2.bold()).lineLimit(1)
+                    Spacer()
+                    Button("Done") { model.menu = false }.buttonStyle(.bordered)
+                }
+                // Controls: what is reached for most, first.
+                Text("Controls").font(.headline)
+                Toggle("On-screen controls", isOn: $controls.visible)
+                // The named layouts live here in a session: this menu replaces the
+                // overlay's top bar, where the same menu sits outside the library.
                 if controls.visible && ControlPresetsModel.enabled {
                     ControlLayoutMenu(style: .row) { openedEditor in
                         model.saveCurrentProfile()
                         if openedEditor { model.menu = false }
                     }
                 }
+                HStack(spacing: 12) {
+                    Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
+                    Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
+                }
+                .buttonStyle(.bordered)
                 LabeledContent("Opacity") { Slider(value: $model.opacity, in: 0.15...1) }
                 LabeledContent("Size") { Slider(value: $controls.sizeScale, in: 0.5...2) }
-                Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
-                if GamepadInput.keyboardMouseAvailable {
-                    ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
-                    if model.controllerMode == "keys" {
-                        Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
-                    } else if model.controllerMode == "dinput" {
-                        // ml1240: the DirectInput device exists only from the launch on.
-                        Text("XInput and DirectInput applies to the next launch.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
                 Divider()
+                // Display: frame rate, shape, the performance overlay.
+                Text("Display").font(.headline)
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
                 // Saved to the game with the rest of the session's profile.
                 // MADEIRA_SESSION_TOOLS=0 hides it.
@@ -3499,27 +3586,29 @@ struct LibraryHUD: View {
                         }.pickerStyle(.menu).labelsHidden()
                     }
                 }
-                Divider()
-                // ml1133's ECO switch, live: the same as the developer overlay's ECO pill.
-                Text("CPU").font(.headline)
-                Toggle("Eco mode", isOn: Binding(get: { eco }, set: { on in eco = on; madeira_set_eco(on ? 1 : 0) }))
-                Text("Runs the game's threads at a low priority, on the efficiency cores: cooler and slower. Use it while a game loads and turn it off to play.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Divider()
-                Text("Mouse & pointer").font(.headline)
-                LibraryPointerSettings()
-                Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Battery", "Thermal"], id: \.self) { field in
-                        Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
-                            model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
-                        })).font(.subheadline)
+                    DisclosureGroup("Overlay fields") {
+                        ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Battery", "Thermal"], id: \.self) { field in
+                            Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
+                                model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
+                            })).font(.subheadline)
+                        }
                     }
                 }
-                // The developer overlay's CAP and F pills (FPSOverlay), for library
-                // sessions: only with MADEIRA_SESSION_DIAGNOSTICS=1 (and not with
-                // MADEIRA_SESSION_TOOLS=0).
+                Divider()
+                // The rest, folded: controller mode, pointer, CPU and diagnostics.
+                DisclosureGroup("More options") {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if GamepadInput.keyboardMouseAvailable {
+                            ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
+                            if model.controllerMode == "keys" {
+                                Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
+                            }
+                        }
+                        LibraryPointerSettings()
+                        // ml1133's ECO switch, live: the same as the developer overlay's ECO pill.
+                        Toggle("Eco mode", isOn: Binding(get: { eco }, set: { on in eco = on; madeira_set_eco(on ? 1 : 0) }))
                 if sessionTools && sessionDiagnostics {
                     Divider()
                     Text("Diagnostics").font(.headline)
@@ -3541,6 +3630,9 @@ struct LibraryHUD: View {
                     }
                     Text("Both apply to Direct3D 12 games only. Capture writes the render passes of the next frame to Documents/capture and its draw list to the log. GPU sync: F1 makes every pass wait for the one before (the default), F6 waits only where the game's barriers ask, F5 makes render passes wait at the fragment stage, F0 has no sync at all (expect flicker; for tests).")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+                    }
+                    .padding(.top, 10)
                 }
                 if let appID = model.activeEntry?.steamAppID, SteamOwnedLibrary.cloudQuitEnabled {
                     Divider()
@@ -3850,7 +3942,31 @@ enum ArtworkCache {
     private static let blurred = NSCache<NSURL, UIImage>()
     private static let context = CIContext(options: [.useSoftwareRenderer: false])
 
-    static func cached(_ url: URL) -> UIImage? { images.object(forKey: url as NSURL) }
+    /// Memory first, then the disk copy kept across launches (a 480 px JPEG of a few
+    /// tens of KB, so reading it here on the main thread costs well under a frame):
+    /// covers are on screen at once when the app opens again, not half a second later.
+    static func cached(_ url: URL) -> UIImage? {
+        if let hit = images.object(forKey: url as NSURL) { return hit }
+        guard !url.isFileURL, let file = diskFile(url), let data = try? Data(contentsOf: file),
+              let image = UIImage(data: data) else { return nil }
+        images.setObject(image, forKey: url as NSURL)
+        return image
+    }
+
+    /// Caches/madeira-artwork/<sha256 of the URL>.jpg. iOS may purge Caches when space
+    /// runs low; the covers are then fetched again.
+    private static let diskFolder: URL? = {
+        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
+        let dir = caches.appendingPathComponent("madeira-artwork", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    private static func diskFile(_ url: URL) -> URL? {
+        guard let dir = diskFolder else { return nil }
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined()
+        return dir.appendingPathComponent(digest + ".jpg")
+    }
     static func cachedBlur(_ url: URL) -> UIImage? { blurred.object(forKey: url as NSURL) }
 
     /// The image at `url` (a web or file URL), downsized; nil when it cannot be had.
@@ -3866,7 +3982,15 @@ enum ArtworkCache {
             data = d
         }
         let image = await Task.detached(priority: .utility) { downsample(data) }.value
-        if let image { images.setObject(image, forKey: url as NSURL) }
+        if let image {
+            images.setObject(image, forKey: url as NSURL)
+            // Keep the downsized copy for the next launch (web artwork only).
+            if !url.isFileURL, let file = diskFile(url) {
+                Task.detached(priority: .background) {
+                    if let jpeg = image.jpegData(compressionQuality: 0.85) { try? jpeg.write(to: file, options: .atomic) }
+                }
+            }
+        }
         return image
     }
 
@@ -3921,6 +4045,13 @@ enum ArtworkCache {
 }
 
 extension View {
+    /// A Settings row with an icon: its separator starts at the row's leading edge like
+    /// every text row's. A Label's row otherwise starts it after the icon, so the rows
+    /// with icons ended their groups with shorter separators.
+    func settingsSeparator() -> some View {
+        alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+    }
+
     /// The library row's buttons in Liquid Glass (iOS 26), the material of the toolbar's
     /// buttons; a frosted material before it.
     @ViewBuilder func libraryRowGlass<S: Shape>(_ shape: S) -> some View {

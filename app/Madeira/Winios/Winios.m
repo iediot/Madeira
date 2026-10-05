@@ -657,12 +657,14 @@ void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
 extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, void *hwnd);
 extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
+extern void winios_drv_close_windows(void);
 extern void winios_dump_window_tree(void);
 extern void ios_dump_all_thread_stacks(void);
 
 #define WINIOS_RING_SIZE 256
 #define WINIOS_EV_MOUSE 0
 #define WINIOS_EV_KEY   1
+#define WINIOS_EV_CLOSE 2   /* Quit game: WM_CLOSE to the top-level windows */
 #define KEYEVENTF_KEYUP 0x0002
 typedef struct {
     unsigned int type;       /* WINIOS_EV_MOUSE / WINIOS_EV_KEY */
@@ -732,6 +734,11 @@ void winios_post_touch_up(int x, int y) {
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
  * 0 for release. Queued like mouse events; drained in pProcessEvents. */
+void winios_post_close(void) {
+    fprintf(stderr, "[winios] post_close\n"); fflush(stderr);
+    winios_q_push_ev(WINIOS_EV_CLOSE, 0, 0, 0, 0);
+}
+
 void winios_post_key(int vk, int down) {
     fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
@@ -801,6 +808,8 @@ BOOL winios_pProcessEvents(DWORD mask) {
         { fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr); }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
+        else if (e.type == WINIOS_EV_CLOSE)
+            winios_drv_close_windows();
         else
             winios_drv_post_mouse(e.x, e.y, e.flags, e.data, NULL);
         drained = TRUE;
@@ -1027,6 +1036,21 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
  * window never covers its picture, and God of War's (full-desktop) window is
  * never drawn. MADEIRA_GAME_WINDOWS=0 turns it off (both sides). */
 static NSMutableSet<NSNumber *> *g_game_metal;  /* game mode: hwnds presenting through Metal */
+/* Every window's client area, kept in every kind of session (the compositor's
+ * g_client_rects exists only while it runs): touch mapping needs the game
+ * window's (winios_game_client_rect). Main thread only. */
+static NSMutableDictionary<NSNumber *, NSValue *> *g_all_client_rects;
+static NSNumber *g_last_metal_key;   /* the most recent window to present through Metal */
+
+int winios_game_client_rect(int *x, int *y, int *w, int *h) {
+    NSNumber *key = g_last_metal_key;
+    NSValue *v = key ? g_all_client_rects[key] : nil;
+    if (!v) return 0;
+    CGRect r = v.CGRectValue;
+    if (r.size.width < 1 || r.size.height < 1) return 0;
+    *x = (int)r.origin.x; *y = (int)r.origin.y; *w = (int)r.size.width; *h = (int)r.size.height;
+    return 1;
+}
 
 static int winios_desktop_session(void) {
     /* read every time: one app run can hold desktop and game sessions */
@@ -1093,6 +1117,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSNumber *key = @((uintptr_t)hwnd);
         if (!g_game_metal) g_game_metal = [NSMutableSet new];
+        g_last_metal_key = key;
         if ([g_game_metal containsObject:key]) return;
         [g_game_metal addObject:key];
         fprintf(stderr, "[winios] game window hwnd=%p presents through Metal; its GDI surface is not drawn\n", hwnd);
@@ -1106,6 +1131,8 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 void winios_session_reset(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
+        [g_all_client_rects removeAllObjects];
+        g_last_metal_key = nil;
         if (g_comp_game) winios_drop_compositor("new session");
     });
 }
@@ -1366,9 +1393,11 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
      * which needs this Wine thread. No-op unless the app turned it on. */
     winios_census_note_frame(hwnd, x, y, w, h, visible);
     dispatch_async(dispatch_get_main_queue(), ^{
+        NSNumber *key = @((uintptr_t)hwnd);
+        if (!g_all_client_rects) g_all_client_rects = [NSMutableDictionary new];
+        g_all_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
         winios_ensure_compositor();
         if (!g_compositor_view) return;
-        NSNumber *key = @((uintptr_t)hwnd);
         if (g_comp_game) {   /* game-mode windows, see winios_game_window_shown */
             g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
             if (!winios_game_window_shown(key)) return;

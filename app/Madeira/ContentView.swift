@@ -285,8 +285,20 @@ final class MetalBackedView: UIView {
             Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad cursor in step
             return (px, py)
         }
-        let g = GameSurfaceLayout.map(point: p, guest: guestSize(), aspect: drawableAspect(),
+        let guest = guestSize()
+        let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
                                       bounds: bounds, mode: effectiveDisplayMode())
+        // The picture filling the view is the game window's swapchain. A windowed game
+        // (Sonic Mania's 424x240) sits in a corner of the guest screen, so the same spot
+        // on that window is the touch's place: mapped onto the whole screen it clicked
+        // the desktop beside the window, which took focus and the game's input with it.
+        var cx: Int32 = 0, cy: Int32 = 0, cw: Int32 = 0, ch: Int32 = 0
+        if winios_game_client_rect(&cx, &cy, &cw, &ch) != 0, guest.width > 0, guest.height > 0 {
+            let x = CGFloat(cx) + g.x / guest.width * CGFloat(cw)
+            let y = CGFloat(cy) + g.y / guest.height * CGFloat(ch)
+            return (Int32(min(max(x, CGFloat(cx)), CGFloat(cx + cw - 1))),
+                    Int32(min(max(y, CGFloat(cy)), CGFloat(cy + ch - 1))))
+        }
         return (Int32(g.x), Int32(g.y))
     }
 
@@ -3213,7 +3225,7 @@ struct ContentView: View {
     /// Madeira Dock: hand the stored sign-in to the host once, point it at the game and
     /// start the normal session with explorer's virtual desktop running dockhost.exe.
     /// Nothing is handed over unless JIT is ready and no session runs.
-    /// From the library (Settings › Madeira Dock) the start is a library
+    /// From the library (Settings › Advanced › Madeira Dock) the start is a library
     /// session: the library's one-session-per-run rule applies first, failures
     /// show in the library, and the session gets the full-screen game view.
     /// `profile` is a Steam game's library entry (its Game details page): the
@@ -3640,6 +3652,33 @@ enum ControlAction: Codable, Equatable, Hashable {
         }
     }
 
+    /// An SF Symbol for an action whose key prints no character, drawn on the
+    /// control instead of its label (Apple's own keyboard glyphs). Letters, digits
+    /// and F-keys keep their text; the mouse buttons have MouseClickGlyph.
+    var glyph: String? {
+        switch self {
+        case .keyboardToggle: return "keyboard"
+        case .key(let vk):
+            switch vk {
+            case 0x0D: return "return"
+            case 0x20: return "space"
+            case 0x1B: return "escape"
+            case 0x09: return "arrow.right.to.line"
+            case 0x10: return "shift"
+            case 0x11: return "control"
+            case 0x12: return "option"
+            case 0x08: return "delete.left"
+            case 0x14: return "capslock"
+            case 0x25: return "arrow.left"
+            case 0x26: return "arrow.up"
+            case 0x27: return "arrow.right"
+            case 0x28: return "arrow.down"
+            default: return nil
+            }
+        default: return nil
+        }
+    }
+
     /// Minimal for pass 1 — the full VK table arrives with the mapping panel.
     static func keyLabel(_ vk: Int32) -> String {
         switch vk {
@@ -3948,16 +3987,19 @@ struct TouchControlsOverlay: View {
     @ViewBuilder private func controls(_ screen: CGSize, session: Bool) -> some View {
         let buttons = ForEach(m.controls) { c in
             TouchControlButton(control: c, screen: screen)
-                // A library session's Control opacity; full while editing.
-                .opacity(session && !m.editing ? library.opacity : 1)
         }
+        // A library session's Control opacity, on the whole set (full while editing): set
+        // on each button inside the glass container it never reached the glass, which
+        // the container draws for all of them together.
+        let opacity = session && !m.editing ? library.opacity : 1
         if #available(iOS 26.0, *) {
             GlassEffectContainer(spacing: 12) {
                 ZStack { buttons }
                     .frame(width: screen.width, height: screen.height, alignment: .topLeading)
             }
+            .opacity(opacity)
         } else {
-            buttons
+            buttons.opacity(opacity)
         }
     }
 
@@ -3970,12 +4012,14 @@ struct TouchControlsOverlay: View {
     /// ml1970: with MADEIRA_CONTROLS_XBOX_DEFAULT=1, a user with no controls file gets the built-in controller
     /// layout on the first landscape overlay, laid out for this screen (never over an existing controls file).
     private func applyDefaultLayout(_ geo: GeometryProxy) {
-        guard m.needsDefaultLayout, geo.size.width > geo.size.height else { return }
-        let i = geo.safeAreaInsets
-        ControlPresetsModel.shared.applyDefaultIfNeeded(screen: ControlPresetScreen(
-            width: Double(geo.size.width), height: Double(geo.size.height),
-            left: Double(i.leading), right: Double(i.trailing),
-            top: Double(i.top), bottom: Double(i.bottom)))
+        guard geo.size.width > geo.size.height else { return }
+        // The real window's size and safe area, as the layout menu measures them: this
+        // overlay ignores the safe area, so its own geometry reports zero insets and
+        // laid a built-in out under the Dynamic Island until it was chosen again.
+        let screen = ControlPresetsModel.currentScreen()
+        if m.needsDefaultLayout { ControlPresetsModel.shared.applyDefaultIfNeeded(screen: screen) }
+        // An active built-in follows the app's current definition (TouchControlPresets.swift).
+        ControlPresetsModel.shared.refreshBuiltInIfNeeded(screen: screen)
     }
 
     /// ml1970: the layout menu, offered only while touch controls are shown.
@@ -4185,12 +4229,23 @@ struct TouchControlButton: View {
             } else {
                 // The label is the glass's content (see glassFace), so it is drawn
                 // on top of the glass rather than blurred underneath it.
-                Text(control.action.label)
-                    .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
-                                  weight: .medium))
+                Group {
+                    if control.action == .mouseLeft || control.action == .mouseRight {
+                        MouseClickGlyph(left: control.action == .mouseLeft)
+                            .frame(width: diameter * 0.30, height: diameter * 0.44)
+                    } else if let glyph = control.action.glyph {
+                        Image(systemName: glyph).font(.system(size: diameter * 0.32, weight: .medium))
+                    } else {
+                        Text(control.action.label)
+                            .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
+                                          weight: .medium))
+                    }
+                }
                     .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
                     .frame(width: size.width, height: size.height)
                     .glassFace(GlassShape(circle: true))
+                    .accessibilityLabel(control.action == .mouseLeft ? "Left click"
+                                        : control.action == .mouseRight ? "Right click" : control.action.label)
             }
         }
         .frame(width: size.width, height: size.height)
@@ -4318,3 +4373,30 @@ struct TouchControlButton: View {
     }
 }
 
+/// A mouse with its left or right button filled: the left- and right-click controls'
+/// face, where a bare "L" or "R" read as the letter keys.
+struct MouseClickGlyph: View {
+    let left: Bool
+    var body: some View {
+        GeometryReader { g in
+            let w = g.size.width, h = g.size.height, line = max(1.5, w * 0.1)
+            let body = RoundedRectangle(cornerRadius: w * 0.5)
+            ZStack(alignment: .top) {
+                // The pressed button: the top half's left or right quarter.
+                Path { p in
+                    p.addRect(CGRect(x: left ? 0 : w / 2, y: 0, width: w / 2, height: h * 0.42))
+                }
+                .fill(.foreground)
+                .clipShape(body)
+                body.stroke(.foreground, lineWidth: line)
+                // The split between the buttons and the line under them.
+                Path { p in
+                    p.move(to: CGPoint(x: w / 2, y: 0)); p.addLine(to: CGPoint(x: w / 2, y: h * 0.42))
+                    p.move(to: CGPoint(x: 0, y: h * 0.42)); p.addLine(to: CGPoint(x: w, y: h * 0.42))
+                }
+                .stroke(.foreground, lineWidth: line * 0.8)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}

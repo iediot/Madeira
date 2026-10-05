@@ -9,8 +9,8 @@ import UIKit
 // On a new install (no `madeiraOnboardingDone` in UserDefaults, which iOS
 // removes with the app) the library opens a full-screen setup: welcome, JIT,
 // Steam sign-in, Valve's client components for Madeira Dock (only when Dock is
-// available), done. Every step can be skipped. Settings › JIT or Settings ›
-// Steam can reopen it. env.MADEIRA_ONBOARDING = 0 never opens it.
+// available), done. Every step can be skipped. Settings › Advanced › Run setup
+// again reopens it. env.MADEIRA_ONBOARDING = 0 never opens it.
 //
 // The JIT page explains StikDebug, the only JIT method in this fork.
 // Sign-in goes through SteamSignIn (the
@@ -97,7 +97,7 @@ enum OnboardingRules {
         open(reason: "first-run")
     }
 
-    /// Settings › JIT › Run setup again.
+    /// Settings › Advanced › Run setup again.
     func rerun() { open(reason: "settings") }
 
     private func open(reason: String) {
@@ -302,7 +302,7 @@ struct OnboardingView: View {
                         dock.prepareClient()
                     }
                 }
-                // A running download continues; Settings › Madeira Dock shows it.
+                // A running download continues; Settings › Advanced › Madeira Dock shows it.
                 secondary("Set up later") { model.next() }
             }
         }
@@ -334,9 +334,9 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 18) {
             header("You're all set", symbol: "checkmark.seal.fill")
             if model.steps.contains(.dockClient) {
-                Text("Settings › Accounts › Madeira Dock lists the Steam games installed in Madeira's drive_c and starts them.")
+                Text("Settings › Advanced › Madeira Dock lists the Steam games installed in Madeira's drive_c and starts them.")
             }
-            Text("You can run this setup again from Settings › JIT or Settings › Accounts.").foregroundStyle(.secondary)
+            Text("You can run this setup again from Settings › Advanced.").foregroundStyle(.secondary)
             primary("Go to your library", symbol: "square.grid.2x2.fill") { model.finish() }
         }
     }
@@ -358,7 +358,7 @@ struct SteamSettingsSection: View {
     @State private var confirmEpicSignOut = false
 
     /// Settings › Accounts: every store account in the same shape, Steam then Epic
-    /// Games: the account, then its Sign out (or Sign in). Always shown: Epic works
+    /// Games: one row with the account (swiped or long-pressed: Log Out), or Sign in. Always shown: Epic works
     /// without Steam's setup.
     static var shown: Bool { true }
 
@@ -388,29 +388,61 @@ struct SteamSettingsSection: View {
         .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in signIn.refresh() }
     }
 
-    @ViewBuilder private func account(_ store: String, name: String?, signIn: @escaping () -> Void,
-                                      signOut: @escaping () -> Void) -> some View {
-        if let name {
-            LabeledContent(store, value: name)
-            Button("Sign out of \(store)", role: .destructive, action: signOut)
-        } else {
-            Button(action: signIn) { Label("Sign in to \(store)", systemImage: "person.crop.circle.badge.plus") }
+    /// One row per store that stays in its place: the account (swipe it to Log Out,
+    /// then the confirmation), or Sign in once logged out. The same row with its
+    /// content swapped, so logging out never removes a row and adds another.
+    private func account(_ store: String, name: String?, signIn: @escaping () -> Void,
+                         signOut: @escaping () -> Void) -> some View {
+        Button {
+            if name == nil { signIn() }
+        } label: {
+            if let name {
+                LabeledContent(store, value: name).foregroundStyle(.primary)
+            } else {
+                Label("Sign in to \(store)", systemImage: "person.crop.circle.badge.plus")
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if name != nil {
+                // An icon with its title, as the system's own swipe actions are. Not
+                // role .destructive: the list takes that for a delete and slides the
+                // rows below up, then back.
+                Button(action: signOut) {
+                    Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+                .tint(.red)
+            }
+        }
+        .contextMenu {
+            if name != nil { Button("Log Out", systemImage: "rectangle.portrait.and.arrow.right", action: signOut) }
+        }
+        .settingsSeparator()
+        .id(store)
+    }
+}
+
+/// Settings › Advanced › Run setup again (hidden with MADEIRA_ONBOARDING=0).
+struct RunSetupAgainRow: View {
+    @ObservedObject private var onboarding = OnboardingModel.shared
+    var body: some View {
+        if onboarding.available {
+            Button { onboarding.rerun() } label: { Label("Run setup again", systemImage: "wand.and.stars") }
+                .settingsSeparator()
         }
     }
 }
 
-/// Settings › Madeira Dock: its sheet (Valve's client components and the installed
-/// Steam games) and its status, apart from the accounts.
-struct MadeiraDockSettingsSection: View {
+/// Settings › Advanced › Madeira Dock: its sheet (Valve's client components and the
+/// installed Steam games) with its status, for repairs.
+struct MadeiraDockRow: View {
     let open: (SettingsSheet) -> Void
     @ObservedObject private var dock = MadeiraDockModel.shared
 
     var body: some View {
-        Section {
-            Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
-            if let status = dock.status {
-                Text(status).font(.caption).foregroundStyle(.secondary)
-            }
+        Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
+            .settingsSeparator()
+        if let status = dock.status {
+            Text(status).font(.caption).foregroundStyle(.secondary)
         }
     }
 }

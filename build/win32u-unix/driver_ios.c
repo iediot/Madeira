@@ -235,10 +235,38 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
         if (st) bad++;
         cnt++;
         if (cnt <= 8 || (cnt & 0xff) == 0)
+        {
+            /* ml2210: keys go to the foreground thread's focus window. Name both, so
+             * a game whose controller works but whose keys do nothing (Sonic Mania,
+             * reading WM_KEYDOWN) shows whether its window has the keyboard at all. */
+            HWND fg = NtUserGetForegroundWindow();
+            GUITHREADINFO info = { .cbSize = sizeof(info) };
+            DWORD tid = fg ? NtUserGetWindowThread( fg, NULL ) : 0;
+            if (!tid || !NtUserGetGUIThreadInfo( tid, &info )) info.hwndFocus = info.hwndActive = 0;
             dprintf(2, "[winios] ml647 drv_post_key #%u vk=0x%x scan=0x%x flags=0x%x "
-                       "-> status=0x%x (failures=%u)\n",
-                    cnt, vk, scan, flags, (unsigned)st, bad);
+                       "-> status=0x%x (failures=%u) foreground=%p active=%p focus=%p\n",
+                    cnt, vk, scan, flags, (unsigned)st, bad, fg, info.hwndActive, info.hwndFocus);
+        }
     }
+}
+
+/* ml2211: Quit game. Posts WM_CLOSE to every visible top-level window, what a
+ * click on a window's close box does. Alt+F4 alone went through keyboard input,
+ * which reaches only the focus window, and a game whose window did not have the
+ * keyboard (Sonic Mania) never saw it. Called on a Wine thread (the input drain). */
+void winios_drv_close_windows(void)
+{
+    HWND *list = list_window_children( NtUserGetDesktopWindow() );
+    unsigned int i, posted = 0;
+
+    if (!list) return;
+    for (i = 0; list[i]; i++)
+    {
+        if (!(NtUserGetWindowLongW( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
+        if (NtUserPostMessage( list[i], WM_CLOSE, 0, 0 )) posted++;
+    }
+    free( list );
+    dprintf( 2, "[winios] ml2211 quit: WM_CLOSE posted to %u visible top-level window(s)\n", posted );
 }
 
 /* [winios-tree] window-tree dump: every top-level window with class,

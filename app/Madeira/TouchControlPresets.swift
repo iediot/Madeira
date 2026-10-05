@@ -65,13 +65,28 @@ enum ControlPresetLayout {
     static let xboxID = "builtin.xbox"
     static let xboxName = "Controller preset"
     static let keyboardID = "builtin.keyboard"
-    static let keyboardName = "Keyboard preset"
+    static let keyboardName = "WASD keyboard"
+    static let arrowsID = "builtin.keyboard.arrows"
+    static let arrowsName = "Arrow keys keyboard"
+    static let platformerID = "builtin.platformer"
+    static let platformerName = "Simple platformer"
+
+    /// The menu's symbol for a built-in.
+    static func symbol(_ id: String) -> String {
+        switch id {
+        case keyboardID, arrowsID: return "keyboard"
+        case platformerID: return "figure.run"
+        default: return "gamecontroller"
+        }
+    }
 
     /// A built-in laid out for `screen`, or nil for a user layout.
     static func builtIn(_ id: String, for screen: ControlPresetScreen) -> [TouchControl]? {
         switch id {
         case xboxID: return xbox(for: screen)
         case keyboardID: return keyboard(for: screen)
+        case arrowsID: return keyboard(for: screen, arrows: true)
+        case platformerID: return platformer(for: screen)
         default: return nil
         }
     }
@@ -81,12 +96,13 @@ enum ControlPresetLayout {
     ///
     ///   Esc (top left)                                      F  Q   (top right)
     ///   ⇧                                                 E   R
-    ///   WASD stick  Ctl                     R click  ␣
-    ///                                          L click (bottom right)
+    ///                                            [ Mouse look ]
+    ///   WASD stick  Ctl                     ␣   R click  L click (bottom right)
     ///
-    /// Looking around is a drag on the empty screen in the Relative pointer
-    /// mode; the layout only holds buttons. Same placement rules as xbox(for:).
-    static func keyboard(for screen: ControlPresetScreen) -> [TouchControl] {
+    /// Looking around is the Mouse look pad left of the buttons: a drag on the
+    /// bare screen clicks where the finger is now, so it cannot turn the camera.
+    /// Same placement rules as xbox(for:).
+    static func keyboard(for screen: ControlPresetScreen, arrows: Bool = false) -> [TouchControl] {
         let s = screen.landscape
         let W = s.width, H = s.height
         guard W > 0, H > 0 else { return [] }
@@ -106,28 +122,68 @@ enum ControlPresetLayout {
         // Left: the WASD stick in the corner, sprint above it, crouch inboard of it.
         let stickScale = 1.45 * k, stick = d(stickScale)
         let stickX = L + 76 * k, stickY = H - B - 12 * k - stick / 2
-        add(.joystickWASD, stickScale, stickX, stickY)
+        add(arrows ? .joystickArrows : .joystickWASD, stickScale, stickX, stickY)
         let small = 0.78 * k, sm = d(small)
         add(.key(0x10), small, stickX, stickY - stick / 2 - 16 * k - sm / 2)            // Shift
         add(.key(0x11), small, stickX + stick / 2 + 22 * k + sm / 2, stickY + stick / 2 - sm / 2)   // Ctrl
         add(.key(0x1B), 0.7 * k, L + d(0.7 * k) / 2 + 6 * k, T + d(0.7 * k) / 2 + 6 * k) // Esc
 
-        // Right: primary fire in the corner, secondary and jump around it, then the
-        // action keys above, clear of the top band.
+        // Right: left click in the corner, right click and Space beside it on the
+        // bottom row; above the clicks the Mouse look pad, then the action keys.
         let fireScale = 1.2 * k, fire = d(fireScale)
         let fireX = W - R - 20 * k - fire / 2, fireY = H - B - 12 * k - fire / 2
         add(.mouseLeft, fireScale, fireX, fireY)
         let mid = 0.95 * k, md = d(mid)
-        add(.mouseRight, mid, fireX - fire / 2 - 18 * k - md / 2, fireY + fire / 2 - md / 2)
-        add(.key(0x20), mid, fireX - fire / 2 - 6 * k - md / 2, fireY - fire / 2 - 14 * k - md / 2)   // Space
+        let rClickX = fireX - fire / 2 - 18 * k - md / 2, rowY = fireY + fire / 2 - md / 2
+        add(.mouseRight, mid, rClickX, rowY)
+        add(.key(0x20), mid, rClickX - md - 14 * k, rowY)                                  // Space
+        // Mouse look (2.6 x 2 diameters, TouchControlsModel.size) over the two clicks.
+        let lookScale = 0.85 * k, lookW = d(lookScale) * 2.6, lookH = d(lookScale) * 2
+        let lookX = min((fireX + rClickX) / 2, W - R - 6 * k - lookW / 2)
+        let lookY = fireY - fire / 2 - 14 * k - lookH / 2
+        add(.mouseLook, lookScale, lookX, lookY)
         let act = 0.8 * k, ad = d(act)
-        let actY = fireY - fire / 2 - 14 * k - md - 18 * k - ad / 2
+        let actY = lookY - lookH / 2 - 14 * k - ad / 2
         add(.key(0x45), act, fireX - ad / 2 - 20 * k, actY)                               // E
         add(.key(0x52), act, fireX + ad / 2 + 4 * k, actY)                                 // R
         add(.key(0x46), 0.7 * k, fireX - d(0.7 * k) / 2 - 20 * k, max(T + d(0.7 * k) / 2 + 6 * k, actY - ad - 14 * k))   // F
         add(.key(0x51), 0.7 * k, fireX + d(0.7 * k) / 2 + 4 * k, max(T + d(0.7 * k) / 2 + 6 * k, actY - ad - 14 * k))    // Q
         return out
     }
+    /// Simple platformer, for 2D games played on the arrow keys:
+    ///
+    ///   Esc (top left)                                  Enter (top right)
+    ///
+    ///   ←   →  (bottom left)                               ↑  (bottom right)
+    ///
+    /// Left and right under the left thumb, jump (up) under the right.
+    static func platformer(for screen: ControlPresetScreen) -> [TouchControl] {
+        let s = screen.landscape
+        let W = s.width, H = s.height
+        guard W > 0, H > 0 else { return [] }
+        let k = min(max(H / 400, 1.0), 1.3)
+        let (L, R, T, B) = margins(s)
+        var out: [TouchControl] = []
+        func add(_ action: ControlAction, _ scale: Double, _ x: Double, _ y: Double) {
+            var c = TouchControl()
+            c.action = action; c.scale = scale
+            c.nx = x / W; c.ny = y / H
+            out.append(c)
+        }
+        func d(_ scale: Double) -> Double { baseDiameter * scale }
+        let big = 1.3 * k, bd = d(big)
+        let rowY = H - B - 16 * k - bd / 2
+        let leftX = L + 24 * k + bd / 2
+        add(.key(0x25), big, leftX, rowY)                                   // ←
+        add(.key(0x27), big, leftX + bd + 22 * k, rowY)                      // →
+        let jump = 1.45 * k, jd = d(jump)
+        add(.key(0x26), jump, W - R - 28 * k - jd / 2, H - B - 16 * k - jd / 2)   // ↑
+        let small = 0.7 * k, sd = d(small)
+        add(.key(0x1B), small, L + sd / 2 + 6 * k, T + sd / 2 + 6 * k)       // Esc
+        add(.key(0x0D), small, W - R - sd / 2 - 6 * k, T + sd / 2 + 6 * k)   // Enter
+        return out
+    }
+
     /// Mirrors `TouchControlsModel.baseDiameter`.
     static let baseDiameter = 64.0
 
@@ -254,6 +310,10 @@ struct ControlPresetStore: Equatable {
                       controls: ControlPresetLayout.xbox(for: .referencePhone)),
         ControlPreset(id: ControlPresetLayout.keyboardID, name: ControlPresetLayout.keyboardName,
                       controls: ControlPresetLayout.keyboard(for: .referencePhone)),
+        ControlPreset(id: ControlPresetLayout.arrowsID, name: ControlPresetLayout.arrowsName,
+                      controls: ControlPresetLayout.keyboard(for: .referencePhone, arrows: true)),
+        ControlPreset(id: ControlPresetLayout.platformerID, name: ControlPresetLayout.platformerName,
+                      controls: ControlPresetLayout.platformer(for: .referencePhone)),
     ]
     static let maxNameLength = 40
 
@@ -461,6 +521,22 @@ final class ControlPresetsModel: ObservableObject {
         load(ControlPresetLayout.xboxID, screen: screen, reason: "new-user-default")
     }
 
+    /// A built-in that is still the active layout is unedited (an edit turns it into
+    /// unsaved controls, see editingEnded), so it follows the app: rebuilt from the
+    /// current definition for this screen whenever that differs from what is on
+    /// screen. A layout fix or a new control in a built-in reaches everyone who uses it.
+    func refreshBuiltInIfNeeded(screen: ControlPresetScreen) {
+        let m = TouchControlsModel.shared
+        guard Self.enabled, !m.editing, let id = m.layoutID, ControlPresetStore.isBuiltIn(id),
+              let p = store.preset(id) else { return }
+        let fresh = ControlPresetStore.layout(of: p, screen: screen)
+        func shape(_ c: [TouchControl]) -> [String] {
+            c.map { "\($0.action)|\(($0.nx * 1000).rounded())|\(($0.ny * 1000).rounded())|\(($0.scale * 100).rounded())" }
+        }
+        guard shape(fresh) != shape(m.controls) else { return }
+        load(id, screen: screen, reason: "built-in updated")
+    }
+
     /// Replace the on-screen layout with this one.
     func load(_ id: String, screen: ControlPresetScreen, reason: String = "chosen") {
         guard let p = store.preset(id) else { return }
@@ -609,7 +685,9 @@ struct ControlLayoutMenu: View {
                 ForEach(presets.available) { p in
                     Button { request(.load(p.id)) } label: {
                         if m.layoutID == p.id { Label(p.name, systemImage: "checkmark") }
-                        else if ControlPresetStore.isBuiltIn(p.id) { Label(p.name, systemImage: "gamecontroller") }
+                        else if ControlPresetStore.isBuiltIn(p.id) {
+                            Label(p.name, systemImage: ControlPresetLayout.symbol(p.id))
+                        }
                         else { Text(p.name) }
                     }
                 }

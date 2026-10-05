@@ -186,39 +186,16 @@ enum LocalDevVPN {
 }
 
 struct JITSettingsSection: View {
-    @ObservedObject private var coordinator = JITCoordinator.shared
-    @ObservedObject private var onboarding = OnboardingModel.shared
-
-    @ObservedObject private var jitState = LibraryJITState.shared
-    /// Settings › JIT's first row, the one most often changed: Enable JIT automatically.
-    var autoEnable: Binding<Bool>? = nil
+    /// Settings › JIT: only Enable JIT automatically. Madeira opens StikDebug itself
+    /// (the Enable JIT button, or this switch at start), so the old JIT setup page and
+    /// the JIT/Memory+ rows had nothing left to do here.
+    var autoEnable: Binding<Bool>
 
     var body: some View {
         Section {
-            if let autoEnable { Toggle("Enable JIT automatically", isOn: autoEnable) }
-            LabeledContent("JIT") { status(jitState.enabled) }
-            LabeledContent("Memory+") { status(LibraryJITState.memory) }
-            Button {
-                coordinator.showSetup = true
-            } label: {
-                Label("JIT setup", systemImage: "bolt.badge.clock")
-            }
-            if onboarding.available {
-                Button {
-                    onboarding.rerun()
-                } label: {
-                    Label("Run setup again", systemImage: "wand.and.stars")
-                }
-            }
+            Toggle("Enable JIT automatically", isOn: autoEnable)
         } header: {
             Text("JIT")
-        }
-    }
-
-    private func status(_ on: Bool) -> some View {
-        HStack(spacing: 6) {
-            Circle().fill(on ? Color.green : Color.red).frame(width: 8, height: 8)
-            Text(on ? "On" : "Off")
         }
     }
 }

@@ -159,7 +159,7 @@ enum SteamGamesRules {
     static func blocker(installed: Bool, client: Bool, signedIn: Bool, updating: Bool = false) -> String? {
         if !installed { return "Steam does not list this game as fully installed yet." }
         if updating { return "This game is being downloaded. Play is available when it is done." }
-        if !client { return "Madeira Dock needs Valve's client components. Download them in Settings › Madeira Dock." }
+        if !client { return "Madeira Dock needs Valve's client components. Download them in Settings › Advanced › Madeira Dock." }
         if !signedIn { return "Sign in to Steam in Settings › Accounts to play." }
         return nil
     }
@@ -425,6 +425,7 @@ struct SteamGamesSection: View {
     @ObservedObject private var model = SteamGamesModel.shared
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var library = LibraryModel.shared
+    @ObservedObject private var hidden = LibraryHidden.shared
     @Environment(\.scenePhase) private var scenePhase
     // Collapsed state of the installed games (the Steam title) and of Not installed.
     @AppStorage("madeiraLibraryHideInstalled") private var hideInstalled = false
@@ -481,6 +482,7 @@ struct SteamGamesSection: View {
         let owned = libraryEnabled ? steam.owned : []
         let signedIn = libraryEnabled && steam.signedIn
         let items = SteamGamesRules.items(installed: model.games, owned: owned, search: search)
+            .filter { !hidden.hides(LibraryHidden.steam($0.id)) }
         let groups = SteamGamesRules.groups(items, downloading: Set(steam.downloads.keys))
         let installed = SteamGamesRules.sorted(groups.installed, by: sort, recorded: recorded)
         Group {
@@ -621,6 +623,7 @@ struct SteamGamesSection: View {
     private func cell(_ item: SteamGamesRules.Item, list: Bool, dense: Bool) -> some View {
         Button { select(item) } label: { SteamGameCell(item: item, list: list, dense: dense) }
             .libraryCardButtonStyle(grid: !list)
+            .libraryHideMenu(LibraryHidden.steam(item.id))
     }
 
     /// An installed game (by Madeira's download or by Steam's client) opens its
@@ -666,6 +669,14 @@ struct SteamGameArtwork: View {
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @State private var image: UIImage?
     @State private var blurred: UIImage?
+
+    /// The cached artwork from the first frame (ArtworkCache keeps it across launches).
+    init(appID: Int, notDownloaded: Bool = false) {
+        self.appID = appID
+        self.notDownloaded = notDownloaded
+        let urls = SteamGamesRules.artwork(appID: appID) { SteamOwnedLibrary.shared.game($0) }
+        _image = State(initialValue: urls.lazy.compactMap { ArtworkCache.cached($0) }.first)
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -814,9 +825,12 @@ private struct SteamGameCell: View {
     /// size, and "Update" when a newer build exists); any other state its badge.
     @ViewBuilder private func pills(_ status: SteamGamesRules.Status, _ entry: LibraryEntry?) -> some View {
         if status.showsFormat, let entry {
-            LibraryBadges(entry: entry, note: status.badge).foregroundStyle(.secondary)
-        } else if let text = status.badge {
-            badge(text)
+            LibraryBadges(entry: entry, note: status.badge, store: "Steam").foregroundStyle(.secondary)
+        } else {
+            HStack(spacing: 4) {
+                if let text = status.badge { badge(text) }
+                badge("Steam")
+            }
         }
     }
 
@@ -1246,7 +1260,7 @@ struct SteamEntrySection: View {
                 }
             } else {
                 if !dock.clientInstalled {
-                    Text("Madeira Dock needs Valve's client components. Download them in Settings › Madeira Dock.")
+                    Text("Madeira Dock needs Valve's client components. Download them in Settings › Advanced › Madeira Dock.")
                         .font(.caption).foregroundStyle(.orange)
                 }
                 Toggle("Smaller JIT pool (512 MB) for this launch", isOn: $dock.compactPool)
@@ -1408,6 +1422,7 @@ struct LibraryAllGames<OtherCell: View>: View {
     @ObservedObject private var epicLibrary = EpicLibrary.shared
     @ObservedObject private var epicAuth = EpicAuth.shared
     @ObservedObject private var epicInstaller = EpicInstaller.shared
+    @ObservedObject private var hidden = LibraryHidden.shared
     @AppStorage("madeiraSteamShowUninstalled") private var showUninstalled = true
     @State private var steamSelected: SteamGameSelection?
     @State private var epicSelected: EpicGame?
@@ -1433,15 +1448,17 @@ struct LibraryAllGames<OtherCell: View>: View {
         let steamOn = MadeiraDock.enabled && SteamGamesSection.shown
         let owned = SteamOwnedLibrary.enabled ? steam.owned : []
         let signedIn = SteamOwnedLibrary.enabled && steam.signedIn
-        let steamItems = steamOn ? SteamGamesRules.items(installed: games.games, owned: owned, search: search) : []
+        let steamItems = (steamOn ? SteamGamesRules.items(installed: games.games, owned: owned, search: search) : [])
+            .filter { !hidden.hides(LibraryHidden.steam($0.id)) }
         let groups = SteamGamesRules.groups(steamItems, downloading: Set(steam.downloads.keys))
         let epicGames = (epicAuth.signedIn ? epicLibrary.games : [])
             .filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) }
-        let epicOnDevice = { (g: EpicGame) in epicInstaller.installed[g.appName] != nil || epicInstaller.installs[g.appName] != nil }
+            .filter { !hidden.hides(LibraryHidden.epic($0.appName)) }
+        let epicOnDevice = { (g: EpicGame) in epicInstaller.installed[g.appName] != nil || epicInstaller.isDownloading(g.appName) }
         let downloading: [Item] = groups.downloading.map { .steam($0) }
-            + epicGames.filter { epicInstaller.installs[$0.appName] != nil }.map { .epic($0) }
+            + epicGames.filter { epicInstaller.isDownloading($0.appName) }.map { .epic($0) }
         var installed: [Item] = groups.installed.map { .steam($0) }
-            + epicGames.filter { epicInstaller.installed[$0.appName] != nil && epicInstaller.installs[$0.appName] == nil }.map { .epic($0) }
+            + epicGames.filter { epicInstaller.installed[$0.appName] != nil && !epicInstaller.isDownloading($0.appName) }.map { .epic($0) }
             + others.map { .other($0) }
         installed.sort { a, b in
             if sort != "name" {
@@ -1511,9 +1528,15 @@ struct LibraryAllGames<OtherCell: View>: View {
                 else { steamSelected = SteamGameSelection(id: s.id) }
             } label: { SteamGameCell(item: s, list: list, dense: dense) }
                 .libraryCardButtonStyle(grid: !list)
+                .libraryHideMenu(LibraryHidden.steam(s.id))
         case .epic(let g):
-            Button { epicSelected = g } label: { EpicGameCard(game: g, list: list) }
+            Button {
+                // Installed: straight to its Game details page, as Steam's games.
+                if !epicInstaller.isDownloading(g.appName), let entry = epicInstaller.entry(g.appName) { open(entry) }
+                else { epicSelected = g }
+            } label: { EpicGameCard(game: g, list: list) }
                 .libraryCardButtonStyle(grid: !list)
+                .libraryHideMenu(LibraryHidden.epic(g.appName))
         case .other(let e):
             otherCell(e, list, dense)
         }

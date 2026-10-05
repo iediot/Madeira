@@ -21,6 +21,11 @@ struct winios_gamepad {
  * not advance them. All callers may run concurrently. No callbacks under lock. */
 void winios_gamepad_set_state(int index, const struct winios_gamepad *state);
 int winios_gamepad_get_state(int index, struct winios_gamepad *out);
+/* A resident slot reads as a connected pad at rest while nothing publishes to
+ * it: games that look for controllers only once, at start (Sonic Mania's
+ * RSDKv5 polls each XInput slot a single time), find player 1 even though the
+ * touch or physical controller only starts publishing later. */
+void winios_gamepad_set_resident(int index, int on);
 
 /* ml2100: the opt-in HID controller (env.MADEIRA_PAD_MODE = hid). Player 1
  * only, served by the wineserver (build/wineserver/hidpad_ios.c) as a DualSense

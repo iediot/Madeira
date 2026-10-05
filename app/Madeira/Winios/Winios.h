@@ -41,6 +41,8 @@ void winios_post_touch_up(int x, int y);
 
 /* Key press bridge (VK codes: RETURN=0x0D SPACE=0x20 ESCAPE=0x1B).
  * down=1 press, down=0 release. */
+/* Quit game: asks every visible top-level window to close (WM_CLOSE), on a Wine thread. */
+void winios_post_close(void);
 void winios_post_key(int vk, int down);
 
 /* S2 desktop compositor placement. Called by the Swift presentation
@@ -77,6 +79,10 @@ int winios_compositor_set_hidden(int hidden);
 void winios_note_game_metal_hwnd(void *hwnd);
 void winios_session_reset(void);
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
+/* Main thread. The client area, in guest screen pixels, of the window whose
+ * swapchain is on screen in a game session (a windowed game's picture fills the
+ * view, so touches belong inside this area). Returns 0 when none is known. */
+int winios_game_client_rect(int *x, int *y, int *w, int *h);
 
 /* Top-level window census, for the starting screen of a Madeira Dock start
  * (DockStartScreen.swift). A Dock start is a desktop session, and the

@@ -58,8 +58,8 @@ jit_setup = (app / 'JITSetup.swift').read_text()
 rules = onboarding[onboarding.index('// MARK: - Rules'):onboarding.index('// MARK: - Setup model')]
 model = block(onboarding, 'final class OnboardingModel')
 settings_section = block(onboarding, 'struct SteamSettingsSection: View')
-dock_settings_section = block(onboarding, 'struct MadeiraDockSettingsSection: View')
-jit_settings_section = block(jit_setup, 'struct JITSettingsSection: View')
+dock_settings_section = block(onboarding, 'struct MadeiraDockRow: View')
+jit_settings_section = block(onboarding, 'struct RunSetupAgainRow: View')
 
 # ------------------------------------------------------------------ static: provenance and project
 require(onboarding.startswith('// SPDX-License-Identifier: GPL-3.0-or-later\n// Copyright 2026 125hz\n'
@@ -93,7 +93,7 @@ require(library.count('!onboarding.presented') >= 2, 'Library: controller comman
 require('onboarding.rerun()' not in settings_section,
         'Settings › Accounts: Run setup again lives in Settings › JIT only')
 require('if onboarding.available {' in jit_settings_section and 'onboarding.rerun()' in jit_settings_section,
-        'Settings › JIT: Run setup again, hidden with MADEIRA_ONBOARDING=0')
+        'Settings › Advanced: Run setup again, hidden with MADEIRA_ONBOARDING=0')
 
 # ------------------------------------------------------------------ static: skippable steps
 view = block(onboarding, 'struct OnboardingView: View')

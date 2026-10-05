@@ -76,6 +76,9 @@ struct EpicInstalledGame: Codable {
                           resume: { [weak self] in self?.resumeAfterBackground() })
     }
     private var hasActiveDownload: Bool { active != nil || !queue.isEmpty }
+    /// A download queued, running, paused or failed. A finished install stays in
+    /// `installs` with the state .installed, so "has an entry" is not "downloading".
+    func isDownloading(_ appName: String) -> Bool { installs[appName]?.download != nil }
     func entry(_ appName: String) -> LibraryEntry? {
         guard installed[appName] != nil else { return nil }
         return LibraryModel.shared.entries.first { $0.epicAppName == appName }
