@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="app/Madeira/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png" width="140" alt="Madeira app icon">
+<img src="docs/assets/icon.png" width="160" alt="Madeira app icon">
 
 # Madeira
 
@@ -100,5 +100,5 @@ GPL-3.0-or-later ([`LICENSE`](LICENSE)) with the Madeira Converter Exception
 Microsoft's Visual C++ runtime is not included.
 
 <p align="center">
-  <img src="docs/assets/banner.png" alt="Madeira — Bringing PC gaming to your iPhone." width="100%">
+  <img src="docs/assets/banner-rounded.png" alt="Madeira — Bringing PC gaming to your iPhone." width="100%">
 </p>
