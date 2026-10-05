@@ -76,7 +76,7 @@ struct EpicGameCard: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                     VStack(alignment: .leading, spacing: 8) {
                         Text(game.title).font(.headline).lineLimit(2)
-                        tags
+                        tags()
                         if let download = installer.installs[game.appName]?.download { SteamDownloadStatus(download: download) }
                     }
                     Spacer(minLength: 0)
@@ -91,10 +91,10 @@ struct EpicGameCard: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .overlay { downloadOverlay }
                         .modifier(LibraryCardArtworkPress())
-                    Text(game.title).font(.footnote.weight(.semibold)).lineLimit(2)
+                    // Fixed lines (LibraryEntryCard); the art's overlay shows a download.
+                    Text(game.title).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
                         .multilineTextAlignment(.leading)
-                    tags
-                    if let download = installer.installs[game.appName]?.download { SteamDownloadStatus(download: download) }
+                    tags(oneRow: true).frame(height: LibraryLayout.pillRow, alignment: .leading)
                 }
                 .padding(4)
             }
@@ -120,9 +120,9 @@ struct EpicGameCard: View {
 
     /// The same pills as a Steam card: once installed the store and the format pills of
     /// any library game (bits, graphics API, size), otherwise the store and the state.
-    @ViewBuilder private var tags: some View {
+    @ViewBuilder private func tags(oneRow: Bool = false) -> some View {
         if !installer.isDownloading(game.appName), let entry = installer.entry(game.appName) {
-            LibraryBadges(entry: entry, store: "Epic").foregroundStyle(.secondary)
+            LibraryBadges(entry: entry, store: "Epic", oneRow: oneRow).foregroundStyle(.secondary)
         } else {
             HStack(spacing: 4) {
                 LibrarySourceTag(text: state)

@@ -7,6 +7,9 @@ import SwiftUI
 
 /// The page geometry Home and the Library page share, from the viewport's width.
 enum LibraryLayout {
+    /// The height a grid card keeps for its one row of pills.
+    static let pillRow: CGFloat = 22
+
     /// The side margin, matching the navigation bar's (and so the search field and title).
     static func margin(_ width: CGFloat) -> CGFloat { width >= 700 ? 20 : 16 }
 
@@ -100,9 +103,11 @@ struct LibraryEntryCard: View {
             LibraryArtwork(entry: entry).aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
                 .modifier(LibraryCardArtworkPress())
-            Text(entry.title).font(.footnote.weight(.semibold)).lineLimit(2)
+            // Fixed lines (two for the title, one for the pills), so loading details
+            // never changes a card's height and moves the grid under the reader.
+            Text(entry.title).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
                 .multilineTextAlignment(.leading)
-            if badges { LibraryBadges(entry: entry).foregroundStyle(.secondary) }
+            if badges { LibraryBadges(entry: entry, oneRow: true).foregroundStyle(.secondary).frame(height: LibraryLayout.pillRow, alignment: .leading) }
         }
         .padding(4)
         .foregroundStyle(.primary)
@@ -391,9 +396,10 @@ struct LibrarySideMenu: View {
                 VStack(spacing: 6) { dot(jitState.enabled); dot(LibraryJITState.memory) }
                     .frame(maxWidth: .infinity)
             } else {
-                HStack(spacing: 12) {
-                    HStack(spacing: 5) { dot(jitState.enabled); Text("JIT") }
-                    HStack(spacing: 5) { dot(LibraryJITState.memory); Text("Memory+") }
+                HStack(alignment: .center, spacing: 0) {
+                    HStack(alignment: .center, spacing: 6) { Text("JIT"); dot(jitState.enabled) }
+                    Spacer(minLength: 12)
+                    HStack(alignment: .center, spacing: 6) { Text("Memory+"); dot(LibraryJITState.memory) }
                 }
                 .padding(.horizontal, 14)
             }

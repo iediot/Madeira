@@ -803,11 +803,10 @@ private struct SteamGameCell: View {
                         .overlay { if notDownloaded { notDownloadedFace(.title) } }
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .modifier(LibraryCardArtworkPress())
-                    Text(item.name).font(.footnote.weight(.semibold)).lineLimit(2)
-                    pills(status, entry)
-                    if let played = steam.playtime[item.id]?.played {
-                        Text(played).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                    }
+                    // Fixed lines (LibraryEntryCard): the pills and playtime arrive later.
+                    Text(item.name).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
+                    pills(status, entry, oneRow: true).frame(height: LibraryLayout.pillRow, alignment: .leading)
+                    Text(steam.playtime[item.id]?.played ?? " ").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }.padding(4)
             }
         }
@@ -823,9 +822,9 @@ private struct SteamGameCell: View {
 
     /// An installed game shows the pills of any library game (bits, graphics API,
     /// size, and "Update" when a newer build exists); any other state its badge.
-    @ViewBuilder private func pills(_ status: SteamGamesRules.Status, _ entry: LibraryEntry?) -> some View {
+    @ViewBuilder private func pills(_ status: SteamGamesRules.Status, _ entry: LibraryEntry?, oneRow: Bool = false) -> some View {
         if status.showsFormat, let entry {
-            LibraryBadges(entry: entry, note: status.badge, store: "Steam").foregroundStyle(.secondary)
+            LibraryBadges(entry: entry, note: status.badge, store: "Steam", oneRow: oneRow).foregroundStyle(.secondary)
         } else {
             HStack(spacing: 4) {
                 if let text = status.badge { badge(text) }

@@ -3952,15 +3952,18 @@ struct TouchControlsOverlay: View {
             // bar; the controls hide while its menu or starting screen is up.
             let session = library.current != nil
             let landscape = geo.size.width > geo.size.height || session
+            // With the library as the front end the controls belong to a game: the
+            // on-screen setting is global now, so the library itself never shows them.
+            let playing = session || !library.enabled
             ZStack(alignment: .top) {
                 if landscape {
                     // The editor (ControlEditor.swift): the dimmed, gridded game behind the
                     // controls, its own bar, and the docked inspector.
                     if m.editing { ControlEditorBackdrop(screen: geo.size) }
-                    if (m.visible || m.editing) && !library.blocksGameplayTouch {
+                    if (m.visible && playing || m.editing) && !library.blocksGameplayTouch {
                         controls(geo.size, session: session)
                     }
-                    if m.editing { ControlEditorBar() } else if session { LibraryHUD() } else { topBar }
+                    if m.editing { ControlEditorBar() } else if session { LibraryHUD() } else if playing { topBar }
                     if m.editing { ControlInspector(screen: geo.size).transition(.opacity) }
                 }
             }
@@ -3973,6 +3976,7 @@ struct TouchControlsOverlay: View {
             .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape) }
+            .onChange(of: library.current) { _, _ in configureGamepad(landscape: landscape) }
             .onDisappear { GamepadInput.shared.configureTouch(controls: []) }
         }
         .ignoresSafeArea()
@@ -4004,7 +4008,7 @@ struct TouchControlsOverlay: View {
     }
 
     private func configureGamepad(landscape: Bool) {
-        let ids = landscape && m.visible && !m.editing && !library.blocksGameplayTouch
+        let ids = landscape && m.visible && (library.current != nil || !library.enabled) && !m.editing && !library.blocksGameplayTouch
             ? m.controls.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
         GamepadInput.shared.configureTouch(controls: Set(ids))
     }
