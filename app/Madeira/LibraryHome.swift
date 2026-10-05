@@ -23,12 +23,13 @@ enum LibraryLayout {
 
 /// What the Library page lists: everything, the Steam games, or the games you added.
 enum LibraryFilter: String, CaseIterable, Identifiable {
-    case all, steam, other
+    case all, steam, epic, other
     var id: String { rawValue }
     var title: String {
         switch self {
         case .all: return "All games"
         case .steam: return "Steam"
+        case .epic: return "Epic Games"
         case .other: return "Other games"
         }
     }
@@ -216,7 +217,7 @@ struct LibraryHome: View {
 
     /// The games you added, in the Library's order.
     private var others: [LibraryEntry] {
-        let mine = model.entries.filter { $0.desktop != true && $0.steamAppID == nil }
+        let mine = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && $0.epicAppName == nil }
         if sort == "added" { return mine.reversed() }
         if sort == "name" { return mine.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending } }
         return mine.sorted { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
@@ -240,6 +241,7 @@ struct LibraryHome: View {
                 SteamGamesSection(search: "", sort: sort, width: width, part: .all, open: open,
                                   seeAll: { seeAll(.steam) })
             }
+            EpicGamesSection(search: "", width: width, shelf: { seeAll(.epic) }, open: open)
             otherGames
         }
         .padding(.bottom, 40)

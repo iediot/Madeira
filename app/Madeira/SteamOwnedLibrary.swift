@@ -39,6 +39,10 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     /// Steam's launch configuration, for "Start with: The game" (SteamDirectStart);
     /// nil in older caches, which then ask Steam once (SteamOwnedLibrary.launchOptions).
     var launches: [SteamLaunchOption]?
+    /// The Windows install's download and installed sizes from PICS, shown on the
+    /// game's page before Install; nil (unknown) in older caches and when PICS gave none.
+    var downloadBytes: UInt64?
+    var installBytes: UInt64?
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
@@ -48,6 +52,9 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
         libraryCapsule = info.libraryCapsule; libraryHero = info.libraryHero; headerImage = info.headerImage
         parentID = info.parentID.map(Int.init)
         launches = info.launches
+        let download = info.downloadSize(for: "windows"), install = info.installedSize(for: "windows")
+        downloadBytes = download > 0 ? download : nil
+        installBytes = install > 0 ? install : nil
     }
 
     var folderName: String { SteamInstallFiles.safeFolderName(installDir.isEmpty ? "app_\(id)" : installDir) }
@@ -353,7 +360,7 @@ final class SteamOwnedLibrary: ObservableObject {
 
     private func handleSessionError(_ error: Error, context: String, report: Bool = true) {
         if case SteamError.logonDenied(let code) = error, SteamError.signInExpiredCodes.contains(code) {
-            self.error = "Your Steam sign-in is no longer valid. Sign out and sign in again in Settings › Steam."
+            self.error = "Your Steam sign-in is no longer valid. Sign out and sign in again in Settings › Accounts."
             SteamLog.event("[steam-account] stored sign-in rejected code=\(code)")
             return
         }

@@ -1597,7 +1597,12 @@ static void *wine_process_thread(void *arg) {
         argv[argc] = NULL;
         dprintf(STDERR_FILENO, "[WineProc] argv[1] = %s\n", exe_path);
         for (int i = 0; i < extra_argc; i++) {
-            dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, extra_argv[i]);
+            /* Epic's one-use code and account identity must not enter session logs. */
+            const char *arg = extra_argv[i];
+            int private_arg = !strncasecmp(arg, "-AUTH_PASSWORD=", 15) ||
+                              !strncasecmp(arg, "-epicuserid=", 12) ||
+                              !strncasecmp(arg, "-epicusername=", 14);
+            dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, private_arg ? "[Epic credential]" : arg);
         }
 
         /* iOS-Madeira: chdir to the unix path that maps to the exe's Wine

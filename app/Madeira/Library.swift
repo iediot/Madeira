@@ -276,6 +276,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// through Valve's client, with Steam's default launch option.
     /// `relativePath` is then its install folder, relative to drive_c.
     var steamAppID: Int?
+    /// Epic's installed app and public art; optional for older library files.
+    var epicAppName: String?
+    var epicLaunchCommand: String?
+    var epicArtworkURL: URL?
+    var epicHeroURL: URL?
     /// How a Steam game starts (Game details › Steam › Start with): nil is Madeira
     /// Dock, the default; "game" is the game's own program in Wine, without Steam
     /// (SteamDirectStart).
@@ -710,7 +715,8 @@ final class LibraryModel: ObservableObject {
         // A Steam game has one entry: a details page opened before its card first saved
         // one (refreshSteamMetadata) updates that entry.
         if let i = next.firstIndex(where: { $0.id == entry.id }) ??
-            next.firstIndex(where: { entry.steamAppID != nil && $0.steamAppID == entry.steamAppID }) {
+            next.firstIndex(where: { entry.steamAppID != nil && $0.steamAppID == entry.steamAppID }) ??
+            next.firstIndex(where: { entry.epicAppName != nil && $0.epicAppName == entry.epicAppName }) {
             // A details sheet may predate an asynchronous metadata refresh.
             if (next[i].metadataChecked ?? .distantPast) > (entry.metadataChecked ?? .distantPast) {
                 entry.folderBytes = next[i].folderBytes; entry.graphicsAPI = next[i].graphicsAPI
@@ -1577,6 +1583,8 @@ struct LibraryArtwork: View {
                let image = UIImage(contentsOfFile: LibraryModel.documents.appendingPathComponent("madeira-art/" + URL(fileURLWithPath: name).lastPathComponent).path) {
                 Image(uiImage: image).resizable().scaledToFill()
                     .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
+            } else if let url = backdrop ? (entry.epicHeroURL ?? entry.epicArtworkURL) : entry.epicArtworkURL {
+                EpicArtwork(url: url)
             } else if let id = entry.steamID ?? entry.steamAppID {   // a store match, else the Steam game itself
                 AsyncImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id)) { image in
                     image.resizable().scaledToFill()
@@ -1773,7 +1781,7 @@ struct LibraryView: View {
     var play: (LibraryEntry) -> Void
     var enableJIT: () -> Void
     @ObservedObject private var jitState = LibraryJITState.shared
-    /// Madeira Dock's start, for Settings › Steam (Onboarding.swift).
+    /// Madeira Dock's start, for Settings › Madeira Dock (Onboarding.swift).
     var startDock: (DockGame, Bool) -> Void = { _, _ in }
     /// First-run setup (Onboarding.swift).
     @ObservedObject private var onboarding = OnboardingModel.shared
@@ -1809,9 +1817,12 @@ struct LibraryView: View {
     // The sections follow the Steam section's games and sign-in (SteamGames.swift).
     @ObservedObject private var steamGames = SteamGamesModel.shared
     @ObservedObject private var steamLibrary = SteamOwnedLibrary.shared
+    // Epic Games joins the library once signed in (Epic/EpicLibraryViews.swift).
+    @ObservedObject private var epicAuth = EpicAuth.shared
+    @ObservedObject private var epicLibrary = EpicLibrary.shared
     private var entries: [LibraryEntry] {
         // Steam games are listed in their own section (SteamGames.swift).
-        let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+        let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && $0.epicAppName == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
         if sort == "added" { return visible.reversed() }
         return visible.sorted {
             if sort == "played", $0.lastPlayed != $1.lastPlayed { return ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
@@ -2008,35 +2019,27 @@ struct LibraryView: View {
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.clear)
             }
-            // JIT and Memory+ show in the header's status capsule on every tab. How JIT is
-            // enabled (StikDebug) comes first: nothing runs without it.
-            if settingsShow("JIT", "StikDebug", "LocalDevVPN") {
-                JITSettingsSection()
+            // Accounts first: Steam and Epic Games, then Madeira Dock on its own.
+            if SteamSettingsSection.shown, settingsShow("Accounts", "Steam", "Epic", "sign in", "sign out", "account") {
+                SteamSettingsSection(open: { settingsSheet = $0 })
             }
-            if settingsShow("JIT", "automatically", "StikDebug", "start") {
-                Section {
-                    Toggle("Enable JIT automatically", isOn: $autoEnableJIT)
-                        .onChange(of: autoEnableJIT) { _, on in if on, !jitState.enabled { enableJIT() } }
-                }
-            }
-            if settingsShow("controls", "pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
-                Section("Controls") { LibraryPointerSettings() }
+            if MadeiraDock.enabled, settingsShow("Madeira Dock", "Dock", "Steam", "client") {
+                MadeiraDockSettingsSection(open: { settingsSheet = $0 })
             }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
                 } header: { Text("Appearance") }
             }
-            // Steam: set up once, after the everyday options.
-            if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
-                SteamSettingsSection(open: { settingsSheet = $0 })
+            if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS"),
+               settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
+            // JIT, with Enable JIT automatically as its first row; JIT setup and Run setup again.
+            if settingsShow("JIT", "automatically", "StikDebug", "LocalDevVPN", "start", "setup") {
+                JITSettingsSection(autoEnable: $autoEnableJIT)
+                    .onChange(of: autoEnableJIT) { _, on in if on, !jitState.enabled { enableJIT() } }
             }
-            // Technical: refresh-rate hold, then memory and synchronisation.
-            if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
-                if settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
-                if settingsShow("memory", "JIT pool", "pool", "video memory", "VRAM", "swap", "coverage", "madsync", "sync", "eco", "all settings") {
-                    RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
-                }
+            if settingsShow("controls", "pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
+                Section("Controls") { LibraryPointerSettings() }
             }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             // For debugging Madeira itself: logging and the original diagnostic screen.
@@ -2047,6 +2050,11 @@ struct LibraryView: View {
                         developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
                     }))
                 } header: { Text("Advanced") }
+            }
+            // Memory and synchronisation: the technical settings, last before the credits.
+            if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS"),
+               settingsShow("memory", "JIT pool", "pool", "video memory", "VRAM", "swap", "coverage", "madsync", "sync", "eco", "all settings") {
+                RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
             }
             // Search: the matching options of All settings, editable here.
             if !settingsSearch.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -2079,6 +2087,7 @@ struct LibraryView: View {
             switch sheet {
             case .allSettings: AllSettingsView()
             case .steamSignIn: SteamSignInView()
+            case .epicSignIn: EpicSignInView()
             case .dock: MadeiraDockView(start: startDock)
             }
         }
@@ -2145,7 +2154,7 @@ struct LibraryView: View {
                     }
                 }
                 libraryBar
-                libraryContent(width: viewport.size.width, filter: SteamGamesSection.shown ? filter : .other)
+                libraryContent(width: viewport.size.width, filter: showsFilters ? filter : .other)
             }
             .padding(.horizontal, LibraryLayout.margin(viewport.size.width)).padding(.vertical, 16)
             .frame(maxWidth: 1400).frame(maxWidth: .infinity)
@@ -2180,10 +2189,11 @@ struct LibraryView: View {
     /// The filter capsules (with Steam on), then the layout options and +.
     private var libraryBar: some View {
         HStack(spacing: 10) {
-            if SteamGamesSection.shown {
+            if showsFilters {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        ForEach(LibraryFilter.allCases) { option in
+                        ForEach(LibraryFilter.allCases.filter { $0 != .steam || SteamGamesSection.shown }
+                                                                .filter { $0 != .epic || EpicGamesSection.shown }) { option in
                             Button {
                                 withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { filter = option }
                             } label: { filterPill(option.title, selected: filter == option) }
@@ -2192,7 +2202,20 @@ struct LibraryView: View {
                         }
                     }.padding(.vertical, 2)
                 }
-                .scrollClipDisabled()
+                // Clipped to its own frame: drawn outside it, the capsules slid under the
+                // options and + buttons. A long fade at the trailing edge says it scrolls.
+                .mask {
+                    HStack(spacing: 0) {
+                        Color.black
+                        // Long and eased, so the capsules dissolve rather than cut off.
+                        LinearGradient(stops: [.init(color: .black, location: 0),
+                                               .init(color: .black.opacity(0.8), location: 0.25),
+                                               .init(color: .black.opacity(0.45), location: 0.55),
+                                               .init(color: .black.opacity(0.15), location: 0.8),
+                                               .init(color: .clear, location: 1)],
+                                       startPoint: .leading, endPoint: .trailing).frame(width: 64)
+                    }
+                }
             } else {
                 Spacer()
             }
@@ -2239,15 +2262,38 @@ struct LibraryView: View {
 
     /// The games for a filter: Steam's installed games, then its Not installed, then
     /// the games you added (with the Windows desktop first among them).
+    /// The filter capsules show once the library has more than one source.
+    private var showsFilters: Bool { SteamGamesSection.shown || EpicGamesSection.shown }
+
     @ViewBuilder private func libraryContent(width: CGFloat, filter: LibraryFilter) -> some View {
-        let steam = MadeiraDock.enabled && SteamGamesSection.shown && filter != .other
+        if filter == .all {
+            // All games: every store together, as Installed and Not installed (SteamGames.swift).
+            let desktop = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry
+            let showDesktop = search.isEmpty || desktop.title.localizedCaseInsensitiveContains(search)
+            LibraryAllGames(search: search, layout: layout, sort: sort, width: width,
+                            others: (showDesktop ? [desktop] : []) + entries, open: { selected = $0 }) { entry, list, dense in
+                libraryItem(entry, list: list, dense: dense)
+            }
+        } else {
+            storeContent(width: width, filter: filter)
+        }
+    }
+
+    /// One store's games, for the Steam, Epic Games and Other games filters.
+    @ViewBuilder private func storeContent(width: CGFloat, filter: LibraryFilter) -> some View {
+        let steam = MadeiraDock.enabled && SteamGamesSection.shown && filter == .steam
+        let epic = EpicGamesSection.shown && filter == .epic
         VStack(alignment: .leading, spacing: 28) {
             if steam {
                 SteamGamesSection(search: search, layout: layout, sort: sort, width: width, part: .all, open: { selected = $0 })
             }
-            if filter != .steam {
+            // The account's Epic games (Epic/EpicLibraryViews.swift), after Steam's.
+            if epic {
+                EpicGamesSection(search: search, layout: layout, width: width, open: { selected = $0 })
+            }
+            if filter == .all || filter == .other {
                 VStack(alignment: .leading, spacing: 14) {
-                    if steam || filter == .all && SteamGamesSection.shown {
+                    if steam || epic {
                         LibrarySectionHeader(title: "Other games", count: entries.count,
                                              collapsed: SteamGamesSection.collapsible ? $hideOthers : nil) { EmptyView() }
                     }
@@ -2984,7 +3030,7 @@ struct MadeiraCredit: View {
 /// MADEIRA_RUNTIME_SETTINGS=0 hides this section.
 /// A sheet opened from Settings; LibraryView presents it from the Form itself.
 enum SettingsSheet: String, Identifiable {
-    case allSettings, steamSignIn, dock
+    case allSettings, steamSignIn, epicSignIn, dock
     var id: String { rawValue }
 }
 

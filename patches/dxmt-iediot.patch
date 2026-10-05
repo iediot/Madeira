@@ -15,11 +15,63 @@ index 56ba86e..fa086b5 100644
  }
  
  template <partitioning partition>
+diff --git a/src/d3d11/d3d11_context_def.cpp b/src/d3d11/d3d11_context_def.cpp
+index 2f5dcd0..b638ffa 100644
+--- a/src/d3d11/d3d11_context_def.cpp
++++ b/src/d3d11/d3d11_context_def.cpp
+@@ -51,8 +51,8 @@ DeferredContextBase::AllocateCommandData(size_t n) {
+ 
+ template <>
+ std::tuple<WMT::Buffer, uint64_t>
+-DeferredContextBase::AllocateStagingBuffer(size_t size, size_t alignment) {
+-  return ctx_state.current_cmdlist->AllocateStagingBuffer(size, alignment);
++DeferredContextBase::AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address) {
++  return ctx_state.current_cmdlist->AllocateStagingBuffer(size, alignment, cpu_address);
+ }
+ 
+ template <>
+@@ -490,4 +490,4 @@ InitializeCommandListPool(MTLD3D11Device *device) {
+   return std::make_unique<MTLD3D11CommandListPool>(device);
+ }
+ 
+-}; // namespace dxmt
+\ No newline at end of file
++}; // namespace dxmt
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 0635a0d..4f0e86a 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -48,8 +48,8 @@ ImmediateContextBase::AllocateCommandData(size_t n) {
+ 
+ template <>
+ std::tuple<WMT::Buffer, uint64_t>
+-ImmediateContextBase::AllocateStagingBuffer(size_t size, size_t alignment) {
+-  return ctx_state.cmd_queue.AllocateStagingBuffer(size, alignment);
++ImmediateContextBase::AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address) {
++  return ctx_state.cmd_queue.AllocateStagingBuffer(size, alignment, cpu_address);
+ }
+ 
+ template <>
+@@ -654,4 +654,4 @@ InitializeImmediateContext(MTLD3D11Device *pDevice, CommandQueue &cmd_queue) {
+   return std::make_unique<MTLD3D11ImmediateContext>(pDevice, cmd_queue);
+ }
+ 
+-}; // namespace dxmt
+\ No newline at end of file
++}; // namespace dxmt
 diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
-index 1e2a92f..6be6b6e 100644
+index 1e2a92f..90c59e2 100644
 --- a/src/d3d11/d3d11_context_impl.cpp
 +++ b/src/d3d11/d3d11_context_impl.cpp
-@@ -609,6 +609,15 @@ inline std::atomic<uint32_t> g_bc_stream_fail{0};
+@@ -27,6 +27,7 @@ since it is for internal use only
+ #include "dxmt_staging.hpp"
+ #include "d3d11_resource.hpp"
+ #include "dxmt_texture.hpp"
++#include "dxmt_texture_upload.hpp"
+ #include "util_flags.hpp"
+ #include "util_math.hpp"
+ #include "util_win32_compat.h"
+@@ -609,6 +610,15 @@ inline std::atomic<uint32_t> g_bc_stream_fail{0};
   * clamp is enabled means no clamped texture was ever streamed to. */
  inline std::atomic<uint32_t> g_bc_clamp_xlated{0};
  inline std::atomic<uint32_t> g_bc_clamp_dropped{0};
@@ -35,7 +87,17 @@ index 1e2a92f..6be6b6e 100644
  /* ml746: COPY-PATH clamp accounting. CopySubresourceRegion never translated mip
   * indices, so every copy touching a clamped texture landed on the wrong level --
   * invisible in the menu (0 copies) and severe in gameplay (1,860). Classified by
-@@ -3779,6 +3788,13 @@ public:
+@@ -3147,7 +3157,8 @@ public:
+ 
+   template <typename T> moveonly_list<T> AllocateCommandData(size_t n = 1);
+ 
+-  std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment);
++  std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment,
++                                                       void **cpu_address = nullptr);
+   void UseCopyDestination(Rc<StagingResource> &);
+   void UseCopySource(Rc<StagingResource> &);
+ 
+@@ -3779,6 +3790,13 @@ public:
       * so they take bias 0, which is what we want. Drop only when a requested
       * logical level sits below its own texture's bias -- it does not exist. */
      {
@@ -49,7 +111,7 @@ index 1e2a92f..6be6b6e 100644
        uint32_t src_bias = 0, dst_bias = 0;
        if (auto t = GetTexture(cmd.pSrc)) src_bias = t->mipBias();
        if (auto t = GetTexture(cmd.pDst)) dst_bias = t->mipBias();
-@@ -4302,6 +4318,13 @@ public:
+@@ -4302,6 +4320,13 @@ public:
         *
         * Without this every streamed update would land on the wrong mip, which is
         * worse than not clamping at all. */
@@ -63,7 +125,34 @@ index 1e2a92f..6be6b6e 100644
        const uint32_t mip_bias = dst->mipBias();
        if (mip_bias) {
          if (cmd.Dst.MipLevel < mip_bias) {
-@@ -4496,6 +4519,13 @@ public:
+@@ -4413,9 +4438,23 @@ public:
+         cmd.EffectiveRows = cmd.DstSize.height;
+         g_bc_stream_ok[bc_kind & 15].fetch_add(1, std::memory_order_relaxed);
+       }
+-      auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
+-      auto [staging_buffer, offset] = AllocateStagingBuffer(bytes_per_depth_slice * cmd.DstSize.depth, 16);
+-      if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
++      const size_t bytes_per_depth_slice = size_t(cmd.EffectiveRows) * cmd.EffectiveBytesPerRow;
++      void *cpu_address = nullptr;
++      auto [staging_buffer, offset] = AllocateStagingBuffer(
++          bytes_per_depth_slice * cmd.DstSize.depth, 16, &cpu_address);
++#ifdef DXMT_IOS
++      static const bool direct_uploads = env::getEnvVar("DXMT_DIRECT_TEXTURE_UPLOAD") == "1";
++#else
++      constexpr bool direct_uploads = false;
++#endif
++      // The ring supplies a fresh suballocation; its existing GPU/command-list
++      // fences retain the backing. Remote handles never expose cpu_address.
++      if (direct_uploads && cpu_address) {
++        staging_buffer.updateTextureContents(offset, pSrcData,
++                          cmd.EffectiveRows, cmd.DstSize.depth,
++                          cmd.EffectiveBytesPerRow, SrcRowPitch, SrcDepthPitch,
++                          cmd.EffectiveBytesPerRow, bytes_per_depth_slice);
++      } else if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
+         for (unsigned depthSlice = 0; depthSlice < cmd.DstSize.depth; depthSlice++) {
+           auto dst_offset = offset + depthSlice * bytes_per_depth_slice;
+           const char *src = ((const char *)pSrcData) + depthSlice * SrcDepthPitch;
+@@ -4496,6 +4535,13 @@ public:
         *
         * Without this every streamed update would land on the wrong mip, which is
         * worse than not clamping at all. */
@@ -77,6 +166,66 @@ index 1e2a92f..6be6b6e 100644
        const uint32_t mip_bias = dst->mipBias();
        if (mip_bias) {
          if (cmd.Dst.MipLevel < mip_bias) {
+@@ -5769,8 +5815,9 @@ public:
+   }
+ 
+   std::tuple<WMT::Buffer, uint64_t>
+-  AllocateStagingBuffer(size_t size, size_t alignment) {
++  AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address = nullptr) {
+     auto [block, offset] = staging_allocator.allocate(1, 0, size, alignment);
++    if (cpu_address) *cpu_address = block.cpu_address;
+     return {block.buffer, offset};
+   }
+ 
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index aeb3673..de0567e 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -739,8 +739,9 @@ public:
+     /* iOS-Madeira 2026-07-03: [PRESENT_GAP] — attribute the exactly-20-FPS
+      * ceiling. Splits each frame into time spent INSIDE Present1 (our
+      * present path: SyncFrame wait, Commit, PresentBoundary) vs OUTSIDE
+-     * (game sim/render/its own frame limiter). gap≈50ms with inside≈0 ⇒
+-     * the game paces itself between presents; inside≈50ms ⇒ we block.
++     * (game work and graphics API calls between presents, including uploads
++     * and resource/shader creation). A long gap with inside≈0 does not isolate
++     * the game or absolve the graphics layer; inside≈50ms locates a Present wait.
+      * Also logs the SyncInterval the game passes (3 @60Hz would = 20). */
+     {
+       auto now = std::chrono::steady_clock::now();
+@@ -748,6 +749,8 @@ public:
+         double gap_ms = std::chrono::duration<double, std::milli>(now - madeira_gap_last_entry_).count();
+         madeira_gap_sum_ms_ += gap_ms;
+         madeira_gap_max_ms_ = std::max(madeira_gap_max_ms_, gap_ms);
++        madeira_gap_over_50_ += gap_ms > 50.0;
++        madeira_gap_over_100_ += gap_ms > 100.0;
+       }
+       madeira_gap_last_entry_ = now;
+       madeira_gap_sync_min_ = std::min(madeira_gap_sync_min_, SyncInterval);
+@@ -755,11 +758,13 @@ public:
+       if ((++madeira_gap_count_ % 64) == 0) {
+         Logger::info(std::format(
+             "[PRESENT_GAP] #{} gap_avg={:.1f}ms gap_max={:.1f}ms inside_avg={:.1f}ms "
+-            "inside_max={:.1f}ms sync_interval={}..{}",
++            "inside_max={:.1f}ms sync_interval={}..{} over_50ms={} over_100ms={}",
+             madeira_gap_count_, madeira_gap_sum_ms_ / 64.0, madeira_gap_max_ms_,
+             madeira_inside_sum_ms_ / 64.0, madeira_inside_max_ms_,
+-            madeira_gap_sync_min_, madeira_gap_sync_max_));
++            madeira_gap_sync_min_, madeira_gap_sync_max_,
++            madeira_gap_over_50_, madeira_gap_over_100_));
+         madeira_gap_sum_ms_ = 0; madeira_gap_max_ms_ = 0;
++        madeira_gap_over_50_ = 0; madeira_gap_over_100_ = 0;
+         madeira_inside_sum_ms_ = 0; madeira_inside_max_ms_ = 0;
+         madeira_gap_sync_min_ = ~0u; madeira_gap_sync_max_ = 0;
+       }
+@@ -1131,6 +1136,7 @@ private:
+    * thread, so plain members are fine. */
+   std::chrono::steady_clock::time_point madeira_gap_last_entry_{};
+   uint64_t madeira_gap_count_ = 0;
++  uint32_t madeira_gap_over_50_ = 0, madeira_gap_over_100_ = 0;
+   double madeira_gap_sum_ms_ = 0, madeira_gap_max_ms_ = 0;
+   double madeira_inside_sum_ms_ = 0, madeira_inside_max_ms_ = 0;
+   UINT madeira_gap_sync_min_ = ~0u, madeira_gap_sync_max_ = 0;
 diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
 index dfc927b..8867ff7 100644
 --- a/src/d3d11/d3d11_texture_device.cpp
@@ -627,6 +776,158 @@ index 0000000..718dc30
 +}
 +
 +} // namespace dxmt
+diff --git a/src/dxmt/dxmt_command_queue.hpp b/src/dxmt/dxmt_command_queue.hpp
+index b8e7348..8b30fee 100644
+--- a/src/dxmt/dxmt_command_queue.hpp
++++ b/src/dxmt/dxmt_command_queue.hpp
+@@ -374,8 +374,9 @@ public:
+   bool WaitCPUFenceBounded(uint64_t seq, uint64_t timeout_ns);
+ 
+   std::tuple<WMT::Buffer, uint64_t>
+-  AllocateStagingBuffer(size_t size, size_t alignment) {
++  AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address = nullptr) {
+     auto [block, offset] = staging_allocator.allocate(ready_for_encode, cpu_coherent.signaledValue(), size, alignment);
++    if (cpu_address) *cpu_address = block.cpu_address;
+     return {block.buffer, offset};
+   }
+ 
+@@ -407,4 +408,4 @@ public:
+   void Retain(uint64_t seq, Allocation *allocation);
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_resource_initializer.cpp b/src/dxmt/dxmt_resource_initializer.cpp
+index ec69d48..0540ec6 100644
+--- a/src/dxmt/dxmt_resource_initializer.cpp
++++ b/src/dxmt/dxmt_resource_initializer.cpp
+@@ -1,6 +1,7 @@
+ #include <memory>
+ #include "Metal.hpp"
+ #include "dxmt_resource_initializer.hpp"
++#include "dxmt_texture_upload.hpp"
+ #include "dxmt_format.hpp"
+ #include "util_math.hpp"
+ #include <cstdint>
+@@ -51,6 +52,12 @@ ResourceInitializer::ResourceInitializer(WMT::Device device) :
+     gpu_command_heap_allocator(StagingBufferBlockAllocator(
+         device, WMTResourceStorageModeManaged | WMTResourceHazardTrackingModeUntracked, false, MEMOWN_INIT_UPLOAD
+     )) {
++  supports_bc_ = device.supportsBCTextureCompression();
++#ifdef DXMT_IOS
++  direct_uploads_ = env::getEnvVar("DXMT_DIRECT_TEXTURE_UPLOAD") == "1";
++  Logger::info(str::format("[texture-stream] staging-block=", kResourceInitializerGpuUploadHeapSize,
++               " native-copy=", direct_uploads_, " init-batch-limit=0"));
++#endif
+   upload_queue_ = device.newCommandQueue(kResourceInitializerChunks);
+   upload_queue_event_ = device.newSharedEvent();
+ 
+@@ -605,7 +612,22 @@ ResourceInitializer::initWithData(
+   do {
+     RETAIN(allocation);
+     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
+-    ALLOC_GPU(temp, total_bytes_needed);
++    WMT::Buffer temp;
++    size_t temp_offset;
++    void *cpu_address = nullptr;
++    if (!(temp = allocateGpuHeap(total_bytes_needed, temp_offset, &cpu_address))) {
++      flushInternal(); continue;
++    }
++    if (direct_uploads_ && cpu_address) {
++#if defined(DXMT_IOS) && !defined(DXMT_MADEIRA)
++      temp.updateTextureContents(temp_offset, data,
++#else
++      copyTextureUpload(static_cast<char *>(cpu_address) + temp_offset, data,
++#endif
++                        align(height_sub, block_size) / block_size, depth_sub,
++                        bytes_per_row_needed, bytes_per_row_increment, bytes_per_image_increment,
++                        bytes_per_row_valid, bytes_per_image_valid);
++    } else {
+ 
+     for (auto depth = 0u; depth < depth_sub; depth++) {
+       if (bytes_per_row_increment != bytes_per_row_needed) {
+@@ -622,6 +644,7 @@ ResourceInitializer::initWithData(
+         temp.updateContents(offset, src_data, length);
+       }
+     }
++    }
+ 
+     copy->type = WMTBlitCommandCopyFromBufferToTexture;
+     copy->src = temp;
+@@ -704,12 +727,13 @@ ResourceInitializer::encode(WMT::CommandBuffer cmdbuf) {
+ }
+ 
+ WMT::Buffer
+-ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset) {
++ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset, void **cpu_address) {
+   auto [block, offset_] = gpu_command_heap_allocator.allocate(
+       current_seq_id_, cached_coherent_seq_id, size, kResourceInitializerGpuUploadHeapAlignment
+   );
+   upload_bytes_since_flush_ += size;
+   offset = offset_;
++  if (cpu_address) *cpu_address = block.cpu_address;
+   return block.buffer;
+ }
+ 
+diff --git a/src/dxmt/dxmt_resource_initializer.hpp b/src/dxmt/dxmt_resource_initializer.hpp
+index 61221b8..6eee314 100644
+--- a/src/dxmt/dxmt_resource_initializer.hpp
++++ b/src/dxmt/dxmt_resource_initializer.hpp
+@@ -116,7 +116,7 @@ private:
+     return false;
+   }
+ 
+-  WMT::Buffer allocateGpuHeap(size_t size, size_t &offset);
++  WMT::Buffer allocateGpuHeap(size_t size, size_t &offset, void **cpu_address = nullptr);
+ 
+   WMT::Buffer allocateZeroBuffer(size_t size);
+ 
+@@ -126,6 +126,8 @@ private:
+   uint64_t cached_coherent_seq_id = 0;
+   size_t upload_bytes_since_flush_ = 0; /* ml1243 */
+   WMT::Device device_;
++  bool supports_bc_ = false;
++  bool direct_uploads_ = false;   /* DXMT_DIRECT_TEXTURE_UPLOAD=1 (dre4moff r30) */
+   WMT::Reference<WMT::CommandQueue> upload_queue_;
+   WMT::Reference<WMT::SharedEvent> upload_queue_event_;
+   WMT::Reference<WMT::Buffer> zero_buffer_;
+diff --git a/src/dxmt/dxmt_ring_bump_allocator.hpp b/src/dxmt/dxmt_ring_bump_allocator.hpp
+index c7b9fc2..a103a26 100644
+--- a/src/dxmt/dxmt_ring_bump_allocator.hpp
++++ b/src/dxmt/dxmt_ring_bump_allocator.hpp
+@@ -204,6 +204,10 @@ public:
+     WMT::Reference<WMT::Buffer> buffer;
+     uint64_t gpu_address;
+     void *mapped_address;
++    /* ported from dre4moff/Madeira (r29/r30 texture uploads): the block's local CPU
++     * view for direct texture copies. Non-owning; null for remote handles, which
++     * need explicit updateContents delivery. */
++    void *cpu_address = nullptr;
+ 
+     ~Block() {
+       mem_census_sub(census_owner, census_bytes);          /* ml677 */
+@@ -234,6 +238,8 @@ public:
+       buffer = std::move(move.buffer);
+       gpu_address = move.gpu_address;
+       mapped_address = move.mapped_address;
++      cpu_address = move.cpu_address;
++      move.cpu_address = nullptr;
+       census_bytes = move.census_bytes;                    /* ml677: move the debt too */
+       census_owner = move.census_owner;
+       move.census_bytes = 0;
+@@ -273,6 +279,11 @@ public:
+     info.memory.set(block.mapped_address);
+     info.length = block_size;
+     block.buffer = device_.newBuffer(info);
++#ifdef DXMT_IOS
++    // Remote handles require explicit updateContents delivery. Never bypass it.
++    if (block.buffer && !(block.buffer.handle & (1ull << 63)))
++      block.cpu_address = info.memory.ptr;
++#endif
+     block.gpu_address = info.gpu_address;
+     block.census_bytes = block_size;                       /* ml677 */
+     block.census_owner = census_owner_;
 diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
 index 849641d..a02cc89 100644
 --- a/src/dxmt/dxmt_texture.hpp
@@ -653,3 +954,286 @@ index 849641d..a02cc89 100644
    unsigned bytes_per_image_ = 0;
    unsigned bytes_per_row_ = 0;
  
+diff --git a/src/dxmt/dxmt_texture_upload.hpp b/src/dxmt/dxmt_texture_upload.hpp
+new file mode 100644
+index 0000000..1a1db2a
+--- /dev/null
++++ b/src/dxmt/dxmt_texture_upload.hpp
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <cstddef>
++#include <cstring>
++namespace dxmt {
++// Writes into a fresh, fenced staging suballocation. Guest padding is not texture data.
++inline void copyTextureUpload(void *dst, const void *src, size_t rows, size_t depth,
++                              size_t dst_row, size_t src_row, size_t src_image,
++                              size_t valid_row, size_t valid_image) {
++  auto *output = static_cast<unsigned char *>(dst);
++  auto *input = static_cast<const unsigned char *>(src);
++  const size_t dst_image = dst_row * rows;
++  if (src_row == dst_row && valid_image == dst_image && src_image == dst_image) {
++    memcpy(output, input, dst_image * depth);
++    return;
++  }
++  for (size_t z = 0; z < depth; ++z) {
++    if (src_row == dst_row) {
++      memcpy(output + z * dst_image, input + z * src_image, valid_image);
++      if (valid_image < dst_image) memset(output + z * dst_image + valid_image, 0, dst_image - valid_image);
++    } else {
++      for (size_t y = 0; y < rows; ++y) {
++        memcpy(output + z * dst_image + y * dst_row, input + z * src_image + y * src_row, valid_row);
++        if (valid_row < dst_row) memset(output + z * dst_image + y * dst_row + valid_row, 0, dst_row - valid_row);
++      }
++    }
++  }
++}
++} // namespace dxmt
+diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
+index 9f90cc5..b894b05 100644
+--- a/src/winemetal/Metal.hpp
++++ b/src/winemetal/Metal.hpp
+@@ -280,6 +280,15 @@ public:
+     ptr.set(data);
+     MTLBuffer_updateContents(handle, offset, ptr, length);
+   }
++  void updateTextureContents(uint64_t offset, const void *data, size_t rows, size_t depth,
++                             size_t dst_row, size_t src_row, size_t src_image,
++                             size_t valid_row, size_t valid_image) {
++    WMTConstMemoryPointer ptr;
++    ptr.set(data);
++    MTLBuffer_updateTextureContents(handle, offset, ptr, rows, depth, dst_row, src_row,
++                                   src_image, valid_row, valid_image);
++  }
++
+ };
+ 
+ class SamplerState : public Object {
+diff --git a/src/winemetal/gen_remote_guard.py b/src/winemetal/gen_remote_guard.py
+index 10dbc16..1bd87b6 100644
+--- a/src/winemetal/gen_remote_guard.py
++++ b/src/winemetal/gen_remote_guard.py
+@@ -54,7 +54,7 @@ ROUTED = {
+     '_MTLDevice_newRenderPipelineState', '_MTLDevice_newComputePipelineState',
+     '_MTLDevice_newDepthStencilState', '_MTLDevice_newSamplerState',
+     # resources and sync
+-    '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLDevice_newSharedEvent',
++    '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLBuffer_updateTextureContents', '_MTLDevice_newSharedEvent',
+     # presentation seam: the HWND stays guest-local, the host layer crosses
+     '_CreateMetalViewFromHWND', '_ReleaseMetalView',
+     '_MetalLayer_nextDrawable', '_MetalDrawable_texture',
+diff --git a/src/winemetal/unix/texture_upload_copy.h b/src/winemetal/unix/texture_upload_copy.h
+new file mode 100644
+index 0000000..f39282d
+--- /dev/null
++++ b/src/winemetal/unix/texture_upload_copy.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++/* Native copy into an already allocated/fenced suballocation. No temporary
++ * image, allocation, GPU submission or wait is introduced by this operation. */
++static inline int wmt_texture_upload_size(size_t rows, size_t depth, size_t row,
++                                         size_t src_row, size_t src_image,
++                                         size_t valid_row, size_t valid_image,
++                                         size_t *size) {
++  if (!rows || !depth || !row || rows > SIZE_MAX / row) return 0;
++  const size_t image = rows * row;
++  if (depth > SIZE_MAX / image || valid_row > row || valid_image > image) return 0;
++  const size_t last = (src_row == row) ? valid_image : valid_row;
++  size_t tail = 0;
++  if (src_row != row) {
++    if (src_row && rows - 1 > SIZE_MAX / src_row) return 0;
++    tail = (rows - 1) * src_row;
++  }
++  if (tail > SIZE_MAX - last) return 0;
++  tail += last;
++  if (src_image && depth - 1 > (SIZE_MAX - tail) / src_image) return 0;
++  *size = image * depth;
++  return 1;
++}
++
++static inline void wmt_copy_texture_upload(void *dst, const void *src,
++                                          size_t rows, size_t depth, size_t dst_row,
++                                          size_t src_row, size_t src_image,
++                                          size_t valid_row, size_t valid_image) {
++  unsigned char *output = (unsigned char *)dst;
++  const unsigned char *input = (const unsigned char *)src;
++  const size_t dst_image = dst_row * rows;
++  if (src_row == dst_row && valid_image == dst_image && src_image == dst_image) {
++    memcpy(output, input, dst_image * depth);
++    return;
++  }
++  for (size_t z = 0; z < depth; ++z) {
++    if (src_row == dst_row) {
++      memcpy(output + z * dst_image, input + z * src_image, valid_image);
++      if (valid_image < dst_image)
++        memset(output + z * dst_image + valid_image, 0, dst_image - valid_image);
++    } else {
++      for (size_t y = 0; y < rows; ++y) {
++        memcpy(output + z * dst_image + y * dst_row, input + z * src_image + y * src_row, valid_row);
++        if (valid_row < dst_row)
++          memset(output + z * dst_image + y * dst_row + valid_row, 0, dst_row - valid_row);
++      }
++    }
++  }
++}
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index db46cda..261a00a 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -5393,6 +5393,45 @@ _MTLBuffer_updateContents(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++#include "texture_upload_copy.h"
++
++static NTSTATUS
++_MTLBuffer_updateTextureContents(void *obj) {
++  const struct unixcall_mtlbuffer_updatetexturecontents *p = (const struct unixcall_mtlbuffer_updatetexturecontents *)obj;
++  size_t size;
++  if (!wmt_texture_upload_size(p->rows, p->depth, p->dst_row, p->src_row,
++                               p->src_image, p->valid_row, p->valid_image, &size) ||
++      p->offset > SIZE_MAX - size || !p->data.ptr)
++    return STATUS_INVALID_PARAMETER;
++  if (wmtr_enabled()) {
++    /* Remote handles must never be sent to ObjC. Keep the established explicit
++     * upload/snapshot ordering, even if a future caller uses this slot remotely. */
++    for (size_t z = 0; z < p->depth; ++z) {
++      const size_t count = p->src_row == p->dst_row ? 1 : p->rows;
++      for (size_t y = 0; y < count; ++y) {
++        struct unixcall_mtlbuffer_updatecontents row = {
++            p->buffer, p->offset + z * p->rows * p->dst_row + y * p->dst_row,
++            p->data, p->src_row == p->dst_row ? p->valid_image : p->valid_row};
++        row.data.ptr = (const char *)p->data.ptr + z * p->src_image + y * p->src_row;
++        NTSTATUS status = _MTLBuffer_updateContents(&row);
++        if (status) return status;
++      }
++    }
++    return STATUS_SUCCESS;
++  }
++  id<MTLBuffer> buffer = (id<MTLBuffer>)p->buffer;
++  if (!buffer || p->offset + size > [buffer length]) return STATUS_INVALID_PARAMETER;
++  void *contents = [buffer contents];
++  if (!contents) return STATUS_INVALID_PARAMETER;
++  wmt_copy_texture_upload((char *)contents + p->offset, p->data.ptr, p->rows, p->depth,
++                          p->dst_row, p->src_row, p->src_image, p->valid_row, p->valid_image);
++#if !TARGET_OS_IOS
++  if ([buffer storageMode] == MTLStorageModeManaged)
++    [buffer didModifyRange:NSMakeRange(p->offset, size)];
++#endif
++  return STATUS_SUCCESS;
++}
++
+ static NTSTATUS
+ _WMTGetOSVersion(void *obj) {
+   struct unixcall_get_os_version *params = obj;
+@@ -6247,6 +6286,16 @@ _MTLBuffer_updateContents32(void *obj) {
+   return status;
+ }
+ 
++static NTSTATUS
++_MTLBuffer_updateTextureContents32(void *obj) {
++  struct unixcall_mtlbuffer_updatetexturecontents *params = (struct unixcall_mtlbuffer_updatetexturecontents *)obj;
++  const void *guest = params->data.ptr;
++  params->data.ptr = wow_in(guest);
++  NTSTATUS status = _MTLBuffer_updateTextureContents(obj);
++  params->data.ptr = guest;
++  return status;
++}
++
+ static NTSTATUS
+ _DispatchData_alloc_init32(void *obj) {
+   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
+@@ -7020,6 +7069,7 @@ const void *__wine_unix_call_funcs[] = {
+      * END of both tables, which is the only place a slot may be added --
+      * rules 3 and 4 of section 7.4. 150 in both. */
+     &_d3d9_nop,                         /* 150 */
++    &_MTLBuffer_updateTextureContents,   /* 151: append only */
+ };
+ 
+ #ifndef DXMT_NATIVE
+@@ -7182,5 +7232,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
+      * sharing the 64-bit handler is correct, not a gap (section 7.11 says the
+      * same about slots 47, 66, 67 and 72). */
+     &_d3d9_nop,                         /* 150 */
++    &_MTLBuffer_updateTextureContents32, /* 151 */
+ };
+ #endif
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index bfd5c86..bfa41ad 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -1862,6 +1862,12 @@ WINEMETAL_API obj_handle_t MTLDevice_newEvent(obj_handle_t device);
+ WINEMETAL_API void
+ MTLBuffer_updateContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data, uint64_t length);
+ 
++// Appended Unix-call slot 151. Existing dispatch indices are unchanged.
++WINEMETAL_API void
++MTLBuffer_updateTextureContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data,
++                               uint64_t rows, uint64_t depth, uint64_t dst_row, uint64_t src_row,
++                               uint64_t src_image, uint64_t valid_row, uint64_t valid_image);
++
+ WINEMETAL_API obj_handle_t SharedEventListener_create();
+ 
+ WINEMETAL_API void SharedEventListener_start(obj_handle_t shared_event_listener);
+diff --git a/src/winemetal/winemetal_thunks.c b/src/winemetal/winemetal_thunks.c
+index c473702..9736f26 100644
+--- a/src/winemetal/winemetal_thunks.c
++++ b/src/winemetal/winemetal_thunks.c
+@@ -1304,3 +1304,12 @@ WINEMETAL_API void
+ MadeiraCtl(struct madeira_ctl_args *args) {
+   UNIX_CALL(138, args);
+ }
++
++WINEMETAL_API void
++MTLBuffer_updateTextureContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data,
++                               uint64_t rows, uint64_t depth, uint64_t dst_row, uint64_t src_row,
++                               uint64_t src_image, uint64_t valid_row, uint64_t valid_image) {
++  struct unixcall_mtlbuffer_updatetexturecontents params = {
++      buffer, offset, data, rows, depth, dst_row, src_row, src_image, valid_row, valid_image};
++  UNIX_CALL(151, &params);
++}
+diff --git a/src/winemetal/winemetal_thunks.h b/src/winemetal/winemetal_thunks.h
+index 1c6ce6b..8e56c06 100644
+--- a/src/winemetal/winemetal_thunks.h
++++ b/src/winemetal/winemetal_thunks.h
+@@ -321,6 +321,14 @@ struct unixcall_mtlbuffer_updatecontents {
+   uint64_t length;
+ };
+ 
++// All fields remain 64-bit across PE/Unix/WoW64; only data.ptr needs translation.
++struct unixcall_mtlbuffer_updatetexturecontents {
++  obj_handle_t buffer;
++  uint64_t offset;
++  struct WMTConstMemoryPointer data;
++  uint64_t rows, depth, dst_row, src_row, src_image, valid_row, valid_image;
++};
++
+ struct unixcall_mtlsharedevent_setevent {
+   obj_handle_t shared_event;
+   obj_handle_t event_handle;
+diff --git a/src/winemetal/wmt_api_names.h b/src/winemetal/wmt_api_names.h
+index 4626826..02e9f8a 100644
+--- a/src/winemetal/wmt_api_names.h
++++ b/src/winemetal/wmt_api_names.h
+@@ -3,7 +3,7 @@
+ #ifndef WMT_API_NAMES_H
+ #define WMT_API_NAMES_H
+ 
+-#define WMT_API_COUNT 151
++#define WMT_API_COUNT 152
+ 
+ static const char *const wmt_api_names[WMT_API_COUNT] = {
+     "NSObject_retain",
+@@ -157,6 +157,7 @@ static const char *const wmt_api_names[WMT_API_COUNT] = {
+     "thunk_DXSOGetCompiledBitcode",
+     "thunk_DXSODestroyBitcode",
+     "d3d9_nop",
++    "MTLBuffer_updateTextureContents",
+ };
+ 
+ #endif

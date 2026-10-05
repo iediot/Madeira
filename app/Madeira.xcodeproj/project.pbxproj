@@ -85,6 +85,10 @@
 		B1000777 /* WineMono.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000777 /* WineMono.swift */; };
 		B1000778 /* LibraryHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000778 /* LibraryHome.swift */; };
 		B1000779 /* ControlEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000779 /* ControlEditor.swift */; };
+		B1000780 /* EpicAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000780 /* EpicAPI.swift */; };
+		B1000781 /* EpicAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000781 /* EpicAuth.swift */; };
+		B1000782 /* EpicSignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000782 /* EpicSignInView.swift */; };
+		B1000783 /* EpicLibraryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000783 /* EpicLibraryViews.swift */; };
 		B1000004 /* madeira-jit.js in Resources */ = {isa = PBXBuildFile; fileRef = B2000004 /* madeira-jit.js */; };
 		A1000040 /* prefix-template.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = A2000040 /* prefix-template.tar.gz */; };
 		A1000041 /* PrefixExtractor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000041 /* PrefixExtractor.c */; };
@@ -132,6 +136,9 @@
 		A1000281 /* Winios/WiniosCursor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000281 /* Winios/WiniosCursor.c */; };
 		A1000245 /* TouchGamepad.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000245 /* TouchGamepad.swift */; };
 		A1000246 /* TouchControlPresets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000246 /* TouchControlPresets.swift */; };
+		B1000784 /* EpicManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000784 /* EpicManifest.swift */; };
+		B1000785 /* EpicChunk.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000785 /* EpicChunk.swift */; };
+		B1000786 /* EpicInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000786 /* EpicInstaller.swift */; };
 /* End PBXBuildFile section */
 
 
@@ -226,6 +233,10 @@
 		B2000777 /* WineMono.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineMono.swift; sourceTree = "<group>"; };
 		B2000778 /* LibraryHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryHome.swift; sourceTree = "<group>"; };
 		B2000779 /* ControlEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlEditor.swift; sourceTree = "<group>"; };
+		B2000780 /* EpicAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicAPI.swift; sourceTree = "<group>"; };
+		B2000781 /* EpicAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicAuth.swift; sourceTree = "<group>"; };
+		B2000782 /* EpicSignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicSignInView.swift; sourceTree = "<group>"; };
+		B2000783 /* EpicLibraryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicLibraryViews.swift; sourceTree = "<group>"; };
 		B2000004 /* madeira-jit.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "madeira-jit.js"; sourceTree = "<group>"; };
 		A2000040 /* prefix-template.tar.gz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = "prefix-template.tar.gz"; sourceTree = "<group>"; };
 		A2000041 /* PrefixExtractor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PrefixExtractor.c; sourceTree = "<group>"; };
@@ -276,6 +287,9 @@
 		A2000281 /* Winios/WiniosCursor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "Winios/WiniosCursor.c"; sourceTree = "<group>"; };
 		A2000245 /* TouchGamepad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TouchGamepad.swift; sourceTree = "<group>"; };
 		A2000246 /* TouchControlPresets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TouchControlPresets.swift; sourceTree = "<group>"; };
+		B2000784 /* EpicManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicManifest.swift; sourceTree = "<group>"; };
+		B2000785 /* EpicChunk.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicChunk.swift; sourceTree = "<group>"; };
+		B2000786 /* EpicInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicInstaller.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -417,6 +431,13 @@
 				B2000777 /* WineMono.swift */,
 				B2000778 /* LibraryHome.swift */,
 				B2000779 /* ControlEditor.swift */,
+				B2000780 /* EpicAPI.swift */,
+				B2000781 /* EpicAuth.swift */,
+				B2000782 /* EpicSignInView.swift */,
+				B2000783 /* EpicLibraryViews.swift */,
+				B2000786 /* EpicInstaller.swift */,
+				B2000785 /* EpicChunk.swift */,
+				B2000784 /* EpicManifest.swift */,
 				B2000004 /* madeira-jit.js */,
 				A2000021 /* nls */,
 				A2000033 /* aarch64-windows */,
@@ -671,6 +692,13 @@
 				B1000777 /* WineMono.swift in Sources */,
 				B1000778 /* LibraryHome.swift in Sources */,
 				B1000779 /* ControlEditor.swift in Sources */,
+				B1000780 /* EpicAPI.swift in Sources */,
+				B1000781 /* EpicAuth.swift in Sources */,
+				B1000782 /* EpicSignInView.swift in Sources */,
+				B1000783 /* EpicLibraryViews.swift in Sources */,
+				B1000786 /* EpicInstaller.swift in Sources */,
+				B1000785 /* EpicChunk.swift in Sources */,
+				B1000784 /* EpicManifest.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

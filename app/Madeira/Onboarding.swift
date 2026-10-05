@@ -30,22 +30,24 @@ enum OnboardingRules {
     static var enabled: Bool { MadeiraConfig.flag("MADEIRA_ONBOARDING") }
 
     enum Step: String, CaseIterable {
-        case welcome, jit, signIn = "sign-in", dockClient = "dock-client", done
+        case welcome, jit, signIn = "sign-in", dockClient = "dock-client", epicSignIn = "epic-sign-in", done
     }
 
     /// JIT is always offered. Sign-in is offered when Steam sign-in is enabled,
     /// or when Madeira Dock is available (Dock needs a sign-in). Valve's client
-    /// components are offered only when Dock is available.
+    /// components are offered only when Dock is available. Epic Games sign-in is
+    /// always offered, after Steam's: its games join the library.
     static func steps(signIn: Bool, dock: Bool) -> [Step] {
         var list: [Step] = [.welcome, .jit]
         if signIn || dock { list.append(.signIn) }
         if dock { list.append(.dockClient) }
+        list.append(.epicSignIn)
         return list + [.done]
     }
 
     /// Whether there is anything to set up between the welcome and done pages.
     static func hasSetup(_ steps: [Step]) -> Bool {
-        steps.contains(.jit) || steps.contains(.signIn) || steps.contains(.dockClient)
+        steps.contains(.jit) || steps.contains(.signIn) || steps.contains(.dockClient) || steps.contains(.epicSignIn)
     }
 
     /// Whether setup opens by itself when the library appears.
@@ -95,7 +97,7 @@ enum OnboardingRules {
         open(reason: "first-run")
     }
 
-    /// Settings › Steam › Run setup again.
+    /// Settings › JIT › Run setup again.
     func rerun() { open(reason: "settings") }
 
     private func open(reason: String) {
@@ -141,7 +143,9 @@ struct OnboardingView: View {
     @ObservedObject private var model = OnboardingModel.shared
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
+    @ObservedObject private var epic = EpicAuth.shared
     @State private var showSignIn = false
+    @State private var showEpicSignIn = false
 
     private var device: String { UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone" }
 
@@ -158,6 +162,7 @@ struct OnboardingView: View {
                     case .jit: jitPage
                     case .signIn: signInPage
                     case .dockClient: dockClientPage
+                    case .epicSignIn: epicSignInPage
                     case .done: donePage
                     }
                 }
@@ -167,6 +172,7 @@ struct OnboardingView: View {
         }
         .interactiveDismissDisabled()
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
+        .sheet(isPresented: $showEpicSignIn) { EpicSignInView() }
         .onAppear {
             signIn.refresh()
             dock.refresh()
@@ -222,6 +228,9 @@ struct OnboardingView: View {
             if pages.contains(.signIn) { point(2, "Sign in to Steam in Madeira.") }
             if pages.contains(.dockClient) {
                 point(3, "Download Valve's Steam client components for Madeira Dock.")
+            }
+            if pages.contains(.epicSignIn) {
+                point(pages.contains(.dockClient) ? 4 : pages.contains(.signIn) ? 3 : 2, "Sign in to Epic Games to add your Epic library.")
             }
             primary("Get started", symbol: "arrow.right") { model.next() }.padding(.top, 8)
             secondary("Skip setup") { model.skip() }
@@ -293,7 +302,29 @@ struct OnboardingView: View {
                         dock.prepareClient()
                     }
                 }
-                // A running download continues; Settings › Steam › Madeira Dock shows it.
+                // A running download continues; Settings › Madeira Dock shows it.
+                secondary("Set up later") { model.next() }
+            }
+        }
+    }
+
+    private var epicSignInPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header("Sign in to Epic Games", symbol: "person.crop.circle.badge.checkmark")
+            Text("Your Epic games appear in your library next to your Steam games, with their artwork.")
+            VStack(alignment: .leading, spacing: 10) {
+                Label("You sign in on Epic's own page, so your password goes only to Epic.", systemImage: "lock.fill")
+                Label("The sign-in is kept in this device's Keychain until you sign out.", systemImage: "iphone")
+            }.font(.subheadline).foregroundStyle(.secondary)
+            if let name = epic.accountName {
+                Label("Signed in as \(name.isEmpty ? "your Epic account" : name)", systemImage: "checkmark.circle.fill")
+                    .font(.headline).foregroundStyle(.green)
+                primary("Continue", symbol: "arrow.right") { model.next() }
+            } else {
+                primary("Sign in to Epic Games", symbol: "person.crop.circle") {
+                    LogStore.shared.log("[onboarding] epic sign-in")
+                    showEpicSignIn = true
+                }
                 secondary("Set up later") { model.next() }
             }
         }
@@ -303,57 +334,84 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 18) {
             header("You're all set", symbol: "checkmark.seal.fill")
             if model.steps.contains(.dockClient) {
-                Text("Settings › Steam › Madeira Dock lists the Steam games installed in Madeira's drive_c and starts them.")
+                Text("Settings › Accounts › Madeira Dock lists the Steam games installed in Madeira's drive_c and starts them.")
             }
-            Text("You can run this setup again from Settings › JIT or Settings › Steam.").foregroundStyle(.secondary)
+            Text("You can run this setup again from Settings › JIT or Settings › Accounts.").foregroundStyle(.secondary)
             primary("Go to your library", symbol: "square.grid.2x2.fill") { model.finish() }
         }
     }
 }
 
-// MARK: - Settings › Steam
+// MARK: - Settings › Accounts and Madeira Dock
 
 /// The library's Steam settings: the signed-in account, Sign in / Sign out
 /// (SteamSignIn; the token stays in its Keychain store), Madeira Dock's sheet
 /// and "Run setup again".
 struct SteamSettingsSection: View {
-    /// Opens Steam sign-in or Madeira Dock. LibraryView presents the sheet from the
-    /// Settings Form: a sheet attached to this section closed again as soon as it
-    /// slid up whenever the Form rebuilt its rows.
+    /// Opens Steam or Epic sign-in. LibraryView presents the sheet from the Settings
+    /// Form: a sheet attached to this section closed again as soon as it slid up
+    /// whenever the Form rebuilt its rows.
     let open: (SettingsSheet) -> Void
     @ObservedObject private var signIn = SteamSignInModel.shared
-    @ObservedObject private var dock = MadeiraDockModel.shared
-    @ObservedObject private var onboarding = OnboardingModel.shared
-    @State private var confirmSignOut = false
+    @ObservedObject private var epic = EpicAuth.shared
+    @State private var confirmSteamSignOut = false
+    @State private var confirmEpicSignOut = false
 
-    /// Shown when Steam sign-in or Madeira Dock is available.
-    static var shown: Bool { SteamSignIn.isEnabled || MadeiraDock.enabled }
+    /// Settings › Accounts: every store account in the same shape, Steam then Epic
+    /// Games: the account, then its Sign out (or Sign in). Always shown: Epic works
+    /// without Steam's setup.
+    static var shown: Bool { true }
 
     var body: some View {
         Section {
-            if let name = signIn.accountName {
-                LabeledContent("Signed in as", value: name)
-                Button("Sign out of Steam", role: .destructive) { confirmSignOut = true }
-            } else {
-                Button { open(.steamSignIn) } label: { Label("Sign in to Steam", systemImage: "person.crop.circle.badge.plus") }
+            if SteamSignIn.isEnabled {
+                account("Steam", name: signIn.accountName,
+                        signIn: { open(.steamSignIn) }, signOut: { confirmSteamSignOut = true })
             }
-            if MadeiraDock.enabled {
-                Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
-                if let status = dock.status {
-                    Text(status).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            if onboarding.available {
-                Button { onboarding.rerun() } label: { Label("Run setup again", systemImage: "wand.and.stars") }
-            }
+            // Epic Games (Epic/): the login is Epic's own page in the app; the account
+            // then stays signed in, and its games join the library.
+            account("Epic Games", name: epic.accountName.map { $0.isEmpty ? "Signed in" : $0 },
+                    signIn: { open(.epicSignIn) }, signOut: { confirmEpicSignOut = true })
         } header: {
-            Text("Steam")
+            Text("Accounts")
         }
-        .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+        .confirmationDialog("Sign out of Steam?", isPresented: $confirmSteamSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { signIn.signOut() }
+        }
+        .confirmationDialog("Sign out of Epic Games?", isPresented: $confirmEpicSignOut, titleVisibility: .visible) {
+            Button("Sign out", role: .destructive) {
+                epic.signOut()
+                EpicLibrary.shared.clear()
+            }
         }
         .onAppear { signIn.refresh() }
         .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in signIn.refresh() }
+    }
+
+    @ViewBuilder private func account(_ store: String, name: String?, signIn: @escaping () -> Void,
+                                      signOut: @escaping () -> Void) -> some View {
+        if let name {
+            LabeledContent(store, value: name)
+            Button("Sign out of \(store)", role: .destructive, action: signOut)
+        } else {
+            Button(action: signIn) { Label("Sign in to \(store)", systemImage: "person.crop.circle.badge.plus") }
+        }
+    }
+}
+
+/// Settings › Madeira Dock: its sheet (Valve's client components and the installed
+/// Steam games) and its status, apart from the accounts.
+struct MadeiraDockSettingsSection: View {
+    let open: (SettingsSheet) -> Void
+    @ObservedObject private var dock = MadeiraDockModel.shared
+
+    var body: some View {
+        Section {
+            Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
+            if let status = dock.status {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 }
 

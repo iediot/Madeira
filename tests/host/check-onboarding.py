@@ -58,6 +58,7 @@ jit_setup = (app / 'JITSetup.swift').read_text()
 rules = onboarding[onboarding.index('// MARK: - Rules'):onboarding.index('// MARK: - Setup model')]
 model = block(onboarding, 'final class OnboardingModel')
 settings_section = block(onboarding, 'struct SteamSettingsSection: View')
+dock_settings_section = block(onboarding, 'struct MadeiraDockSettingsSection: View')
 jit_settings_section = block(jit_setup, 'struct JITSettingsSection: View')
 
 # ------------------------------------------------------------------ static: provenance and project
@@ -89,8 +90,8 @@ require('.fullScreenCover(isPresented: $onboarding.presented) { OnboardingView()
 require('onboarding.presentIfNeeded()' in block(library, 'struct LibraryView: View'),
         'Library: setup is considered when the library appears')
 require(library.count('!onboarding.presented') >= 2, 'Library: controller commands do not act behind setup')
-require('if onboarding.available {' in settings_section and 'onboarding.rerun()' in settings_section,
-        'Settings › Steam: Run setup again, hidden with MADEIRA_ONBOARDING=0')
+require('onboarding.rerun()' not in settings_section,
+        'Settings › Accounts: Run setup again lives in Settings › JIT only')
 require('if onboarding.available {' in jit_settings_section and 'onboarding.rerun()' in jit_settings_section,
         'Settings › JIT: Run setup again, hidden with MADEIRA_ONBOARDING=0')
 
@@ -109,7 +110,7 @@ require('dock.prepareClient()' in block(view, 'private var dockClientPage'), "co
 require('SteamSignInView()' in view and 'open(.steamSignIn)' in settings_section
         and 'case .steamSignIn: SteamSignInView()' in library, "sign-in through #45's sheet")
 require('signIn.signOut()' in settings_section, "sign-out through #45's model")
-require('open(.dock)' in settings_section and 'case .dock: MadeiraDockView(start: startDock)' in library,
+require('open(.dock)' in dock_settings_section and 'case .dock: MadeiraDockView(start: startDock)' in library,
         "Settings opens Dock's sheet")
 for forbidden in ['SteamTokenStore', 'credentialsForDock', 'refreshToken', 'SecItem', 'kSec', 'accessToken']:
     require(forbidden not in onboarding, f'Onboarding.swift: no {forbidden} (tokens only via the sign-in store)')
@@ -130,7 +131,7 @@ require('.exe' not in rules, 'rules key nothing on program names')
 
 # ------------------------------------------------------------------ static: Dock from the library
 start = block(content, 'private func startDock(_ game: DockGame, compactPool: Bool')
-require('LibraryView(play: launchLibraryEntry, enableJIT: enableJIT,\n                                startDock: { startDock($0, compactPool: $1) })' in content,
+require('LibraryView(play: { launchLibraryEntry($0) }, enableJIT: enableJIT,\n                                startDock: { startDock($0, compactPool: $1) })' in content,
         "ContentView hands Dock's start to the library")
 held = start.index('LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN")')
 require(held < start.index('MadeiraDock.writeHandoff('), 'a held Dock start writes no sign-in transfer')
@@ -166,17 +167,17 @@ import Foundation
     }
     static func main() {
         typealias R = OnboardingRules
-        let full: [R.Step] = [.welcome, .jit, .signIn, .dockClient, .done]
+        let full: [R.Step] = [.welcome, .jit, .signIn, .dockClient, .epicSignIn, .done]
         expect(R.doneKey == "madeiraOnboardingDone", "done key")
         expect(R.Step.jit.rawValue == "jit" && R.Step.signIn.rawValue == "sign-in"
                && R.Step.dockClient.rawValue == "dock-client", "log step names")
 
         // JIT is always present; Steam pages still follow their feature switches.
         expect(R.steps(signIn: true, dock: true) == full, "with Dock: JIT, sign-in, then Valve's client components")
-        expect(R.steps(signIn: true, dock: false) == [.welcome, .jit, .signIn, .done],
+        expect(R.steps(signIn: true, dock: false) == [.welcome, .jit, .signIn, .epicSignIn, .done],
                "without Dock: JIT and sign-in, no components page")
         expect(R.steps(signIn: false, dock: true) == full, "Dock keeps the sign-in page after JIT (it needs a sign-in)")
-        expect(R.steps(signIn: false, dock: false) == [.welcome, .jit, .done],
+        expect(R.steps(signIn: false, dock: false) == [.welcome, .jit, .epicSignIn, .done],
                "JIT remains when Steam setup is unavailable")
         expect(R.hasSetup(full) && R.hasSetup([.welcome, .jit, .done])
                && !R.hasSetup([.welcome, .done]), "hasSetup")
@@ -206,9 +207,10 @@ import Foundation
                "a page not in the list ends setup")
         expect(R.next(after: .signIn, in: [.welcome, .jit, .signIn, .done]) == .done,
                "without Dock, sign-in leads to done")
-        expect(R.position(of: .jit, in: full)! == (1, 3)
-               && R.position(of: .signIn, in: full)! == (2, 3)
-               && R.position(of: .dockClient, in: full)! == (3, 3), "step n of m with Dock")
+        expect(R.position(of: .jit, in: full)! == (1, 4)
+               && R.position(of: .signIn, in: full)! == (2, 4)
+               && R.position(of: .dockClient, in: full)! == (3, 4)
+               && R.position(of: .epicSignIn, in: full)! == (4, 4), "step n of m with Dock")
         expect(R.position(of: .jit, in: [.welcome, .jit, .signIn, .done])! == (1, 2)
                && R.position(of: .signIn, in: [.welcome, .jit, .signIn, .done])! == (2, 2),
                "two steps without Dock")

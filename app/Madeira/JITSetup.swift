@@ -190,9 +190,12 @@ struct JITSettingsSection: View {
     @ObservedObject private var onboarding = OnboardingModel.shared
 
     @ObservedObject private var jitState = LibraryJITState.shared
+    /// Settings › JIT's first row, the one most often changed: Enable JIT automatically.
+    var autoEnable: Binding<Bool>? = nil
 
     var body: some View {
         Section {
+            if let autoEnable { Toggle("Enable JIT automatically", isOn: autoEnable) }
             LabeledContent("JIT") { status(jitState.enabled) }
             LabeledContent("Memory+") { status(LibraryJITState.memory) }
             Button {

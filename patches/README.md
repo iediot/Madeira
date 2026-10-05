@@ -15,6 +15,9 @@ changes to them are kept here and applied on top (`git -C FEX apply --3way
   - Big L1 for the hottest threads (LookupCache.h GrantBigL1): a thread at the 128K-entry
     L1 ceiling still missing 20,000+ times a second gets a 512K-entry L1, at most 4 threads
     (env.MADEIRA_FEX_BIG_L1 = 0 turns it off).
+- `dxmt-iediot.patch` also carries dre4moff/Madeira's r29/r30 texture-upload work (direct copies into the
+  local staging block for `UpdateSubresource` and resource creation, through `copyTextureUpload`), opt-in with
+  `env.DXMT_DIRECT_TEXTURE_UPLOAD = 1` as in their release.
 - `dxmt-iediot.patch`: single-level texture halving for BC1/BC3, RGBA8 and R8/A8
   at any size (ml2100/2101/2113), texture census, Metal 4 atomic fix.
 

@@ -220,6 +220,15 @@ struct SteamAppInfo {
         }
     }
 
+    /// Approximate installed size for a platform: the base install depots' `maxsize`
+    /// (uncompressed), saturating like downloadSize. 0 when PICS gave no sizes.
+    func installedSize(for os: String) -> UInt64 {
+        installDepots(os: os).reduce(0) { total, d in
+            let (sum, overflow) = total.addingReportingOverflow(d.maxSize)
+            return overflow ? UInt64.max : sum
+        }
+    }
+
     // MARK: - Parsing
 
     /// Parse app info from a PICS text-VDF buffer.
