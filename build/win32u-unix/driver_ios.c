@@ -181,12 +181,44 @@ static UINT winios_key_extended_flag( UINT vk, UINT scan, int nav_e0 )
  * VK_ESCAPE=0x1B, ...); flags is 0 for key-down, KEYEVENTF_KEYUP (0x2)
  * for key-up. Scan code derived via the default layout so games reading
  * scan codes (DirectInput-style) see something plausible. */
+/* ml2212: keyboard input goes to the foreground window's focus. A game shown on the
+ * game view (Sonic Mania) could be left with NO foreground window at all: its window
+ * was never activated, so every key was accepted by the server and delivered to
+ * nobody (log: foreground=0x0 active=0x0 focus=0x0), while XInput, which needs no
+ * focus, worked. When a key is about to be sent and nothing is foreground, bring the
+ * topmost visible top-level window forward; activating it gives it the focus, as
+ * Windows does for a newly shown application window. A session that has a foreground
+ * window is never touched. */
+static void winios_ensure_foreground(void)
+{
+    HWND *list;
+    unsigned int i;
+
+    if (NtUserGetForegroundWindow()) return;
+    if (!(list = list_window_children( NtUserGetDesktopWindow() ))) return;
+    for (i = 0; list[i]; i++)
+    {
+        DWORD style = NtUserGetWindowLongW( list[i], GWL_STYLE );
+        if (!(style & WS_VISIBLE) || (style & (WS_CHILD | WS_DISABLED))) continue;
+        if (NtUserSetForegroundWindow( list[i] ))
+        {
+            static int logged;
+            if (logged++ < 4)
+                dprintf( 2, "[winios] ml2212 no foreground window: brought %p forward for keyboard input\n", list[i] );
+        }
+        break;
+    }
+    free( list );
+}
+
 void winios_drv_post_key(unsigned short vk, unsigned int flags)
 {
     INPUT input = {0};
     NTSTATUS st;
     UINT scan;
     static int nav_e0 = -1;
+
+    winios_ensure_foreground();   /* ml2212 */
 
     /* ml647: DERIVE THE SCAN CODE. This used to hardcode wScan = 0 while the
      * comment above claimed it was "derived via the default layout" — the

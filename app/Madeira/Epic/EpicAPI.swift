@@ -158,10 +158,15 @@ final class EpicLibrary: ObservableObject {
             if let ns = record.namespace, let id = record.catalogItemId, ns != "ue" { wanted[ns, default: []].insert(id) }
         }
         let catalog = await fetchCatalog(token: token, wanted: wanted)
+        // Mobile-store copies (Epic Games Store on iOS/Android) are library records too,
+        // with no Windows build. Like Legendary, keep only games in the Windows asset
+        // list; if that list fails to load, keep everything.
+        let windows = await fetchWindowsAssets(token: token)
 
         var games: [EpicGame] = []
         for record in records {
             guard let appName = record.appName, !appName.isEmpty, record.namespace != "ue" else { continue }
+            if let windows, !windows.contains("\(record.namespace ?? "")/\(record.catalogItemId ?? "")") { continue }
             let item = record.catalogItemId.flatMap { catalog[$0] }
             let title = (record.title?.isEmpty == false ? record.title : item?.title) ?? ""
             guard !title.isEmpty else { continue }
@@ -178,7 +183,7 @@ final class EpicLibrary: ObservableObject {
                 heroURL: Self.artwork(from: images, preferring: heroPreference)
             ))
         }
-        LogStore.shared.log("[epic-library] records=\(records.count) catalog-lookups=\(wanted.values.reduce(0) { $0 + $1.count }) found=\(catalog.count) games=\(games.count)")
+        LogStore.shared.log("[epic-library] records=\(records.count) windows-assets=\(windows.map { String($0.count) } ?? "unavailable") catalog-lookups=\(wanted.values.reduce(0) { $0 + $1.count }) found=\(catalog.count) games=\(games.count)")
         // The library lists a game once per entitlement; keep one per title.
         return games.reduce(into: [EpicGame]()) { kept, game in
             if !kept.contains(where: { $0.title == game.title }) { kept.append(game) }
@@ -230,6 +235,24 @@ final class EpicLibrary: ObservableObject {
             }
         }
         return nil
+    }
+
+    /// "namespace/catalogItemId" for every game the account can install on Windows.
+    private func fetchWindowsAssets(token: String) async -> Set<String>? {
+        var components = URLComponents(string: "https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Windows")!
+        components.queryItems = [URLQueryItem(name: "label", value: "Live")]
+        var request = URLRequest(url: components.url!)
+        request.setValue("bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let assets = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return nil }
+        let keys = Set(assets.compactMap { asset -> String? in
+            guard let ns = asset["namespace"] as? String, let id = asset["catalogItemId"] as? String else { return nil }
+            return "\(ns)/\(id)"
+        })
+        return keys.isEmpty ? nil : keys
     }
 
     private func fetchPage(token: String, cursor: String?) async throws -> ([EpicLibraryRecord], String?) {

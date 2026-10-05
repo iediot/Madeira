@@ -184,7 +184,7 @@ struct EpicInstalledGame: Codable {
                     let message = (error as? EpicAuthError)?.message ?? error.localizedDescription
                     installs[id]?.state = .failed(message)
                     outcome = .failed(message)
-                    LogStore.shared.log("[epic-install] failure completed-bytes=\(installs[id]?.progress.doneBytes ?? 0) total-bytes=\(installs[id]?.progress.totalBytes ?? 0)", level: .error)
+                    LogStore.shared.log("[epic-install] failure completed-bytes=\(installs[id]?.progress.doneBytes ?? 0) total-bytes=\(installs[id]?.progress.totalBytes ?? 0) reason=\(message)", level: .error)
                 }
             }
             active = nil

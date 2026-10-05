@@ -7,7 +7,13 @@ import zlib
 
 enum EpicContentError: LocalizedError {
     case invalid(String)
-    var errorDescription: String? { if case .invalid(let message) = self { return message }; return nil }
+    case httpStatus(Int)
+    var errorDescription: String? {
+        switch self {
+        case .invalid(let message): return message
+        case .httpStatus(let status): return "Epic download failed (HTTP \(status)). Try again."
+        }
+    }
 }
 
 struct EpicReader {

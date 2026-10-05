@@ -208,38 +208,80 @@ struct EpicManifest {
         return result
     }
 
-    static func fetch(namespace: String, catalogItemID: String, appName: String, token: String) async throws -> (Self, URL) {
-        var url = URL(string: "https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/v2/platform/Windows/namespace")!
-        for part in [namespace, "catalogItem", catalogItemID, "app", appName, "label", "Live"] { url.appendPathComponent(part) }
+    private static let launcherHost = "https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets"
+
+    private static func launcherRequest(_ url: URL, token: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.setValue("bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("UELauncher/11.0.1-14907503+++Portal+Release-Live Windows/10.0.19041.1.256.64bit", forHTTPHeaderField: "User-Agent")
-        let data = try await download(request, limit: 4 * 1024 * 1024)
+        return request
+    }
+
+    /// The library can list an entitlement under an app name that has no Windows
+    /// build (Dead Cells: a hex id, 404). Legendary takes app names from the Windows
+    /// asset list instead; look the game up there by namespace and catalog item.
+    private static func windowsAppName(namespace: String, catalogItemID: String, token: String) async throws -> String? {
+        var components = URLComponents(string: launcherHost + "/Windows")!
+        components.queryItems = [URLQueryItem(name: "label", value: "Live")]
+        let data = try await download(launcherRequest(components.url!, token: token), limit: 16 * 1024 * 1024)
+        let assets = (try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? [])
+            .filter { $0["namespace"] as? String == namespace }
+        let match = assets.first { $0["catalogItemId"] as? String == catalogItemID } ?? (assets.count == 1 ? assets[0] : nil)
+        return match?["appName"] as? String
+    }
+
+    static func fetch(namespace: String, catalogItemID: String, appName: String, token: String) async throws -> (Self, URL) {
+        func assetURL(_ app: String) -> URL {
+            var url = URL(string: launcherHost + "/v2/platform/Windows/namespace")!
+            for part in [namespace, "catalogItem", catalogItemID, "app", app, "label", "Live"] { url.appendPathComponent(part) }
+            return url
+        }
+        let data: Data
+        do {
+            data = try await download(launcherRequest(assetURL(appName), token: token), limit: 4 * 1024 * 1024)
+        } catch EpicContentError.httpStatus(404) {
+            guard let windowsName = try await windowsAppName(namespace: namespace, catalogItemID: catalogItemID, token: token),
+                  windowsName != appName
+            else { throw EpicContentError.invalid("Epic has no Windows version of this game for your account.") }
+            data = try await download(launcherRequest(assetURL(windowsName), token: token), limit: 4 * 1024 * 1024)
+        }
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let element = (json["elements"] as? [[String: Any]])?.first,
-              let manifest = (element["manifests"] as? [[String: Any]])?.first,
-              let uri = manifest["uri"] as? String, var components = URLComponents(string: uri),
-              let original = components.url else { throw EpicContentError.invalid("Epic did not return a Windows manifest.") }
-        if let params = manifest["queryParams"] as? [[String: String]] {
-            components.queryItems = (components.queryItems ?? []) + params.compactMap { param in
-                param["name"].map { URLQueryItem(name: $0, value: param["value"]) }
+              let manifests = element["manifests"] as? [[String: Any]], !manifests.isEmpty
+        else { throw EpicContentError.invalid("Epic did not return a Windows manifest.") }
+        // Epic lists the same manifest on several CDNs, each with its own signed query.
+        // One often refuses a given game (403/404): try them in order, as Legendary
+        // does, and keep the base of the one that answered for the chunks.
+        var lastError: Error = EpicContentError.invalid("Epic did not return a Windows manifest.")
+        for manifest in manifests {
+            guard let uri = manifest["uri"] as? String, var components = URLComponents(string: uri),
+                  let original = components.url else { continue }
+            if let params = manifest["queryParams"] as? [[String: String]] {
+                components.queryItems = (components.queryItems ?? []) + params.compactMap { param in
+                    param["name"].map { URLQueryItem(name: $0, value: param["value"]) }
+                }
             }
+            guard let manifestURL = components.url else { continue }
+            let bytes: Data
+            do { bytes = try await download(URLRequest(url: manifestURL), limit: maximumSize) }
+            catch { lastError = error; continue }
+            if let hash = element["hash"] as? String, EpicSHA1.hash(bytes) != (try hex(hash, count: 20)) {
+                lastError = EpicContentError.invalid("Epic CDN manifest SHA-1 mismatch.")
+                continue
+            }
+            var base = URLComponents(url: original.deletingLastPathComponent(), resolvingAgainstBaseURL: false)!
+            base.query = nil; base.fragment = nil
+            return (try parse(bytes), base.url!)
         }
-        guard let manifestURL = components.url else { throw EpicContentError.invalid("Invalid Epic manifest URL.") }
-        let bytes = try await download(URLRequest(url: manifestURL), limit: maximumSize)
-        if let hash = element["hash"] as? String, EpicSHA1.hash(bytes) != (try hex(hash, count: 20)) {
-            throw EpicContentError.invalid("Epic CDN manifest SHA-1 mismatch.")
-        }
-        var base = URLComponents(url: original.deletingLastPathComponent(), resolvingAgainstBaseURL: false)!
-        base.query = nil; base.fragment = nil
-        return (try parse(bytes), base.url!)
+        throw lastError
     }
 
     /// URLSession spools responses to disk so a bad CDN response cannot fill RAM.
     static func download(_ request: URLRequest, limit: Int) async throws -> Data {
         let (file, response) = try await URLSession.shared.download(for: request)
         defer { try? FileManager.default.removeItem(at: file) }
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw EpicContentError.invalid("Epic download failed. Try again.") }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw EpicContentError.httpStatus(status) }
         let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size <= limit else { throw EpicContentError.invalid("Epic download exceeds the size limit.") }
         return try Data(contentsOf: file)

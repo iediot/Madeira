@@ -2236,8 +2236,11 @@ struct LibraryView: View {
             if focused == nil { focused = LibraryEntry.desktopID }
             GlassSkin.shared.start()   // liquid metal on the navigation bar's glass pills
         }
-        .onChange(of: focused) { _, id in
-            if let id { withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { reader.scrollTo(id, anchor: .center) } }
+        .onChange(of: focused) { old, id in
+            // Controller navigation only, and not the starting focus: that is the Desktop
+            // entry, now at the very bottom, and scrolling to it put every visit there.
+            guard old != nil, let id, controller.connected else { return }
+            withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { reader.scrollTo(id, anchor: .center) }
         }
         }
         }
