@@ -1850,6 +1850,10 @@ struct LibraryView: View {
     @State private var selected: LibraryEntry?
     /// The Desktop sheet, opened by pulling up past the end of the library.
     @State private var desktopMenu = false
+    /// The Library page is scrolled to its end: only then does the Desktop strip show.
+    @State private var libraryAtEnd = false
+    /// The floating tab bar's width, measured on screen (LibraryTabBarWidth).
+    @State private var tabBarWidth: CGRect?
     @State private var search = ""
     /// The Settings tab's own search text, kept apart from the library's.
     @State private var settingsSearch = ""
@@ -2215,6 +2219,7 @@ struct LibraryView: View {
             }
             .refreshable { await SteamGamesSection.refresh() }
             .libraryScrollTracking()
+            .libraryKeepsScroll("home")
         }
     }
 
@@ -2234,31 +2239,39 @@ struct LibraryView: View {
                 }
                 libraryBar
                 libraryContent(width: viewport.size.width, filter: showsFilters ? filter : .other)
-                // The Windows desktop is not a game: a quiet line at the end, and pulling
-                // up past it (or tapping it) opens its sheet.
-                if search.isEmpty {
-                    LibraryDesktopHint { desktopMenu = true }
-                }
+                // The end of the page: on screen, the Desktop strip shows (iOS 18+;
+                // before it the strip always shows).
+                LibraryEndMarker(atEnd: $libraryAtEnd)
             }
             .padding(.horizontal, LibraryLayout.margin(viewport.size.width)).padding(.vertical, 16)
             .frame(maxWidth: 1400).frame(maxWidth: .infinity)
         }
         .refreshable { await SteamGamesSection.refresh() }
         .libraryScrollTracking()
-        .libraryPullUp(enabled: search.isEmpty && !desktopMenu) { desktopMenu = true }
-        .sheet(isPresented: $desktopMenu) {
-            let desktop = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry
-            LibraryDesktopSheet(start: { desktopMenu = false; play(desktop) },
-                                settings: {
-                                    desktopMenu = false
-                                    // After the sheet has gone, as the store pages do.
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { selected = desktop }
-                                },
-                                add: {
-                                    desktopMenu = false
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { browser = true }
-                                })
+        .libraryKeepsScroll("library")
+        // Under the drawer (added after it, it covered the drawer's buttons and every tap
+        // closed it instead).
+        .overlay {
+            if desktopMenu {
+                Color.black.opacity(0.18).ignoresSafeArea()
+                    .onTapGesture { withAnimation(LibraryDesktopDrawer.spring) { desktopMenu = false } }
+                    .transition(.opacity)
+            }
         }
+        .background { if !wide { LibraryTabBarWidth(width: $tabBarWidth).frame(width: 0, height: 0) } }
+        // The Windows desktop is not a game: a drawer whose strip shows once the library
+        // is scrolled to its end, dragged (or tapped) up into view, apart from scrolling.
+        // A bottom inset, not an overlay, so it sits above the tab bar, never under it.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            let desktop = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry
+            LibraryDesktopDrawer(open: $desktopMenu, shown: libraryAtEnd || desktopMenu,
+                                 width: min(viewport.size.width - 32, 480),
+                                 bar: wide ? nil : tabBarWidth,
+                                 start: { desktopMenu = false; play(desktop) },
+                                 settings: { desktopMenu = false; selected = desktop },
+                                 add: { desktopMenu = false; browser = true })
+        }
+
         .onReceive(controller.commands) { command in
             guard tab == 1, selected == nil, !browser, !onboarding.presented else { return }
             let items = entries
@@ -4030,11 +4043,13 @@ final class LibraryScrollActivity: ObservableObject {
 }
 
 extension View {
-    /// Pulling up past the end of a scroll view, while the finger is still down, calls
-    /// `action` once per pull (iOS 18+; before it the end's hint is tapped instead).
-    @ViewBuilder func libraryPullUp(enabled: Bool, action: @escaping () -> Void) -> some View {
+    /// Keeps a page's place across a rotation: turning a phone swaps the tab bar for the
+    /// side menu, which builds the page's scroll view again at its top. The place is kept
+    /// as a fraction of the scrollable height (the grid reflows at the new width) and put
+    /// back once the new scroll view has its size (iOS 18+).
+    @ViewBuilder func libraryKeepsScroll(_ key: String) -> some View {
         if #available(iOS 18.0, *) {
-            modifier(LibraryPullUp(enabled: enabled, action: action))
+            modifier(LibraryKeepsScroll(key: key))
         } else {
             self
         }
@@ -4192,97 +4207,238 @@ extension View {
     }
 }
 
-/// How far past the end a pull opens the Desktop sheet, and its single trigger per pull.
-@available(iOS 18.0, *)
-private struct LibraryPullUp: ViewModifier {
-    let enabled: Bool
-    let action: () -> Void
-    @State private var dragging = false
-    @State private var fired = false
-    func body(content: Content) -> some View {
-        content
-            .onScrollPhaseChange { _, phase in
-                dragging = phase == .interacting
-                if !dragging { fired = false }
-            }
-            .onScrollGeometryChange(for: CGFloat.self) { geo in
-                // Positive once the content's end has been pulled up past the bottom.
-                geo.contentOffset.y + geo.containerSize.height - geo.contentSize.height - geo.contentInsets.bottom
-            } action: { _, past in
-                guard enabled, dragging, !fired, past > 72 else { return }
-                fired = true
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                action()
-            }
-    }
-}
-
-/// The library's last line: where the Windows desktop is.
-struct LibraryDesktopHint: View {
-    let open: () -> Void
-    var body: some View {
-        Button(action: open) {
-            VStack(spacing: 6) {
-                Image(systemName: "chevron.compact.up").font(.title2.weight(.medium))
-                Text("Swipe up for Desktop").font(.footnote.weight(.medium))
-            }
-            .foregroundStyle(.tertiary)
-            .frame(maxWidth: .infinity)
-            .padding(.top, 20).padding(.bottom, 12)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Desktop")
-        .accessibilityHint("Opens the Windows desktop options")
-    }
-}
-
-/// The Windows desktop's sheet: Start as the one large action, then its settings and
-/// adding a game as two soft tiles.
-struct LibraryDesktopSheet: View {
+/// The Windows desktop's drawer at the bottom of the Library page, as wide as the tab
+/// bar and resting on it, with only its "Desktop" label showing. Dragged up it rises under
+/// the finger into the panel (Start, its settings, adding a game); letting go (or a tap
+/// on the label) snaps it open or shut. Hidden, it slides back down under the bar.
+struct LibraryDesktopDrawer: View {
+    static let peek: CGFloat = 40
+    static let spring = Animation.spring(response: 0.38, dampingFraction: 0.86)
+    /// The panel's height above the label, open.
+    private static let panel: CGFloat = 132
+    @Binding var open: Bool
+    /// Scrolled to the end (or open): otherwise it slides back under the bar.
+    var shown = true
+    /// The panel's width with the side menu (no tab bar).
+    var width: CGFloat = 360
+    /// The tab bar's glass on screen: the drawer takes its width and its foot traces the
+    /// bar's top outline, so the two read as one shape.
+    var bar: CGRect? = nil
+    /// Where the drawer's inset ends on screen (measured), to place the foot on the bar.
+    @State private var insetBottom: CGFloat = 0
     let start: () -> Void
     let settings: () -> Void
     let add: () -> Void
+    @State private var drag: CGFloat = 0
+
     var body: some View {
-        VStack(spacing: 22) {
+        // 0 closed, 1 open, following the finger; past either end it gives way slowly.
+        let raw = (open ? 1 : 0) - drag / Self.panel
+        let progress = raw < 0 ? raw / 4 : raw > 1 ? 1 + (raw - 1) / 4 : raw
+        let p = min(max(progress, 0), 1)
+        VStack(spacing: 0) {
             VStack(spacing: 10) {
-                Image(systemName: "desktopcomputer").font(.system(size: 40, weight: .regular))
-                    .foregroundStyle(.secondary)
-                Text("Windows Desktop").font(.title2.bold())
+                Button(action: start) {
+                    Label("Start desktop", systemImage: "play.fill").font(.headline)
+                        .frame(maxWidth: .infinity, minHeight: 50)
+                        .background(Capsule().fill(Color.accentColor))
+                        .foregroundStyle(.white)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                HStack(spacing: 10) {
+                    tile("Settings", "slider.horizontal.3", action: settings)
+                    tile("Add a game", "plus", action: add)
+                }
             }
-            .padding(.top, 8)
-            Button(action: start) {
-                Label("Start desktop", systemImage: "play.fill").font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 54)
-                    .background(Capsule().fill(Color.accentColor))
-                    .foregroundStyle(.white)
-                    .contentShape(Capsule())
+            .padding(.horizontal, 16).padding(.top, 16)
+            // Revealed from the bottom up, rising out of the bar; never resized.
+            .frame(height: Self.panel, alignment: .top)
+            .frame(height: Self.panel * max(progress, 0), alignment: .bottom)
+            .opacity(Double(p * p))
+            .clipped()
+            .allowsHitTesting(p > 0.9)
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.up").font(.caption.weight(.bold))
+                    .rotationEffect(.degrees(180 * p))
+                Text("Desktop").font(.subheadline.weight(.semibold))
             }
-            .buttonStyle(.plain)
-            HStack(spacing: 12) {
-                tile("Desktop settings", "slider.horizontal.3", action: settings)
-                tile("Add a game", "plus", action: add)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, minHeight: Self.peek)
+            .contentShape(Rectangle())
+            .onTapGesture { withAnimation(Self.spring) { open.toggle() } }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel("Desktop")
+            .accessibilityHint(open ? "Closes the desktop options" : "Opens the desktop options")
+            // The foot: down beside the bar's round ends to its middle height.
+            Color.clear.frame(height: foot)
+        }
+        .frame(width: bar?.width ?? width)
+        .libraryPanelGlass(LibraryDrawerShape(radius: 24, footRadius: bar.map { $0.height / 2 } ?? 0))
+        .gesture(
+            // In the screen's space: the drawer grows as it is dragged, so its own
+            // space moved under the finger and fed the drag back into itself.
+            DragGesture(minimumDistance: 6, coordinateSpace: .global)
+                .onChanged { drag = $0.translation.height }
+                .onEnded { value in
+                    let end = (open ? 1 : 0) - value.predictedEndTranslation.height / Self.panel
+                    withAnimation(Self.spring) {
+                        open = end > 0.5
+                        drag = 0
+                    }
+                }
+        )
+        .offset(x: barShift, y: foot + (shown ? 0 : Self.peek + 4))
+        // Hidden it fades too: below a floating bar there is a gap it would show in.
+        .opacity(shown ? 1 : 0)
+        .allowsHitTesting(shown)
+        // The inset keeps the label's height; the open panel rises above it over the games.
+        .frame(maxWidth: .infinity)
+        .frame(height: Self.peek, alignment: .bottom)
+        .background {
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { place(geo.frame(in: .global)) }
+                    .onChange(of: geo.frame(in: .global)) { _, frame in place(frame) }
             }
         }
-        .padding(.horizontal, 24).padding(.vertical, 20)
-        .frame(maxWidth: 480)
-        .presentationDetents([.height(340)])
-        .presentationDragIndicator(.visible)
-        .presentationCornerRadius(34)
+        .animation(Self.spring, value: open)
+        .animation(Self.spring, value: shown)
+    }
+
+    @State private var insetMidX: CGFloat = 0
+    private func place(_ frame: CGRect) {
+        if insetBottom != frame.maxY { insetBottom = frame.maxY }
+        if insetMidX != frame.midX { insetMidX = frame.midX }
+    }
+
+    /// How far the drawer reaches below its inset: across any gap to the bar, then down
+    /// to the bar's middle height.
+    private var foot: CGFloat {
+        guard let bar else { return 0 }
+        return max(0, bar.minY - insetBottom) + bar.height / 2
+    }
+
+    /// The bar's centre against the inset's (a bar not centred on the page).
+    private var barShift: CGFloat {
+        guard let bar, insetMidX > 0 else { return 0 }
+        return bar.midX - insetMidX
     }
 
     private func tile(_ title: String, _ symbol: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 12) {
-                Image(systemName: symbol).font(.title3.weight(.semibold))
-                Text(title).font(.subheadline.weight(.semibold)).lineLimit(2).multilineTextAlignment(.leading)
+            HStack(spacing: 10) {
+                Image(systemName: symbol).font(.body.weight(.semibold))
+                Text(title).font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.85)
             }
-            .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
-            .padding(16)
-            .background(RoundedRectangle(cornerRadius: 22).fill(Color(uiColor: .tertiarySystemFill)))
+            .frame(maxWidth: .infinity, minHeight: 50)
+            .background(Capsule().fill(Color(uiColor: .tertiarySystemFill)))
             .foregroundStyle(.primary)
-            .contentShape(RoundedRectangle(cornerRadius: 22))
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// An invisible line after the library's last games: true while it is on screen.
+struct LibraryEndMarker: View {
+    @Binding var atEnd: Bool
+    var body: some View {
+        if #available(iOS 18.0, *) {
+            Color.clear.frame(height: 1)
+                .onScrollVisibilityChange(threshold: 0.01) { visible in atEnd = visible }
+                .accessibilityHidden(true)
+        } else {
+            Color.clear.frame(height: 1).onAppear { atEnd = true }.accessibilityHidden(true)
+        }
+    }
+}
+
+@MainActor private enum LibraryScrollPlaces {
+    static var fractions: [String: CGFloat] = [:]
+}
+
+@available(iOS 18.0, *)
+private struct LibraryKeepsScroll: ViewModifier {
+    let key: String
+    @State private var position = ScrollPosition()
+    @State private var restored = false
+
+    private struct Place: Equatable { var fraction: CGFloat; var scrollable: CGFloat }
+
+    func body(content: Content) -> some View {
+        content
+            .scrollPosition($position)
+            .onScrollGeometryChange(for: Place.self) { geo in
+                let scrollable = geo.contentSize.height + geo.contentInsets.top + geo.contentInsets.bottom - geo.containerSize.height
+                let y = geo.contentOffset.y + geo.contentInsets.top
+                return Place(fraction: scrollable > 0 ? min(max(y / scrollable, 0), 1) : 0, scrollable: scrollable)
+            } action: { _, place in
+                if !restored {
+                    guard place.scrollable > 0 else { return }
+                    restored = true
+                    if let fraction = LibraryScrollPlaces.fractions[key], fraction > 0 {
+                        position.scrollTo(y: fraction * place.scrollable)
+                        return
+                    }
+                }
+                LibraryScrollPlaces.fractions[key] = place.fraction
+            }
+    }
+}
+
+/// The width of the tab bar's visible glass, which iOS does not report: the widest
+/// narrower-than-the-bar view inside UITabBar (the floating platter on iOS 26), else the
+/// bar itself. nil until found.
+struct LibraryTabBarWidth: UIViewRepresentable {
+    /// The glass's frame in the window (the screen's space).
+    @Binding var width: CGRect?
+    func makeUIView(context: Context) -> Probe { Probe { found in if width != found { width = found } } }
+    func updateUIView(_ view: Probe, context: Context) { view.measure() }
+
+    final class Probe: UIView {
+        let report: (CGRect?) -> Void
+        init(report: @escaping (CGRect?) -> Void) { self.report = report; super.init(frame: .zero) }
+        required init?(coder: NSCoder) { nil }
+        override func didMoveToWindow() { super.didMoveToWindow(); measure() }
+        override func layoutSubviews() { super.layoutSubviews(); measure() }
+        func measure() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let window = self.window, let bar = Self.tabBar(in: window) else { return }
+                let platter = bar.subviews
+                    .filter { !$0.isHidden && $0.alpha > 0 && $0.bounds.height >= 30 && $0.bounds.width < bar.bounds.width - 8 }
+                    .max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
+                let glass = platter ?? bar
+                let frame = glass.convert(glass.bounds, to: window)
+                self.report(frame.width > 100 ? frame : nil)
+            }
+        }
+        private static func tabBar(in view: UIView) -> UITabBar? {
+            if let bar = view as? UITabBar, !bar.isHidden { return bar }
+            for sub in view.subviews { if let bar = tabBar(in: sub) { return bar } }
+            return nil
+        }
+    }
+}
+
+/// The drawer over the tab bar: round top corners and straight sides down to the bar's
+/// middle, with the bar's own shape (a continuous capsule, `footRadius` its half height,
+/// the rect's bottom its middle) cut out. The cut is a few points inside the bar's edge,
+/// so the drawer's rim tucks under the bar's and the two read as one outline. No bar (0):
+/// a rounded rect.
+struct LibraryDrawerShape: Shape {
+    var radius: CGFloat
+    var footRadius: CGFloat
+    /// How far the cut sits inside the bar's edge.
+    var tuck: CGFloat = 3
+    func path(in rect: CGRect) -> Path {
+        let R = min(footRadius, rect.width / 2, rect.height)
+        let body = UnevenRoundedRectangle(topLeadingRadius: radius, bottomLeadingRadius: R > 0 ? 0 : radius,
+                                          bottomTrailingRadius: R > 0 ? 0 : radius, topTrailingRadius: radius,
+                                          style: .continuous).path(in: rect)
+        guard R > 0 else { return body }
+        let bar = CGRect(x: rect.minX, y: rect.maxY - R, width: rect.width, height: 2 * R).insetBy(dx: tuck, dy: tuck)
+        return body.subtracting(Capsule(style: .continuous).path(in: bar))
     }
 }
