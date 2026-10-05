@@ -166,8 +166,6 @@ struct LibraryHero: View {
 
     private func info(wide: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(entry.lastPlayed != nil ? "CONTINUE PLAYING" : "READY TO PLAY")
-                .font(.caption.weight(.bold)).tracking(1.2).foregroundStyle(.secondary)
             Text(entry.title)
                 .font(wide ? .system(size: 46, weight: .bold) : .largeTitle.bold())
                 .lineLimit(2).minimumScaleFactor(0.6)

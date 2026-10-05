@@ -41,9 +41,8 @@ def between(source, first, last):
 
 # The callback drop runs before the pool is reclaimed.
 reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )')
-drop = re.search(r'    if \(peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb\)\n    \{\n.*?\n    \}\n',
-                 reclaim, re.S)
-assert drop and drop.start() < reclaim.index('pthread_mutex_lock( &ios_pool_lock )'), \
+drop = '    ios_alias_receiver_retire( peb );\n'
+assert reclaim.index(drop) < reclaim.index('pthread_mutex_lock( &ios_pool_lock )'), \
     'the dying registrant must lose the callback before its pool copy is reclaimed'
 
 code = r'''
@@ -53,29 +52,30 @@ code = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000D)
+#define STATUS_NO_MEMORY ((NTSTATUS)0xC0000017)
 #define ERR(...) do { } while (0)
 static void *cur_peb;
 void *ios_jit_current_peb(void) { return cur_peb; }
 int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real, unsigned long long *size,
                        void **owner )
 { (void)idx; (void)low; (void)real; (void)size; (void)owner; return 0; }
-void ios_push_subfloor_window( unsigned long long a, unsigned long long b, unsigned long long c, void *owner )
-{ (void)a; (void)b; (void)c; (void)owner; }
 static void ios_resolve_fex_exports( void ) { }
 '''
 code += between(native, '#define IOS_JIT_MAX_MAPPINGS', '\n};')
 code += 'static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];\n'
 code += 'static int ios_jit_mapping_count = 0;\n'
-code += between(native, 'static void (*ios_jit_alias_pushback_cb)', 'static void *ios_jit_alias_pushback_peb = NULL;')
+code += between(native, 'typedef void (*ios_alias_callback)', '\nvoid ios_jit_add_mapping').removesuffix('\nvoid ios_jit_add_mapping\n')
 code += function(native, 'void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)')
+code += function(native, 'void ios_push_subfloor_window( unsigned long long low_base, unsigned long long real_base,')
 code += between(native, 'struct ios_push_jit_aliases_args {', '\n};')
 code += function(native, 'static int ios_jit_owned_copy( void *pe_base, void *peb )')
-code += function(native, 'static int ios_jit_alias_drain_wants( int i, void *own )')
+code += function(native, 'static int ios_jit_alias_drain_wants( int i, void *own )\n{')
 code += function(native, 'NTSTATUS unixcall_ios_push_jit_aliases(void *args)')
-code += 'static void reclaim_drop( void *peb )\n{\n' + drop.group(0) + '}\n'
+code += 'static void reclaim_drop( void *peb )\n{\n' + drop + '}\n'
 code += r'''
 /* ---- model of one emulator's alias table (IosJitAlias.cpp) ---- */
 struct fex { struct { uint64_t pe, jit, size; } e[256]; int n; int adds; };
@@ -106,6 +106,29 @@ static uint64_t fex_fwd( struct fex *f, uint64_t a )
 }
 static void cb_main( unsigned long long p, unsigned long long j, unsigned long long s ) { fex_add( &fex_main, p, j, s ); }
 static void cb_child( unsigned long long p, unsigned long long j, unsigned long long s ) { fex_add( &fex_child, p, j, s ); }
+static pthread_mutex_t borrow_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t borrow_changed = PTHREAD_COND_INITIALIZER;
+static int borrowed, release_borrow, retired;
+static void cb_borrow( unsigned long long p, unsigned long long j, unsigned long long s )
+{
+    (void)p; (void)j; (void)s;
+    pthread_mutex_lock( &borrow_lock );
+    borrowed = 1;
+    pthread_cond_broadcast( &borrow_changed );
+    while (!release_borrow) pthread_cond_wait( &borrow_changed, &borrow_lock );
+    assert( !retired );
+    pthread_mutex_unlock( &borrow_lock );
+}
+static void *push_borrow( void *unused )
+{ (void)unused; ios_push_subfloor_window( 0x140000000, 0x1400000000, 0x1000, (void *)9999 ); return NULL; }
+static void *retire_borrow( void *unused )
+{
+    (void)unused; reclaim_drop( (void *)9999 );
+    pthread_mutex_lock( &borrow_lock );
+    retired = 1;
+    pthread_mutex_unlock( &borrow_lock );
+    return NULL;
+}
 
 #define MAIN_PEB  ((void *)0x71ffff0000ull)
 #define CHILD_PEB ((void *)0x10999c000ull)
@@ -136,7 +159,7 @@ int main( void )
     assert( ios_jit_mappings[0].map_peb == MAIN_PEB );
     reg.callback = cb_main;
     assert( unixcall_ios_push_jit_aliases( &reg ) == STATUS_SUCCESS );
-    assert( ios_jit_alias_pushback_peb == MAIN_PEB );
+    assert( ios_alias_receivers[0].peb == MAIN_PEB );
     assert( fex_main.adds == 2 );
     assert( fex_fwd( &fex_main, NT_PE + 0x6a744 ) == NT_MAIN + 0x6a744 );
     assert( fex_rev( &fex_main, NT_MAIN + SYSCALL_HELPER ) == NT_PE + SYSCALL_HELPER );   /* [pool-rip-fix] in main */
@@ -156,7 +179,7 @@ int main( void )
 
     reg.callback = cb_child;
     assert( unixcall_ios_push_jit_aliases( &reg ) == STATUS_SUCCESS );
-    assert( ios_jit_alias_pushback_peb == CHILD_PEB );
+    assert( ios_alias_receivers[1].peb == CHILD_PEB );
     assert( fex_main.adds == main_adds );                       /* the main table is untouched */
     assert( fex_fwd( &fex_main, NT_PE + 0x6a744 ) == NT_MAIN + 0x6a744 );
     assert( fex_child.adds == 5 );                              /* 4 shared images + ntdll once */
@@ -167,20 +190,63 @@ int main( void )
     assert( fex_rev( &fex_child, NT_MAIN + SYSCALL_HELPER ) == NT_MAIN + SYSCALL_HELPER );
     assert( fex_rev( &fex_child, 0x160000000ull + SYSCALL_HELPER ) == 0x160000000ull + SYSCALL_HELPER );
 
-    /* After the child registered every later image goes to its emulator, as before. */
+    /* A crash reporter registers after the game; late cryptnet still reaches
+     * BOTH emulators, and the game keeps its own ntdll mapping. */
     cur_peb = MAIN_PEB;
     ios_jit_add_mapping( (void *)0x71f0000000ull, (void *)0x151000000ull, 0x10000 );
     assert( fex_rev( &fex_child, 0x151000010ull ) == 0x71f0000010ull );
+    assert( fex_rev( &fex_main, 0x151000010ull ) == 0x71f0000010ull );
+    assert( fex_fwd( &fex_child, NT_PE + 0x6a744 ) == NT_CHILD + 0x6a744 );
+    int child_late = fex_child.adds;
+    ios_alias_receivers_push_mapping( 0 ); /* shared ntdll must not replace child's copy */
+    assert( fex_child.adds == child_late );
+    int main_before_window = fex_main.adds;
+    ios_push_subfloor_window( 0x140000000, 0xd32000000, 0x1000, CHILD_PEB );
+    assert( fex_main.adds == main_before_window && fex_child.adds == child_late + 1 );
 
-    /* The child dies: its callback is dropped, the next map calls nothing. */
+    /* The reporter dies: the game continues receiving late mappings. */
     int child_adds = fex_child.adds;
-    reclaim_drop( MAIN_PEB );                                   /* not the registrant: kept */
-    assert( ios_jit_alias_pushback_cb == cb_child );
     reclaim_drop( CHILD_PEB );
-    assert( !ios_jit_alias_pushback_cb && !ios_jit_alias_pushback_peb );
+    assert( ios_alias_receivers[0].callback == cb_main );
+    assert( !ios_alias_receivers[1].callback && !ios_alias_receivers[1].peb );
     ios_jit_add_mapping( (void *)0x71f2000000ull, (void *)0x151200000ull, 0x10000 );
-    assert( fex_child.adds == child_adds && fex_main.adds == main_adds );
-    printf( "child gets its own ntdll copy, main unchanged\n" );
+    assert( fex_child.adds == child_adds );
+    assert( fex_rev( &fex_main, 0x151200010ull ) == 0x71f2000010ull );
+    reclaim_drop( MAIN_PEB );
+    main_adds = fex_main.adds;
+    ios_jit_add_mapping( (void *)0x71f4000000ull, (void *)0x151400000ull, 0x10000 );
+    assert( fex_main.adds == main_adds && fex_child.adds == child_adds );
+
+    /* Bounded registration rejects saturation, reuses a retired slot and
+     * replaces a same-owner registration without consuming a new slot. */
+    pthread_mutex_lock( &ios_alias_receivers_lock );
+    for (int i = 0; i < IOS_ALIAS_RECEIVERS_MAX; i++)
+        assert( ios_alias_receiver_register_locked( (void *)(uintptr_t)(i + 1), cb_main ) );
+    assert( !ios_alias_receiver_register_locked( (void *)9999, cb_child ) );
+    assert( ios_alias_receiver_register_locked( (void *)1, cb_child ) );
+    pthread_mutex_unlock( &ios_alias_receivers_lock );
+    reclaim_drop( (void *)1 );
+    pthread_mutex_lock( &ios_alias_receivers_lock );
+    assert( ios_alias_receiver_register_locked( (void *)9999, cb_child ) );
+    pthread_mutex_unlock( &ios_alias_receivers_lock );
+
+    /* Retirement waits for a callback borrowed on another thread. */
+    pthread_mutex_lock( &ios_alias_receivers_lock );
+    assert( ios_alias_receiver_register_locked( (void *)9999, cb_borrow ) );
+    pthread_mutex_unlock( &ios_alias_receivers_lock );
+    pthread_t push, retire;
+    assert( !pthread_create( &push, NULL, push_borrow, NULL ) );
+    pthread_mutex_lock( &borrow_lock );
+    while (!borrowed) pthread_cond_wait( &borrow_changed, &borrow_lock );
+    assert( !pthread_create( &retire, NULL, retire_borrow, NULL ) );
+    assert( pthread_mutex_trylock( &ios_alias_receivers_lock ) != 0 );
+    assert( !retired );
+    release_borrow = 1;
+    pthread_cond_broadcast( &borrow_changed );
+    pthread_mutex_unlock( &borrow_lock );
+    assert( !pthread_join( push, NULL ) && !pthread_join( retire, NULL ) );
+    assert( retired );
+    printf( "private ntdll preserved; both live emulators receive late mappings; retirement and bounds pass\n" );
     return 0;
 }
 '''
@@ -192,7 +258,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-child-ntdll-alias-') as directo
     executable = folder / 'check'
     cc = os.environ.get('CC', 'cc')
     flags = [cc, '-std=gnu11', '-Wall', '-Wextra', '-Wno-unused-function', '-Wno-unused-parameter',
-             '-Werror', '-g', str(source), '-o', str(executable)]
+             '-Werror', '-g', '-pthread', str(source), '-o', str(executable)]
     sanitize = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all']
     if subprocess.run(flags[:1] + sanitize + flags[1:], capture_output=True).returncode == 0:
         print('built with AddressSanitizer/UBSan')
@@ -206,6 +272,6 @@ with tempfile.TemporaryDirectory(prefix='madeira-child-ntdll-alias-') as directo
     assert err.count('[alias-push] peb=0x10999c000 registered its emulator: 1 image(s) mapped to this '
                      'process\'s own copy') == 1, err
     assert '[alias-push] peb=0x71ffff0000 registered' not in err, err
-    assert err.count('callback dropped before its pool copy is reclaimed') == 1, err
+    assert err.count('callback retired before its pool copy is reclaimed') == 4, err
 print('PASS: a child emulator maps ntdll to the child copy, the main is unchanged, '
-      'a dead registrant loses the callback')
+      'live emulators retain late aliases after another registers or exits')

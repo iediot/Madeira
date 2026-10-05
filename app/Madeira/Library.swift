@@ -2329,7 +2329,7 @@ struct LibraryView: View {
             let desktop = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry
             let showDesktop = search.isEmpty || desktop.title.localizedCaseInsensitiveContains(search)
             LibraryAllGames(search: search, layout: layout, sort: sort, width: width,
-                            others: (showDesktop ? [desktop] : []) + entries, open: { selected = $0 }) { entry, list, dense in
+                            others: entries, desktop: showDesktop ? desktop : nil, open: { selected = $0 }) { entry, list, dense in
                 libraryItem(entry, list: list, dense: dense)
             }
         } else {
@@ -2635,8 +2635,6 @@ struct LibraryDetail: View {
                         }))
                     } header: { Text("Launch") } footer: {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Directly: the game is Wine's first program, with no desktop; small windows such as launchers and message boxes are drawn over the game, a window drawn without DirectX that fills the screen is not. In the Wine desktop: the game starts inside the Wine desktop at the Resolution above, where every window shows.")
-                            Text("The working folder is a C:\\ path, for example C:\\Games\\Some Game. Start Windows services first is for launchers that need them (Steam-style COM); Madeira writes a batch file for it in C:\\madeira-games.")
                             if !entry.runsInDesktop && (entry.isBatch || entry.startServices == true) {
                                 // Wine stops with its first process (the ml1163 open risk).
                                 Text("Started directly, Wine stops when its first program exits, so a batch file that starts the game and exits closes the game too. Start it in the Wine desktop instead.")

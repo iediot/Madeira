@@ -963,8 +963,6 @@ struct SteamGameSheet: View {
                                 Text(formatBytes(freeSpace)).foregroundStyle(tooBig ? Color.red : Color.secondary)
                             }
                         }
-                        Text(SteamGameSheet.downloadNote)
-                            .font(.footnote).foregroundStyle(.secondary)
                     }
                     Section {
                         Link(destination: URL(string: "https://store.steampowered.com/app/\(appID)/")!) {
@@ -992,7 +990,6 @@ struct SteamGameSheet: View {
         }
     }
 
-    static let downloadNote = "Games download directly from Steam with your account into C:\\Program Files (x86)\\Steam\\steamapps\\common. You can leave Madeira while it downloads: on iOS 26 and later iOS shows the download's progress and keeps it going; on earlier versions it pauses after a short while and continues when you return. A download pauses while a game is running and continues afterwards."
 
     @ViewBuilder private func primaryAction(_ item: SteamGamesRules.Item) -> some View {
         if let installed = item.installed {
@@ -1412,8 +1409,10 @@ struct LibraryAllGames<OtherCell: View>: View {
     var layout = "cards"
     var sort = "played"
     var width: CGFloat = 390
-    /// The games you added (and the Windows desktop), already searched and sorted.
+    /// The games you added, already searched and sorted.
     let others: [LibraryEntry]
+    /// The Windows desktop: not a game, so on its own at the very bottom.
+    var desktop: LibraryEntry? = nil
     let open: (LibraryEntry) -> Void
     @ViewBuilder let otherCell: (LibraryEntry, Bool, Bool) -> OtherCell
     @ObservedObject private var games = SteamGamesModel.shared
@@ -1503,6 +1502,12 @@ struct LibraryAllGames<OtherCell: View>: View {
                             cell(item, list: list, dense: dense)
                         }
                     }
+                }
+            }
+            // The Windows desktop: not a game, so last, on its own.
+            if let desktop {
+                LibraryCells(items: [desktop], layout: layout, width: width) { entry, list, dense in
+                    otherCell(entry, list, dense)
                 }
             }
         }

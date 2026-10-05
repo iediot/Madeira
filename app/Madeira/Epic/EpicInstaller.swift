@@ -252,7 +252,13 @@ private actor EpicInstallWorker {
                   },
                   progress: @escaping @Sendable (SteamDownloadProgress) async -> Void) async throws -> EpicInstalledGame {
         try Task.checkCancellation()
-        guard manifest.meta.appName == job.game.appName else { throw EpicContentError.invalid("Epic returned a different game's manifest.") }
+        // The build's own AppName can differ from the library's (another internal name,
+        // or other capitals) for the right game: the manifest came from that game's
+        // assets endpoint and matched Epic's SHA-1, and Legendary does not compare them.
+        // Logged, never fatal: refusing here stopped installs of games the account owns.
+        if manifest.meta.appName.caseInsensitiveCompare(job.game.appName) != .orderedSame {
+            LogStore.shared.log("[epic-install] manifest app name differs from the library's (accepted)")
+        }
         let root = try folder(job.installDir), requestedLaunch = manifest.meta.launchExe.replacingOccurrences(of: "\\", with: "/")
         _ = try safeURL(requestedLaunch, under: root)
         if !manifest.meta.prereqPath.isEmpty { _ = try safeURL(manifest.meta.prereqPath, under: root) }
@@ -375,37 +381,5 @@ private actor EpicInstallWorker {
         return EpicInstalledGame(game: job.game, appName: job.game.appName, installDir: job.installDir,
                                  buildVersion: manifest.meta.buildVersion, launchExe: launch, launchCommand: manifest.meta.launchCommand,
                                  prereqName: manifest.meta.prereqName, prereqPath: manifest.meta.prereqPath, prereqArgs: manifest.meta.prereqArgs)
-    }
-}
-
-/// What an Epic game will take, shown on its page before Install: the download (the
-/// compressed chunks) and the installed size (the files), from the game's manifest,
-/// with the device's free space. Fetched when the page opens; kept per game.
-@MainActor final class EpicSizes: ObservableObject {
-    static let shared = EpicSizes()
-    struct Size { var download: UInt64; var install: UInt64 }
-    @Published private(set) var sizes: [String: Size] = [:]
-    private var loading: Set<String> = []
-
-    func load(_ game: EpicGame) {
-        guard sizes[game.appName] == nil, !loading.contains(game.appName),
-              let catalog = game.catalogItemId, !catalog.isEmpty else { return }
-        loading.insert(game.appName)
-        Task {
-            defer { loading.remove(game.appName) }
-            guard let token = try? await EpicAuth.shared.validAccessToken(),
-                  let (manifest, _) = try? await EpicManifest.fetch(namespace: game.namespace, catalogItemID: catalog,
-                                                                    appName: game.appName, token: token) else { return }
-            sizes[game.appName] = Size(download: manifest.chunks.reduce(0) { $0 + UInt64(max(0, $1.fileSize)) },
-                                       install: manifest.files.reduce(0) { $0 + $1.size })
-        }
-    }
-
-    /// Free space where games are installed (the same measure the installer checks).
-    nonisolated static var free: UInt64 {
-        let values = try? LibraryModel.drive.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
-                                                                      .volumeAvailableCapacityKey])
-        return UInt64(max(0, max(values?.volumeAvailableCapacityForImportantUsage ?? 0,
-                                 Int64(values?.volumeAvailableCapacity ?? 0))))
     }
 }

@@ -2951,19 +2951,66 @@ uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base )
  * too. Without this, late-loaded DLLs (e.g. dlopen after process init)
  * would have unregistered alias ranges and FEX would emit NoExecOp for
  * code in their copies. */
-static void (*ios_jit_alias_pushback_cb)(unsigned long long, unsigned long long, unsigned long long) = NULL;
-/* The process whose emulator owns ios_jit_alias_pushback_cb. Every x64
- * pseudo-process loads its OWN emulator (libarm64ecfex.dll at its own VA,
- * own pool copy, own alias table) and replaces the callback when it
- * registers, so the callback points into the pool copy of the last process
- * to register. ios_jit_reclaim_process drops it when that process exits.
- * ml1205: a sub-floor window is pushed only through its owner's callback
- * (ios_push_subfloor_window). */
-static void *ios_jit_alias_pushback_peb = NULL;
+typedef void (*ios_alias_callback)(unsigned long long, unsigned long long, unsigned long long);
+#define IOS_ALIAS_RECEIVERS_MAX 128
+static struct { void *peb; ios_alias_callback callback; }
+    ios_alias_receivers[IOS_ALIAS_RECEIVERS_MAX];
+/* Every emulator has its own alias table. A later registrant must not steal
+ * late DLL notifications from an already running process. Serialize calls
+ * with retirement so no borrowed callback can run after its pool is freed.
+ * Callbacks only update FEX's alias table; they must not re-enter Wine here. */
+static pthread_mutex_t ios_alias_receivers_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ios_jit_alias_drain_wants( int i, void *own );
+
+static int ios_alias_receiver_register_locked( void *peb, ios_alias_callback callback )
+{
+    int i, free_slot = -1;
+    for (i = 0; i < IOS_ALIAS_RECEIVERS_MAX; i++)
+    {
+        if (ios_alias_receivers[i].peb == peb)
+        {
+            ios_alias_receivers[i].callback = callback;
+            return 1;
+        }
+        if (!ios_alias_receivers[i].peb && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) return 0;
+    ios_alias_receivers[free_slot].peb = peb;
+    ios_alias_receivers[free_slot].callback = callback;
+    return 1;
+}
+
+static void ios_alias_receivers_push_mapping( int mapping )
+{
+    int i;
+    pthread_mutex_lock( &ios_alias_receivers_lock );
+    for (i = 0; i < IOS_ALIAS_RECEIVERS_MAX; i++)
+        if (ios_alias_receivers[i].peb &&
+            ios_jit_alias_drain_wants( mapping, ios_alias_receivers[i].peb ))
+            ios_alias_receivers[i].callback(
+                (unsigned long long)(uintptr_t)ios_jit_mappings[mapping].pe_base,
+                (unsigned long long)(uintptr_t)ios_jit_mappings[mapping].jit_base,
+                (unsigned long long)ios_jit_mappings[mapping].size );
+    pthread_mutex_unlock( &ios_alias_receivers_lock );
+}
+
+static void ios_alias_receiver_retire( void *peb )
+{
+    int i;
+    pthread_mutex_lock( &ios_alias_receivers_lock );
+    for (i = 0; i < IOS_ALIAS_RECEIVERS_MAX; i++)
+        if (ios_alias_receivers[i].peb == peb)
+        {
+            ios_alias_receivers[i].callback = NULL;
+            ios_alias_receivers[i].peb = NULL;
+            dprintf(2, "[alias-push] peb=%p callback retired before its pool copy is reclaimed\n", peb);
+        }
+    pthread_mutex_unlock( &ios_alias_receivers_lock );
+}
 
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
-    int i;
+    int i, published_slot = -1;
 
     /* Task #33: purge every entry whose PE range OVERLAPS the new image's.
      * A fresh PE image at [pe_base, pe_base+size) proves any overlapping
@@ -3041,20 +3088,14 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
         __sync_synchronize();
         ios_jit_mappings[slot].pe_base = pe_base;
         if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
+        published_slot = slot;
     }
 
     /* If xtajit64 has already registered its alias-mapping push callback
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
      * mapping to it too. Early mappings (added before xtajit64 loads) are
      * picked up by the iteration in unix_ios_push_jit_aliases. */
-    {
-        /* Loaded once: a child's exit can clear it between a test and a call. */
-        void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
-            __atomic_load_n(&ios_jit_alias_pushback_cb, __ATOMIC_ACQUIRE);
-        if (cb)
-            cb((unsigned long long)(uintptr_t)pe_base, (unsigned long long)(uintptr_t)jit_base,
-               (unsigned long long)size);
-    }
+    if (published_slot >= 0) ios_alias_receivers_push_mapping( published_slot );
 }
 
 /* ml951: hand a sub-floor image window to FEX so QueryGuestExecutableRange can
@@ -3081,18 +3122,12 @@ void ios_push_subfloor_window( unsigned long long low_base, unsigned long long r
                  low_base );
         return;
     }
-    void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
-        __atomic_load_n(&ios_jit_alias_pushback_cb, __ATOMIC_ACQUIRE);   /* loaded once, as above */
-    if (!cb) return;   /* pushed later by the catch-up loop */
-    /* ml1205: another process's FEX. The owner's catch-up loop delivers it when
-     * the owner's FEX starts later; a window the owner maps after another
-     * process has replaced the callback is not pushed to the owner (one global
-     * callback, a known gap). The owner is read after the callback: the register
-     * path stores it before its release store of the callback. */
-    if (owner && owner != ios_jit_alias_pushback_peb) return;
-    fprintf( stderr, "ml951: pushing sub-floor window guest %#llx+%#llx -> real %#llx to FEX (owner %p)\n",
-             low_base, size, real_base, owner );
-    cb( low_base, real_base, size );
+    int i;
+    pthread_mutex_lock( &ios_alias_receivers_lock );
+    for (i = 0; i < IOS_ALIAS_RECEIVERS_MAX; i++)
+        if (ios_alias_receivers[i].peb && (!owner || owner == ios_alias_receivers[i].peb))
+            ios_alias_receivers[i].callback( low_base, real_base, size );
+    pthread_mutex_unlock( &ios_alias_receivers_lock );
 }
 
 /* unix_ios_push_jit_aliases handler. Called from PE-side ntdll's
@@ -3352,6 +3387,7 @@ static int ios_jit_alias_drain_wants( int i, void *own )
 {
     void *owner = ios_jit_mappings[i].owner_peb;
 
+    if (!ios_jit_mappings[i].pe_base || !ios_jit_mappings[i].size) return 0;
     if (owner)
         return own && owner == own && ios_jit_mappings[i].pe_base && ios_jit_mappings[i].size;
     return ios_jit_owned_copy( ios_jit_mappings[i].pe_base, own ) < 0;
@@ -3367,9 +3403,13 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
      * arm64ec_process_init_dispatchers, on its first thread) */
     void *self = ios_jit_current_peb();
     int i, own_pushed = 0;
-    if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
-    ios_jit_alias_pushback_peb = self;
-    __atomic_store_n(&ios_jit_alias_pushback_cb, params->callback, __ATOMIC_RELEASE);
+    if (!params || !params->callback || !self) return STATUS_INVALID_PARAMETER;
+    pthread_mutex_lock( &ios_alias_receivers_lock );
+    if (!ios_alias_receiver_register_locked( self, params->callback ))
+    {
+        pthread_mutex_unlock( &ios_alias_receivers_lock );
+        return STATUS_NO_MEMORY;
+    }
 
     /* ml951: any sub-floor window registered before xtajit64 loaded has not been
      * pushed yet — the per-registration push above needs this callback. Catch up,
@@ -3383,7 +3423,7 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
         int i;
         for (i = 0; ios_subfloor_enum( i, &lo, &re, &sz, &own ); i++)
             if (sz && (!own || own == self))
-                ios_push_subfloor_window( lo, re, sz, own );
+                params->callback( lo, re, sz );
     }
     /* Drain current table to the callback. A child-owned copy shares pe_base
      * with the parent entry and FEX keeps one entry per PE range, so only one
@@ -3397,6 +3437,7 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
                          (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
                          (unsigned long long)ios_jit_mappings[i].size);
     }
+    pthread_mutex_unlock( &ios_alias_receivers_lock );
     if (own_pushed)
         dprintf(2, "[alias-push] peb=%p registered its emulator: %d image(s) mapped to this "
                 "process's own copy instead of the parent's\n", self, own_pushed);
@@ -10119,18 +10160,7 @@ void ios_jit_reclaim_process( void *peb )
 
     if (!peb || !rx_base) return;
 
-    /* The alias-push callback lives in the emulator of the LAST process that
-     * registered one (ios_jit_alias_pushback_peb). If that process is the one
-     * dying, its emulator's pool copy is reclaimed below and the next image
-     * map anywhere would call freed (later reused) code. Drop the callback:
-     * the next emulator to register gets the whole table from its drain. */
-    if (peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb)
-    {
-        dprintf(2, "[alias-push] peb=%p exits while its emulator receives the alias pushes: "
-                "callback dropped before its pool copy is reclaimed\n", peb);
-        __atomic_store_n(&ios_jit_alias_pushback_cb, NULL, __ATOMIC_RELEASE);
-        ios_jit_alias_pushback_peb = NULL;
-    }
+    ios_alias_receiver_retire( peb );
 
     pthread_mutex_lock( &ios_pool_lock );
 

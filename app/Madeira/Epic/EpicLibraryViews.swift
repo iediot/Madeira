@@ -266,7 +266,6 @@ struct EpicGameSheet: View {
                     LabeledContent("Free space on this device") {
                         Text(EpicSizeRow.format(UInt64(max(0, free)))).foregroundStyle(tooBig ? Color.red : Color.secondary)
                     }
-                    Text(Self.downloadNote).font(.footnote).foregroundStyle(.secondary)
                 }
                 Section {
                     if let url = URL(string: "https://store.epicgames.com/browse?q=" + (game.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")) {
@@ -287,7 +286,6 @@ struct EpicGameSheet: View {
         }
     }
 
-    static let downloadNote = "Games download directly from Epic with your account into C:\\Program Files\\Epic Games. You can leave Madeira while it downloads: on iOS 26 and later iOS shows the download's progress and keeps it going; on earlier versions it pauses after a short while and continues when you return."
 
     @ViewBuilder private var primaryAction: some View {
         if installer.installed[game.appName] != nil, !installer.isDownloading(game.appName),
@@ -382,5 +380,37 @@ struct EpicEntrySection: View {
                 }
             }
         }
+    }
+}
+
+/// What an Epic game will take, shown on its page before Install: the download (the
+/// compressed chunks) and the installed size (the files), from the game's manifest,
+/// with the device's free space. Fetched when the page opens; kept per game.
+@MainActor final class EpicSizes: ObservableObject {
+    static let shared = EpicSizes()
+    struct Size { var download: UInt64; var install: UInt64 }
+    @Published private(set) var sizes: [String: Size] = [:]
+    private var loading: Set<String> = []
+
+    func load(_ game: EpicGame) {
+        guard sizes[game.appName] == nil, !loading.contains(game.appName),
+              let catalog = game.catalogItemId, !catalog.isEmpty else { return }
+        loading.insert(game.appName)
+        Task {
+            defer { loading.remove(game.appName) }
+            guard let token = try? await EpicAuth.shared.validAccessToken(),
+                  let (manifest, _) = try? await EpicManifest.fetch(namespace: game.namespace, catalogItemID: catalog,
+                                                                    appName: game.appName, token: token) else { return }
+            sizes[game.appName] = Size(download: manifest.chunks.reduce(0) { $0 + UInt64(max(0, $1.fileSize)) },
+                                       install: manifest.files.reduce(0) { $0 + $1.size })
+        }
+    }
+
+    /// Free space where games are installed (the same measure the installer checks).
+    nonisolated static var free: UInt64 {
+        let values = try? LibraryModel.drive.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
+                                                                      .volumeAvailableCapacityKey])
+        return UInt64(max(0, max(values?.volumeAvailableCapacityForImportantUsage ?? 0,
+                                 Int64(values?.volumeAvailableCapacity ?? 0))))
     }
 }
