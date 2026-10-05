@@ -2352,7 +2352,20 @@ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned 
 void set_fd_events( struct fd *fd, int events )
 {
     int user = fd->poll_index;
-    assert( poll_users[user] == fd );
+
+    /* Madeira: the server runs inside the app, so this assert ended Madeira itself:
+     * Party Animals, once its HTTPS worked, polled a socket whose fd has no poll slot
+     * (a pseudo fd, poll_index -1, or a slot already handed to another fd) and the
+     * iPad app aborted in poll_socket -> set_fd_events. Such an fd has nothing for
+     * the poll loop to watch: say so, and leave the poll table alone. */
+    if (user < 0 || user >= nb_users || poll_users[user] != fd)
+    {
+        static unsigned int warned;
+        if (warned++ < 16)
+            fprintf( stderr, "[wineserver-fd] set_fd_events: fd %p (unix %d) has no poll slot (index %d), events %d ignored\n",
+                     fd, fd->unix_fd, user, events );
+        return;
+    }
 
     set_fd_epoll_events( fd, user, events );
 

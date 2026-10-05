@@ -43,6 +43,21 @@ stick. Otherwise a deflected touch stick takes priority; resting touch preserves
 the physical value. Touch updates are event-driven and require no polling timer.
 Keyboard/mouse mappings and the existing layout format are retained.
 
+### Mouse look touch area
+
+Add a control in the layout editor and choose **Mouse look** in the keyboard
+tab's **Pointer, sticks & special** section. Drag it into place and pinch to
+resize it. This rectangular area sends relative mouse movement immediately as
+one finger swipes, without pressing any mouse button. Lift and start a new swipe
+to keep turning; use separate **L click** / **R click** controls to fire or aim.
+Other fingers can operate movement and buttons at the same time.
+
+**Look sensitivity** in the mapping panel shares the existing relative touch
+sensitivity setting. The pad always sends relative movement, regardless of the
+screen's pointer mode. Normal game-surface touches still click on touch-down.
+The control is saved with custom layouts and game profiles. Editing, hiding,
+removing, resizing or backgrounding the pad discards its current stroke.
+
 ## Layouts
 
 While touch controls are shown, the landscape top bar has a layout button

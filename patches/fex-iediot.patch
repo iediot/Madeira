@@ -283,6 +283,34 @@ index 032a62b..53dc4c5 100644
  
          // Jump to the block
          br(TMP4);
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 8311d56..2e0e58e 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -24,6 +24,7 @@ $end_info$
+ #include <FEXCore/Utils/TypeDefines.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/fextl/set.h>
++#include <fmt/ranges.h>
+ 
+ namespace FEXCore::Frontend {
+ #include "Interface/Core/VSyscall/VSyscall.inc"
+@@ -1608,6 +1609,15 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
+                             BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
+                                                                                              "PartialDecode",
+                             OpAddress);
++          // [iOS-Madeira] The bytes FEX refused, and the block's first bytes: tells a real
++          // unsupported x86 instruction from code that was not (fully) written yet.
++          static int BadBytesLogged;
++          if (BadBytesLogged++ < 8) {
++            const uint8_t* Bad = InstStream.AdjustedInstStream;
++            const uint8_t* Entry = Bad - (OpAddress - RIPToDecode);
++            LogMan::Msg::EFmt("[decode-fail] at {:X}: {:02x} | block {:X}: {:02x}", OpAddress,
++                              fmt::join(Bad, Bad + 16, " "), RIPToDecode, fmt::join(Entry, Entry + 16, " "));
++          }
+         }
+         break;
+       }
 diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
 index f231071..583d655 100644
 --- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp

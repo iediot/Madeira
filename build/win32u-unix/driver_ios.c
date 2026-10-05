@@ -85,6 +85,15 @@ static int winios_direct_cursor_on(void)
     return !winios_desktop_mode() && winios_direct_cursor_wanted && winios_direct_cursor_wanted();
 }
 
+/* The app's mouse code hears the program's cursor visibility and position in
+ * the desktop session too (its compositor still draws the arrow): a game that
+ * hides its cursor for mouse-look is then given relative motion and, on iPad,
+ * pointer lock, as on the direct path. */
+static int winios_cursor_reports_on(void)
+{
+    return winios_direct_cursor_wanted && winios_direct_cursor_wanted();
+}
+
 /* Wine's cursor position, read the way NtUserGetCursorPos does but without the
  * DPI mapping: the app posts and draws in the server's screen pixels. */
 static void winios_report_cursor_pos(void)
@@ -140,7 +149,7 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
                     hwnd, flags, x, y, (unsigned)st);
     }
     /* The server has already moved (and clipped) its cursor for a MOVE. */
-    if ((flags & MOUSEEVENTF_MOVE) && winios_direct_cursor_on()) winios_report_cursor_pos();
+    if ((flags & MOUSEEVENTF_MOVE) && winios_cursor_reports_on()) winios_report_cursor_pos();
 }
 
 /* The dedicated navigation keys (arrows, Insert/Delete, Home/End, Page
@@ -439,6 +448,8 @@ static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
         cursor_show = winios_direct_cursor_show;
     }
     if (!cursor_set) return;
+    if (winios_desktop_mode() && winios_cursor_reports_on() && winios_direct_cursor_show)
+        winios_direct_cursor_show( cursor != 0 );   /* desktop session: visibility only, see winios_cursor_reports_on */
     if (!cursor)
     {
         if (cursor_show) cursor_show( 0 );

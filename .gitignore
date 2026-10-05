@@ -180,3 +180,6 @@ research/MoltenVK/
 research/mesa-25.0.7/
 research/mesa-25.0.7.tar.xz
 research/mesa-venv/
+
+# Wine Mono, fetched by build/wine-mono/fetch.sh (42 MB, verified by SHA-256)
+app/Madeira/wine-mono-*.tar.xz

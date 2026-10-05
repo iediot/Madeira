@@ -21,6 +21,21 @@ index 90b5aa66..a5bdc930 100644
  
  The LGPL permits combining this library with proprietary components (such
  as Apple's Metal Shader Converter) subject to LGPL-2.1 section 6; see the
+diff --git a/dlls/mscoree/metahost.c b/dlls/mscoree/metahost.c
+index 0e34d738..9cd4b962 100644
+--- a/dlls/mscoree/metahost.c
++++ b/dlls/mscoree/metahost.c
+@@ -711,7 +711,9 @@ HRESULT ICLRRuntimeInfo_GetRuntimeHost(ICLRRuntimeInfo *iface, RuntimeHost **res
+ 
+ #ifdef __i386__
+ static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','-','x','8','6','.','d','l','l',0};
+-#elif defined(__x86_64__)
++#elif defined(__x86_64__) || defined(__arm64ec__)
++/* ARM64EC: Wine Mono ships x86 and x86_64 runtimes only, and an ARM64EC process
++ * runs the x86_64 one (Terraria and other .NET games on Madeira). */
+ static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','-','x','8','6','_','6','4','.','d','l','l',0};
+ #else
+ static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','.','d','l','l',0};
 diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
 index e617138e..ea201969 100644
 --- a/dlls/ntdll/unix/socket.c

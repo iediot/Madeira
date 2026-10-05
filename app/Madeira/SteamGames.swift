@@ -419,6 +419,9 @@ struct SteamGamesSection: View {
     var part: Part = .all
     /// Opens a game's Game details page (LibraryView's details sheet).
     let open: (LibraryEntry) -> Void
+    /// Set on the Home page: the section is drawn as shelves (Downloading, Steam games,
+    /// Not installed) whose See all opens the Library on its Steam filter.
+    var seeAll: (() -> Void)? = nil
     @ObservedObject private var model = SteamGamesModel.shared
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var library = LibraryModel.shared
@@ -480,64 +483,12 @@ struct SteamGamesSection: View {
         let items = SteamGamesRules.items(installed: model.games, owned: owned, search: search)
         let groups = SteamGamesRules.groups(items, downloading: Set(steam.downloads.keys))
         let installed = SteamGamesRules.sorted(groups.installed, by: sort, recorded: recorded)
-        let collapsible = Self.collapsible
         Group {
             if Self.shown {
-                VStack(alignment: .leading, spacing: 14) {
-                    if part != .notInstalled {
-                    LibrarySectionHeader(title: "Steam", count: installed.count,
-                                         collapsed: collapsible ? $hideInstalled : nil) {
-                        if steam.refreshing { ProgressView().accessibilityLabel("Refreshing Steam library") }
-                    }
-                    // Signed out: the account's games need a sign-in; say so here rather
-                    // than hiding the section until someone finds Settings › Steam.
-                    if SteamGamesRules.showsSignIn(library: libraryEnabled, signedIn: steam.signedIn) {
-                        SteamSignInCard { showSignIn = true }
-                    }
-                    // Saves that differ on the two sides wait for a choice on the game's page.
-                    // A line here, not an alert: an alert would close a page that is open.
-                    if SteamOwnedLibrary.cloudEnabled, !steam.cloudUndecided.isEmpty {
-                        let names = steam.cloudUndecided.compactMap { id in model.games.first { $0.id == id }?.name }
-                        Label("Steam Cloud: \(names.joined(separator: ", ")) \(names.count == 1 ? "has" : "have") saves that differ from this device's. Open the game's details to choose which to keep.",
-                              systemImage: "exclamationmark.icloud")
-                            .font(.footnote).foregroundStyle(.orange)
-                    }
-                    if let waiting = steam.cloudWaitingFor {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                            Text("Syncing \(model.games.first { $0.id == waiting }?.name ?? "the game")'s Steam Cloud saves, then starting it…")
-                        }.font(.footnote).foregroundStyle(.secondary)
-                    }
-                    if hideInstalled && collapsible {
-                        EmptyView()
-                    } else if !groups.downloading.isEmpty || !installed.isEmpty {
-                        LibraryCells(items: groups.downloading + installed, layout: layout, width: width) { item, list, dense in
-                            cell(item, list: list, dense: dense)
-                        }
-                    } else if signedIn && !steam.refreshing && groups.notInstalled.isEmpty && search.isEmpty {
-                        Text(steam.libraryUpdated == nil ? "Pull down to load your Steam library."
-                             : "No Windows games were found in this Steam library.").foregroundStyle(.secondary)
-                    }
-                    }
-                    if part != .installed && signedIn && !groups.notInstalled.isEmpty {
-                        Button {
-                            withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { showUninstalled.toggle() }
-                        } label: {
-                            HStack {
-                                Text("Not installed").font(.headline)
-                                Text("\(groups.notInstalled.count)").font(.subheadline).foregroundStyle(.secondary)
-                                Spacer()
-                                Image(systemName: "chevron.right").font(.caption.weight(.semibold))
-                                    .rotationEffect(.degrees(showUninstalled ? 90 : 0)).foregroundStyle(.secondary)
-                            }.contentShape(Rectangle()).frame(minHeight: 44)
-                        }.buttonStyle(.plain)
-                            .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
-                        if showUninstalled {
-                            LibraryCells(items: groups.notInstalled, layout: layout, width: width) { item, list, dense in
-                                cell(item, list: list, dense: dense)
-                            }
-                        }
-                    }
+                if let seeAll {
+                    shelves(groups: groups, installed: installed, signedIn: signedIn, seeAll: seeAll)
+                } else {
+                    sections(groups: groups, installed: installed, signedIn: signedIn)
                 }
             } else {
                 // Nothing to show yet: an empty placeholder keeps the scan below running.
@@ -562,6 +513,109 @@ struct SteamGamesSection: View {
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
         } message: { Text(steam.error ?? "") }
+    }
+
+    /// The Library page's layout: the Steam title over the downloading and installed
+    /// games, then Not installed, folding on its own.
+    @ViewBuilder private func sections(groups: SteamGamesRules.Groups, installed: [SteamGamesRules.Item], signedIn: Bool) -> some View {
+        let collapsible = Self.collapsible
+        VStack(alignment: .leading, spacing: 14) {
+            if part != .notInstalled {
+            LibrarySectionHeader(title: "Steam", count: installed.count,
+                                 collapsed: collapsible ? $hideInstalled : nil) {
+                if steam.refreshing { ProgressView().accessibilityLabel("Refreshing Steam library") }
+            }
+            // Signed out: the account's games need a sign-in; say so here rather
+            // than hiding the section until someone finds Settings › Steam.
+            if SteamGamesRules.showsSignIn(library: libraryEnabled, signedIn: steam.signedIn) {
+                SteamSignInCard { showSignIn = true }
+            }
+            // Saves that differ on the two sides wait for a choice on the game's page.
+            // A line here, not an alert: an alert would close a page that is open.
+            if SteamOwnedLibrary.cloudEnabled, !steam.cloudUndecided.isEmpty {
+                let names = steam.cloudUndecided.compactMap { id in model.games.first { $0.id == id }?.name }
+                Label("Steam Cloud: \(names.joined(separator: ", ")) \(names.count == 1 ? "has" : "have") saves that differ from this device's. Open the game's details to choose which to keep.",
+                      systemImage: "exclamationmark.icloud")
+                    .font(.footnote).foregroundStyle(.orange)
+            }
+            if let waiting = steam.cloudWaitingFor {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Syncing \(model.games.first { $0.id == waiting }?.name ?? "the game")'s Steam Cloud saves, then starting it…")
+                }.font(.footnote).foregroundStyle(.secondary)
+            }
+            if hideInstalled && collapsible {
+                EmptyView()
+            } else if !groups.downloading.isEmpty || !installed.isEmpty {
+                LibraryCells(items: groups.downloading + installed, layout: layout, width: width) { item, list, dense in
+                    cell(item, list: list, dense: dense)
+                }
+            } else if signedIn && !steam.refreshing && groups.notInstalled.isEmpty && search.isEmpty {
+                Text(steam.libraryUpdated == nil ? "Pull down to load your Steam library."
+                     : "No Windows games were found in this Steam library.").foregroundStyle(.secondary)
+            }
+            }
+            if part != .installed && signedIn && !groups.notInstalled.isEmpty {
+                Button {
+                    withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { showUninstalled.toggle() }
+                } label: {
+                    HStack {
+                        Text("Not installed").font(.headline)
+                        Text("\(groups.notInstalled.count)").font(.subheadline).foregroundStyle(.secondary)
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                            .rotationEffect(.degrees(showUninstalled ? 90 : 0)).foregroundStyle(.secondary)
+                    }.contentShape(Rectangle()).frame(minHeight: 44)
+                }.buttonStyle(.plain)
+                    .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
+                if showUninstalled {
+                    LibraryCells(items: groups.notInstalled, layout: layout, width: width) { item, list, dense in
+                        cell(item, list: list, dense: dense)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Home page's layout: a shelf each for the downloads, the installed games and
+    /// the account's other games, edge to edge like the rest of Home.
+    @ViewBuilder private func shelves(groups: SteamGamesRules.Groups, installed: [SteamGamesRules.Item], signedIn: Bool,
+                                      seeAll: @escaping () -> Void) -> some View {
+        let margin = LibraryLayout.margin(width)
+        VStack(alignment: .leading, spacing: 30) {
+            if SteamOwnedLibrary.cloudEnabled, !steam.cloudUndecided.isEmpty {
+                let names = steam.cloudUndecided.compactMap { id in model.games.first { $0.id == id }?.name }
+                Label("Steam Cloud: \(names.joined(separator: ", ")) \(names.count == 1 ? "has" : "have") saves that differ from this device's. Open the game's details to choose which to keep.",
+                      systemImage: "exclamationmark.icloud")
+                    .font(.footnote).foregroundStyle(.orange).padding(.horizontal, margin)
+            }
+            if let waiting = steam.cloudWaitingFor {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Syncing \(model.games.first { $0.id == waiting }?.name ?? "the game")'s Steam Cloud saves, then starting it…")
+                }.font(.footnote).foregroundStyle(.secondary).padding(.horizontal, margin)
+            }
+            if !groups.downloading.isEmpty {
+                LibraryShelf(title: "Downloading", count: groups.downloading.count, items: groups.downloading, width: width) { item in
+                    cell(item, list: false, dense: false)
+                }
+            }
+            if !installed.isEmpty {
+                LibraryShelf(title: "Steam games", count: installed.count, items: Array(installed.prefix(20)), width: width,
+                             seeAll: seeAll) { item in
+                    cell(item, list: false, dense: false)
+                }
+            }
+            if SteamGamesRules.showsSignIn(library: libraryEnabled, signedIn: steam.signedIn) {
+                SteamSignInCard { showSignIn = true }.padding(.horizontal, margin)
+            }
+            if signedIn && !groups.notInstalled.isEmpty {
+                LibraryShelf(title: "Not installed", count: groups.notInstalled.count, items: Array(groups.notInstalled.prefix(20)),
+                             width: width, seeAll: seeAll) { item in
+                    cell(item, list: false, dense: false)
+                }
+            }
+        }
     }
 
     private func cell(_ item: SteamGamesRules.Item, list: Bool, dense: Bool) -> some View {
@@ -737,10 +791,7 @@ private struct SteamGameCell: View {
                         .overlay { overlay(download) }
                         .overlay { if notDownloaded { notDownloadedFace(.title) } }
                         .clipShape(RoundedRectangle(cornerRadius: 10))
-                        .modifier(LibraryCardArtworkPress { pressed, bounds in
-                            AmbientGlowItem(id: "steam-\(item.id)", seed: item.id, art: .steam(item.id), dimmed: notDownloaded,
-                                            pressed: pressed, bounds: bounds)
-                        })
+                        .modifier(LibraryCardArtworkPress())
                     Text(item.name).font(.footnote.weight(.semibold)).lineLimit(2)
                     pills(status, entry)
                     if let played = steam.playtime[item.id]?.played {

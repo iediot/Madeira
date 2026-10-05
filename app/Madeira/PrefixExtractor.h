@@ -6,5 +6,8 @@
 // its contents are extracted directly into dest_dir (i.e. dest_dir/drive_c/...
 // not dest_dir/prefix/drive_c/...).
 int madeira_extract_prefix_tgz(const char *tgz_path, const char *dest_dir);
+// Extracts an xz-compressed tar (GNU long names included) into dest_dir as is,
+// keeping its top-level directory. Returns 0 on success, -1 on error.
+int madeira_extract_tar_xz(const char *path, const char *dest_dir);
 
 #endif

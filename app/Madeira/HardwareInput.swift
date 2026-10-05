@@ -541,6 +541,10 @@ final class HardwareInput: ObservableObject {
 
     /// A program on the game view, with its cursor drawn by this file.
     private var directCursorLive: Bool { Self.directCursorEnabled && !Self.desktopMode }
+    /// The driver reports the program's cursor visibility and position: on the game
+    /// view, and in the desktop session too (whose compositor draws the arrow), so a
+    /// Dock game that hides its cursor for mouse-look gets relative motion and lock.
+    private var cursorReportsLive: Bool { Self.directCursorEnabled }
 
     // MARK: published state
 
@@ -1241,7 +1245,8 @@ final class HardwareInput: ObservableObject {
     // MARK: - route, drawn cursor and automatic lock
 
     private var cursorShownForRoute: Bool {
-        if Self.desktopMode { return true }
+        // The desktop session's cursor counts as shown until the driver says otherwise.
+        if Self.desktopMode { return !cursorReportsLive || cursorState.reports == 0 || cursorState.shown != 0 }
         return directCursorLive && cursorState.shown != 0
     }
 
@@ -1260,7 +1265,7 @@ final class HardwareInput: ObservableObject {
     /// The driver's position reports are wanted while the drawn cursor follows
     /// Wine's cursor, and as the automatic lock's sign of a live program.
     private func updateTracking() {
-        guard directCursorLive else { return }
+        guard cursorReportsLive else { return }
         let on = mouseInUse && (currentRoute == .relative || lastAbsolute == nil)
         winios_direct_cursor_track(on ? 1 : 0)
     }
@@ -1310,7 +1315,7 @@ final class HardwareInput: ObservableObject {
     }
 
     private func updateAutoLock() {
-        guard Self.autoLockEnabled, directCursorLive, Self.pointerLockAvailable, mousePath == .gcmouse else {
+        guard Self.autoLockEnabled, cursorReportsLive, Self.pointerLockAvailable, mousePath == .gcmouse else {
             if pointerLocked && lockedByUs { setPointerLocked(false, byUs: true, why: "automatic lock unavailable") }
             return
         }

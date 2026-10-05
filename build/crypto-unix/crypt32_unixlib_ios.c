@@ -867,30 +867,20 @@ static void ios_load_roots_locked(void)
     ios_roots_loaded = TRUE;
 }
 
+static NTSTATUS ios_enum_root_certs_wow( struct enum_root_certs_params *params );
+
+/* Madeira: 64-bit callers enumerate with the same per-thread cursor as WoW64 ones.
+ * This used to be Wine's consuming walk (list_remove + free of each certificate it
+ * returned), which is right when every process has its own unix side but not here,
+ * where one unix side serves the whole session: the first 64-bit process to build
+ * its root store took all 121 roots and every later one -- Valve's client in
+ * dockhost.exe, the game -- got an EMPTY store. Every HTTPS chain then ended in
+ * CERT_TRUST_IS_UNTRUSTED_ROOT (0x20) even at ISRG Root X1: Party Animals' "failed
+ * to fetch account data", and Steam's HTTP thread retrying api.steampowered.com
+ * twice a second for the whole session. */
 static NTSTATUS enum_root_certs( void *args )
 {
-    struct enum_root_certs_params *params = args;
-    struct list *ptr;
-    struct root_cert *cert;
-    NTSTATUS status = STATUS_SUCCESS;
-
-    pthread_mutex_lock( &ios_root_lock );
-    ios_load_roots_locked();
-
-    if (!(ptr = list_head( &root_cert_list ))) status = STATUS_NO_MORE_ENTRIES;
-    else
-    {
-        cert = LIST_ENTRY( ptr, struct root_cert, entry );
-        *params->needed = cert->size;
-        if (cert->size <= params->size)
-        {
-            memcpy( params->buffer, cert->data, cert->size );
-            list_remove( &cert->entry );
-            free( cert );
-        }
-    }
-    pthread_mutex_unlock( &ios_root_lock );
-    return status;
+    return ios_enum_root_certs_wow( args );
 }
 
 /* The WoW64 enumeration: each thread keeps its own position; the rootstore

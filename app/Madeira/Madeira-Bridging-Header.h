@@ -1,4 +1,5 @@
 #import "JITAllocator.h"
+#import "PrefixExtractor.h"
 #import "FEXBridge.h"
 #import "WineServerBridge.h"
 #import "WineProcessBridge.h"

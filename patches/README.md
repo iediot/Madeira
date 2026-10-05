@@ -6,7 +6,8 @@ changes to them are kept here and applied on top (`git -C FEX apply --3way
 `build/fex-arm64ec/build.sh`, `build/fex-wow64/build.sh`,
 `build/dxmt-pe/build.sh d3d11` and `build/dxmt-ios/build.sh`.
 
-- `fex-iediot.patch`: folded L1 lookup index (ml2111), `[lookup-stats]` (ml2110,
+- `fex-iediot.patch`: `[decode-fail]` byte dump when the decoder refuses an entry block (shows a real
+  unsupported instruction apart from code that was never written), folded L1 lookup index (ml2111), `[lookup-stats]` (ml2110,
   `env.MADEIRA_FEX_LOOKUP_STATS = 1`), iOS host build guards, and the ARM64EC
   JIT alias table grown from 256 to 2048 entries (ml1201, from vcvkk's fork, without
   its log line, which crashed when called from native code without a TEB:

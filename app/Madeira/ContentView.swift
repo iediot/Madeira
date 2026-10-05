@@ -1231,6 +1231,8 @@ struct ContentView: View {
     /// replaces both bodies below, and a running library session gets the
     /// full-screen `sessionBody`.
     @ObservedObject private var library = LibraryModel.shared
+    /// The library's side menu (wide screens) replaces the navigation bar.
+    @ObservedObject private var libraryChrome = LibraryChrome.shared
     /// "Use New Interface" (actionButtons) applies at the next start.
     @State private var showFrontendRestart = false
 
@@ -1255,7 +1257,7 @@ struct ContentView: View {
                 if library.enabled && library.current != nil {
                     sessionBody
                 } else if library.enabled {
-                    LibraryView(play: launchLibraryEntry, enableJIT: enableJIT,
+                    LibraryView(play: { launchLibraryEntry($0) }, enableJIT: enableJIT,
                                 startDock: { startDock($0, compactPool: $1) })
                 } else if vSizeClass == .compact {
                     landscapeBody
@@ -1275,7 +1277,7 @@ struct ContentView: View {
             // under the title, the buttons and the search field behind a
             // progressive blur (as in the App Store), with no hard edge.
             .toolbarBackground(library.enabled && !Self.systemScrollEdge ? .visible : .automatic, for: .navigationBar)
-            .navigationBarHidden(library.enabled ? library.current != nil : vSizeClass == .compact)
+            .navigationBarHidden(library.enabled ? library.current != nil || libraryChrome.sideMenu : vSizeClass == .compact)
             // A second session cannot start in this process; offer to close Madeira.
             .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
                                                             set: { if !$0 { library.restartNotice = nil } })) {
@@ -2448,7 +2450,26 @@ struct ContentView: View {
     /// Play in the library (Library.swift): checks that a session can start,
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
-    private func launchLibraryEntry(_ entry: LibraryEntry) {
+    private func launchLibraryEntry(_ entry: LibraryEntry, monoChecked: Bool = false) {
+        // A .NET program (Terraria, XNA games) needs Wine Mono in the prefix: unpack it the
+        // first time, link it on every launch, then carry on (WineMono.swift).
+        if !monoChecked {
+            var program: URL?, folder: URL?
+            if let appID = entry.steamAppID,
+               let game = MadeiraDock.games(drive: MadeiraDock.drive).first(where: { $0.id == appID }) {
+                folder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir, isDirectory: true)
+                if entry.startsSteamGameDirectly, let rel = entry.steamProgram, !rel.isEmpty {
+                    program = folder?.appendingPathComponent(rel)
+                }
+            } else if entry.desktop != true {
+                program = try? LibraryModel.executable(entry.launchRelativePath)
+                folder = program?.deletingLastPathComponent()
+            }
+            if WineMono.isInstalled || WineMono.needed(program: program, folder: folder) {
+                WineMono.shared.prepare(drive: LibraryModel.drive) { _ in launchLibraryEntry(entry, monoChecked: true) }
+                return
+            }
+        }
         // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
         // unless its Game details page chose "The game": then its own program starts below, like
         // any library game (SteamDirectStart).
@@ -3508,6 +3529,7 @@ enum ControlAction: Codable, Equatable, Hashable {
     case key(Int32)          // Windows virtual-key code
     case mouseLeft
     case mouseRight
+    case mouseLook          // movable touch area: relative motion, no mouse buttons
     case joystickWASD        // renders as a stick, posts W/A/S/D
     case joystickArrows      // renders as a stick, posts the arrow keys
     case keyboardToggle      // raises the iOS keyboard, as in portrait
@@ -3576,6 +3598,7 @@ enum ControlAction: Codable, Equatable, Hashable {
     /// Drawn size, given the layout's diameter for a round button. Shoulders
     /// are wide, Start/Select are small pills, stick clicks are small circles.
     func controlSize(diameter d: CGFloat) -> CGSize {
+        if self == .mouseLook { return CGSize(width: d * 2.6, height: d * 2) }
         switch padFace {
         case .wide:    return CGSize(width: d * 1.6, height: d * 0.74)
         case .capsule: return CGSize(width: d * 1.2, height: d * 0.5)
@@ -3589,6 +3612,7 @@ enum ControlAction: Codable, Equatable, Hashable {
         case .none:            return "—"
         case .mouseLeft:       return "L"
         case .mouseRight:      return "R"
+        case .mouseLook:       return "Mouse look"
         case .keyboardToggle:  return "⌨"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "↕"
@@ -3647,7 +3671,7 @@ final class TouchControlsModel: ObservableObject {
     @Published var editing = false {            // transient, never persisted
         didSet {
             // ml1970: an ended edit is written back to the custom layout it came from.
-            if !oldValue && editing { editBaseline = controls }
+            if !oldValue && editing { editBaseline = controls; ControlEditorHistory.shared.begin(controls) }
             if oldValue && !editing {
                 ControlPresetsModel.shared.editingEnded(baseline: editBaseline)
                 // Edited during a game: the game's profile keeps the new layout at once.
@@ -3741,7 +3765,11 @@ final class TouchControlsModel: ObservableObject {
         for c in controls {
             let r = Self.diameter(c) / 2
             let centre = center(of: c, in: bounds.size)
-            if hypot(p.x - centre.x, p.y - centre.y) <= r { return true }
+            if c.action == .mouseLook {
+                let size = Self.size(c)
+                if CGRect(x: centre.x - size.width / 2, y: centre.y - size.height / 2,
+                          width: size.width, height: size.height).contains(p) { return true }
+            } else if hypot(p.x - centre.x, p.y - centre.y) <= r { return true }
         }
         return false
     }
@@ -3765,7 +3793,7 @@ final class TouchControlsModel: ObservableObject {
         else if c.nx > 0.6 { x = screen.width - (lw - lx) * layout.kx }
         else { x = screen.width / 2 + (lx - lw / 2) * layout.kx }
         let y = layout.bottom - (lh - ly) * layout.ky
-        return CGPoint(x: x, y: max(y, layout.top + Self.diameter(c) / 2))
+        return CGPoint(x: x, y: max(y, layout.top + Self.size(c).height / 2))
     }
 
     /// The controls' area below the game and the shrink factors for this screen.
@@ -3777,11 +3805,11 @@ final class TouchControlsModel: ObservableObject {
         let lw = screen.height, lh = screen.width
         var kx: CGFloat = 1, ky: CGFloat = 1
         for c in controls {
-            let r = Self.diameter(c) / 2
+            let size = Self.size(c)
             let lx = CGFloat(c.nx) * lw, fromBottom = lh - CGFloat(c.ny) * lh
             let fromSide = c.nx < 0.4 ? lx : c.nx > 0.6 ? lw - lx : 0
-            if fromSide > 0 { kx = min(kx, max(0.2, (screen.width / 2 - r - 6) / fromSide)) }
-            if fromBottom > 0 { ky = min(ky, max(0.2, (bottom - top - r) / fromBottom)) }
+            if fromSide > 0 { kx = min(kx, max(0.2, (screen.width / 2 - size.width / 2 - 6) / fromSide)) }
+            if fromBottom > 0 { ky = min(ky, max(0.2, (bottom - top - size.height / 2) / fromBottom)) }
         }
         return (top: top, bottom: bottom, kx: kx, ky: ky)
     }
@@ -3868,13 +3896,14 @@ struct TouchControlsOverlay: View {
             let landscape = geo.size.width > geo.size.height || session
             ZStack(alignment: .top) {
                 if landscape {
+                    // The editor (ControlEditor.swift): the dimmed, gridded game behind the
+                    // controls, its own bar, and the docked inspector.
+                    if m.editing { ControlEditorBackdrop(screen: geo.size) }
                     if (m.visible || m.editing) && !library.blocksGameplayTouch {
                         controls(geo.size, session: session)
                     }
-                    if session && !m.editing { LibraryHUD() } else { topBar }
-                    if m.editing, let i = m.index(of: m.selected) {
-                        MappingPanel(control: m.controls[i], screen: geo.size)
-                    }
+                    if m.editing { ControlEditorBar() } else if session { LibraryHUD() } else { topBar }
+                    if m.editing { ControlInspector(screen: geo.size).transition(.opacity) }
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
@@ -3930,11 +3959,6 @@ struct TouchControlsOverlay: View {
             top: Double(i.top), bottom: Double(i.bottom)))
     }
 
-    /// ml1970: while editing, a Done button ends the edit (keeping it in the
-    /// active custom layout) in place of the checkmark, and the show/hide glyph
-    /// is hidden. MADEIRA_CONTROLS_EDITOR_DONE=0 restores the previous bar.
-    static let editorDone = GamepadInput.flag("MADEIRA_CONTROLS_EDITOR_DONE")
-
     /// ml1970: the layout menu, offered only while touch controls are shown.
     static func showsLayoutMenu(_ m: TouchControlsModel) -> Bool {
         ControlPresetsModel.enabled && m.visible && !m.editing
@@ -3942,45 +3966,13 @@ struct TouchControlsOverlay: View {
 
     private var topBar: some View {
         HStack(spacing: 10) {
-            if m.editing && Self.editorDone {
-                Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    withAnimation(.easeInOut(duration: 0.22)) {
-                        m.selected = nil
-                        m.editing = false
-                    }
-                } label: {
-                    Text("Done")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 18)
-                        .frame(height: 44)
-                        .background(GlassShape())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Done editing controls")
-            } else {
-                glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
-                if Self.showsLayoutMenu(m) {
-                    ControlLayoutMenu()
-                        .transition(.opacity.combined(with: .scale))
-                }
-                glassButton(m.editing ? "checkmark" : "pencil") {
-                    m.editing.toggle()
-                    if !m.editing { m.selected = nil }
-                }
+            glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
+            if Self.showsLayoutMenu(m) {
+                ControlLayoutMenu()
+                    .transition(.opacity.combined(with: .scale))
             }
-            if m.editing {
-                glassButton("plus") {
-                    var c = TouchControl()
-                    // Stagger, so repeated adds do not stack invisibly.
-                    c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
-                    c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
-                    m.controls.append(c)
-                    m.selected = c.id
-                }
-                .transition(.opacity.combined(with: .scale))
-            }
+            glassButton("pencil") { m.editing = true }
+                .accessibilityLabel("Edit controls")
         }
         .padding(.top, 10)
         .animation(.easeInOut(duration: 0.22), value: m.editing)
@@ -3992,7 +3984,7 @@ struct TouchControlsOverlay: View {
         MagnificationGesture()
             .onChanged { v in
                 guard m.editing, let i = m.index(of: m.selected) else { return }
-                if pinchBase == nil { pinchBase = m.controls[i].scale }
+                if pinchBase == nil { pinchBase = m.controls[i].scale; ControlEditorHistory.shared.record() }
                 m.controls[i].scale = min(max((pinchBase ?? 1) * Double(v), 0.5), 3.0)
             }
             .onEnded { _ in pinchBase = nil }
@@ -4088,6 +4080,7 @@ struct TouchControlButton: View {
     /// The resting outline and the edit-mode selection ring, in the shape the
     /// control actually has.
     private var outline: AnyShape {
+        if control.action == .mouseLook { return AnyShape(RoundedRectangle(cornerRadius: 18)) }
         switch control.action.padFace {
         case .some(.wide):    return AnyShape(RoundedRectangle(cornerRadius: size.height * 0.30))
         case .some(.capsule): return AnyShape(Capsule())
@@ -4141,7 +4134,13 @@ struct TouchControlButton: View {
 
     var body: some View {
         ZStack {
-            if control.action.isPadStick {
+            if control.action == .mouseLook {
+                Label("Mouse look", systemImage: "hand.draw")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .frame(width: size.width, height: size.height)
+                    .glassFace(GlassShape(cornerRadius: 18))
+            } else if control.action.isPadStick {
                 ZStack {
                     Circle().fill(.white.opacity(isDown ? 0.55 : 0.25))
                         .frame(width: diameter * 0.42, height: diameter * 0.42)
@@ -4187,25 +4186,10 @@ struct TouchControlButton: View {
         // glass control animated its press; the state change now applies at once.
         // ml646: the springy knob, same curve as the portrait pad overlay.
         .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
-        .overlay(alignment: .topTrailing) {
-            if isSelected {
-                Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    m.controls.removeAll { $0.id == control.id }
-                    m.selected = nil
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 22, height: 22)
-                        .background(Circle().fill(.red.opacity(0.85)))
-                }
-                .buttonStyle(.plain)
-                .offset(x: 8, y: -8)
-            }
-        }
         .overlay {
-            if let action = control.action.padName, !m.editing {
+            if control.action == .mouseLook, !m.editing {
+                TouchMouseLookSurface(screen: screen)
+            } else if let action = control.action.padName, !m.editing {
                 TouchPadSurface(control: control.id, action: action) { vector, down in
                     padVector = vector; isDown = down
                 }
@@ -4222,12 +4206,20 @@ struct TouchControlButton: View {
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
                     if m.editing {
-                        m.selected = control.id
+                        if m.selected != control.id { withAnimation(.snappy(duration: 0.25)) { m.selected = control.id } }
                         guard let i = m.index(of: control.id) else { return }
-                        if dragBase == nil { dragBase = CGPoint(x: control.nx, y: control.ny) }
+                        if dragBase == nil {
+                            dragBase = CGPoint(x: control.nx, y: control.ny)
+                            ControlEditorHistory.shared.record()
+                        }
                         let b = dragBase ?? .zero
-                        m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
-                        m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
+                        // Into line with the other controls and the screen's middle (ControlSnap).
+                        let p = ControlSnap.shared.snap(
+                            CGPoint(x: min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97),
+                                    y: min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)),
+                            moving: control.id, in: screen)
+                        m.controls[i].nx = Double(p.x)
+                        m.controls[i].ny = Double(p.y)
                     } else if let q = control.action.stickKeys {
                         isDown = true
                         applyStick(snap(v.translation), q)
@@ -4238,6 +4230,7 @@ struct TouchControlButton: View {
                 }
                 .onEnded { _ in
                     dragBase = nil
+                    if m.editing { ControlSnap.shared.clear() }
                     if let q = control.action.stickKeys {
                         applyStick(-1, q)          // release every held direction
                         isDown = false
@@ -4246,7 +4239,7 @@ struct TouchControlButton: View {
                         press(false)
                     }
                 },
-            including: control.action.isPad && !m.editing ? .subviews : .all
+            including: (control.action.isPad || control.action == .mouseLook) && !m.editing ? .subviews : .all
         )
     }
 
@@ -4298,7 +4291,7 @@ struct TouchControlButton: View {
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
         case .keyboardToggle:
             if down { MetalBackedView.toggleKeyboard() }
-        case .none, .joystickWASD, .joystickArrows:
+        case .none, .joystickWASD, .joystickArrows, .mouseLook:
             break                                              // sticks drive themselves
         case .pad:
             break     // TouchPadSurface owns pad presses and cancellation.
@@ -4306,214 +4299,3 @@ struct TouchControlButton: View {
     }
 }
 
-/// ml645 — the mapping panel. Shown for the selected control in edit mode.
-struct MappingPanel: View {
-    let control: TouchControl
-    let screen: CGSize
-    @ObservedObject private var m = TouchControlsModel.shared
-    @State private var tab = 0                    // 0 keyboard, 1 controller
-
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                tabButton(0, "keyboard")
-                tabButton(1, "gamecontroller")
-            }
-            Rectangle().fill(.white.opacity(0.15)).frame(height: 1)
-            ScrollView {
-                (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
-                    .padding(10)
-            }
-        }
-        .frame(width: layout.size.width, height: layout.size.height)
-        .background(GlassShape())
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.18), lineWidth: 1))
-        .position(layout.center)
-    }
-
-    private struct Placement { var center: CGPoint; var size: CGSize }
-
-    /// ml646: the panel must NEVER sit under the control it is editing.
-    ///
-    /// The old version only tried below/above and then clamped, which on a
-    /// 390pt-tall landscape phone silently put the panel right on top of any
-    /// control near the middle: 240 of panel + 64 of control + gaps does not fit
-    /// in 390 either way, so the clamp was the only thing deciding placement.
-    ///
-    /// Try each side in turn, at shrinking sizes, and take the first that fits
-    /// on the screen along the axis it separates on. Clamping the OTHER axis is
-    /// then always safe — below/above are separated vertically, so no horizontal
-    /// clamp can reintroduce an overlap, and vice versa.
-    private var layout: Placement {
-        let cx = CGFloat(control.nx) * screen.width
-        let cy = CGFloat(control.ny) * screen.height
-        let r  = TouchControlsModel.diameter(control) / 2
-        let gap: CGFloat = 14, edge: CGFloat = 8
-
-        for size in [CGSize(width: 340, height: 236),
-                     CGSize(width: 300, height: 196),
-                     CGSize(width: 264, height: 164)] {
-            let clampX = min(max(cx, size.width  / 2 + edge), screen.width  - size.width  / 2 - edge)
-            let clampY = min(max(cy, size.height / 2 + edge), screen.height - size.height / 2 - edge)
-            if cy + r + gap + size.height <= screen.height - edge {
-                return Placement(center: CGPoint(x: clampX, y: cy + r + gap + size.height / 2), size: size)
-            }
-            if cy - r - gap - size.height >= edge {
-                return Placement(center: CGPoint(x: clampX, y: cy - r - gap - size.height / 2), size: size)
-            }
-            if cx + r + gap + size.width <= screen.width - edge {
-                return Placement(center: CGPoint(x: cx + r + gap + size.width / 2, y: clampY), size: size)
-            }
-            if cx - r - gap - size.width >= edge {
-                return Placement(center: CGPoint(x: cx - r - gap - size.width / 2, y: clampY), size: size)
-            }
-        }
-        // Nothing fits alongside — smallest panel, corner furthest from the
-        // control, so it still cannot cover it.
-        let size = CGSize(width: 264, height: 164)
-        return Placement(
-            center: CGPoint(x: cx < screen.width  / 2 ? screen.width  - size.width  / 2 - edge
-                                                      : size.width  / 2 + edge,
-                            y: cy < screen.height / 2 ? screen.height - size.height / 2 - edge
-                                                      : size.height / 2 + edge),
-            size: size)
-    }
-
-    private func tabButton(_ i: Int, _ icon: String) -> some View {
-        Button { tab = i } label: {
-            Image(systemName: icon)                       // stroke, not filled
-                .font(.system(size: 16, weight: .regular))
-                .foregroundStyle(.white.opacity(tab == i ? 1.0 : 0.38))
-                .frame(maxWidth: .infinity, minHeight: 36)
-        }
-        .buttonStyle(.plain)
-    }
-
-    // ---- catalogues ----
-    private var letters: [(String, ControlAction)] {
-        (0x41...0x5A).map { (String(UnicodeScalar(UInt8($0))), ControlAction.key(Int32($0))) }
-    }
-    private var digits: [(String, ControlAction)] {
-        (0x30...0x39).map { (String(UnicodeScalar(UInt8($0))), ControlAction.key(Int32($0))) }
-    }
-    private var fkeys: [(String, ControlAction)] {
-        (0...11).map { ("F\($0 + 1)", ControlAction.key(Int32(0x70 + $0))) }
-    }
-    private var numpad: [(String, ControlAction)] {
-        (0...9).map { ("N\($0)", ControlAction.key(Int32(0x60 + $0))) }
-        + [("N*", .key(0x6A)), ("N+", .key(0x6B)), ("N−", .key(0x6D)),
-           ("N.", .key(0x6E)), ("N/", .key(0x6F))]
-    }
-
-    private var keyboardTab: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if GamepadInput.keyboardMouseAvailable, !control.action.isPad, control.action != .none, control.action != .keyboardToggle {
-                bindingSection
-            }
-            section("Pointer, sticks & special", [
-                ("L click", .mouseLeft), ("R click", .mouseRight),
-                ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
-                ("Keyboard", .keyboardToggle), ("None", .none),
-            ])
-            section("Letters", letters)
-            section("Numbers", digits)
-            section("Function", fkeys)
-            section("Modifiers & editing", [
-                ("Esc", .key(0x1B)), ("Tab", .key(0x09)), ("Caps", .key(0x14)),
-                ("Shift", .key(0x10)), ("Ctrl", .key(0x11)), ("Alt", .key(0x12)),
-                ("Space", .key(0x20)), ("Enter", .key(0x0D)), ("Bksp", .key(0x08)),
-                ("Win", .key(0x5B)),
-            ])
-            section("Navigation", [
-                ("←", .key(0x25)), ("↑", .key(0x26)), ("→", .key(0x27)), ("↓", .key(0x28)),
-                ("Ins", .key(0x2D)), ("Del", .key(0x2E)), ("Home", .key(0x24)),
-                ("End", .key(0x23)), ("PgUp", .key(0x21)), ("PgDn", .key(0x22)),
-            ])
-            section("Symbols", [
-                ("-", .key(0xBD)), ("=", .key(0xBB)), ("[", .key(0xDB)), ("]", .key(0xDD)),
-                ("\\", .key(0xDC)), (";", .key(0xBA)), ("'", .key(0xDE)), (",", .key(0xBC)),
-                (".", .key(0xBE)), ("/", .key(0xBF)), ("`", .key(0xC0)),
-            ])
-            section("Numpad", numpad)
-        }
-    }
-
-    private var controllerTab: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Sticks first: on a landscape phone a fourth section sits below the
-            // fold, and the sticks are the controls most layouts need.
-            section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
-                               ("L3", .pad("L3")), ("R3", .pad("R3"))])
-            section("Face", [("A", .pad("A")), ("B", .pad("B")), ("X", .pad("X")), ("Y", .pad("Y"))])
-            section("D-pad", [("D↑", .pad("D↑")), ("D↓", .pad("D↓")),
-                              ("D←", .pad("D←")), ("D→", .pad("D→"))])
-            section("Bumpers & triggers", [("LB", .pad("LB")), ("RB", .pad("RB")),
-                                           ("LT", .pad("LT")), ("RT", .pad("RT"))])
-            // Start and Select are XInput's Menu and View; the layout keeps the
-            // XInput names, the chips and the buttons read Start/Select.
-            section("System", [("Start", .pad("Menu")), ("Select", .pad("View")),
-                               ("Guide", .pad("Guide"))])
-        }
-    }
-
-    /// Keyboard-and-mouse controller mode: which physical input performs this
-    /// control's action. A key stick binds to a stick; everything else to a
-    /// button or trigger. The chosen chip is highlighted; tapping it again clears.
-    private var bindingSection: some View {
-        let names = control.action.stickKeys != nil ? PadBindings.stickNames : PadBindings.buttonNames
-        return VStack(alignment: .leading, spacing: 6) {
-            Text("Controller button for this action (keyboard & mouse mode)")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.45))
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
-                ForEach(names, id: \.self) { name in
-                    let on = control.padBinding == name
-                    Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        if let i = m.index(of: control.id) { m.controls[i].padBinding = on ? nil : name }
-                    } label: {
-                        Text(name == "Menu" ? "Start" : name == "View" ? "Select" : name)
-                            .font(.system(size: 12, weight: .medium)).lineLimit(1).minimumScaleFactor(0.55)
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity, minHeight: 30)
-                            .background(RoundedRectangle(cornerRadius: 7).fill(on ? Color.accentColor.opacity(0.6) : .white.opacity(0.12)))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-    }
-
-    private func section(_ title: String, _ items: [(String, ControlAction)]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.45))
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, it in
-                    chip(it.0, it.1)
-                }
-            }
-        }
-    }
-
-    private func chip(_ label: String, _ action: ControlAction) -> some View {
-        let on = control.action == action
-        return Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            if let i = m.index(of: control.id) { m.controls[i].action = action }
-        } label: {
-            Text(label)
-                .font(.system(size: 12, weight: .medium))
-                .lineLimit(1)
-                .minimumScaleFactor(0.55)
-                .foregroundStyle(.white.opacity(action.isPad ? 0.55 : 1.0))
-                .frame(maxWidth: .infinity, minHeight: 30)
-                .background(RoundedRectangle(cornerRadius: 7)
-                    .fill(.white.opacity(on ? 0.36 : 0.12)))
-        }
-        .buttonStyle(.plain)
-    }
-}

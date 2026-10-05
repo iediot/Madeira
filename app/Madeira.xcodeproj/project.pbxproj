@@ -82,6 +82,9 @@
 		A1000034 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000035 /* IOKit.framework */; };
 		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036 /* StikJITHelper.swift */; };
 		B1000001 /* JITSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000001 /* JITSetup.swift */; };
+		B1000777 /* WineMono.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000777 /* WineMono.swift */; };
+		B1000778 /* LibraryHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000778 /* LibraryHome.swift */; };
+		B1000779 /* ControlEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000779 /* ControlEditor.swift */; };
 		B1000004 /* madeira-jit.js in Resources */ = {isa = PBXBuildFile; fileRef = B2000004 /* madeira-jit.js */; };
 		A1000040 /* prefix-template.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = A2000040 /* prefix-template.tar.gz */; };
 		A1000041 /* PrefixExtractor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000041 /* PrefixExtractor.c */; };
@@ -93,6 +96,8 @@
 		A1000054 /* MetalFX.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000054 /* MetalFX.framework */; };
 		A1000055 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000055 /* libsqlite3.tbd */; };
 		A1000615 /* liblzma.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000615 /* liblzma.tbd */; };
+		A1000620 /* libcompression.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000620 /* libcompression.tbd */; };
+		A1000621 /* wine-mono-11.0.0-x86.tar.xz in Resources */ = {isa = PBXBuildFile; fileRef = A2000621 /* wine-mono-11.0.0-x86.tar.xz */; };
 		A1000060 /* libwin32u_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000060 /* libwin32u_unix.a */; };
 		A1000070 /* Winios/Winios.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000070 /* Winios/Winios.m */; };
 		A1000080 /* arm64ec-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000080 /* arm64ec-windows */; };
@@ -218,6 +223,9 @@
 		A2000035 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		A2000036 /* StikJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StikJITHelper.swift; sourceTree = "<group>"; };
 		B2000001 /* JITSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITSetup.swift; sourceTree = "<group>"; };
+		B2000777 /* WineMono.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineMono.swift; sourceTree = "<group>"; };
+		B2000778 /* LibraryHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryHome.swift; sourceTree = "<group>"; };
+		B2000779 /* ControlEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlEditor.swift; sourceTree = "<group>"; };
 		B2000004 /* madeira-jit.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "madeira-jit.js"; sourceTree = "<group>"; };
 		A2000040 /* prefix-template.tar.gz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = "prefix-template.tar.gz"; sourceTree = "<group>"; };
 		A2000041 /* PrefixExtractor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PrefixExtractor.c; sourceTree = "<group>"; };
@@ -230,6 +238,8 @@
 		A2000054 /* MetalFX.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalFX.framework; path = System/Library/Frameworks/MetalFX.framework; sourceTree = SDKROOT; };
 		A2000055 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
 		A2000615 /* liblzma.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = liblzma.tbd; path = usr/lib/liblzma.tbd; sourceTree = SDKROOT; };
+		A2000620 /* libcompression.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libcompression.tbd; path = usr/lib/libcompression.tbd; sourceTree = SDKROOT; };
+		A2000621 /* wine-mono-11.0.0-x86.tar.xz */ = {isa = PBXFileReference; lastKnownFileType = file; path = "wine-mono-11.0.0-x86.tar.xz"; sourceTree = "<group>"; };
 		A2000056 /* IOSDisplayShim.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOSDisplayShim.h; sourceTree = "<group>"; };
 		A2000060 /* libwin32u_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libwin32u_unix.a; sourceTree = "<group>"; };
 		A2000070 /* Winios/Winios.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = Winios/Winios.m; sourceTree = "<group>"; };
@@ -293,6 +303,7 @@
 				A1000054 /* MetalFX.framework in Frameworks */,
 				A1000055 /* libsqlite3.tbd in Frameworks */,
 				A1000615 /* liblzma.tbd in Frameworks */,
+				A1000620 /* libcompression.tbd in Frameworks */,
 				A1000060 /* libwin32u_unix.a in Frameworks */,
 				A1000090 /* libgnutls.a in Frameworks */,
 				A1000091 /* libhogweed.a in Frameworks */,
@@ -403,6 +414,9 @@
 				A200000A /* EntitlementChecker.swift */,
 				A2000036 /* StikJITHelper.swift */,
 				B2000001 /* JITSetup.swift */,
+				B2000777 /* WineMono.swift */,
+				B2000778 /* LibraryHome.swift */,
+				B2000779 /* ControlEditor.swift */,
 				B2000004 /* madeira-jit.js */,
 				A2000021 /* nls */,
 				A2000033 /* aarch64-windows */,
@@ -413,6 +427,7 @@
 				A20000D2 /* licenses */,
 				A2000081 /* x86_64-vcruntime */,
 				A2000040 /* prefix-template.tar.gz */,
+				A2000621 /* wine-mono-11.0.0-x86.tar.xz */,
 				A2000094 /* cacert.pem */,
 				A2000041 /* PrefixExtractor.c */,
 				A2000043 /* PrefixExtractor.h */,
@@ -459,6 +474,7 @@
 				A2000054 /* MetalFX.framework */,
 				A2000055 /* libsqlite3.tbd */,
 				A2000615 /* liblzma.tbd */,
+				A2000620 /* libcompression.tbd */,
 				A2000060 /* libwin32u_unix.a */,
 				A2000090 /* libgnutls.a */,
 				A2000091 /* libhogweed.a */,
@@ -547,6 +563,7 @@
 				A10000D2 /* licenses in Resources */,
 				A1000081 /* x86_64-vcruntime in Resources */,
 				A1000040 /* prefix-template.tar.gz in Resources */,
+				A1000621 /* wine-mono-11.0.0-x86.tar.xz in Resources */,
 				A1000094 /* cacert.pem in Resources */,
 				A1000910 /* Assets.xcassets in Resources */,
 				B1000004 /* madeira-jit.js in Resources */,
@@ -651,6 +668,9 @@
 				A1000701 /* Winios/WiniosGL.m in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
 				B1000001 /* JITSetup.swift in Sources */,
+				B1000777 /* WineMono.swift in Sources */,
+				B1000778 /* LibraryHome.swift in Sources */,
+				B1000779 /* ControlEditor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

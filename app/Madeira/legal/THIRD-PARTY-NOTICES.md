@@ -32,6 +32,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **Mesa** 25.0.7 (OSMesa, Zink, softpipe) | MIT (+ permissive, see `docs/license.rst`) | Patched (`build/mesa-ios/patches`). Separate dylib `gl/libOSMesa.dylib`, desktop OpenGL backend. |
 | **MoltenVK** 1.4.2 | Apache-2.0 | Unmodified. Separate dylib `gl/libMoltenVK.dylib`; contains SPIRV-Cross, SPIRV-Tools (Apache-2.0) and cereal (BSD-3-Clause). |
 | **libxml2** 2.12.10 and **libxslt** 1.1.45 | MIT (Daniel Veillard and contributors) | Unmodified, statically linked into Wine's `msxml3.dll` (`arm64ec-windows`) | Wine's bundled copies (`wine/libs/xml2`, `wine/libs/xslt`), built with the module by `build/wine-pe/build-modules.sh`. Licence texts in `LICENSES/MIT-libxml2.txt` and `LICENSES/MIT-libxslt.txt`. |
+| **Wine Mono** 11.0.0 | MIT (Wine Mono); bundled Mono class libraries MIT, with BSD, MS-PL and Apache-2.0 components | Unmodified official release, `wine-mono-11.0.0-x86.tar.xz` (SHA-256 `0cd723aa…abe5fd`), fetched by `build/wine-mono/fetch.sh` and unpacked on the device the first time a .NET program starts | The .NET runtime Wine uses for .NET programs. Source and the full licence texts: https://gitlab.winehq.org/mono/wine-mono (tag `wine-mono-11.0.0`); the licence files also ship inside the archive. |
 
 ## Why GPL-3.0-or-later
 

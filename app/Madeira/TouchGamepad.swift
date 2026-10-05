@@ -175,3 +175,90 @@ final class TouchPadView: UIView {
         if fingers.isEmpty { changed?(.zero, false) }
     }
 }
+
+// MARK: - Mouse look motion (host-testable)
+
+/// Each stroke starts at zero motion. Fractional counts preserve slow aiming;
+/// lifting or cancellation discards them before the next stroke.
+struct TouchMouseLookMotion {
+    private var previous: CGPoint?
+    private var carry = CGPoint.zero
+
+    mutating func begin(at point: CGPoint) {
+        previous = point.x.isFinite && point.y.isFinite ? point : nil
+        carry = .zero
+    }
+    mutating func reset() { previous = nil; carry = .zero }
+    mutating func move(to point: CGPoint, sensitivity: Double) -> (Int32, Int32) {
+        guard let last = previous else { return (0, 0) }
+        guard point.x.isFinite, point.y.isFinite, sensitivity.isFinite else {
+            reset(); return (0, 0)
+        }
+        previous = point
+        let gain = CGFloat(max(0.1, min(8, sensitivity)))
+        carry.x += (point.x - last.x) * gain
+        carry.y += (point.y - last.y) * gain
+        let x = Int32(max(-30000, min(30000, carry.x)))
+        let y = Int32(max(-30000, min(30000, carry.y)))
+        // Drop overflow rather than replaying a large jump over later events.
+        carry.x -= carry.x.rounded(.towardZero)
+        carry.y -= carry.y.rounded(.towardZero)
+        return (x, y)
+    }
+}
+
+// MARK: - Mouse look touch lifetime
+
+struct TouchMouseLookSurface: UIViewRepresentable {
+    let screen: CGSize
+    func makeUIView(context: Context) -> TouchMouseLookView { TouchMouseLookView() }
+    func updateUIView(_ view: TouchMouseLookView, context: Context) {
+        if view.screen != screen { view.reset(); view.screen = screen }
+    }
+    static func dismantleUIView(_ view: TouchMouseLookView, coordinator: ()) { view.reset() }
+}
+
+/// One finger owns the stroke, even outside the pad's bounds. Extra fingers
+/// never replace it, and touches here never generate mouse button events.
+final class TouchMouseLookView: UIView {
+    var screen = CGSize.zero
+    private var finger: UITouch?
+    private var motion = TouchMouseLookMotion()
+    private var previousSize = CGSize.zero
+
+    init() {
+        super.init(frame: .zero)
+        isMultipleTouchEnabled = true
+        backgroundColor = .clear
+        accessibilityLabel = "Mouse look"
+        NotificationCenter.default.addObserver(self, selector: #selector(reset),
+            name: UIApplication.willResignActiveNotification, object: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    deinit { NotificationCenter.default.removeObserver(self) }
+    @objc func reset() { finger = nil; motion.reset() }
+    override func didMoveToWindow() { super.didMoveToWindow(); if window == nil { reset() } }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if previousSize != bounds.size { reset(); previousSize = bounds.size }
+    }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard finger == nil, UIApplication.shared.applicationState == .active,
+              let touch = touches.first(where: { $0.type == .direct || $0.type == .pencil }) else { return }
+        finger = touch
+        motion.begin(at: touch.location(in: self))
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard UIApplication.shared.applicationState == .active else { reset(); return }
+        guard let finger, touches.contains(finger) else { return }
+        let (x, y) = motion.move(to: finger.location(in: self), sensitivity: InputSettings.shared.sensRel)
+        // MOUSEEVENTF_MOVE only: raw input receives the delta even if the game
+        // recentres or clips its cursor. Never send ABSOLUTE here.
+        if x != 0 || y != 0 { winios_pointer(x, y, 0x0001, 0) }
+    }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { finish(touches) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { finish(touches) }
+    private func finish(_ touches: Set<UITouch>) {
+        if let finger, touches.contains(finger) { reset() }
+    }
+}

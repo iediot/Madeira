@@ -189,8 +189,12 @@ struct JITSettingsSection: View {
     @ObservedObject private var coordinator = JITCoordinator.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
 
+    @ObservedObject private var jitState = LibraryJITState.shared
+
     var body: some View {
         Section {
+            LabeledContent("JIT") { status(jitState.enabled) }
+            LabeledContent("Memory+") { status(LibraryJITState.memory) }
             Button {
                 coordinator.showSetup = true
             } label: {
@@ -205,6 +209,13 @@ struct JITSettingsSection: View {
             }
         } header: {
             Text("JIT")
+        }
+    }
+
+    private func status(_ on: Bool) -> some View {
+        HStack(spacing: 6) {
+            Circle().fill(on ? Color.green : Color.red).frame(width: 8, height: 8)
+            Text(on ? "On" : "Off")
         }
     }
 }

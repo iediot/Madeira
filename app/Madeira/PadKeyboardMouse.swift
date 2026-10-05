@@ -206,7 +206,7 @@ final class PadKeyboardMouse {
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
         case .keyboardToggle:
             if down { DispatchQueue.main.async { MetalBackedView.toggleKeyboard() } }
-        case .none, .joystickWASD, .joystickArrows, .pad:
+        case .none, .joystickWASD, .joystickArrows, .pad, .mouseLook:
             break                                              // sticks are handled by sector; pad actions are XInput's
         }
     }

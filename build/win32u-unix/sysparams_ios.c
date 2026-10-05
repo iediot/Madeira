@@ -3919,6 +3919,29 @@ static const struct { short w, h; } ios_standard_modes[] =
     { 2560, 1440 },
 };
 
+/* The screen-shaped ladder (as gamescope's single output mode): the session
+ * default scaled down in steps, keeping its aspect ratio, so a game choosing
+ * from the list renders the screen's own shape instead of a 16:9 or 4:3 mode
+ * the app then letterboxes. Widths are multiples of 8, heights even. */
+static const struct { short num, den; } ios_shaped_steps[] =
+{
+    { 1, 1 }, { 9, 10 }, { 4, 5 }, { 3, 4 }, { 2, 3 }, { 3, 5 }, { 1, 2 }, { 2, 5 }, { 1, 3 },
+};
+
+static BOOL ios_shaped_mode( UINT step, int def_w, int def_h, int *w, int *h )
+{
+    int mw, mh;
+
+    if (step >= ARRAY_SIZE(ios_shaped_steps) || def_w <= 0 || def_h <= 0) return FALSE;
+    mw = def_w * ios_shaped_steps[step].num / ios_shaped_steps[step].den / 8 * 8;
+    mh = (int)(((INT64)mw * def_h + def_w / 2) / def_w) & ~1;
+    if (!step) mw = def_w, mh = def_h;
+    if (mw < 320 || mh < 200) return FALSE;
+    *w = mw;
+    *h = mh;
+    return TRUE;
+}
+
 /* Index 0 is always the CURRENT mode: EnumDisplaySettings callers compare the
  * list against ENUM_CURRENT_SETTINGS/ENUM_REGISTRY_SETTINGS and a current mode
  * missing from the list reads as "this monitor cannot do what it is doing".
@@ -3946,6 +3969,25 @@ static BOOL ios_mode_at_index( UINT index, int *w, int *h )
 
     cw = ios_screen_def_w ? ios_screen_def_w : sw;
     ch = ios_screen_def_h ? ios_screen_def_h : sh;
+
+    /* The screen-shaped ladder first; the standard PC table only with
+     * MADEIRA_STANDARD_MODES=1 (its 16:9 and 4:3 sizes are what games picked
+     * and the app then drew with black bars). */
+    for (i = 0; i < ARRAY_SIZE(ios_shaped_steps); i++)
+    {
+        int mw, mh;
+
+        if (!ios_shaped_mode( i, cw, ch, &mw, &mh )) continue;
+        if (mw == sw && mh == sh) continue;                     /* already index 0 */
+        if (++n != index) continue;
+        *w = mw;
+        *h = mh;
+        return TRUE;
+    }
+    {
+        const char *standard = getenv( "MADEIRA_STANDARD_MODES" );  /* 1: also list the standard PC modes */
+        if (!standard || strcmp( standard, "1" )) return FALSE;
+    }
 
     for (i = 0; i < ARRAY_SIZE(ios_standard_modes); i++)
     {
@@ -4156,6 +4198,10 @@ static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const 
 
         /* the session default is always acceptable */
         if (want_w == ios_screen_def_w && want_h == ios_screen_def_h) found = TRUE;
+        /* and so is every size of the screen-shaped ladder */
+        for (i = 0; !found && i < ARRAY_SIZE(ios_shaped_steps); i++)
+            found = ios_shaped_mode( i, ios_screen_def_w, ios_screen_def_h, &mw, &mh ) &&
+                    mw == want_w && mh == want_h;
         /* A saved explicit request may exceed the conservative advertised
          * ladder (see ios_mode_at_index). Accept the whole standard table up
          * to four times the session default; enumeration is a first-launch
