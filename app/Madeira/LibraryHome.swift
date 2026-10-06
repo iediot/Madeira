@@ -242,33 +242,14 @@ struct LibraryHome: View {
                     card(entry)
                 }
             }
-            if MadeiraDock.enabled {
-                SteamGamesSection(search: "", sort: sort, width: width, part: .all, open: open,
-                                  seeAll: { seeAll(.steam) })
+            // Every store together, as the Library's All games: Installed (the games
+            // you added among them) and Not installed. No store has its own shelf.
+            LibraryAllGames(search: "", sort: sort, width: width, others: others,
+                            shelves: { seeAll(.all) }, add: add, open: open) { entry, _, _ in
+                card(entry)
             }
-            EpicGamesSection(search: "", width: width, shelf: { seeAll(.epic) }, open: open)
-            otherGames
         }
         .padding(.bottom, 40)
-    }
-
-    private var otherGames: some View {
-        let mine = others
-        let desktop = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry
-        return LibraryShelf(title: "Other games", count: mine.count, items: Array(mine.prefix(20)), width: width,
-                            seeAll: mine.isEmpty ? nil : { seeAll(.other) }) {
-            HStack(alignment: .top, spacing: LibraryLayout.shelfGap(width)) {
-                Button { open(desktop) } label: { LibraryEntryCard(entry: desktop, badges: false) }
-                    .libraryCardButtonStyle(grid: true)
-                    .frame(width: LibraryLayout.shelfCard(width))
-                Button(action: add) { LibraryAddCard() }
-                    .libraryCardButtonStyle(grid: true)
-                    .frame(width: LibraryLayout.shelfCard(width))
-            }
-            .fixedSize()
-        } cell: { entry in
-            card(entry)
-        }
     }
 
     private func card(_ entry: LibraryEntry) -> some View {

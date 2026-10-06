@@ -36,6 +36,53 @@ index 0e34d738..9cd4b962 100644
  static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','-','x','8','6','_','6','4','.','d','l','l',0};
  #else
  static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','.','d','l','l',0};
+diff --git a/dlls/ntdll/heap.c b/dlls/ntdll/heap.c
+index 3f8a7549..3361f1e3 100644
+--- a/dlls/ntdll/heap.c
++++ b/dlls/ntdll/heap.c
+@@ -635,6 +635,12 @@ static void valgrind_notify_free_all( SUBHEAP *subheap, const struct heap *heap
+ }
+ 
+ /* get the memory protection type to use for a given heap */
++#ifdef __arm64ec__
++/* Madeira-private NtAllocateVirtualMemoryEx attribute: "this reservation is an
++ * executable heap's own memory". Not a Windows flag; must match virtual_ios.c. */
++#define MADEIRA_MEM_EXTENDED_PARAMETER_HEAP 0x40000000
++#endif
++
+ static inline ULONG get_protection_type( DWORD flags )
+ {
+     return (flags & HEAP_CREATE_ENABLE_EXECUTE) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+@@ -1073,8 +1079,27 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
+ #endif
+ 
+     /* allocate the memory block */
+-    if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, region_size, MEM_RESERVE,
+-                                           get_protection_type( flags ) )))
++#ifdef __arm64ec__
++    /* iOS-Madeira: an executable heap's reservation is PAGE_EXECUTE_READWRITE and
++     * grows in HEAP_INITIAL_GROW_SIZE (1 MB) steps, which the host allocator's
++     * size rule takes for a JIT code chunk and backs with a R+X JIT-pool slot. Its
++     * own metadata updates (the LFH InterlockedAnd on group->free_bits) are then
++     * LL/SC loops that can never complete under store emulation. Tag the
++     * reservation so the host treats the heap as data (ios_guest_anon_rwx_view_ok,
++     * virtual_ios.c); only the reservation is tagged, commits inherit it. */
++    if (flags & HEAP_CREATE_ENABLE_EXECUTE)
++    {
++        MEM_EXTENDED_PARAMETER param = {{ 0 }};
++        param.Type = MemExtendedParameterAttributeFlags;
++        param.ULong64 = MADEIRA_MEM_EXTENDED_PARAMETER_HEAP;
++        status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &addr, region_size, MEM_RESERVE,
++                                            get_protection_type( flags ), &param, 1 );
++    }
++    else
++#endif
++    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, region_size, MEM_RESERVE,
++                                      get_protection_type( flags ) );
++    if (status)
+     {
+         WARN( "Could not allocate %#Ix bytes, status %#lx\n", *region_size, status );
+         return NULL;
 diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
 index e617138e..ea201969 100644
 --- a/dlls/ntdll/unix/socket.c

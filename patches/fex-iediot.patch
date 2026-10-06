@@ -1,5 +1,5 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index be54311..fc8216a 100644
+index be54311..bc15a58 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -121,6 +121,160 @@ static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
@@ -244,6 +244,22 @@ index be54311..fc8216a 100644
    {
      auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
  
+@@ -2457,6 +2643,15 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
+       Dest = RW;
+     }
+     ios_fex_mono_count_helper(RW ? 0 : 1);
++
++    /* No alias: the target is plain memory, e.g. an executable NT heap that the host keeps
++     * read-write (virtual_ios.c VPROT_HEAP). Its pages may be write-trapped for SMC detection,
++     * and a direct store would fault into HandleRWXAccessViolation, which takes
++     * CodeInvalidationMutex -- already held here, so the thread would wait on itself forever.
++     * Let the frontend untrap, store and retrap under the lock we hold instead. */
++    if (!RW && CTX->SyscallHandler->WriteUntrackedLocked(Thread, Dest, Size, Value)) {
++      // stored; fall through to the invalidation below
++    } else
+ #endif
+ 
+     if (Size == 8) {
 diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
 index 032a62b..53dc4c5 100644
 --- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
@@ -505,7 +521,7 @@ index ffa2709..19ddcf2 100644
      L1Entry.HostCode = Entry.HostCode;
  
 diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
-index b2eca70..20f05fb 100644
+index b2eca70..9760560 100644
 --- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
 +++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
 @@ -704,6 +704,7 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
@@ -527,6 +543,44 @@ index b2eca70..20f05fb 100644
  }
  
  static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
+@@ -2322,13 +2327,14 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+   // thread identity into the word (waiters only ever test zero/nonzero); on
+   // timeout, emulate this one access with the same helpers the !IsJIT path
+   // uses and leave the code unpatched.
+-#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
++#if defined(FEX_IOS_HOST)
+   /* The backpatch lock lives in the code buffer, which is execute-only on iOS: JITCodeTail is
+    * emitted after each block, so &SpinLockFutex is in the dual-mapped pool's RX view. The
+    * LDAXR/STLXR acquire below would take a permission fault on the store, inside this handler.
+    * Take the WHOLE lock through the writable alias (both views map the same physical page, so the
+-   * exclusive pair is a genuine atomic, and every participant uses this one address). Scoped to
+-   * the WOW64 module; the ARM64EC module is unchanged. */
++   * exclusive pair is a genuine atomic, and every participant uses this one address). Both the
++   * WOW64 and the ARM64EC module: the ARM64EC one faulted here (BUS: unhandled store, stlxr into
++   * JIT-POOL-RX) once RimWorld with its DLC reached an unaligned atomic. */
+   uint32_t* BPFutex = FEXCore::DualMap::WriteAddr(&InlineTail->SpinLockFutex);
+ #else
+   uint32_t* BPFutex = &InlineTail->SpinLockFutex;
+diff --git a/FEXCore/include/FEXCore/HLE/SyscallHandler.h b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+index d1f4dec..4d82092 100644
+--- a/FEXCore/include/FEXCore/HLE/SyscallHandler.h
++++ b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+@@ -73,6 +73,15 @@ public:
+ 
+   virtual void SleepThread(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {}
+ 
++  // iOS-Madeira: store Value (Size 4 or 8 bytes) to the host address Address, which may sit on a
++  // page the frontend has write-trapped for SMC detection, without faulting. The caller holds
++  // CodeInvalidationMutex exclusively; the implementation must not take ThreadCreationMutex
++  // (lock order). Returns false when it did not store (the caller then stores directly).
++  // Last in the interface so existing vtable slots keep their positions.
++  virtual bool WriteUntrackedLocked(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint8_t Size, uint64_t Value) {
++    return false;
++  }
++
+ protected:
+   SyscallOSABI OSABI;
+ };
 diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
 index 61d7a23..57acf04 100644
 --- a/Source/Windows/ARM64EC/IosJitAlias.cpp
@@ -559,6 +613,37 @@ index 61d7a23..57acf04 100644
    // Identical re-registration: nothing to do.
    for (int i = 0; i < count; i++) {
      if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index fbaf76f..4af7c0f 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -756,6 +756,26 @@ public:
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 
++  // Called by MonoBackpatcherWrite with CodeInvalidationMutex held exclusively. Untrap (which
++  // also invalidates the range), store, retrap. BeginUntrackedWriteLocked's NtProtectVirtualMemory
++  // notification is skipped while IntervalsLock is held, so nothing here re-enters the mutex.
++  // ThreadCreationMutex is deliberately not taken: it orders before CodeInvalidationMutex.
++  bool WriteUntrackedLocked(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint8_t Size, uint64_t Value) override {
++    if (!InvalidationTracker || (Size != 4 && Size != 8)) {
++      return false;
++    }
++    if (!InvalidationTracker->BeginUntrackedWriteLocked(Address, Size)) {
++      return false;
++    }
++    if (Size == 8) {
++      *reinterpret_cast<volatile uint64_t*>(Address) = Value;
++    } else {
++      *reinterpret_cast<volatile uint32_t*>(Address) = static_cast<uint32_t>(Value);
++    }
++    InvalidationTracker->ReprotectRWXIntervals(Address, Size);
++    return true;
++  }
++
+   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
+     OvercommitTracker->MarkRange(Start, Length);
+   }
 diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
 index 081d7cb..37bedd6 100644
 --- a/Source/Windows/Common/InvalidationTracker.cpp

@@ -1412,6 +1412,10 @@ struct LibraryAllGames<OtherCell: View>: View {
     let others: [LibraryEntry]
     /// The Windows desktop: not a game, so on its own at the very bottom.
     var desktop: LibraryEntry? = nil
+    /// Home: the two groups as sideways shelves (See all opens the Library), with
+    /// Add a game at the end of Installed.
+    var shelves: (() -> Void)? = nil
+    var add: (() -> Void)? = nil
     let open: (LibraryEntry) -> Void
     @ViewBuilder let otherCell: (LibraryEntry, Bool, Bool) -> OtherCell
     @ObservedObject private var games = SteamGamesModel.shared
@@ -1468,7 +1472,56 @@ struct LibraryAllGames<OtherCell: View>: View {
         let notInstalled: [Item] = ((signedIn ? groups.notInstalled.map { Item.steam($0) } : [])
             + epicGames.filter { !epicOnDevice($0) }.map { Item.epic($0) })
             .sorted { title($0).localizedStandardCompare(title($1)) == .orderedAscending }
-        return VStack(alignment: .leading, spacing: 28) {
+        return Group {
+            if let shelves {
+                shelvesBody(onDevice: downloading + installed, notInstalled: notInstalled, seeAll: shelves,
+                            signIn: SteamGamesRules.showsSignIn(library: SteamOwnedLibrary.enabled, signedIn: steam.signedIn) && steamOn)
+            } else {
+                sections(downloading: downloading, installed: installed, notInstalled: notInstalled, steamOn: steamOn)
+            }
+        }
+        .onAppear {
+            games.refresh()
+            if SteamOwnedLibrary.enabled { steam.start(); steam.reconcileSession() }
+            epicLibrary.refreshIfStale()
+        }
+        .sheet(item: $steamSelected) { selection in
+            SteamGameSheet(appID: selection.id) { entry in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
+            }
+        }
+        .sheet(item: $epicSelected) { game in EpicGameSheet(game: game, open: open) }
+        .sheet(isPresented: $showSignIn) { SteamSignInView() }
+    }
+
+    /// Home: Installed and Not installed as shelves, every store together.
+    @ViewBuilder private func shelvesBody(onDevice: [Item], notInstalled: [Item], seeAll: @escaping () -> Void,
+                                          signIn: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 32) {
+            if signIn {
+                SteamSignInCard { showSignIn = true }.padding(.horizontal, LibraryLayout.margin(width))
+            }
+            LibraryShelf(title: "Installed", count: onDevice.count, items: Array(onDevice.prefix(20)), width: width,
+                         seeAll: seeAll) {
+                if let add {
+                    Button(action: add) { LibraryAddCard() }
+                        .libraryCardButtonStyle(grid: true)
+                        .frame(width: LibraryLayout.shelfCard(width))
+                }
+            } cell: { item in
+                cell(item, list: false, dense: false)
+            }
+            if !notInstalled.isEmpty {
+                LibraryShelf(title: "Not installed", count: notInstalled.count, items: Array(notInstalled.prefix(20)),
+                             width: width, seeAll: seeAll) { item in
+                    cell(item, list: false, dense: false)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func sections(downloading: [Item], installed: [Item], notInstalled: [Item], steamOn: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 28) {
             if SteamGamesRules.showsSignIn(library: SteamOwnedLibrary.enabled, signedIn: steam.signedIn) && steamOn {
                 SteamSignInCard { showSignIn = true }
             }
@@ -1510,18 +1563,6 @@ struct LibraryAllGames<OtherCell: View>: View {
                 }
             }
         }
-        .onAppear {
-            games.refresh()
-            if SteamOwnedLibrary.enabled { steam.start(); steam.reconcileSession() }
-            epicLibrary.refreshIfStale()
-        }
-        .sheet(item: $steamSelected) { selection in
-            SteamGameSheet(appID: selection.id) { entry in
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
-            }
-        }
-        .sheet(item: $epicSelected) { game in EpicGameSheet(game: game, open: open) }
-        .sheet(isPresented: $showSignIn) { SteamSignInView() }
     }
 
     @ViewBuilder private func cell(_ item: Item, list: Bool, dense: Bool) -> some View {
