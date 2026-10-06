@@ -698,6 +698,21 @@ void madeira_hidpad_init( void )
         return;
     }
     release_object( symlink );
+    /* ml2302: the Xbox identity's XI_ twin, a second name for this device. */
+    {
+        char xi[200];
+        if (hidpad_xi_link( id, xi, sizeof(xi), NULL, 0 ))
+        {
+            snprintf( path, sizeof(path), "\\??\\%s", xi );
+            hidpad_ascii_name( path, nameW, ARRAY_SIZE(nameW), &name );
+            if ((symlink = create_obj_symlink( NULL, &name, OBJ_PERMANENT | OBJ_CASE_INSENSITIVE, &device->obj, NULL )))
+            {
+                release_object( symlink );
+                fprintf( stderr, "[hid-pad] ml2302 XI twin \\??\\%s\n", xi );
+            }
+            else fprintf( stderr, "[hid-pad] ml2302 cannot create the XI twin: %#x\n", get_error() );
+        }
+    }
 
     fprintf( stderr, "[hid-pad] ml2101 device %s %04x:%04x \"%s\" input %u output %u feature %u bytes, "
              "preparsed %u bytes, \\??\\%s\n", id->env, id->vid, id->pid, device->product,

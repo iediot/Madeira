@@ -299,6 +299,21 @@ void winios_drv_close_windows(void)
     }
     free( list );
     dprintf( 2, "[winios] ml2211 quit: WM_CLOSE posted to %u visible top-level window(s)\n", posted );
+    /* ml2303: a Desktop session ends with the shell, which ignores WM_CLOSE to its
+     * windows: Quit waited 8 s and offered Close Madeira. The desktop window's
+     * Close (explorer's desktop_wnd_proc, SC_CLOSE) is ExitWindows: every program
+     * gets the end-session messages to save, then the session ends and the library
+     * returns as after a game. Only in Desktop mode, where the desktop is the
+     * session; a game's own quit stays its WM_CLOSE. */
+    {
+        const char *desktop = getenv( "MADEIRA_DESKTOP" );
+        if (desktop && desktop[0] == '1')
+        {
+            BOOL ok = NtUserPostMessage( NtUserGetDesktopWindow(), WM_SYSCOMMAND, SC_CLOSE, 0 );
+            dprintf( 2, "[winios] ml2303 quit: Desktop session, SC_CLOSE to the desktop window %s\n",
+                     ok ? "posted" : "FAILED" );
+        }
+    }
 }
 
 /* [winios-tree] window-tree dump: every top-level window with class,

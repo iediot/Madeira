@@ -26,6 +26,7 @@
 #ifndef MADEIRA_HIDPAD_IDS_H
 #define MADEIRA_HIDPAD_IDS_H
 
+#include <stdio.h>
 #include <string.h>
 
 #define HIDPAD_KIND_NONE      0
@@ -35,6 +36,9 @@
 
 /* GUID_DEVINTERFACE_HID, lower case as setupapi writes it. */
 #define HIDPAD_HID_INTERFACE_GUID "{4d1e55b2-f16f-11cf-88cb-001111000030}"
+/* GUID_DEVINTERFACE_WINEXINPUT (wine/dlls/windows.gaming.input/main.c, winexinput.sys):
+ * the interface Wine lists an XInput pad's "&XI_" twin under. */
+#define HIDPAD_WINEXINPUT_GUID    "{6c53d5fd-6480-440f-b618-476750c5e1a6}"
 /* GUID_DEVCLASS_HIDCLASS. */
 #define HIDPAD_HIDCLASS_GUID      "{745a17a0-74d3-11d0-b6fe-00a0c90f57da}"
 
@@ -135,6 +139,40 @@ static inline void hidpad_interface_link( const struct hidpad_identity *id, char
         for (p = parts[i]; *p && len + 1 < size; p++) buf[len++] = *p == '\\' ? '#' : *p;
     }
     if (size) buf[len] = 0;
+}
+
+/* ml2302: the Xbox identity's "&XI_00" twin, as Wine's winexinput.sys lists every
+ * XInput pad: the same instance ID with IG_ turned into XI_, under the WINEXINPUT
+ * interface only (not GUID_DEVINTERFACE_HID, so DirectInput, SDL and Rewired keep
+ * seeing one controller). windows.gaming.input skips IG_ devices and makes its
+ * Gamepad class only from XI_ ones; Unity's new Input System reads Xbox pads through
+ * it (Ogu and the Secret Forest). The report layout is winexinput's already
+ * (X/Y, Rx/Ry, triggers as one Z, ten buttons, hat), so it is the same device.
+ * `instance_out` gets the XI_ device instance ID. 0 for an identity without one. */
+static inline int hidpad_xi_link( const struct hidpad_identity *id, char *buf, unsigned int size,
+                                  char *instance_out, unsigned int instance_size )
+{
+    char device_id[64];
+    unsigned int i, len = 0;
+    const char *parts[3];
+
+    if (id->kind != HIDPAD_KIND_XBOX || strlen( id->device_id ) >= sizeof(device_id)) return 0;
+    strcpy( device_id, id->device_id );
+    {
+        char *ig = strstr( device_id, "&IG_" );
+        if (!ig) return 0;
+        ig[1] = 'X'; ig[2] = 'I';   /* "&IG_" -> "&XI_" */
+    }
+    if (instance_out) snprintf( instance_out, instance_size, "%s\\%s", device_id, id->instance );
+    parts[0] = device_id; parts[1] = id->instance; parts[2] = HIDPAD_WINEXINPUT_GUID;
+    for (i = 0; i < 3; i++)
+    {
+        const char *p;
+        if (i && len + 1 < size) buf[len++] = '#';
+        for (p = parts[i]; *p && len + 1 < size; p++) buf[len++] = *p == '\\' ? '#' : *p;
+    }
+    if (size) buf[len] = 0;
+    return 1;
 }
 
 #endif

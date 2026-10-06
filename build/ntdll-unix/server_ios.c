@@ -4169,6 +4169,52 @@ static void ios_hidpad_publish(void)
     }
     wine_log_write( "[hid-pad] ml2102 %s %04X:%04X registered (%u/4 keys) as %s rev=ml2105",
                     id->env, id->vid, id->pid, written, symlink );
+    /* ml2302: the Xbox identity's XI_ twin (hidpad_xi_link), listed under the
+     * WINEXINPUT interface only, the way Wine lists winexinput's devices, so
+     * windows.gaming.input makes a Gamepad of it and nothing else sees two pads. */
+    {
+        char xi[200], xi_instance[128], xi_symlink[210];
+        unsigned int xi_written = 0;
+        if (hidpad_xi_link( id, xi, sizeof(xi), xi_instance, sizeof(xi_instance) ))
+        {
+            snprintf( xi_symlink, sizeof(xi_symlink), "\\\\?\\%s", xi );
+            if ((key = ios_hidpad_key( enumkey, xi_instance )))
+            {
+                ios_hidpad_value( key, "ClassGUID", REG_SZ, &class_guid, 1, 0 );
+                ios_hidpad_value( key, "Class", REG_SZ, &class_name, 1, 0 );
+                ios_hidpad_value( key, "DeviceDesc", REG_SZ, &desc, 1, 0 );
+                ios_hidpad_value( key, "Mfg", REG_SZ, &id->manufacturer, 1, 0 );
+                ios_hidpad_value( key, "ContainerID", REG_SZ, &id->container_id, 1, 0 );
+                ios_hidpad_value( key, "ConfigFlags", REG_DWORD, NULL, 0, 0 );
+                NtClose( key );
+                xi_written++;
+            }
+            snprintf( path, sizeof(path), "%s\\##?#%s", HIDPAD_WINEXINPUT_GUID, xi );
+            if ((key = ios_hidpad_key( classes, path )))
+            {
+                const char *value = xi_instance;
+                ios_hidpad_value( key, "DeviceInstance", REG_SZ, &value, 1, 0 );
+                NtClose( key );
+                xi_written++;
+            }
+            snprintf( path, sizeof(path), "%s\\##?#%s\\#", HIDPAD_WINEXINPUT_GUID, xi );
+            if ((key = ios_hidpad_key( classes, path )))
+            {
+                const char *value = xi_symlink;
+                ios_hidpad_value( key, "SymbolicLink", REG_SZ, &value, 1, 0 );
+                NtClose( key );
+                xi_written++;
+            }
+            snprintf( path, sizeof(path), "%s\\##?#%s\\#\\Control", HIDPAD_WINEXINPUT_GUID, xi );
+            if ((key = ios_hidpad_key( classes, path )))
+            {
+                ios_hidpad_value( key, "Linked", REG_DWORD, NULL, 0, 1 );
+                NtClose( key );
+                xi_written++;
+            }
+            wine_log_write( "[hid-pad] ml2302 XI twin registered (%u/4 keys) as %s", xi_written, xi_symlink );
+        }
+    }
 }
 #endif
 
