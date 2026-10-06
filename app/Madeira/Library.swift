@@ -4823,11 +4823,14 @@ struct LibraryDrawerShape: Shape {
 /// MADEIRA_UNITY_RESOLUTION=0 leaves the registry alone.
 enum UnityResolution {
     static func apply(prefix: String, size: String?) {
-        guard MadeiraConfig.flag("MADEIRA_UNITY_RESOLUTION"), let size else { return }
+        // One line every session, whatever happens: a silent skip cost a test round.
+        func skip(_ why: String) { LogStore.shared.log("[unity-res] skipped: \(why)") }
+        guard MadeiraConfig.flag("MADEIRA_UNITY_RESOLUTION") else { return skip("MADEIRA_UNITY_RESOLUTION=0") }
+        guard let size else { return skip("no session entry yet") }
         let parts = size.split(separator: "x").compactMap { Int($0) }
-        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return skip("size \(size)") }
         let file = prefix + "/user.reg"
-        guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { return }
+        guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { return skip("user.reg unreadable") }
         let w = String(format: "%08x", parts[0]), h = String(format: "%08x", parts[1])
         var changed = 0
         let lines = text.components(separatedBy: "\n").map { line -> String in
@@ -4847,7 +4850,7 @@ enum UnityResolution {
             if updated != line { changed += 1 }
             return updated
         }
-        guard changed > 0 else { return }
+        guard changed > 0 else { return skip("nothing to change at \(size)") }
         do {
             try lines.joined(separator: "\n").write(toFile: file, atomically: true, encoding: .utf8)
             LogStore.shared.log("[unity-res] \(changed) saved Unity setting(s) set to \(size) full screen")

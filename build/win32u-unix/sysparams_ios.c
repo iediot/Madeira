@@ -4132,6 +4132,29 @@ static BOOL ios_mode_at_index( UINT index, int *w, int *h )
         *h = mh;
         return TRUE;
     }
+    /* ml2301: the PC aspect ratios too, each the largest that fits the session
+     * default. Programs that keep only 16:9 / 16:10 / 4:3 modes found none in a
+     * screen-shaped list and fell back to their own default: Slime Rancher
+     * reset itself to 800x600 at its main menu, and its Apply crashed indexing
+     * the empty list. These have fewer pixels than index 0, so a program that
+     * takes the largest mode still gets the screen's shape.
+     * MADEIRA_ASPECT_MODES=0 leaves them out. */
+    {
+        static const struct { short x, y; } aspects[] = { { 16, 9 }, { 16, 10 }, { 4, 3 } };
+        const char *aspect = getenv( "MADEIRA_ASPECT_MODES" );
+        if (!aspect || strcmp( aspect, "0" ))
+            for (i = 0; i < ARRAY_SIZE(aspects); i++)
+            {
+                int mw = ch * aspects[i].x / aspects[i].y, mh = ch;
+                if (mw > cw) { mw = cw; mh = cw * aspects[i].y / aspects[i].x; }
+                mw &= ~7; mh &= ~1;
+                if (mw < 320 || mh < 200 || (mw == sw && mh == sh)) continue;
+                if (++n != index) continue;
+                *w = mw;
+                *h = mh;
+                return TRUE;
+            }
+    }
     {
         const char *standard = getenv( "MADEIRA_STANDARD_MODES" );  /* 1: also list the standard PC modes */
         if (!standard || strcmp( standard, "1" )) return FALSE;
