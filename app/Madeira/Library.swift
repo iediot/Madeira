@@ -212,7 +212,7 @@ struct LibraryEntry: Codable, Identifiable {
     }
     /// How the monitor is scaled to the screen (DisplayMode raw value; nil = Fit).
     var display: String?
-    /// FPS limit: 1 = 60, 3 = 30, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
+    /// FPS limit: 1 = 60, 3 = 30, 4 = 40, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
     var fpsMode = 1
     /// FEX's X87ReducedPrecision for this game. Off by default, as in FEX; only
     /// an explicit choice exports FEX_X87REDUCEDPRECISION=1.
@@ -273,6 +273,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// D3D9 anisotropic filtering limit (DXMT_D9_ANISO_LIMIT: 1, 2, 4 or 8);
     /// nil = the application's own choice.
     var anisotropyLimit: Int?
+    /// "Report an NVIDIA GPU": DXGI names NVIDIA as the vendor (GeForce RTX
+    /// 3060, 10DE:2544), DXMT's NVAPI answers, and win32u registers the same
+    /// display adapter, for games that refuse a GPU without a known vendor's
+    /// driver. nil = off.
+    var reportNVIDIA: Bool?
     /// A Steam game (SteamGames.swift): Madeira Dock starts it by this App ID
     /// through Valve's client, with Steam's default launch option.
     /// `relativePath` is then its install folder, relative to drive_c.
@@ -316,6 +321,18 @@ struct LibraryEntry: Codable, Identifiable {
     /// Experimental MetalFX frame interpolation between the game's frames
     /// (DXMT's present path, MADEIRA_FRAMEGEN); nil = off.
     var frameGeneration: Bool?
+    /// MetalFX spatial upscaling factor (Display › MetalFX upscaling: 1.5 or 2;
+    /// nil = off), passed on as this game's `metalfx-upscale` line.
+    var metalFXUpscale: Double?
+
+    /// What MadeiraConfig.applyGame writes for this game: the lines its pickers
+    /// stand for, then its own config, which wins where both set a key.
+    var gameConfigText: String? {
+        var lines: [String] = []
+        if let metalFXUpscale { lines.append("metalfx-upscale = \(metalFXUpscale)") }
+        if let config, !config.isEmpty { lines.append(config) }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
@@ -460,14 +477,14 @@ struct LibraryEntry: Codable, Identifiable {
 
     var windowsPath: String { "C:\\" + relativePath.replacingOccurrences(of: "/", with: "\\") }
 
-    /// The vsync mode to apply: a saved 30 FPS limit runs as 60 when DXMT has
-    /// no 30 FPS cap (mode 3 would otherwise present uncapped).
-    var effectiveFPSMode: Int32 { fpsMode == 3 && !ProMotionIntent.has30Cap ? 1 : Int32(fpsMode) }
+    /// The vsync mode to apply: a saved 30 or 40 FPS limit runs as 60 when it is
+    /// not offered (DXMT without that cap would present uncapped).
+    var effectiveFPSMode: Int32 { ProMotionIntent.supportedMode(fpsMode) }
 
     func validate() throws {
         let size = pixelResolution.split(separator: "x").compactMap { Int($0) }
         guard size.count == 2, (320...4096).contains(size[0]), (240...4096).contains(size[1]),
-              (0...3).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
+              (0...4).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
               !launchArguments.contains("\0"), !launchWindowsPath.contains("\0"),
               launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
@@ -537,6 +554,22 @@ struct LibraryEntry: Codable, Identifiable {
         // Set or unset, so a previous session's choice never stays.
         if avx == true { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if frameGeneration == true { setenv("MADEIRA_FRAMEGEN", "1", 1) } else { unsetenv("MADEIRA_FRAMEGEN") }
+        // "Report an NVIDIA GPU": DXMT's vendor extension (DXGI vendor 10DE,
+        // NVAPI), with DXGI's output carrying user32's monitor and mode list so
+        // the game finds its monitor on the adapter. The device id goes into
+        // DXMT_CONFIG (ContentView); win32u reads DXMT_ENABLE_NVEXT for the
+        // registry adapter. Set or unset, so one game's choice never leaks into
+        // the next session; when set, it wins over madeira.cfg's lines for the
+        // same keys (ml1184's per-launch list in WineProcessBridge.m).
+        if reportNVIDIA == true {
+            setenv("DXMT_ENABLE_NVEXT", "1", 1)
+            setenv("DXMT_WSI_MONITOR_IDENTITY", "1", 1)
+            setenv("DXMT_WSI_MODE_TABLE", "1", 1)
+        } else {
+            unsetenv("DXMT_ENABLE_NVEXT")
+            unsetenv("DXMT_WSI_MONITOR_IDENTITY")
+            unsetenv("DXMT_WSI_MODE_TABLE")
+        }
         // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
         // (the default) or Wine's standard sync nothing is exported here.
         if SyncEngine.current == .fastsync {
@@ -549,7 +582,7 @@ struct LibraryEntry: Codable, Identifiable {
         madeira_set_vsync_locked(effectiveFPSMode)
         // This game's own lines; a launch without any unsets the previous game's.
         do {
-            let pairs = try MadeiraConfig.applyGame(config)
+            let pairs = try MadeiraConfig.applyGame(gameConfigText)
             if !pairs.isEmpty {
                 LogStore.shared.log("[game-cfg] " + pairs.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
             }
@@ -1100,7 +1133,7 @@ final class LibraryModel: ObservableObject {
 
     func setFPS(_ mode: Int) {
         fpsMode = mode
-        let applied: Int32 = mode == 3 && !ProMotionIntent.has30Cap ? 1 : Int32(mode)
+        let applied = ProMotionIntent.supportedMode(mode)
         madeira_set_vsync_locked(applied)
         ProMotionIntent.apply(mode: applied)
         saveCurrentProfile()
@@ -1833,6 +1866,244 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
     }
 }
 
+// MARK: - Group by rules (Foundation only; tests/host/check-library-groups.py compiles this part)
+
+/// The library's Group by choice: "platform" is the sections (LibraryView);
+/// "played" groups by when a game was last played, "installed" into Installed
+/// and Not installed, and "none" is one grid. Those three list the games you
+/// added and Steam's games together, each group in the library's Sort by order.
+enum LibraryGrouping {
+    enum Source: Hashable {
+        case entry(UUID), steam(Int)
+        var key: String {
+            switch self {
+            case .entry(let id): return "entry:" + id.uuidString
+            case .steam(let appID): return "steam:\(appID)"
+            }
+        }
+    }
+
+    /// One game of any source, as far as the groups and the sort need it.
+    struct Game: Identifiable, Equatable {
+        let source: Source
+        var title: String
+        /// On disk; a Steam game being downloaded counts, as under the Steam title.
+        var installed: Bool
+        var lastPlayed: Date?
+        var bytes: Int64?
+        /// Its library entry's place in the library file (later is newer); nil without one.
+        var position: Int?
+        var id: Source { source }
+    }
+
+    struct Group: Identifiable, Equatable {
+        let id: String
+        /// nil: no header (Group by None).
+        let title: String?
+        var games: [Game]
+    }
+
+    /// Sort by ("played", "name", "added" or "size") as the library sorts the games
+    /// you added: a game without a library entry sorts as never played, of unknown
+    /// size and, for "added", after the games that have one; ties go by name.
+    static func sorted(_ games: [Game], by sort: String) -> [Game] {
+        games.sorted { a, b in
+            switch sort {
+            case "played":
+                if a.lastPlayed != b.lastPlayed { return (a.lastPlayed ?? .distantPast) > (b.lastPlayed ?? .distantPast) }
+            case "added":
+                if a.position != b.position { return (a.position ?? -1) > (b.position ?? -1) }
+            case "size":
+                if a.bytes != b.bytes { return (a.bytes ?? -1) > (b.bytes ?? -1) }
+            default:
+                break
+            }
+            let order = a.title.localizedStandardCompare(b.title)
+            return order == .orderedSame ? a.source.key < b.source.key : order == .orderedAscending
+        }
+    }
+
+    /// The groups of a Group by choice other than "platform", in page order,
+    /// without empty ones. Last played: today, the past 7 and 30 days (counted
+    /// from the start of today), earlier, then never played.
+    static func groups(_ games: [Game], by grouping: String, sort: String,
+                       now: Date = Date(), calendar: Calendar = .current) -> [Group] {
+        let games = sorted(games, by: sort)
+        var groups: [Group]
+        switch grouping {
+        case "played":
+            let today = calendar.startOfDay(for: now)
+            let week = calendar.date(byAdding: .day, value: -6, to: today) ?? today
+            let month = calendar.date(byAdding: .day, value: -29, to: today) ?? today
+            groups = [Group(id: "today", title: "Today", games: []), Group(id: "week", title: "Past 7 days", games: []),
+                      Group(id: "month", title: "Past 30 days", games: []), Group(id: "earlier", title: "Earlier", games: []),
+                      Group(id: "never", title: "Never played", games: [])]
+            for game in games {
+                let index: Int
+                if let played = game.lastPlayed {
+                    index = played >= today ? 0 : played >= week ? 1 : played >= month ? 2 : 3
+                } else {
+                    index = 4
+                }
+                groups[index].games.append(game)
+            }
+        case "installed":
+            groups = [Group(id: "installed", title: "Installed", games: games.filter(\.installed)),
+                      Group(id: "notInstalled", title: "Not installed", games: games.filter { !$0.installed })]
+        default:
+            groups = [Group(id: "all", title: nil, games: games)]
+        }
+        return groups.filter { !$0.games.isEmpty }
+    }
+
+    /// The collapsed groups' ids, stored comma-separated ("played.today,installed.notInstalled").
+    static func collapsed(_ stored: String) -> Set<String> {
+        Set(stored.split(separator: ",").map(String.init))
+    }
+
+    static func storing(_ collapsed: Set<String>) -> String { collapsed.sorted().joined(separator: ",") }
+}
+
+// MARK: - Group by view
+
+extension LibraryGrouping.Game {
+    /// A game you added; `position` is its index in LibraryModel.entries.
+    init(entry: LibraryEntry, position: Int) {
+        self.init(source: .entry(entry.id), title: entry.title, installed: true,
+                  lastPlayed: entry.lastPlayed, bytes: entry.folderBytes, position: position)
+    }
+}
+
+/// The library page under a Group by other than Platform: the games you added
+/// and Steam's games in one set of groups (LibraryGrouping). A card opens as in
+/// its own section: a game you added or an installed Steam game its Game details
+/// page, any other Steam game its download sheet. Not installed Steam games are
+/// listed only while signed in.
+struct LibraryGroupedGames<LocalCell: View>: View {
+    let grouping: String
+    let search: String
+    var layout = "cards"
+    var sort = "played"
+    var width: CGFloat = 390
+    /// Opens a game's Game details page (LibraryView's details sheet).
+    let open: (LibraryEntry) -> Void
+    /// A game you added: LibraryView's own card, with its controller focus.
+    @ViewBuilder let localCell: (_ entry: LibraryEntry, _ list: Bool, _ dense: Bool) -> LocalCell
+    @ObservedObject private var library = LibraryModel.shared
+    @ObservedObject private var steamGames = SteamGamesModel.shared
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("madeiraLibraryCollapsedGroups") private var collapsedGroups = ""
+    @State private var steamSheet: SteamSelection?
+
+    private struct SteamSelection: Identifiable { let id: Int }
+
+    private struct Sources {
+        var games: [LibraryGrouping.Game] = []
+        var entries: [UUID: LibraryEntry] = [:]
+        var steam: [Int: SteamGamesRules.Item] = [:]
+    }
+
+    private var sources: Sources {
+        var result = Sources()
+        let query = search.trimmingCharacters(in: .whitespaces)
+        var steamEntries: [Int: (position: Int, entry: LibraryEntry)] = [:]
+        for (position, entry) in library.entries.enumerated() where entry.desktop != true {
+            if let appID = entry.steamAppID { steamEntries[appID] = (position, entry) }
+            else if query.isEmpty || entry.title.localizedCaseInsensitiveContains(query) {
+                result.entries[entry.id] = entry
+                result.games.append(LibraryGrouping.Game(entry: entry, position: position))
+            }
+        }
+        if SteamGamesSection.shown {
+            let enabled = SteamOwnedLibrary.enabled
+            let downloading = Set(steam.downloads.keys)
+            for item in SteamGamesRules.items(installed: steamGames.games, owned: enabled ? steam.owned : [], search: query) {
+                let installed = item.installed != nil || downloading.contains(item.id)
+                guard installed || (enabled && steam.signedIn) else { continue }
+                let recorded = steamEntries[item.id]
+                let steamPlayed = steam.playtime[item.id].flatMap {
+                    $0.lastPlayed > 0 ? Date(timeIntervalSince1970: TimeInterval($0.lastPlayed)) : nil
+                }
+                result.steam[item.id] = item
+                result.games.append(LibraryGrouping.Game(source: .steam(item.id), title: item.name, installed: installed,
+                                                         lastPlayed: [recorded?.entry.lastPlayed, steamPlayed].compactMap { $0 }.max(),
+                                                         bytes: recorded?.entry.folderBytes, position: recorded?.position))
+            }
+        }
+        return result
+    }
+
+    var body: some View {
+        let sources = self.sources
+        let groups = LibraryGrouping.groups(sources.games, by: grouping, sort: sort)
+        let collapsed = LibraryGrouping.collapsed(collapsedGroups)
+        VStack(alignment: .leading, spacing: 24) {
+            if groups.isEmpty {
+                if search.isEmpty {
+                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
+                } else {
+                    Text("No games match your search.").foregroundStyle(.secondary)
+                }
+            }
+            ForEach(groups) { group in
+                let key = grouping + "." + group.id
+                VStack(alignment: .leading, spacing: 14) {
+                    if let title = group.title {
+                        LibrarySectionHeader(title: title, count: group.games.count,
+                                             collapsed: SteamGamesSection.collapsible ? collapsedBinding(key) : nil) { EmptyView() }
+                    }
+                    if !(collapsed.contains(key) && SteamGamesSection.collapsible) {
+                        LibraryCells(items: group.games, layout: layout, width: width) { game, list, dense in
+                            cell(game, sources, list: list, dense: dense)
+                        }
+                    }
+                }
+            }
+        }
+        // As the Steam section does: the library reappears after every session.
+        .onAppear {
+            steamGames.refresh()
+            if SteamOwnedLibrary.enabled { steam.start(); steam.reconcileSession() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { steamGames.refresh(); if SteamOwnedLibrary.enabled { steam.reconcileSession() } }
+        }
+        .sheet(item: $steamSheet) { selection in
+            SteamGameSheet(appID: selection.id) { entry in
+                // Let the download sheet finish dismissing before presenting the details page.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
+            }
+        }
+        .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
+            Button("OK", role: .cancel) { steam.error = nil }
+        } message: { Text(steam.error ?? "") }
+    }
+
+    private func collapsedBinding(_ key: String) -> Binding<Bool> {
+        Binding(get: { LibraryGrouping.collapsed(collapsedGroups).contains(key) }, set: { on in
+            var set = LibraryGrouping.collapsed(collapsedGroups)
+            if on { set.insert(key) } else { set.remove(key) }
+            collapsedGroups = LibraryGrouping.storing(set)
+        })
+    }
+
+    @ViewBuilder private func cell(_ game: LibraryGrouping.Game, _ sources: Sources, list: Bool, dense: Bool) -> some View {
+        switch game.source {
+        case .entry(let id):
+            if let entry = sources.entries[id] { localCell(entry, list, dense) }
+        case .steam(let appID):
+            if let item = sources.steam[appID] {
+                Button {
+                    if let installed = item.installed { open(library.steamEntry(installed, title: item.name)) }
+                    else { steamSheet = SteamSelection(id: appID) }
+                } label: { SteamGameCell(item: item, list: list, dense: dense) }
+                    .libraryCardButtonStyle(grid: !list)
+            }
+        }
+    }
+}
+
 struct LibraryView: View {
     @ObservedObject private var model = LibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
@@ -2144,7 +2415,7 @@ struct LibraryView: View {
                 SettingsSearchResults(query: settingsSearch.trimmingCharacters(in: .whitespaces), refresh: settingsRefresh)
             }
             // Credits, last, folded away unless searched for.
-            if settingsShow("about", "credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "bahacan16", "spitefulowl") {
+            if settingsShow("about", "credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "bahacan16", "spitefulowl", "meshoklv") {
                 Section {
                     DisclosureGroup("Credits", isExpanded: Binding(get: { creditsOpen || !settingsSearch.isEmpty },
                                                                     set: { creditsOpen = $0 })) {
@@ -2154,6 +2425,7 @@ struct LibraryView: View {
                         MadeiraCredit(name: "Jesse", handle: "JesseLovelace", role: "Steam Cloud saves, faster game launches, and fixes that let more games run")
                         MadeiraCredit(name: "bahacan16", handle: "bahacan16", role: "Direct3D 12 and DXMT fixes, game launcher windows, per-game settings, PlayStation controllers, and save backups")
                         MadeiraCredit(name: "spitefulowl", handle: "spitefulowl", role: "Wine and FEX runtime fixes, DXMT texture and memory fixes, audio, the swap tier, and library launch options")
+                        MadeiraCredit(name: "meshoklv", handle: "meshoklv", role: "Controller fixes for games that ship their own XInput or need focus, and touch taps that stay off the mouse")
                     }
                 } header: { Text("About") }
             }
@@ -2529,6 +2801,36 @@ struct LibraryDetail: View {
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
+    static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
+    /// The presets, plus a stored size that is none of them (a screen shape
+    /// chosen on another device), so the picker never shows a blank choice.
+    static func resolutions(keeping current: String) -> [String] {
+        presetResolutions.contains(current) || current == screenShapeResolution || current == metalFXShapeResolution
+            ? presetResolutions : presetResolutions + [current]
+    }
+    /// "WxH" matching this screen's landscape aspect at 720 lines (width
+    /// rounded to a multiple of 8), or nil when it equals a preset or
+    /// MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
+    static var screenShapeResolution: String? {
+        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
+        let bounds = UIScreen.main.bounds
+        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
+        guard short > 0 else { return nil }
+        let width = Int((720 * long / short / 8).rounded()) * 8
+        guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
+        return "\(width)x720"
+    }
+    /// The same shape at 480 lines, the size MetalFX 1.5× brings to 720; nil
+    /// when it equals a preset or MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
+    static var metalFXShapeResolution: String? {
+        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
+        let bounds = UIScreen.main.bounds
+        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
+        guard short > 0 else { return nil }
+        let width = Int((480 * long / short / 8).rounded()) * 8
+        guard (640...4096).contains(width), !presetResolutions.contains("\(width)x480") else { return nil }
+        return "\(width)x480"
+    }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
         let count = MadeiraConfig.parse(config ?? "").count
@@ -2631,13 +2933,23 @@ struct LibraryDetail: View {
                         if entry.resolution != "native" && !entry.resolution.hasSuffix("%") && !LibraryEntry.portraitShapes.contains(entry.resolution) {
                             Text(entry.resolution.replacingOccurrences(of: "x", with: "×")).tag(entry.resolution)
                         }
+                        // The same shape at 480 lines, which MetalFX 1.5× brings to 720.
+                        if let shape = Self.metalFXShapeResolution, entry.metalFXUpscale == 1.5 || entry.resolution == shape {
+                            Text("Screen shape for MetalFX 1.5× (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        }
                     }
                     Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
                         ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                     }
+                    // Every setting here is the Desktop's too: its programs present through
+                    // the same path, and its launch applies them like a game's
+                    // (applyEnvironment, gameConfigText). check-frontend holds the parity.
+                    Picker("MetalFX upscaling", selection: $entry.metalFXUpscale) {
+                        Text("Off").tag(Double?.none)
+                        Text("1.5×").tag(Double?.some(1.5))
+                        Text("2×").tag(Double?.some(2))
+                    }
                     FPSChoice(mode: $entry.fpsMode)
-                    // The Desktop too: its programs present through the same path, and its
-                    // launch exports the switch like a game's (applyEnvironment).
                     Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
                 }
                 Section("On screen") {
@@ -2727,6 +3039,7 @@ struct LibraryDetail: View {
                         Text("Application default").tag(0)
                         ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
                     }
+                    Toggle("Report an NVIDIA GPU", isOn: Binding(get: { entry.reportNVIDIA ?? false }, set: { entry.reportNVIDIA = $0 ? true : nil }))
                     // Fastsync-only switches: shown for every game, usable only while
                     // Settings › Sync engine is Fastsync.
                     Group {
@@ -3098,6 +3411,8 @@ struct FPSChoice: View {
         HStack { Text("FPS limit"); Spacer(); Picker("FPS limit", selection: $mode) {
             // 30 needs DXMT's 30 FPS cap (ProMotionIntent.has30Cap); a saved 30 stays selectable.
             if ProMotionIntent.has30Cap || mode == 3 { Text("30 FPS").tag(3) }
+            // 40 needs DXMT's 40 FPS cap and a 120 Hz panel (ProMotionIntent.has40Cap).
+            if ProMotionIntent.has40Cap || mode == 4 { Text("40 FPS").tag(4) }
             Text("60 FPS").tag(1); Text("Display maximum").tag(0); Text("Uncapped").tag(2)
         }.labelsHidden().pickerStyle(.menu) }
     }

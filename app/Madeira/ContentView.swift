@@ -79,6 +79,36 @@ final class MetalHostView: UIView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
+/// Touches on the game view outside the on-screen controls reach the program as
+/// a mouse. Some games (Dark Souls Remastered) switch to keyboard and mouse
+/// prompts on any mouse event and then ignore the controller, so a stray tap
+/// next to a touch button costs the player the controller. MADEIRA_TOUCH_MOUSE
+/// (madeira.cfg `env.NAME`, else the process environment): "1" always sends
+/// them (the previous behaviour), "0" never does, and by default they are not
+/// sent while the landscape overlay shows at least one controller mapping,
+/// unless touch is set to work as a trackpad. A hardware mouse or trackpad is
+/// not affected.
+@MainActor enum TouchMouseGate {
+    enum Mode: String { case auto, on, off }
+    static let mode: Mode = {
+        let v = MadeiraConfig.get("env.MADEIRA_TOUCH_MOUSE")  // 1: touches always reach the program as a mouse, 0: never; default: not while touch controller mappings are shown
+            ?? ProcessInfo.processInfo.environment["MADEIRA_TOUCH_MOUSE"]
+        let m: Mode = v == "1" ? .on : (v == "0" ? .off : .auto)
+        LogStore.shared.log("[touch-mouse] mode=\(m.rawValue)")
+        return m
+    }()
+    /// Set by TouchControlsOverlay.configureGamepad: the landscape overlay is
+    /// visible, not editing, and has at least one controller mapping.
+    static var padOverlay = false
+    static func suppressing(touchpad: Bool) -> Bool {
+        switch mode {
+        case .on: return false
+        case .off: return true
+        case .auto: return padOverlay && !touchpad
+        }
+    }
+}
+
 // SwiftUI-hosted placeholder: geometry + touch input only.
 final class MetalBackedView: UIView {
     private static var layerRegistered = false
@@ -542,11 +572,34 @@ final class MetalBackedView: UIView {
     private func forgetOutsideGame(_ touches: Set<UITouch>) {
         for t in touches { outsideGameTouches.remove(ObjectIdentifier(t)) }
     }
+    // Direct touches that began while TouchMouseGate was suppressing stay
+    // swallowed until they lift, so a change of the gate never leaves a button held.
+    private var tmgSwallowed: Set<ObjectIdentifier> = []
+    /// Returns the touches that should still be handled (nil = nothing left).
+    private func tmgFilter(_ touches: Set<UITouch>, _ phase: UITouch.Phase) -> Set<UITouch>? {
+        if phase == .began {
+            _ = TouchMouseGate.mode   // logs the mode once
+            guard TouchMouseGate.suppressing(touchpad: touchPointerMode) else { return touches }
+            let direct = touches.filter { $0.type == .direct }
+            guard !direct.isEmpty else { return touches }
+            for t in direct { tmgSwallowed.insert(ObjectIdentifier(t)) }
+            let rest = touches.subtracting(direct)
+            return rest.isEmpty ? nil : rest
+        }
+        guard !tmgSwallowed.isEmpty else { return touches }
+        let mine = touches.filter { tmgSwallowed.contains(ObjectIdentifier($0)) }
+        guard !mine.isEmpty else { return touches }
+        if phase == .ended || phase == .cancelled {
+            for t in mine { tmgSwallowed.remove(ObjectIdentifier(t)) }
+        }
+        let rest = touches.subtracting(mine)
+        return rest.isEmpty ? nil : rest
+    }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .began) { return }
         let touches = dropOutsideGame(touches, began: true)
-        guard !touches.isEmpty else { return }
+        guard !touches.isEmpty, let touches = tmgFilter(touches, .began) else { return }
         if touchPointerMode { touchModeBegan(touches); return }
         guard desktopTrackpad else {
             guard let t = touches.first else { return }
@@ -594,7 +647,7 @@ final class MetalBackedView: UIView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .moved) { return }
         let touches = dropOutsideGame(touches, began: false)
-        guard !touches.isEmpty else { return }
+        guard !touches.isEmpty, let touches = tmgFilter(touches, .moved) else { return }
         if touchPointerMode { touchModeMoved(touches, event); return }
         guard desktopTrackpad else {
             guard let t = touches.first else { return }
@@ -676,9 +729,9 @@ final class MetalBackedView: UIView {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .ended) { return }
-        let all = touches, touches = dropOutsideGame(touches, began: false)
+        let all = touches, kept = dropOutsideGame(touches, began: false)
         forgetOutsideGame(all)
-        guard !touches.isEmpty else { return }
+        guard !kept.isEmpty, let touches = tmgFilter(kept, .ended) else { return }
         if touchPointerMode { touchModeEnded(touches, event); return }
         guard desktopTrackpad else {
             guard let t = touches.first else { return }
@@ -722,9 +775,9 @@ final class MetalBackedView: UIView {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         if HardwareInput.shared.interceptTouches(touches, event, .cancelled) { return }
-        let all = touches, touches = dropOutsideGame(touches, began: false)
+        let all = touches, kept = dropOutsideGame(touches, began: false)
         forgetOutsideGame(all)
-        guard !touches.isEmpty else { return }
+        guard !kept.isEmpty, let touches = tmgFilter(kept, .cancelled) else { return }
         if touchPointerMode { touchModeCancelled(touches); return }
         guard desktopTrackpad else {
             guard let t = touches.first else { return }
@@ -2793,7 +2846,27 @@ struct ContentView: View {
                     logStore.log("DXMT config: \(parts.joined(separator: ";")) via \(source) (\(parts.count) option\(parts.count == 1 ? "" : "s"))")
                 }
             }
-            if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) }
+            // MetalFX spatial upscaling (metalfx-upscale; Game details › MetalFX
+            // upscaling writes it to the game's own lines). The D3D12 runtime reads
+            // the key itself; D3D11 games get DXMT's MetalFX swapchain at the same
+            // factor (DXMT takes 1 to 2).
+            if let txt = MadeiraConfig.gameValue("metalfx-upscale") ?? MadeiraConfig.get("metalfx-upscale"),
+               let factor = Double(txt), factor >= 1.1 {
+                setenv("DXMT_METALFX_SPATIAL_SWAPCHAIN", "1", 1)
+                dxmtOptions.append("d3d11.metalSpatialUpscaleFactor=\(min(factor, 2))")
+                logStore.log("MetalFX upscaling: \(txt)x via metalfx-upscale")
+            } else {
+                unsetenv("DXMT_METALFX_SPATIAL_SWAPCHAIN")
+            }
+            // A library entry's "Report an NVIDIA GPU" (LibraryEntry.applyEnvironment):
+            // DXGI's device id is the GeForce RTX 3060 win32u registers as the
+            // display adapter (sysparams_ios.c), so every API names one GPU.
+            if profile?.reportNVIDIA == true {
+                dxmtOptions.append("dxgi.customDeviceId=2544")
+                logStore.log("DXMT config: dxgi.customDeviceId=2544 via Report an NVIDIA GPU")
+            }
+            // Unset otherwise, so a previous session's options in this app process do not apply.
+            if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) } else { unsetenv("DXMT_CONFIG") }
             // ml1255: DXMT reads the variable into a MAX_PATH buffer (util_env.cpp
             // getEnvVar); from a longer value it gets nothing, and every option is lost.
             let dxmtLength = dxmtOptions.joined(separator: ";").utf16.count
@@ -3977,7 +4050,7 @@ struct TouchControlsOverlay: View {
             .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: library.current) { _, _ in configureGamepad(landscape: landscape) }
-            .onDisappear { GamepadInput.shared.configureTouch(controls: []) }
+            .onDisappear { GamepadInput.shared.configureTouch(controls: []); TouchMouseGate.padOverlay = false }
         }
         .ignoresSafeArea()
     }
@@ -4011,6 +4084,7 @@ struct TouchControlsOverlay: View {
         let ids = landscape && m.visible && (library.current != nil || !library.enabled) && !m.editing && !library.blocksGameplayTouch
             ? m.controls.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
         GamepadInput.shared.configureTouch(controls: Set(ids))
+        TouchMouseGate.padOverlay = !ids.isEmpty
     }
 
     /// ml1970: with MADEIRA_CONTROLS_XBOX_DEFAULT=1, a user with no controls file gets the built-in controller

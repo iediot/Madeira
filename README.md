@@ -84,7 +84,7 @@ changes to FEX and DXMT live in [`patches/`](patches). The full walkthrough is i
 Madeira was created by **Will Faust** ([@willfaust](https://github.com/willfaust)), with
 **[@125hz](https://github.com/125hz)**, **[@Jfishin](https://github.com/Jfishin)**,
 **[@JesseLovelace](https://github.com/JesseLovelace)**, **[@danperks](https://github.com/danperks)**,
-**[@bahacan16](https://github.com/bahacan16)** and **[@spitefulowl](https://github.com/spitefulowl)**.
+**[@bahacan16](https://github.com/bahacan16)**, **[@spitefulowl](https://github.com/spitefulowl)** and **[@meshoklv](https://github.com/meshoklv)**.
 This fork also carries fixes from the forks of llucasandersen, x3gamer10, vcvkk, c-gow and
 dre4moff.
 

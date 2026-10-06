@@ -2443,13 +2443,91 @@ C_ASSERT( sizeof(struct ios_xinput_state) == 16 );
 C_ASSERT( sizeof(struct ios_xinput_caps) == 20 );
 C_ASSERT( sizeof(struct winios_gamepad) == 20 );
 
+/* There is no window manager on iOS, so nothing ever activates a window: a
+ * game's ShowWindow/SetWindowPos calls typically carry SWP_NOACTIVATE, and
+ * GetForegroundWindow() is then not the game's window. A game that ignores
+ * its input unless it is in the foreground (Dark Souls Remastered compares
+ * GetForegroundWindow() with its own window every frame) reads the pad and
+ * drops it.
+ *
+ * Standing in for the window manager: while a process polls XInput and the
+ * foreground window is not one of its own, make its main window (the largest
+ * top-level, non-child window of at least 320x200) foreground and active.
+ * A window of the same process already in front, such as one of its dialogs,
+ * is left alone. Checked at most once a second.
+ * MADEIRA_FOREGROUND_FIX=0 turns this off. */
+static HWND ios_main_window( DWORD pid )
+{
+    HWND *list, best = 0;
+    LONGLONG best_area = 0;
+    UINT dpi = get_thread_dpi();
+    int i;
+
+    if (!(list = list_window_children( 0 ))) return 0;
+    for (i = 0; list[i]; i++)
+    {
+        DWORD wpid = 0, style;
+        LONGLONG area;
+        RECT r;
+
+        if (!get_window_thread( list[i], &wpid ) || wpid != pid) continue;
+        style = get_window_long( list[i], GWL_STYLE );
+        if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) continue;
+        if (!get_window_rect( list[i], &r, dpi )) continue;
+        if (r.right - r.left < 320 || r.bottom - r.top < 200) continue;
+        area = (LONGLONG)(r.right - r.left) * (r.bottom - r.top);
+        if (area > best_area) { best = list[i]; best_area = area; }
+    }
+    free( list );
+    return best;
+}
+
+static void ios_foreground_check(void)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static long long next_ns;
+    static int enabled = -1, logged;
+    DWORD pid = GetCurrentProcessId(), fg_pid = 0;
+    HWND fg, main_hwnd;
+    struct timespec ts;
+    long long now;
+    BOOL ok;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_FOREGROUND_FIX" );  /* 0: never make the game's main window foreground */
+        enabled = !(e && e[0] == '0' && !e[1]);
+    }
+    if (!enabled) return;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (pthread_mutex_trylock( &lock )) return;
+    if (now < next_ns) { pthread_mutex_unlock( &lock ); return; }
+    next_ns = now + 1000000000LL;
+    pthread_mutex_unlock( &lock );
+
+    if ((fg = NtUserGetForegroundWindow()) && get_window_thread( fg, &fg_pid ) && fg_pid == pid) return;
+    if (!(main_hwnd = ios_main_window( pid ))) return;
+
+    ok = set_foreground_window( main_hwnd, FALSE, TRUE );
+    if (logged < 16)
+    {
+        logged++;
+        dprintf( 2, "[fg] activated main window %p of pid %04x (foreground was %p) ok=%d\n",
+                 main_hwnd, (unsigned)pid, fg, ok );
+    }
+}
+
 /***********************************************************************
  *           ios_gamepad_query
  *
  * The body of NtUserCallTwoParam_GetGamepadState. `index` is the XInput user
  * index (0-3) and `op` selects the payload; see NtUserGamepadOp_* in
- * wine/include/ntuser.h. Returns 1 when a pad is connected in that slot and
- * `buffer` was filled, 0 otherwise — which is also what an upstream,
+ * wine/include/ntuser.h. Op 2 (ml2106, NtUserGamepadOp_SetVibration) passes
+ * the game's XINPUT_VIBRATION in from XInputSetState; an xinput that predates
+ * it never sends it. Returns 1 when a pad is connected in that slot and
+ * `buffer` was filled (or read), 0 otherwise — which is also what an upstream,
  * non-Madeira win32u returns for a code it does not know, so xinput1_3's
  * runtime probe falls back to the existing HID path.
  */
@@ -2458,6 +2536,7 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
     struct winios_gamepad pad;
 
     if (!buffer || index >= 4) return 0;
+    if (op == 0 && index == 0) ios_foreground_check();
     if (!winios_gamepad_get_state( index, &pad )) return 0;
 
     switch (op)
@@ -2488,14 +2567,22 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
          * (low bits clear, as real XInput reports them) and the triggers 8. */
         caps->type     = 1;
         caps->sub_type = 1;
-        /* Controller rumble is not implemented by this transport. */
         caps->flags    = 0;
         caps->gamepad.buttons       = 0xf3ff;
         caps->gamepad.left_trigger  = 0xff;
         caps->gamepad.right_trigger = 0xff;
         caps->gamepad.thumb_lx = caps->gamepad.thumb_ly = (SHORT)0xffc0;
         caps->gamepad.thumb_rx = caps->gamepad.thumb_ry = (SHORT)0xffc0;
-        caps->left_motor_speed = caps->right_motor_speed = 0;
+        /* ml2106: motors only while the app applies XInput rumble
+         * (env.MADEIRA_PAD_OUTPUT); 0xff is what a wired Xbox pad reports. */
+        caps->left_motor_speed = caps->right_motor_speed = winios_gamepad_rumble_caps() ? 0xff : 0;
+        return 1;
+    }
+    case 2:   /* ml2106 NtUserGamepadOp_SetVibration: XINPUT_VIBRATION (4 bytes, in) */
+    {
+        const WORD *motors = buffer;
+
+        winios_gamepad_set_vibration( index, motors[0], motors[1] );
         return 1;
     }
     default:

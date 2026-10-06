@@ -1,11 +1,11 @@
 diff --git a/LICENSE-MADEIRA.md b/LICENSE-MADEIRA.md
-index 90b5aa66..a5bdc930 100644
+index df45a9e6..8e8d72c0 100644
 --- a/LICENSE-MADEIRA.md
 +++ b/LICENSE-MADEIRA.md
-@@ -48,6 +48,18 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
-     QueryInterruptTime from the performance counter, pull request #23);
-     `f4bbccf9499` (ntdll ARM64EC: unwind data for x64 code running at a fixed
-     base below 4 GB, pull request #24).
+@@ -55,6 +55,18 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
+     above and came first; it is recorded as merged with no change of its own.
+   - Author bahacan16, merged on 2026-10-06: `67b8c8bed51` (xinput1_3 iOS:
+     send XInputSetState motors to the host pad, pull request #20).
 +  - opengl32: OpenGL ES contexts for Madeira's winios WGL driver
 +    (`dlls/opengl32/unix_wgl.c`) and the fixed low image base limited to x86
 +    builds (`dlls/opengl32/Makefile.in`). Author: Connor Gow, written with AI

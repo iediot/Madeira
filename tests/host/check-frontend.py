@@ -24,7 +24,9 @@ exit report.
    status, with no image names; the display-rate hold is opt-in and the 30 FPS
    cap is detected; the app wires the library into ContentView and
    GamepadInput; game details offer Resolution (with Screen shape) for every
-   entry, Aspect & scaling and control opacity/size; the in-game menu offers
+   entry, Aspect & scaling and control opacity/size, and the Desktop's page
+   every setting a game's has (only program-specific sections left out); the
+   in-game menu offers
    Aspect & scaling, opacity, size and the Touch pointer mode; a session
    saves those choices to the game; the starting screen's controls are one row
    of glyph-only buttons with VoiceOver labels; and Settings ends with Credits
@@ -98,7 +100,11 @@ var published: (Int32, Int32) = (0, 0)
 func winios_display_mode_changed(_ w: Int32, _ h: Int32) { published = (w, h) }
 var vsync: Int32 = -1
 func madeira_set_vsync_locked(_ mode: Int32) { vsync = mode }
-enum ProMotionIntent { static var has30Cap = true }
+enum ProMotionIntent {
+    static var has30Cap = true
+    static var has40Cap = true
+''' + block(fps, '    static func supportedMode(_ mode: Int) -> Int32 {') + r'''
+}
 struct TouchControl: Codable, Equatable { var nx = 0.5 }
 enum ControlAction: Codable, Equatable, Hashable { case none }   // LibraryEntry.controllerBinds
 enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry's per-game DirectInput choice
@@ -200,12 +206,22 @@ game.config = "fence-chain = 6"; game.applyEnvironment()
 expect(MadeiraConfig.game == "fence-chain = 6", "the game's own config is applied at launch")
 game.config = nil; game.applyEnvironment()
 expect(MadeiraConfig.game == nil, "a game without its own config clears the previous one")
+game.metalFXUpscale = 1.5; game.config = "metalfx-upscale = 2"; game.applyEnvironment()
+expect(MadeiraConfig.game == "metalfx-upscale = 1.5\nmetalfx-upscale = 2", "MetalFX upscaling comes first, so the game's own line wins")
+game.metalFXUpscale = nil; game.config = nil
 // FPS limit: 30 needs DXMT's 30 FPS cap; without it a saved 30 runs as 60.
 game.fpsMode = 3; game.applyEnvironment()
 expect(vsync == 3, "30 FPS applied when DXMT has the cap")
 ProMotionIntent.has30Cap = false; game.applyEnvironment()
 expect(vsync == 1, "a saved 30 FPS runs as 60 without DXMT's 30 FPS cap")
-ProMotionIntent.has30Cap = true; game.fpsMode = 1; game.applyEnvironment()
+ProMotionIntent.has30Cap = true
+// 40 needs DXMT's 40 FPS cap and a 120 Hz panel; without them a saved 40 runs as 60.
+game.fpsMode = 4; game.applyEnvironment()
+expect(vsync == 4, "40 FPS applied when it is offered")
+expect((try? game.validate()) != nil, "a 40 FPS profile validates")
+ProMotionIntent.has40Cap = false; game.applyEnvironment()
+expect(vsync == 1, "a saved 40 FPS runs as 60 without the 40 FPS cap")
+ProMotionIntent.has40Cap = true; game.fpsMode = 1; game.applyEnvironment()
 expect(vsync == 1, "60 FPS applied")
 // "XInput and DirectInput": MADEIRA_DINPUT_PAD for that game's launch only; the
 // next launch without the choice clears it unless madeira.cfg sets it.
@@ -456,6 +472,9 @@ check('MadeiraConfig.flag("MADEIRA_PROMOTE", fallback: false)' in fps,
 check('if mode == 1 { return holdMaximum ? panelMaxFPS : 0 }' in fps, 'no display link in the 60 cap by default')
 check('__attribute__((weak)) void madeira_set_display_max_fps' in shim and 'ProMotionIntent.has30Cap' in fps
       and 'ProMotionIntent.has30Cap || mode == 3' in lib, 'the 30 FPS cap is offered only with DXMT support')
+check('__attribute__((weak)) int madeira_dxmt_has_40_cap(void) {\n    return 0;' in shim
+      and 'madeira_dxmt_has_40_cap() != 0 && panelMaxFPS >= 120' in fps
+      and 'ProMotionIntent.has40Cap || mode == 4' in lib, 'the 40 FPS cap is offered only with DXMT support and a 120 Hz panel')
 check('LibraryView(play: launchLibraryEntry' in content, 'ContentView shows the library when it is the chosen interface')
 check('runWineFullSequence(profile: entry)' in content and 'profile.applyEnvironment()' in content,
       'library launches use the shared launch path with the profile applied')
@@ -487,6 +506,27 @@ check('Picker("Resolution", selection: $entry.resolution)' in detail and 'Deskto
 check('screenShapeResolution' in detail and 'Text("Screen shape (' in detail and 'MADEIRA_SCREEN_SHAPE_RESOLUTION' in detail,
       'game details: Screen shape resolution choice')
 check('Picker("Aspect & scaling"' in detail and 'entry.display = $0' in detail, 'game details: Aspect & scaling')
+# The Desktop's details page carries every setting a game's page does. What the Desktop
+# entry leaves out names or starts one particular program: its title and cover, how it
+# starts, its launch arguments, a Home Screen link, its executable. A block gated off
+# for the Desktop must be one of those and hold no other control.
+form_body = detail[:detail.index('.navigationTitle("Game details")')]
+desktop_out = ('Section("Library details")', 'Picker("Start"', 'TextField("Launch arguments"',
+               'Text("Home Screen")', 'Section("Executable")')
+desktop_controls = {'Picker("Start"', 'Toggle("Start Windows services first"'}
+hidden = []
+for gate in re.finditer(r'\bif\b[^{\n]*(?:entry\.desktop != true|entry\.usesLaunchOptions)[^{\n]*\{', form_body):
+    depth, end = 1, gate.end()
+    while depth:
+        depth += (form_body[end] == '{') - (form_body[end] == '}')
+        end += 1
+    gated = form_body[gate.end():end]
+    controls = set(re.findall(r'\b(?:Toggle|Picker|Slider|FPSChoice|ControllerModeChoice)\("?[^",)]*"?', gated))
+    controls = {c if c.endswith('"') or '"' not in c else c.rstrip('"') for c in controls}
+    if not any(marker in gated for marker in desktop_out) or {c for c in controls if not any(c.startswith(a) for a in desktop_controls)}:
+        hidden.append(gated.strip().splitlines()[0][:80])
+check(not hidden and 'Picker("MetalFX upscaling"' in form_body,
+      'Desktop details: every setting a game has, only program-specific sections left out (gated: %s)' % hidden)
 check('LabeledContent("Control opacity")' in detail and 'LabeledContent("Control size")' in detail,
       'game details: control opacity and size sliders')
 check('Picker("Aspect & scaling", selection: $model.displayMode)' in hud and 'MADEIRA_SESSION_TOOLS' in hud,
@@ -535,7 +575,8 @@ for who in ('name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "1
             'name: "Jfishin", handle: "Jfishin"', 'name: "Jesse", handle: "JesseLovelace"',
             'name: "Dan Perks", handle: "danperks"',
             'name: "bahacan16", handle: "bahacan16"',
-            'name: "spitefulowl", handle: "spitefulowl"'):
+            'name: "spitefulowl", handle: "spitefulowl"',
+            'name: "meshoklv", handle: "meshoklv"'):
     check('MadeiraCredit(' + who in last, 'Settings credits: ' + who)
 check('https://github.com/\\(handle)' in block(lib, 'struct MadeiraCredit: View'),
       'a credit links the GitHub account')

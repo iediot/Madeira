@@ -6,6 +6,8 @@
 #import "IOSDisplayShim.h"
 #import "Winios/Winios.h"
 #import "Winios/WiniosCursor.h"
+// ml2106: rumble / DualSense output to the physical pad (PadOutput.m)
+#import "PadOutput.h"
 // Steam content decoders (liblzma shim, zstd decoder, zip chunks), used by the owned library's downloads.
 #import "SwiftSteam/lzma_shim.h"
 
@@ -52,6 +54,9 @@ void madeira_set_display_max_fps(int panel_hz, int intent_hz);
 // 1 when DXMT's own madeira_set_display_max_fps (and with it the 30 FPS cap,
 // vsync mode 3) is linked; valid after the first madeira_set_display_max_fps call.
 int madeira_dxmt_has_display_pacing(void);
+// 1 when DXMT has the 40 FPS cap (vsync mode 4). Defined by DXMT; IOSDisplayShim.m
+// carries a weak fallback that returns 0, so the app links against a DXMT without it.
+int madeira_dxmt_has_40_cap(void);
 
 /* ml526: startup phase timeline (Winios.m) */
 void winios_phase(const char *name);

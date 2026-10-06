@@ -39,6 +39,14 @@ Removing an entry never removes the game's files or saves.
 
 - Layouts: cards, compact cards, list and compact list (one short row per
   game). Sort by last played, name, date added or folder size. Search by title.
+- Group by: **Platform** (the default) is the sections below. **Last played**
+  (Today, Past 7 days, Past 30 days, Earlier, Never played), **Installed**
+  (Installed, then Not installed) and **None** (one grid) list the games you
+  added and Steam's games together, each group in the Sort by order. A Steam
+  game counts as played when Madeira or Steam last started it, and as
+  installed while it downloads. Not installed Steam games are listed only while
+  signed in. Group titles collapse like the section titles, and each one's
+  state is remembered.
 - Sections, as in the fork's library: when Madeira Dock is available,
   **Steam** (the Steam games being downloaded and the games Steam has
   installed, with their count; a **Sign in to Steam** card when signed out),
@@ -87,7 +95,10 @@ Removing an entry never removes the game's files or saves.
 ## Game details
 
 Tapping a game opens its details page; it stays up until the session's
-starting screen takes over (or an error is shown). A profile holds:
+starting screen takes over (or an error is shown). The Desktop's page has every
+setting below as well; it leaves out only what names or starts one program (title
+and cover, Launch, launch arguments, the Home Screen link and the executable),
+and check-frontend fails if a setting is hidden from it. A profile holds:
 
 - title and cover image;
 - **Resolution**: the size of the Windows screen (the virtual monitor) the game
@@ -101,10 +112,19 @@ starting screen takes over (or an error is shown). A profile holds:
   letterboxes the shape the game actually draws (its back buffer) and **Fill
   height** keeps that shape at full height. Touches are mapped through the same
   rectangle, so input lines up in every mode;
+- **MetalFX upscaling** (Off, 1.5× or 2×): the picture is
+  scaled up with MetalFX's spatial scaler before it reaches the screen, by the
+  D3D12 runtime's swapchain or DXMT's MetalFX swapchain for D3D11. It becomes
+  the game's `metalfx-upscale` line (see This game's config). With 1.5×,
+  Resolution also offers the screen's shape at 480 lines, which 1.5× brings to
+  720;
 - FPS limit: 60, the display maximum or uncapped (the same presentation
   pacing modes as the FPS pill in the developer interface), and 30 when DXMT
   has its 30 FPS cap (willfaust/dxmt#1; DXMT without it would present mode 3
-  uncapped, so the choice is hidden and a saved 30 runs as 60);
+  uncapped, so the choice is hidden and a saved 30 runs as 60), and 40 (mode 4)
+  when DXMT has its 40 FPS cap (`madeira_dxmt_has_40_cap`) and the panel reaches
+  120 Hz, which is held while it runs (25 ms is three 120 Hz refreshes but
+  rounds to 33 ms at 60 Hz); a saved 40 runs as 60 otherwise;
 - reduced-precision x87: off by default, as in FEX; only an explicit choice
   exports `FEX_X87REDUCEDPRECISION=1`;
 - **AVX and AVX2**: off by default, as in FEX's iOS build; only an explicit
@@ -120,7 +140,7 @@ starting screen takes over (or an error is shown). A profile holds:
 - **Frame generation (experimental)**, off by default: exports
   `MADEIRA_FRAMEGEN=1`, and DXMT's present path (D3D11 and D3D12 alike) shows a
   MetalFX-interpolated frame between every two game frames; FPS limits do not
-  apply while it is on. The Desktop's page has it too;
+  apply while it is on;
 - launch arguments (double-quoted tokens, at most 64 and 4 KB in total, the
   whole command included; not for Steam games, which start with Steam's own
   launch option, through Madeira Dock or as **The game**), in their own section
