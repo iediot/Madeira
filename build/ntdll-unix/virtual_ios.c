@@ -12110,13 +12110,17 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
      * has no host meaning for ANY view here, and the SMC contract holds the same way:
      * the emulator invalidates before it untraps. Superseded by upstream's
      * ios_guest_anon_rwx_is_host_data, which keeps guest JIT code chunks on the pool
-     * path; kept as an opt-in fallback with MADEIRA_GUEST_ANON_WRITE=1. */
+     * path -- but that rule needs the ARM64EC map and never runs in a 32-bit (WoW64)
+     * process, so this is the 32-bit path again, on by default (MADEIRA_GUEST_ANON_WRITE=0
+     * turns it off). */
     {
         static int anon = -1;
         if (anon < 0)
         {
+            /* On by default: Overcooked (32-bit Unity) ran at ~50 FPS with it and was
+             * stuck under store emulation without it. 0 turns it off. */
             const char *s = getenv( "MADEIRA_GUEST_ANON_WRITE" );
-            anon = (s && *s == '1') ? 1 : 0;
+            anon = (s && (*s == '0' || *s == 'n' || *s == 'N')) ? 0 : 1;
         }
         if (anon)
         {
