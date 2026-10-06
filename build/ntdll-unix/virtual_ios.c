@@ -9268,6 +9268,9 @@ extern const void *winegstreamer_unix_call_funcs[];
 /* opengl32's unix side, compiled from wine/dlls/opengl32/unix_{wgl,thunks}.c
  * into libntdll_unix.a (build/ntdll-unix/build.sh). */
 extern const void *opengl32_unix_call_funcs[];
+#ifdef MADEIRA_MOLTENVK
+extern const void *winevulkan_unix_call_funcs[];   /* PR #88 */
+#endif
 extern const void *opengl32_unix_call_wow64_funcs[];
 
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
@@ -9617,6 +9620,14 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             }
             libname = "win32u (stub table)";
             funcs64 = funcs_wow64 = (const void *)ios_stub_unix_call_table;
+#ifdef MADEIRA_MOLTENVK
+        } else if (match && strstr(match, "winevulkan")) {
+            /* PR #88 (xssp11): Vulkan over MoltenVK. Vulkan's generated 32-bit
+             * thunks do not translate Madeira's guest pointers yet: 64-bit only,
+             * and a 32-bit caller gets no table rather than a wrong one. */
+            libname = "winevulkan (MoltenVK, 64-bit only)";
+            funcs64 = (const void *)winevulkan_unix_call_funcs;
+#endif
         } else if (match && strstr(match, "opengl32")) {
             /* Real opengl32 unix side (OpenGL ES / desktop GL through the winios
              * WGL driver). MADEIRA_NO_GL=1 keeps the old GL-absent stub table.

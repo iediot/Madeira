@@ -1813,6 +1813,10 @@ static UINT nulldrv_VulkanInit( UINT version, void *vulkan_handle, const struct 
     return STATUS_NOT_IMPLEMENTED;
 }
 
+#ifdef MADEIRA_MOLTENVK
+#include "moltenvk_ios.c"   /* PR #88: VkSurfaceKHR on the window's CAMetalLayer */
+#endif
+
 static UINT nulldrv_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs )
 {
     return STATUS_NOT_IMPLEMENTED;
@@ -1965,6 +1969,9 @@ static void load_display_driver(void)
                         "(MADEIRA_GAME_WINDOWS=0 hides them)\n" );
         }
         winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
+#ifdef MADEIRA_MOLTENVK
+        winios_user_driver.pVulkanInit = winios_VulkanInit;
+#endif
         /* OpenGL ES behind WGL (opengl_ios.c). MADEIRA_NO_GL=1 restores the
          * GL-absent behaviour (every context creation fails). */
         if (!getenv( "MADEIRA_NO_GL" )) winios_user_driver.pOpenGLInit = winios_OpenGLInit;

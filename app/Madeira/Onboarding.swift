@@ -9,7 +9,7 @@ import UIKit
 // On a new install (no `madeiraOnboardingDone` in UserDefaults, which iOS
 // removes with the app) the library opens a full-screen setup: welcome, JIT,
 // Steam sign-in, Valve's client components for Madeira Dock (only when Dock is
-// available), done. Every step can be skipped. Settings › Advanced › Run setup
+// available), Epic sign-in, Wine Mono, done. Every step can be skipped. Settings › Advanced › Run setup
 // again reopens it. env.MADEIRA_ONBOARDING = 0 never opens it.
 //
 // The JIT page explains StikDebug, the only JIT method in this fork.
@@ -30,24 +30,26 @@ enum OnboardingRules {
     static var enabled: Bool { MadeiraConfig.flag("MADEIRA_ONBOARDING") }
 
     enum Step: String, CaseIterable {
-        case welcome, jit, signIn = "sign-in", dockClient = "dock-client", epicSignIn = "epic-sign-in", done
+        case welcome, jit, signIn = "sign-in", dockClient = "dock-client", epicSignIn = "epic-sign-in", wineMono = "wine-mono", done
     }
 
     /// JIT is always offered. Sign-in is offered when Steam sign-in is enabled,
     /// or when Madeira Dock is available (Dock needs a sign-in). Valve's client
     /// components are offered only when Dock is available. Epic Games sign-in is
-    /// always offered, after Steam's: its games join the library.
+    /// always offered, after Steam's: its games join the library. Wine Mono is
+    /// offered independently of either store for .NET Framework games.
     static func steps(signIn: Bool, dock: Bool) -> [Step] {
         var list: [Step] = [.welcome, .jit]
         if signIn || dock { list.append(.signIn) }
         if dock { list.append(.dockClient) }
         list.append(.epicSignIn)
+        list.append(.wineMono)
         return list + [.done]
     }
 
     /// Whether there is anything to set up between the welcome and done pages.
     static func hasSetup(_ steps: [Step]) -> Bool {
-        steps.contains(.jit) || steps.contains(.signIn) || steps.contains(.dockClient) || steps.contains(.epicSignIn)
+        steps.contains(.jit) || steps.contains(.signIn) || steps.contains(.dockClient) || steps.contains(.epicSignIn) || steps.contains(.wineMono)
     }
 
     /// Whether setup opens by itself when the library appears.
@@ -144,6 +146,7 @@ struct OnboardingView: View {
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
     @ObservedObject private var epic = EpicAuth.shared
+    @ObservedObject private var mono = WineMonoModel.shared
     @State private var showSignIn = false
     @State private var showEpicSignIn = false
 
@@ -163,6 +166,7 @@ struct OnboardingView: View {
                     case .signIn: signInPage
                     case .dockClient: dockClientPage
                     case .epicSignIn: epicSignInPage
+                    case .wineMono: wineMonoPage
                     case .done: donePage
                     }
                 }
@@ -176,6 +180,7 @@ struct OnboardingView: View {
         .onAppear {
             signIn.refresh()
             dock.refresh()
+            mono.refresh()
         }
     }
 
@@ -325,6 +330,31 @@ struct OnboardingView: View {
                     LogStore.shared.log("[onboarding] epic sign-in")
                     showEpicSignIn = true
                 }
+                secondary("Set up later") { model.next() }
+            }
+        }
+    }
+
+    private var wineMonoPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header("Set up .NET Framework", symbol: "shippingbox")
+            Text("Games built on Microsoft's .NET Framework need Wine Mono. Madeira downloads it from WineHQ: about 42 MB, about 130 MB once installed.")
+            if WineMonoModel.available {
+                Label("Wine Mono is installed.", systemImage: "checkmark.circle.fill")
+                    .font(.headline).foregroundStyle(.green)
+                primary("Continue", symbol: "arrow.right") { model.next() }
+            } else {
+                if mono.busy {
+                    HStack(spacing: 12) { ProgressView(); Text(mono.status).foregroundStyle(.secondary) }
+                } else {
+                    if let error = mono.error {
+                        Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
+                    }
+                    primary(mono.error == nil ? "Download Wine Mono" : "Try again", symbol: "arrow.down.circle.fill") {
+                        mono.install()
+                    }
+                }
+                Text("You can download it later from Settings › .NET Framework.").font(.subheadline).foregroundStyle(.secondary)
                 secondary("Set up later") { model.next() }
             }
         }

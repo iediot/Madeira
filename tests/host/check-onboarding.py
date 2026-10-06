@@ -97,7 +97,7 @@ require('if onboarding.available {' in jit_settings_section and 'onboarding.reru
 
 # ------------------------------------------------------------------ static: skippable steps
 view = block(onboarding, 'struct OnboardingView: View')
-for page in ['private var signInPage', 'private var dockClientPage']:
+for page in ['private var signInPage', 'private var dockClientPage', 'private var wineMonoPage']:
     require('secondary("Set up later") { model.next() }' in block(view, page), f'{page.split()[-1]}: Set up later')
 require('secondary("Skip setup") { model.skip() }' in block(view, 'private var welcome'), 'welcome: visible Skip setup')
 jit_page = block(view, 'private var jitPage')
@@ -167,17 +167,17 @@ import Foundation
     }
     static func main() {
         typealias R = OnboardingRules
-        let full: [R.Step] = [.welcome, .jit, .signIn, .dockClient, .epicSignIn, .done]
+        let full: [R.Step] = [.welcome, .jit, .signIn, .dockClient, .epicSignIn, .wineMono, .done]
         expect(R.doneKey == "madeiraOnboardingDone", "done key")
         expect(R.Step.jit.rawValue == "jit" && R.Step.signIn.rawValue == "sign-in"
                && R.Step.dockClient.rawValue == "dock-client", "log step names")
 
         // JIT is always present; Steam pages still follow their feature switches.
         expect(R.steps(signIn: true, dock: true) == full, "with Dock: JIT, sign-in, then Valve's client components")
-        expect(R.steps(signIn: true, dock: false) == [.welcome, .jit, .signIn, .epicSignIn, .done],
+        expect(R.steps(signIn: true, dock: false) == [.welcome, .jit, .signIn, .epicSignIn, .wineMono, .done],
                "without Dock: JIT and sign-in, no components page")
         expect(R.steps(signIn: false, dock: true) == full, "Dock keeps the sign-in page after JIT (it needs a sign-in)")
-        expect(R.steps(signIn: false, dock: false) == [.welcome, .jit, .epicSignIn, .done],
+        expect(R.steps(signIn: false, dock: false) == [.welcome, .jit, .epicSignIn, .wineMono, .done],
                "JIT remains when Steam setup is unavailable")
         expect(R.hasSetup(full) && R.hasSetup([.welcome, .jit, .done])
                && !R.hasSetup([.welcome, .done]), "hasSetup")
@@ -207,10 +207,11 @@ import Foundation
                "a page not in the list ends setup")
         expect(R.next(after: .signIn, in: [.welcome, .jit, .signIn, .done]) == .done,
                "without Dock, sign-in leads to done")
-        expect(R.position(of: .jit, in: full)! == (1, 4)
-               && R.position(of: .signIn, in: full)! == (2, 4)
-               && R.position(of: .dockClient, in: full)! == (3, 4)
-               && R.position(of: .epicSignIn, in: full)! == (4, 4), "step n of m with Dock")
+        expect(R.position(of: .jit, in: full)! == (1, 5)
+               && R.position(of: .signIn, in: full)! == (2, 5)
+               && R.position(of: .dockClient, in: full)! == (3, 5)
+               && R.position(of: .epicSignIn, in: full)! == (4, 5)
+               && R.position(of: .wineMono, in: full)! == (5, 5), "step n of m with Dock")
         expect(R.position(of: .jit, in: [.welcome, .jit, .signIn, .done])! == (1, 2)
                && R.position(of: .signIn, in: [.welcome, .jit, .signIn, .done])! == (2, 2),
                "two steps without Dock")
@@ -227,8 +228,10 @@ import Foundation
         expect(!R.enabled, "MADEIRA_ONBOARDING=0 in the environment turns setup off")
         unsetenv("MADEIRA_ONBOARDING")
         try! "# notes\nenv.MADEIRA_ONBOARDING = 0\n".write(to: cfg, atomically: true, encoding: .utf8)
+        MadeiraConfig.invalidate()
         expect(!R.enabled, "env.MADEIRA_ONBOARDING = 0 in madeira.cfg turns setup off")
         try! "env.MADEIRA_ONBOARDING = 1\n".write(to: cfg, atomically: true, encoding: .utf8)
+        MadeiraConfig.invalidate()
         expect(R.enabled, "env.MADEIRA_ONBOARDING = 1 keeps it on")
         exit(failed == 0 ? 0 : 1)
     }

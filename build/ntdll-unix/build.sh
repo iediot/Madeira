@@ -15,6 +15,10 @@ SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
 
+# PR #88: Vulkan over MoltenVK is built in unless MADEIRA_MOLTENVK=0.
+MVK_DEFINE=""
+[[ "${MADEIRA_MOLTENVK:-1}" == 1 ]] && MVK_DEFINE="-DMADEIRA_MOLTENVK=1"
+
 compile_one() {
     local src=$1
     local name=$2
@@ -33,7 +37,7 @@ compile_one() {
         -D_ACRTIMP= -DWINBASEAPI= \
         -DBINDIR=\"/usr/local/bin\" -DLIBDIR=\"/usr/local/lib\" \
         -DDATADIR=\"/usr/local/share\" -DSYSTEMDLLPATH=\"\" \
-        -DWINE_UNIX_LIB -DWINE_IOS=1 \
+        -DWINE_UNIX_LIB -DWINE_IOS=1 $MVK_DEFINE \
         -Dget_thread_context=ntdll_get_thread_context \
         -Dset_thread_context=ntdll_set_thread_context \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
@@ -120,6 +124,18 @@ compile_unixlib "$WINE_SRC/dlls/opengl32/unix_wgl.c" "opengl32_wgl" "opengl32" \
     -I"$WINE_SRC/dlls/opengl32"
 compile_unixlib "$WINE_SRC/dlls/opengl32/unix_thunks.c" "opengl32_thunks" "opengl32" \
     -I"$WINE_SRC/dlls/opengl32"
+# Vulkan (PR #88): winevulkan's unix side, 64-bit only, over MoltenVK through
+# win32u's Vulkan driver (build/win32u-unix/moltenvk_ios.c). MADEIRA_MOLTENVK=0
+# builds without it.
+VULKAN_OBJECTS=()
+rm -f "$OBJ_DIR/winevulkan_unixlib.o" "$OBJ_DIR/winevulkan_thunks.o"
+if [[ "${MADEIRA_MOLTENVK:-1}" == 1 ]]; then
+    compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan.c" "winevulkan_unixlib" "winevulkan" \
+        -I"$WINE_SRC/dlls/winevulkan" -DMADEIRA_MOLTENVK=1
+    compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan_thunks.c" "winevulkan_thunks" "winevulkan" \
+        -I"$WINE_SRC/dlls/winevulkan" -DMADEIRA_MOLTENVK=1
+    VULKAN_OBJECTS=("$OBJ_DIR/winevulkan_unixlib.o" "$OBJ_DIR/winevulkan_thunks.o")
+fi
 # iOS-Madeira 2026-08-03 (#79 transport): in-process NSI TCP connection
 # tables (nsiproxy.sys is not shipped; PE nsi.dll falls back to this).
 compile_one "$BUILD_DIR/nsi_unixlib_ios.c" "nsi_unixlib_ios"
@@ -219,6 +235,7 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
     "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" "$OBJ_DIR/opengl32_wgl.o" "$OBJ_DIR/opengl32_thunks.o" \
+    "${VULKAN_OBJECTS[@]}" \
     "$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \

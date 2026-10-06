@@ -29,4 +29,8 @@ CAMetalLayer *madeira_display_layer_for_hwnd(void *hwnd);
 void winios_screen_size(int *w, int *h);
 void winios_display_mode_changed(int w, int h);
 
+/* Vulkan holds one retained CAMetalLayer per VkSurfaceKHR. */
+void *madeira_vulkan_layer_lease_create(void *hwnd);
+void madeira_vulkan_layer_lease_release(void *lease);
+
 #endif

@@ -73,6 +73,14 @@ assert len(dns) == 1, len(dns)
 assert "funcs64 = (const void *)dnsapi_unix_call_funcs;" in dns[0], dns[0]
 assert "funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;" in dns[0], dns[0]
 branches = [b for b in branches if b is not dns[0]]
+# MoltenVK currently supports 64-bit callers only. Leave the wow64 table unset
+# so ios_bind_unixlib_table rejects a 32-bit caller instead of exposing host pointers.
+vk = [b for b in branches if 'strstr(match, "winevulkan")' in b.split("\n")[0]]
+assert len(vk) == 1, len(vk)
+assert "funcs64 = (const void *)winevulkan_unix_call_funcs;" in vk[0], vk[0]
+assert not re.search(r"funcs_wow64\s*=", vk[0]), vk[0]
+assert re.search(r"funcs_wow64\s*=\s*NULL", chain), "wow64 starts unsupported"
+branches = [b for b in branches if b is not vk[0]]
 assert len(branches) == len(upstream) + 1, len(branches)
 for (test, table), body in zip(upstream, branches):
     assert test in body.split("\n")[0], (test, body.split("\n")[0])

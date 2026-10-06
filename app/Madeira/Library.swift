@@ -2413,6 +2413,7 @@ struct LibraryView: View {
                 }
             }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
+            if settingsShow(".NET Framework", "Wine Mono", "runtime", "download") { WineMonoSettingsSection() }
             // For debugging Madeira itself: logging and the original diagnostic screen.
             if settingsShow("advanced", "diagnostics", "extended logging", "logging", "log", "interface", "developer", "setup",
                             "Madeira Dock", "Dock", "Steam", "client") {

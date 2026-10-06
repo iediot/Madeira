@@ -19,4 +19,10 @@
 #undef SONAME_LIBVULKAN
 #undef SONAME_LIBGNUTLS
 
+#ifdef MADEIRA_MOLTENVK
+/* The MoltenVK the OpenGL path already ships (app/Madeira/gl), resolved through
+ * MADEIRA_GL_DIR by vulkan_ios.c. */
+#define SONAME_LIBVULKAN "libMoltenVK.dylib"
+#endif
+
 #endif
