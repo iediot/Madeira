@@ -31,6 +31,7 @@
 #define HIDPAD_KIND_NONE      0
 #define HIDPAD_KIND_DUALSENSE 1
 #define HIDPAD_KIND_GENERIC   2
+#define HIDPAD_KIND_XBOX      3
 
 /* GUID_DEVINTERFACE_HID, lower case as setupapi writes it. */
 #define HIDPAD_HID_INTERFACE_GUID "{4d1e55b2-f16f-11cf-88cb-001111000030}"
@@ -86,6 +87,24 @@ static const struct hidpad_identity hidpad_identities[] =
           "HID_DEVICE" },
         "{4d616465-6972-6148-4944-47454e000001}",
         "Madeira", "Madeira Gamepad", "",
+    },
+    {
+        /* The default (GamepadInput.configuredPadMode): an Xbox 360 controller as
+         * Windows shows one, the HID side of an XInput pad, with player 1 kept on
+         * XInput too. "&IG_00" is Windows' marker for that HID side: DirectInput
+         * and raw input list it, and SDL, Unity and Rewired, which find pads by
+         * enumerating HID devices, take IG_ to mean "poll XInput for this one",
+         * so a game reading both APIs still sees one controller (Ogu and the
+         * Secret Forest saw none with XInput alone). Microsoft's IDs on purpose:
+         * the DirectInput games that skip 045E as "already XInput" then read the
+         * XInput view, as on Windows. Same generic report layout. */
+        HIDPAD_KIND_XBOX, "xbox", 0x045e, 0x028e, 0x0114,
+        "HID\\VID_045E&PID_028E&IG_00", "9&4d616465&0&0000",
+        { "HID\\VID_045E&PID_028E&REV_0114&IG_00", "HID\\VID_045E&PID_028E&IG_00",
+          "HID\\VID_045E&UP:0001_U:0005", "HID_DEVICE_SYSTEM_GAME", "HID_DEVICE_UP:0001_U:0005",
+          "HID_DEVICE" },
+        "{4d616465-6972-6148-4944-58424f580001}",
+        "Microsoft", "Controller (XBOX 360 For Windows)", "",
     },
 };
 

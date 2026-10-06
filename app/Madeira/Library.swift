@@ -4832,14 +4832,15 @@ enum UnityResolution {
         var changed = 0
         let lines = text.components(separatedBy: "\n").map { line -> String in
             guard line.hasPrefix("\"Screenmanager "), let eq = line.range(of: "\"=dword:") else { return line }
-            let name = line[line.index(after: line.startIndex)..<eq.lowerBound]
+            let name = line[line.index(after: line.startIndex)..<eq.lowerBound]   // "Screenmanager …_h…"
+            let key = name.dropFirst("Screenmanager ".count)
             let value: String?
-            if name.hasPrefix("Resolution Width_") || name.hasPrefix("Resolution Window Width_") { value = w }
-            else if name.hasPrefix("Resolution Height_") || name.hasPrefix("Resolution Window Height_") { value = h }
-            else if name.hasPrefix("Is Fullscreen mode_") { value = "00000001" }
+            if key.hasPrefix("Resolution Width_") || key.hasPrefix("Resolution Window Width_") { value = w }
+            else if key.hasPrefix("Resolution Height_") || key.hasPrefix("Resolution Window Height_") { value = h }
+            else if key.hasPrefix("Is Fullscreen mode_") { value = "00000001" }
             // 0 exclusive, 1 full-screen window, 2 maximized, 3 windowed: the last two leave
             // the game a window in part of the screen.
-            else if name.hasPrefix("Fullscreen mode_") { value = line.hasSuffix("00000002") || line.hasSuffix("00000003") ? "00000001" : nil }
+            else if key.hasPrefix("Fullscreen mode_") { value = line.hasSuffix("00000002") || line.hasSuffix("00000003") ? "00000001" : nil }
             else { value = nil }
             guard let value else { return line }
             let updated = "\"" + name + "\"=dword:" + value

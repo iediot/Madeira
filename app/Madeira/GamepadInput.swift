@@ -68,7 +68,9 @@ final class GamepadInput: @unchecked Sendable {
     static func configuredPadMode() -> (value: String, source: String) {
         if let v = MadeiraConfig.get(padModeKey), !v.isEmpty { return (v.lowercased(), "cfg") }
         if let v = ProcessInfo.processInfo.environment["MADEIRA_PAD_MODE"], !v.isEmpty { return (v.lowercased(), "env") }
-        return ("xinput", "default")
+        // ml2300: an Xbox controller every API can see (XInput, DirectInput, raw HID),
+        // as Windows shows one; env.MADEIRA_PAD_MODE = xinput keeps the old XInput-only pad.
+        return ("xbox", "default")
     }
 
     /// ml2106: what of a game's controller output reaches the physical pad
@@ -102,13 +104,14 @@ final class GamepadInput: @unchecked Sendable {
         // physical controller publishes), for games that only look once at start.
         // env.MADEIRA_PAD0_RESIDENT = 0 restores "connected only while publishing".
         let resident = Self.enabled && Self.flag("MADEIRA_PAD0_RESIDENT")
-        guard ["hid", "dualsense", "generic"].contains(mode.value) else {
+        guard ["hid", "dualsense", "generic", "xbox"].contains(mode.value) else {
             winios_gamepad_set_resident(0, resident ? 1 : 0)
             LogStore.shared.log("[hid-pad] ml2100 session mode=xinput source=\(mode.source) slot0-resident=\(resident ? 1 : 0)")
             beginPadOutput(xinput: output.xinput && Self.enabled, hid: false, value: output.value)
             return
         }
-        winios_gamepad_set_resident(0, 0)
+        // The Xbox identity keeps XInput player 1, and with it the resident slot.
+        winios_gamepad_set_resident(0, mode.value == "xbox" && resident ? 1 : 0)
         guard Self.enabled else {
             LogStore.shared.log("[hid-pad] ml2100 session mode=\(mode.value) ignored: MADEIRA_XINPUT=0 turns every controller off")
             beginPadOutput(xinput: false, hid: false, value: output.value)
@@ -119,13 +122,14 @@ final class GamepadInput: @unchecked Sendable {
         let sony = first?.extendedGamepad is GCDualSenseGamepad || first?.extendedGamepad is GCDualShockGamepad
         let kind: String
         switch mode.value {
-        case "dualsense", "generic": kind = mode.value
+        case "dualsense", "generic", "xbox": kind = mode.value
         // No pad yet: a DualSense, the identity this mode exists for.
         default: kind = first == nil || sony ? "dualsense" : "generic"
         }
         setenv("MADEIRA_HIDPAD", kind, 1)
         if kind == "generic", let name = first?.vendorName { setenv("MADEIRA_HIDPAD_NAME", name, 1) }
-        let keepXInput = Self.optIn("MADEIRA_HIDPAD_XINPUT")
+        // The Xbox identity is the HID side of an XInput pad: player 1 stays on XInput.
+        let keepXInput = kind == "xbox" || Self.optIn("MADEIRA_HIDPAD_XINPUT")
         queue.async { [self] in hidActive = true; hidKeepsXInput = keepXInput; sample() }
         LogStore.shared.log("[hid-pad] ml2100 session mode=\(mode.value) source=\(mode.source) kind=\(kind) "
                             + "pad=\(first?.productCategory ?? "none") xinput-slot0=\(keepXInput ? "kept" : "off")")

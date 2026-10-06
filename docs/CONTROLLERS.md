@@ -199,6 +199,20 @@ and off and its releases.
 
 ## Player 1 as a HID controller (DualSense, DirectInput)
 
+**The default (ml2300): an Xbox controller every API sees.** Unless
+`env.MADEIRA_PAD_MODE` says otherwise, player 1 is both an XInput pad and a HID
+device with Microsoft's IDs (045E:028E, "Controller (XBOX 360 For Windows)") whose
+instance ID carries `&IG_00`, as a wired Xbox 360 pad looks on Windows. XInput
+games read the XInput view; DirectInput and raw HID list the HID device; and
+frameworks that find pads by enumerating HID devices (SDL, Unity's input
+systems, Rewired) take `IG_` to mean "an XInput pad" and poll XInput for it, so
+a game reading several APIs still sees one controller. With XInput alone those
+frameworks found nothing (Ogu and the Secret Forest). The touch controller
+feeds the same pad. `env.MADEIRA_PAD_MODE = xinput` restores the XInput-only pad;
+`hid`, `dualsense` and `generic` work as below. Not covered yet:
+Windows.Gaming.Input's Gamepad class, which needs Wine's separate `&XI_` device.
+
+
 XInput stays the default and is unchanged. A game can instead see player 1 as
 what it is, a HID game controller, the way CrossOver shows a DualSense on a
 Mac: `env.MADEIRA_PAD_MODE = hid` in madeira.cfg (Settings > All settings >
