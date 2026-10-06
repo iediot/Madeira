@@ -3461,6 +3461,8 @@ struct ContentView: View {
         let winePrefixPath = documentsPath.appendingPathComponent("wine").path
 
         logStore.log("Wine prefix: \(winePrefixPath)")
+        // Before the server loads the registry: Unity games restart at this session's size.
+        UnityResolution.apply(prefix: winePrefixPath, size: LibraryModel.shared.activeEntry?.pixelResolution)
 
         let result = wineserver_start(winePrefixPath)
         if result == 0 {

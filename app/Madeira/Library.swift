@@ -4757,3 +4757,44 @@ struct LibraryDrawerShape: Shape {
         return body.subtracting(Capsule(style: .continuous).path(in: bar))
     }
 }
+
+/// Unity games start at the resolution they saved last (HKCU\\Software\\<company>\\<product>,
+/// "Screenmanager Resolution Width_h…" and friends), not the monitor's: Slime Rancher came
+/// back at 800×600 (4:3 on a wide phone), Ogu and the Secret Forest windowed at 1280×646.
+/// Before the wineserver loads the registry (one session per run, so nothing else has it
+/// open), every Unity game's saved size becomes this session's virtual monitor, full screen.
+/// MADEIRA_UNITY_RESOLUTION=0 leaves the registry alone.
+enum UnityResolution {
+    static func apply(prefix: String, size: String?) {
+        guard MadeiraConfig.flag("MADEIRA_UNITY_RESOLUTION"), let size else { return }
+        let parts = size.split(separator: "x").compactMap { Int($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return }
+        let file = prefix + "/user.reg"
+        guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { return }
+        let w = String(format: "%08x", parts[0]), h = String(format: "%08x", parts[1])
+        var changed = 0
+        let lines = text.components(separatedBy: "\n").map { line -> String in
+            guard line.hasPrefix("\"Screenmanager "), let eq = line.range(of: "\"=dword:") else { return line }
+            let name = line[line.index(after: line.startIndex)..<eq.lowerBound]
+            let value: String?
+            if name.hasPrefix("Resolution Width_") || name.hasPrefix("Resolution Window Width_") { value = w }
+            else if name.hasPrefix("Resolution Height_") || name.hasPrefix("Resolution Window Height_") { value = h }
+            else if name.hasPrefix("Is Fullscreen mode_") { value = "00000001" }
+            // 0 exclusive, 1 full-screen window, 2 maximized, 3 windowed: the last two leave
+            // the game a window in part of the screen.
+            else if name.hasPrefix("Fullscreen mode_") { value = line.hasSuffix("00000002") || line.hasSuffix("00000003") ? "00000001" : nil }
+            else { value = nil }
+            guard let value else { return line }
+            let updated = "\"" + name + "\"=dword:" + value
+            if updated != line { changed += 1 }
+            return updated
+        }
+        guard changed > 0 else { return }
+        do {
+            try lines.joined(separator: "\n").write(toFile: file, atomically: true, encoding: .utf8)
+            LogStore.shared.log("[unity-res] \(changed) saved Unity setting(s) set to \(size) full screen")
+        } catch {
+            LogStore.shared.log("[unity-res] could not update user.reg: \(error.localizedDescription)", level: .error)
+        }
+    }
+}
