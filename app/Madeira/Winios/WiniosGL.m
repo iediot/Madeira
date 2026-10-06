@@ -34,6 +34,8 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 
 #include "../IOSDisplayShim.h"
 
@@ -275,6 +277,16 @@ static BOOL pipeline_ensure(MadeiraGLPresenter *p, MTLPixelFormat format) {
     return YES;
 }
 
+// Frames put on screen by GL, both backends. DXMT counts its own presents
+// (madeira_get_present_count); madeira_frame_count adds the two, so the FPS
+// readout and the launch checks that wait for a first frame see GL games too.
+static _Atomic uint64_t gl_present_count;
+extern uint64_t madeira_get_present_count(void);
+
+uint64_t madeira_frame_count(void) {
+    return madeira_get_present_count() + atomic_load_explicit(&gl_present_count, memory_order_relaxed);
+}
+
 // The presenter behind *state, created on first use for hwnd's layer.
 static MadeiraGLPresenter *presenter_get(void **state, void *hwnd) {
     MadeiraGLPresenter *p = (__bridge MadeiraGLPresenter *)*state;
@@ -330,6 +342,7 @@ static BOOL present_slot(MadeiraGLPresenter *p, GLSlot *s, void *hwnd) {
     [cb presentDrawable:drawable];
     [cb commit];
     s->last = cb;
+    atomic_fetch_add_explicit(&gl_present_count, 1, memory_order_relaxed);
 
     if (++p->frames == 1 || p->frames % 600 == 0)
         GLLOG("hwnd %p: %lu frames presented (%dx%d)", hwnd, p->frames, p->width, p->height);

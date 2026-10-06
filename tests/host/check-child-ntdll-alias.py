@@ -64,6 +64,9 @@ int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *rea
                        void **owner )
 { (void)idx; (void)low; (void)real; (void)size; (void)owner; return 0; }
 static void ios_resolve_fex_exports( void ) { }
+/* kinivi's FEX-module marking (ios_image_is_fex) names the image; no image here. */
+static const char *ios_pe_module_name( const void *base, size_t size ) { (void)base; (void)size; return ""; }
+#include <strings.h>
 '''
 code += between(native, '#define IOS_JIT_MAX_MAPPINGS', '\n};')
 code += 'static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];\n'
