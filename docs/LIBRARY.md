@@ -102,11 +102,32 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
 
 - title and cover image;
 - **Resolution**: the size of the Windows screen (the virtual monitor) the game
-  renders for: 640×480 to 2560×1440, plus **Screen shape**, this device's own
-  aspect ratio at 720 lines (for example 1560×720 on a 19.5:9 phone), so a game
-  fills the screen without bars. It is exported as the session default
-  (`MADEIRA_SCREEN_W/H`, `MADEIRA_SCREEN_SRC=knob`), which win32u reports for
-  the session. New entries use 1024×768, the size main uses for every launch;
+  renders for, chosen from this device's list (ml1172, `ResolutionChoices` in
+  `GuestDisplay.swift`; the developer interface's Resolution menu shows the
+  same list):
+  - **This screen's shape**, which fills the screen without bars: the screen's
+    aspect ratio at 944×656's pixel count (light), at 1280×720's (≈720p, the
+    **default**, so a 19.5:9 iPhone keeps the 1408×648 it always had and a
+    game's mode list is unchanged) and at 1920×1080's (≈1080p), sides rounded
+    to multiples of 8, then the screen's **native** pixels; a size past native
+    is left out. On an 11-inch iPad (1180×820 points): 944×656, 1152×800,
+    1728×1200, 2360×1640; on an iPhone 16 Pro Max: 1168×536, 1408×648,
+    2120×976, 2868×1320;
+  - **16:9 widescreen**: 960×540, 1280×720, 1600×900, 1920×1080, 2560×1440;
+  - **4:3 classic**: 640×480, 800×600, 1024×768, 1280×960.
+
+  Each PC group's title says whether it fills this screen or leaves bars
+  above and below or at the sides (in Fit). A saved size the list lacks (chosen
+  on another device) is shown as "saved". The choice is exported as the session
+  default (`MADEIRA_SCREEN_W/H`, `MADEIRA_SCREEN_SRC=knob`), which win32u
+  reports for the session. A program's own display-mode change
+  (ChangeDisplaySettings to a size win32u lists) resizes that monitor for the
+  rest of the session and the picture follows it;
+  `env.MADEIRA_VIRTUAL_MODE_SET = 0` keeps the chosen size. New entries, and
+  the Desktop entry, take the default. Upstream's fixed default, 1408×648, is
+  a 19.5:9 phone's shape; on a screen of another shape, entries saved with it
+  are reset once to the default (UserDefaults
+  `madeira.ml1172.resolution-reset`);
 - **Aspect & scaling**: how that screen is shown. **Fit** letterboxes it,
   **Fill** covers the screen and crops, **Stretch** fills it exactly, **Aspect**
   letterboxes the shape the game actually draws (its back buffer) and **Fill
@@ -277,7 +298,8 @@ StikDebug JIT (`docs/JIT.md`), Steam sign-in
 (`docs/STEAM_SIGNIN.md`) through `SteamSignInModel`/`SteamSignInView` (the
 token stays in sign-in's Keychain store), and Madeira Dock
 (`docs/MADEIRA_DOCK.md`) through
-`MadeiraDockModel.prepareClient()`/`MadeiraDockView`.
+`MadeiraDockModel.prepareClient()`/`MadeiraDockView`, and Wine Mono through
+`WineMonoModel` (`app/Madeira/WineMono.swift`, below).
 
 **First-run setup.** On a new install the library opens a full-screen setup
 once: welcome, **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
@@ -289,6 +311,20 @@ page has **Skip setup**. Finishing or skipping stores
 app. The JIT page is always available; Steam pages follow their feature
 switches. Setup never opens over a running session.
 
+**Wine Mono** (`app/Madeira/WineMono.swift`). Games built on .NET Framework
+start through Wine's mscoree, which needs Wine Mono at `C:\windows\mono\mono-2.0`.
+Release builds do not carry it; setup's Wine Mono page and **Settings › .NET
+Framework** download it from WineHQ (`wine-mono-<ver>-x86.tar.xz`, about 42 MB,
+pinned by SHA-256 in `build/wine-mono/pin.sh`), unpack it on the device with
+Apple's LZMA decoder and a small tar reader, without the compile-time
+`lib/mono/*-api` assemblies (about 135 MB installed), apply bundle.sh's ml1281
+mscorlib patch (both hashes checked), and install it in one rename to
+`Library/Application Support/WineMono/wine-mono`, excluded from backups. Each
+session links `C:\windows\mono\mono-2.0` to the bundled copy (a development
+build made after `build/wine-mono/fetch.sh`) or, failing that, to the download.
+Settings can remove it again. `tests/host/check-wine-mono.py` runs the installer
+code on the real tarball. Log tag: `[wine-mono]`.
+
 Setup starts no Wine session and allocates no JIT pool. It stores the selected
 JIT method and may store a validated pairing file (paired on the device or
 imported) in the Keychain (docs/JIT.md). On iOS 27, a Connect automatically
@@ -298,6 +334,8 @@ verified download without Wine. It changes no engine switch or launch
 configuration.
 
 **Settings › JIT** and **Settings › Steam** both show **Run setup again**.
+**Settings › .NET Framework** shows Wine Mono's state, with **Download Wine
+Mono** or **Remove Wine Mono** (hidden in a build that carries it).
 Settings › Steam also shows the signed-in account with **Sign out of Steam**
 (or **Sign in to Steam**), **Madeira Dock** (Dock's sheet, with the last Dock
 result under it). A game started from the Dock sheet here runs as a library
@@ -357,7 +395,6 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_RUNTIME_SETTINGS` | on | no Display and Memory & sync sections in Settings |
 | `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling (a session does not save it) and no Diagnostics in the in-game menu |
 | `MADEIRA_SESSION_DIAGNOSTICS` | off | `1` shows the in-game menu's Diagnostics: frame capture (render-target pixels to `Documents/capture`) and GPU sync, for Direct3D 12 games |
-| `MADEIRA_SCREEN_SHAPE_RESOLUTION` | on | no Screen shape resolution choice |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
 | `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › JIT/Steam have no **Run setup again** |
 | `MADEIRA_LIBRARY_COLLAPSE` | on | the **Steam** and **Other games** titles do not collapse (**Not installed** still folds) |

@@ -34,6 +34,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **libxml2** 2.12.10 and **libxslt** 1.1.45 | MIT (Daniel Veillard and contributors) | Unmodified, statically linked into Wine's `msxml3.dll` (`arm64ec-windows`) | Wine's bundled copies (`wine/libs/xml2`, `wine/libs/xslt`), built with the module by `build/wine-pe/build-modules.sh`. Licence texts in `LICENSES/MIT-libxml2.txt` and `LICENSES/MIT-libxslt.txt`. |
 | **Wine Mono** 11.0.0 | MIT (Wine Mono); bundled Mono class libraries MIT, with BSD, MS-PL and Apache-2.0 components | Unmodified official release, `wine-mono-11.0.0-x86.tar.xz` (SHA-256 `0cd723aa…abe5fd`), fetched by `build/wine-mono/fetch.sh` and unpacked on the device the first time a .NET program starts | The .NET runtime Wine uses for .NET programs. Source and the full licence texts: https://gitlab.winehq.org/mono/wine-mono (tag `wine-mono-11.0.0`); the licence files also ship inside the archive. |
 | **NVAPI SDK headers** | MIT (NVIDIA Corporation & affiliates) | Unmodified headers, compiled into DXMT's `nvapi64.dll` (`arm64ec-windows`) | `dxmt/external/nvapi`. DXMT's own NVAPI implementation answers only with Madeira's opt-in "Report an NVIDIA GPU" switch; no NVIDIA binary is shipped. Licence text in `LICENSES/MIT-NVAPI.txt`. |
+| **Wine Mono** 11.0.0 | Mono: LGPL or MIT X11 per part; FNA: Ms-PL and MIT; FAudio, FNA3D, MojoShader, SDL3: zlib; winforms, wpf, monoDX, System.Speech and Wine Mono's own code: MIT (`build/wine-mono/COPYING`) | Prebuilt runtime, unmodified except `lib/mono/4.5/mscorlib.dll` (4 IL bytes in `GC.Collect`, `build/wine-mono/bundle.sh`), bundled as `wine-mono/` with that COPYING only in a development build made after `build/wine-mono/fetch.sh`; **release builds do not include it** (the packaging step removes `wine-mono/`). Instead the app downloads it from WineHQ when the user asks (setup or Settings › .NET Framework, `app/Madeira/WineMono.swift`), checks it against the same SHA-256, unpacks it without `lib/mono/*-api` and applies the same mscorlib patch on the device | Runs .NET Framework programs; Wine's mscoree loads it. The x86 tarball from `dl.winehq.org`, SHA-256 pinned in `build/wine-mono/pin.sh`. The compile-time reference assemblies (`lib/mono/*-api`, which include the GPL-licensed ICSharpCode.SharpZipLib) are not bundled. Exact corresponding source: `wine-mono-11.0.0-src.tar.xz` from the same folder; see "Corresponding source" below. |
 
 ## Why GPL-3.0-or-later
 
@@ -158,6 +159,23 @@ and the exact source they are built from is tracked here in the same way:
   every run of the build script verifies before extracting
 - `build/ffmpeg/build.sh` -- the exact build machinery and configure flags. No
   patches are applied, and the script needs no network.
+
+Wine Mono is not linked into anything: `build/wine-mono/bundle.sh` copies the
+prebuilt runtime into the bundle as files. Its source release is 372 MB, too
+large for the repository, so it is pinned rather than tracked:
+
+- `build/wine-mono/pin.sh` -- the version, and the SHA-256 of both the x86
+  tarball that is bundled and `wine-mono-11.0.0-src.tar.xz`, its source
+  (`c504cb0b91ce09b72869e063844ce114564d4ac340479a82aa6789f51510e520`)
+- `build/wine-mono/fetch.sh --source` -- downloads both from
+  `https://dl.winehq.org/wine/wine-mono/11.0.0/` and verifies them
+
+Release builds do not ship Wine Mono (decided 2026-10-06): the packaging step
+removes `wine-mono/` from the app, and Madeira fetches it from WineHQ on first
+use instead (`app/Madeira/WineMono.swift`), so the copy on a device comes from
+WineHQ, not from Madeira. A release that did ship it would have to attach that source
+tarball next to the package and add the licence texts COPYING lists to
+`LICENSES/`.
 
 ## Relinking and static linking
 

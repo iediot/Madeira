@@ -724,15 +724,36 @@ final class LibraryModel: ObservableObject {
                 if model.current != nil { model.saveCurrentProfile() }
             }
         }
-        guard FileManager.default.fileExists(atPath: file.path) else { return }
-        do {
-            let doc = try JSONDecoder().decode(Document.self, from: Data(contentsOf: file))
-            guard doc.version == 1 else { throw LibraryError.message("This library uses a newer format.") }
-            entries = doc.entries
-        } catch {
-            readOnly = true
-            self.error = "Library could not be opened. The original file was preserved. " + error.localizedDescription
+        if FileManager.default.fileExists(atPath: file.path) {
+            do {
+                let doc = try JSONDecoder().decode(Document.self, from: Data(contentsOf: file))
+                guard doc.version == 1 else { throw LibraryError.message("This library uses a newer format.") }
+                entries = doc.entries
+            } catch {
+                readOnly = true
+                self.error = "Library could not be opened. The original file was preserved. " + error.localizedDescription
+            }
         }
+        resetPhoneResolution()
+    }
+
+    /// ml1172: every new entry used to get 1408x648, a 19.5:9 phone's shape.
+    /// On a screen of another shape (an iPad: a third of it black in Fit)
+    /// those entries are reset once to this device's default. Nothing tells a
+    /// deliberate 1408x648 from the old default, so a game set to it on purpose
+    /// is reset too; on a 19.5:9 iPhone nothing changes.
+    private func resetPhoneResolution() {
+        let key = "madeira.ml1172.resolution-reset"
+        guard !readOnly, !UserDefaults.standard.bool(forKey: key) else { return }
+        let phone = "1408x648"
+        let reset = ResolutionChoices.fills(1408, 648) ? 0 : entries.filter { $0.resolution == phone }.count
+        if reset > 0 {
+            var next = entries
+            for i in next.indices where next[i].resolution == phone { next[i].resolution = ResolutionChoices.defaultValue }
+            guard persist(next) else { return }   // try again at the next start
+        }
+        UserDefaults.standard.set(true, forKey: key)
+        LogStore.shared.log("[library] ml1172 resolution default \(ResolutionChoices.defaultValue); \(reset) entries reset from \(phone)")
     }
 
     func refreshFlag() {
@@ -795,13 +816,15 @@ final class LibraryModel: ObservableObject {
         guard entries.contains(where: { $0.steamAppID == appID }) else { return }
         persist(entries.filter { $0.steamAppID != appID })
     }
-    private func persist(_ next: [LibraryEntry]) {
-        guard !readOnly else { return }
+    @discardableResult
+    private func persist(_ next: [LibraryEntry]) -> Bool {
+        guard !readOnly else { return false }
         do {
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(Document(version: 1, entries: next)).write(to: file, options: .atomic)
             entries = next
-        } catch { self.error = "Could not save the library: " + error.localizedDescription }
+            return true
+        } catch { self.error = "Could not save the library: " + error.localizedDescription; return false }
     }
 
     /// Install size and graphics API, at most once a day per entry.
@@ -2415,7 +2438,7 @@ struct LibraryView: View {
                 SettingsSearchResults(query: settingsSearch.trimmingCharacters(in: .whitespaces), refresh: settingsRefresh)
             }
             // Credits, last, folded away unless searched for.
-            if settingsShow("about", "credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "bahacan16", "spitefulowl", "meshoklv") {
+            if settingsShow("about", "credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace", "bahacan16", "spitefulowl", "meshoklv", "TheHadesc") {
                 Section {
                     DisclosureGroup("Credits", isExpanded: Binding(get: { creditsOpen || !settingsSearch.isEmpty },
                                                                     set: { creditsOpen = $0 })) {
@@ -2426,6 +2449,7 @@ struct LibraryView: View {
                         MadeiraCredit(name: "bahacan16", handle: "bahacan16", role: "Direct3D 12 and DXMT fixes, game launcher windows, per-game settings, PlayStation controllers, and save backups")
                         MadeiraCredit(name: "spitefulowl", handle: "spitefulowl", role: "Wine and FEX runtime fixes, DXMT texture and memory fixes, audio, the swap tier, and library launch options")
                         MadeiraCredit(name: "meshoklv", handle: "meshoklv", role: "Controller fixes for games that ship their own XInput or need focus, and touch taps that stay off the mouse")
+                        MadeiraCredit(name: "TheHadesc", handle: "TheHadesc", role: "Madeira Dock starts for games whose Steam launch entries do not start at zero, and a touch gamepad that survives the in-game keyboard")
                     }
                 } header: { Text("About") }
             }
@@ -2801,36 +2825,6 @@ struct LibraryDetail: View {
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
-    static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
-    /// The presets, plus a stored size that is none of them (a screen shape
-    /// chosen on another device), so the picker never shows a blank choice.
-    static func resolutions(keeping current: String) -> [String] {
-        presetResolutions.contains(current) || current == screenShapeResolution || current == metalFXShapeResolution
-            ? presetResolutions : presetResolutions + [current]
-    }
-    /// "WxH" matching this screen's landscape aspect at 720 lines (width
-    /// rounded to a multiple of 8), or nil when it equals a preset or
-    /// MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
-    static var screenShapeResolution: String? {
-        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
-        let bounds = UIScreen.main.bounds
-        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
-        guard short > 0 else { return nil }
-        let width = Int((720 * long / short / 8).rounded()) * 8
-        guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
-        return "\(width)x720"
-    }
-    /// The same shape at 480 lines, the size MetalFX 1.5× brings to 720; nil
-    /// when it equals a preset or MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
-    static var metalFXShapeResolution: String? {
-        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
-        let bounds = UIScreen.main.bounds
-        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
-        guard short > 0 else { return nil }
-        let width = Int((480 * long / short / 8).rounded()) * 8
-        guard (640...4096).contains(width), !presetResolutions.contains("\(width)x480") else { return nil }
-        return "\(width)x480"
-    }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
         let count = MadeiraConfig.parse(config ?? "").count
@@ -2888,6 +2882,10 @@ struct LibraryDetail: View {
                     } else if let played = entry.lastPlayed {
                         Text("Last played \(played.formatted(.relative(presentation: .named)))").font(.subheadline).foregroundStyle(.secondary)
                     }
+                    // A game Valve's client starts (Madeira Dock): can it start without a connection?
+                    if DockOffline.enabled, let appID = entry.steamAppID, !entry.startsSteamGameDirectly {
+                        DockOfflineMark(appID: appID)
+                    }
                 }
                 .padding(.top, 84)   // under the artwork, which the cover overlaps by 72 pt
             }
@@ -2917,6 +2915,9 @@ struct LibraryDetail: View {
                     .listRowBackground(Color.clear)
                 Section("Display") {   // first after Play: the setting changed most often, then On screen
                     // The Windows screen the game renders for (and the Desktop's size).
+                    // ml1172: this device's choices (ResolutionChoices), grouped.
+                    let groups = ResolutionChoices.groups()
+                    let metalFX = ResolutionChoices.metalFX(in: groups)
                     Picker("Resolution", selection: $entry.resolution) {
                         // Shares of this screen's own pixels, in its own shape: the game fills it.
                         ForEach(LibraryEntry.screenScales, id: \.self) { percent in
@@ -2933,9 +2934,13 @@ struct LibraryDetail: View {
                         if entry.resolution != "native" && !entry.resolution.hasSuffix("%") && !LibraryEntry.portraitShapes.contains(entry.resolution) {
                             Text(entry.resolution.replacingOccurrences(of: "x", with: "×")).tag(entry.resolution)
                         }
-                        // The same shape at 480 lines, which MetalFX 1.5× brings to 720.
-                        if let shape = Self.metalFXShapeResolution, entry.metalFXUpscale == 1.5 || entry.resolution == shape {
-                            Text("Screen shape for MetalFX 1.5× (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        // The screen's shape at 480 lines, which MetalFX 1.5× brings to 720.
+                        if let shape = metalFX, entry.metalFXUpscale == 1.5 || entry.resolution == shape.value {
+                            Text(shape.label).tag(shape.value)
+                        }
+                        // A size none of them has, so the picker never shows a blank choice.
+                        if entry.resolution != metalFX?.value, let saved = ResolutionChoices.extra(entry.resolution, in: groups, note: "saved") {
+                            Text(saved.label).tag(entry.resolution)
                         }
                     }
                     Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
@@ -3334,6 +3339,57 @@ struct ControllerBindsPage: View {
         case 0x6E: return "Numpad ."
         case 0x6F: return "Numpad /"
         default:   return ControlAction.keyLabel(vk)
+        }
+    }
+}
+
+/// Game details: whether a Steam game that Valve's client starts (Madeira Dock)
+/// can start without a connection (DockOffline.Mark). Steam's offline sign-in
+/// belongs to the account: once Valve's client has reported that it can sign the
+/// account in offline, every installed game can start that way, and the client
+/// answers the license question from the list it cached. Only a game whose
+/// per-user program Steam prepares on its first start still needs that one start
+/// online. Tapping the line explains it; an offline start is always Steam's
+/// decision at that moment.
+struct DockOfflineMark: View {
+    let appID: Int
+    @State private var explain = false
+    /// The game's install record lists per-user executables (read once; it scans the library).
+    @State private var preparedOnline = false
+    var body: some View {
+        let mark = DockOffline.mark(appID, preparedOnline: preparedOnline)
+        let ready: Bool = { if case .ready = mark { return true } else { return false } }()
+        Button { explain = true } label: {
+            // Not a Label: inside a Form row a Label takes the list's wide icon column,
+            // which leaves the text far from its symbol.
+            HStack(spacing: 5) {
+                Image(systemName: ready ? "checkmark.circle.fill" : "wifi.exclamationmark")
+                Text(Self.line(mark))
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(ready ? Color.green : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .task { preparedOnline = MadeiraDock.games(drive: MadeiraDock.drive).first { $0.id == appID }?.customExecutables ?? false }
+        .alert(ready ? "Can be played offline" : "Not ready for offline play yet", isPresented: $explain) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(Self.explanation(mark)) }
+    }
+    static func line(_ mark: DockOffline.Mark) -> String {
+        switch mark {
+        case .ready: return "Can be played offline"
+        case .needsFirstStart: return "Start once online to play offline"
+        case .needsOnline: return "Start a game online to play offline"
+        }
+    }
+    static func explanation(_ mark: DockOffline.Mark) -> String {
+        switch mark {
+        case .ready(let saved):
+            return "Steam signed in online on this device on \(saved.formatted(date: .abbreviated, time: .omitted)) and can now sign this account in without a connection. With no internet, Madeira asks Steam to start the game offline; Steam checks its saved sign-in and its saved list of your licenses each time. Its offline sign-in expires after a while, so start a game online now and then. A game that needs its own servers still needs them."
+        case .needsFirstStart:
+            return "Steam can sign this account in offline, but it prepares this game's program for your account the first time it starts, and that needs a connection. Start this game once while you are online."
+        case .needsOnline:
+            return "Steam has not saved an offline sign-in on this device yet. Start any Steam game once while you are online; after that, installed games can start without a connection."
         }
     }
 }
@@ -4265,6 +4321,7 @@ enum LibraryKeyboard {
         fputs("[frontend-keyboard] key-window input activated\n", stderr)
     }
     static func hide() {
+        if window != nil { fputs("[frontend-keyboard] key-window input deactivated\n", stderr) }
         input?.releaseModifiers(); input?.resignFirstResponder(); window?.isHidden = true
         window = nil; input = nil; previous?.makeKey(); previous = nil
     }

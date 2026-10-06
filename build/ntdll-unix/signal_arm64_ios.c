@@ -3748,6 +3748,675 @@ static void *ios_mach_exception_thread( void *arg )
                                                      (uint64_t)state.__pc,
                                                      (uint64_t)fault_addr );
                     }
+                    /* STR (immediate, unsigned offset, 32-bit): 1011 1001 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xb9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* STRB (immediate, unsigned offset, 8-bit): 0011 1001 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x39000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* STRH (immediate, unsigned offset, 16-bit): 0111 1001 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x79000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* STP (signed offset, 64-bit): 10101001 00 imm7 Rt2 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xa9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        int rt2 = (insn >> 10) & 0x1f;
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
+                        *(uint64_t *)(rw_addr + 8) = IOS_STORE_SRC(rt2);
+                        emulated = 1;
+                    }
+                    /* STP (signed offset, 32-bit): 00101001 00 imm7 Rt2 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x29000000)
+                    {
+                        int rt = insn & 0x1f;
+                        int rt2 = (insn >> 10) & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
+                        *(uint32_t *)(rw_addr + 4) = (uint32_t)IOS_STORE_SRC(rt2);
+                        emulated = 1;
+                    }
+                    /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
+                    else if ((insn & 0xffe00c00) == 0xf8200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* STLR (Store-Release Register, 64-bit):
+                     *   1100 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0xc89ffc00)
+                     * Used by FEX's HandleUnalignedAccess backpatch
+                     * (`std::atomic_ref<uint32_t>(PC).store(..., release)` → STLR).
+                     * Without this we infinite-loop on unaligned atomic faults
+                     * because FEX can't patch its own JIT block on iOS RX-only memory. */
+                    else if ((insn & 0xfffffc00) == 0xc89ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint64_t *)rw_addr, IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* STLR (Store-Release Register, 32-bit):
+                     *   1000 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0x889ffc00)
+                     * Same use case — FEX's backpatch is a 32-bit instruction store. */
+                    else if ((insn & 0xfffffc00) == 0x889ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint32_t *)rw_addr, (uint32_t)IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* STLRH (Store-Release 16-bit):
+                     *   0100 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0x489ffc00) */
+                    else if ((insn & 0xfffffc00) == 0x489ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint16_t *)rw_addr, (uint16_t)IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* STLRB (Store-Release 8-bit):
+                     *   0000 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0x089ffc00) */
+                    else if ((insn & 0xfffffc00) == 0x089ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint8_t *)rw_addr, (uint8_t)IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* ml1231: STLURB/STLURH/STLUR (FEAT_LRCPC2, store-release with an
+                     * unscaled 9-bit offset), what FEX emits for guest stores once the
+                     * host reports LRCPC2:
+                     *   ss01 1001 000i iiii iiii 00nn nnnt tttt   (mask 0x3fe00c00, val 0x19000000)
+                     * fault_addr already includes the offset. A guest store can be
+                     * misaligned, so the bytes are copied after a release fence rather
+                     * than with an atomic store that could itself alignment-fault. */
+                    else if ((insn & 0x3fe00c00) == 0x19000000)
+                    {
+                        int rt = insn & 0x1f;
+                        uint64_t v = IOS_STORE_SRC(rt);
+                        __atomic_thread_fence(__ATOMIC_RELEASE);
+                        memcpy((void *)rw_addr, &v, 1u << (insn >> 30));
+                        emulated = 1;
+                    }
+                    /* STR (register, 32-bit): 1011 1000 001 Rm option S 10 Rn Rt */
+                    else if ((insn & 0xffe00c00) == 0xb8200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* STR (immediate, post/pre-index, 64-bit): 1111 1000 00 0imm9 0[10]1 Rn Rt */
+                    else if ((insn & 0xffe00000) == 0xf8000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
+                        emulated = 1;
+                        /* Post-index (bits 11:10 = 01) / pre-index (bits 11:10 = 11):
+                         * MUST update Rn += signed imm9. Without this, memcpy-style
+                         * loops would write the same address forever. */
+                        int idx_mode = (insn >> 10) & 3;  // bits 11:10
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;  // sign-extend 9-bit
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
+                    }
+                    /* STR (immediate, post/pre-index, 32-bit): 1011 1000 00 0imm9 0[10]1 Rn Rt */
+                    else if ((insn & 0xffe00000) == 0xb8000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                        int idx_mode = (insn >> 10) & 3;
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
+                    }
+                    /* STRB (immediate, post/pre-index, 8-bit): 0011 1000 00 0imm9 0[10]1 Rn Rt
+                     * Hits when iOS memcpy handles the trailing bytes after the
+                     * 8-byte D-store loop completes (660 bytes = 82*8 + 4 bytes
+                     * tail; the tail is byte-by-byte). */
+                    else if ((insn & 0xffe00000) == 0x38000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                        int idx_mode = (insn >> 10) & 3;
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
+                    }
+                    /* STRH (immediate, post/pre-index, 16-bit): 0111 1000 00 0imm9 0[10]1 Rn Rt */
+                    else if ((insn & 0xffe00000) == 0x78000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                        int idx_mode = (insn >> 10) & 3;
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, post/pre-index, D-reg = 64-bit):
+                     * 11 111 1 00 00 0 imm9 idx Rn Rt   — encoding 0xfc000400 base.
+                     * The fc008600 = `str d0, [x16], #8` from iOS memcpy hits
+                     * this when copying compiled FEX blocks to RX-only memory. */
+                    else if ((insn & 0xffe00000) == 0xfc000000 && (insn & 0xc00) != 0)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            /* Low 64 bits of the 128-bit Q-reg = D-reg. */
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 8);
+                            emulated = 1;
+                            int idx_mode = (insn >> 10) & 3;
+                            if (idx_mode == 1 || idx_mode == 3)
+                            {
+                                int rn = (insn >> 5) & 0x1f;
+                                int imm9 = (insn >> 12) & 0x1ff;
+                                if (imm9 & 0x100) imm9 |= ~0x1ff;
+                                state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            }
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, post/pre-index, S-reg = 32-bit):
+                     * 10 111 1 00 00 0 imm9 idx Rn Rt   — base 0xbc000400. */
+                    else if ((insn & 0xffe00000) == 0xbc000000 && (insn & 0xc00) != 0)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 4);
+                            emulated = 1;
+                            int idx_mode = (insn >> 10) & 3;
+                            if (idx_mode == 1 || idx_mode == 3)
+                            {
+                                int rn = (insn >> 5) & 0x1f;
+                                int imm9 = (insn >> 12) & 0x1ff;
+                                if (imm9 & 0x100) imm9 |= ~0x1ff;
+                                state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            }
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, post/pre-index, Q-reg = 128-bit):
+                     * 00 111 1 00 10 0 imm9 idx Rn Rt   — base 0x3c800400. */
+                    else if ((insn & 0xffe00000) == 0x3c800000 && (insn & 0xc00) != 0)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
+                            emulated = 1;
+                            int idx_mode = (insn >> 10) & 3;
+                            if (idx_mode == 1 || idx_mode == 3)
+                            {
+                                int rn = (insn >> 5) & 0x1f;
+                                int imm9 = (insn >> 12) & 0x1ff;
+                                if (imm9 & 0x100) imm9 |= ~0x1ff;
+                                state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            }
+                        }
+                    }
+                    /* SIMD/FP STUR (immediate, UNSCALED, Q-reg = 128-bit):
+                     * 00 111 1 00 10 0 imm9 00 Rn Rt   — 0x3c800000, bits[11:10]==00.
+                     * The pre/post-index branch above requires (insn & 0xc00) != 0,
+                     * so the unscaled form fell straight through to "undecoded" —
+                     * the [store-undecoded] "ADD THIS ENCODING" line in ml592.
+                     * NO writeback: unscaled STUR does not modify Rn (the
+                     * post-indexed encoding is 0x3c9f04c0, not 0x3c9f00c0). */
+                    else if ((insn & 0xffe00c00) == 0x3c800000)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
+                            emulated = 1;
+                        }
+                    }
+                    /* GPR STR (immediate, unsigned offset, 64-bit X-reg):
+                     *   1111 1001 00 imm12 Rn Rt   (base 0xf9000000, mask 0xffc00000)
+                     * Hits for `str xN, [xM, #imm]` and `str xN, [xM]` —
+                     * what the C compiler emits for `*ptr = uint64_value`.
+                     * Wine's PE loader / ARM64EC compiler-generated code triggers this
+                     * when initializing data in a page that's been mprotect'd RX-only
+                     * on iOS. fault_addr already includes the imm12 offset. */
+                    else if ((insn & 0xffc00000) == 0xf9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* GPR STR (immediate, unsigned offset, 32-bit W-reg):
+                     *   1011 1001 00 imm12 Rn Rt   (base 0xb9000000, mask 0xffc00000)
+                     * `*ptr32 = uint32_value` analogue. */
+                    else if ((insn & 0xffc00000) == 0xb9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* SIMD/FP STR (immediate, unsigned offset, D-reg): 11 111 1 01 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xfd000000)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 8);
+                            emulated = 1;
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, unsigned offset, S-reg): 10 111 1 01 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xbd000000)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 4);
+                            emulated = 1;
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, unsigned offset, Q-reg): 00 111 1 01 10 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x3d800000)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
+                            emulated = 1;
+                        }
+                    }
+                    /* ml350: STRB (register offset): 0011 1000 001 Rm opt S 10 Rn Rt
+                     * (mask 0xffe00c00, val 0x38200800). FEX's own STLRB backpatch
+                     * rewrites to DMB+`strb wN,[xM,xzr]` — chrome_elf writing its
+                     * interception thunk bytes to an anon-RWX page hit this and
+                     * looped (ml349: insn 0x383f68c8). fault_addr is already the
+                     * final address; no base/offset math needed. */
+                    else if ((insn & 0xffe00c00) == 0x38200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* ml350: STRH (register offset): 0111 1000 001 ... (val 0x78200800) */
+                    else if ((insn & 0xffe00c00) == 0x78200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
+                        emulated = 1;
+                    }
+                    /* ml1276: SIMD&FP STR (register offset), B/H/S/D/Q:
+                     *   size 111 1 00 opc(1)0 1 Rm option S 10 Rn Rt
+                     *   mask 0x3f600c00, value 0x3c200800; opc<1> picks Q (size 00 only).
+                     * FEX addresses 32-bit guest memory as [x19, wN, uxtw] (x19 = the
+                     * guest window), so a guest SSE store becomes STR qN, [x19, wM, uxtw].
+                     * Terraria's Mono x86 JIT copied into its RWX code buffer with one
+                     * (0x3cab4a70) and, undecoded, looped through FEX's SMC handler 2000
+                     * times: FEX re-granted RWX, the alias page stays physically RX.
+                     * The address is taken from the registers rather than fault_addr,
+                     * which need not be the start of an access that crosses into the
+                     * faulting page; each 16 KB page of the destination takes its own
+                     * alias, and the store is refused unless all of it has one. */
+                    else if ((insn & 0x3f600c00) == 0x3c200800)
+                    {
+                        const unsigned size = insn >> 30;
+                        const unsigned bytes = ((insn >> 23) & 1) ? (size == 0 ? 16u : 0u) : (1u << size);
+                        const unsigned option = (insn >> 13) & 7;
+                        const int rt = insn & 0x1f, rn = (insn >> 5) & 0x1f, rm = (insn >> 16) & 0x1f;
+
+                        if (have_neon && bytes && (option & 2))  /* option<1> = 0 is unallocated */
+                        {
+                            uint64_t off = IOS_STORE_SRC(rm), ea, a;
+                            uintptr_t part_rw[2];
+                            unsigned part_len[2], parts = 0, done = 0, i;
+
+                            if (option == 2) off = (uint32_t)off;                        /* UXTW */
+                            else if (option == 6) off = (uint64_t)(int64_t)(int32_t)off; /* SXTW */
+                            if (insn & 0x1000) off <<= __builtin_ctz(bytes);
+                            ea = (rn == 31 ? state.__sp : state.__x[rn]) + off;
+                            while (done < bytes && parts < 2)
+                            {
+                                unsigned len = bytes - done;
+                                a = ea + done;
+                                if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
+                                part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
+                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                if (!part_rw[parts]) break;
+                                part_len[parts++] = len;
+                                done += len;
+                            }
+                            if (done == bytes)
+                            {
+                                const uint8_t *src = (const uint8_t *)&neon_state.__v[rt];
+                                for (i = 0, done = 0; i < parts; done += part_len[i], i++)
+                                    memcpy( (void *)part_rw[i], src + done, part_len[i] );
+                                emulated = 1;
+                            }
+                            {
+                                static int simd_reg_n;
+                                if (simd_reg_n < 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[simd-str-reg] ml1276 #%d insn=0x%08x bytes=%u ea=0x%llx fault=0x%llx parts=%u %s\n",
+                                        ++simd_reg_n, insn, bytes, (unsigned long long)ea,
+                                        (unsigned long long)fault_addr, parts,
+                                        emulated ? "emulated" : "REFUSED: a page of the store has no alias");
+                            }
+                        }
+                    }
+                    /* ml1283: the immediate-offset pair and SIMD&FP stores the cases above
+                     * miss, with the base writeback the indexed forms need:
+                     *   STP/STNP Wt|Xt, post-index, pre-index, non-temporal:
+                     *     sf 0 101 0 0 mode(2) 0 imm7 Rt2 Rn Rt, mask 0x7e400000 val 0x28000000
+                     *     (mode 10, signed offset, is matched earlier);
+                     *   SIMD&FP STUR and STR post-/pre-index, B/H/S/D/Q:
+                     *     size 111 1 00 opc(1)0 0 imm9 mode(2) Rn Rt, mask 0x3f600000 val 0x3c000000
+                     *     (mode 00 unscaled, 01 post, 11 pre; 10 is unallocated).
+                     * A 64-bit .NET program reached both, each an access violation while
+                     * undecoded: ntdll's own STP X9, X8, [X10, #0x80]! (0xa9882149)
+                     * initialising a critical section mscoree had placed in RWX memory,
+                     * and Mono's x86 JIT writing a float into its code buffer, translated
+                     * as STUR S0, [X19, #41] (0xbc029260). As ml1276: the address comes from
+                     * the registers, each 16 KB page takes its own alias, the store is
+                     * refused unless all of it has one, and Rn is written back only after
+                     * the whole store. Rn == 31 is SP. */
+                    else if (((insn & 0x7e400000) == 0x28000000 && ((insn >> 23) & 3) != 2)
+                             || ((insn & 0x3f600000) == 0x3c000000 && ((insn >> 10) & 3) != 2))
+                    {
+                        const int pair = (insn & 0x3c000000) == 0x28000000;
+                        const int rt = insn & 0x1f, rn = (insn >> 5) & 0x1f;
+                        uint8_t src[16];
+                        unsigned bytes = 0;
+                        int64_t imm = 0;
+                        int post = 0, wb = 0;
+
+                        if (pair)
+                        {
+                            const unsigned mode = (insn >> 23) & 3;   /* 0 stnp, 1 post, 3 pre */
+                            const unsigned elem = (insn >> 31) ? 8u : 4u;
+                            int64_t imm7 = (int64_t)((insn >> 15) & 0x7f);
+                            uint64_t a = IOS_STORE_SRC(rt), b = IOS_STORE_SRC((insn >> 10) & 0x1f);
+                            if (imm7 & 0x40) imm7 -= 0x80;
+                            imm = imm7 * (int64_t)elem;
+                            post = mode == 1;
+                            wb = mode == 1 || mode == 3;
+                            bytes = 2 * elem;
+                            memcpy( src, &a, elem );
+                            memcpy( src + elem, &b, elem );
+                        }
+                        else if (have_neon)
+                        {
+                            const unsigned size = insn >> 30, mode = (insn >> 10) & 3;
+                            int64_t imm9 = (int64_t)((insn >> 12) & 0x1ff);
+                            if (imm9 & 0x100) imm9 -= 0x200;
+                            imm = imm9;
+                            post = mode == 1;
+                            wb = mode != 0;
+                            bytes = ((insn >> 23) & 1) ? (size == 0 ? 16u : 0u) : (1u << size);
+                            memcpy( src, &neon_state.__v[rt], 16 );
+                        }
+                        if (bytes)
+                        {
+                            const uint64_t base = rn == 31 ? state.__sp : state.__x[rn];
+                            const uint64_t ea = post ? base : base + (uint64_t)imm;
+                            uint64_t a;
+                            uintptr_t part_rw[2];
+                            unsigned part_len[2], parts = 0, done = 0, i;
+
+                            while (done < bytes && parts < 2)
+                            {
+                                unsigned len = bytes - done;
+                                a = ea + done;
+                                if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
+                                part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
+                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                if (!part_rw[parts]) break;
+                                part_len[parts++] = len;
+                                done += len;
+                            }
+                            if (done == bytes)
+                            {
+                                for (i = 0, done = 0; i < parts; done += part_len[i], i++)
+                                    memcpy( (void *)part_rw[i], src + done, part_len[i] );
+                                if (wb)
+                                {
+                                    if (rn == 31) state.__sp = base + (uint64_t)imm;
+                                    else          state.__x[rn] = base + (uint64_t)imm;
+                                }
+                                emulated = 1;
+                            }
+                            {
+                                static int imm_store_n;
+                                if (imm_store_n < 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[imm-store] ml1283 #%d insn=0x%08x %s bytes=%u ea=0x%llx fault=0x%llx%s %s\n",
+                                        ++imm_store_n, insn, pair ? "stp" : "simd", bytes,
+                                        (unsigned long long)ea, (unsigned long long)fault_addr,
+                                        wb ? " (writeback)" : "",
+                                        emulated ? "emulated" : "REFUSED: a page of the store has no alias");
+                            }
+                        }
+                    }
+                    /* ml1284: STXR / STLXR Ws, Wt|Xt, [Xn] into an aliased page.
+                     *   size 001000 0 0 0 Rs o0 11111 Rn Rt, mask 0x3fe07c00 val 0x08007c00
+                     * The paired LDXR/LDAXR read the RX view and succeeded; only the store
+                     * faults, so the exclusive monitor never sees it and replaying it as a
+                     * plain store would lose a racing update. ntdll's RtlEnterCriticalSection
+                     * (LDAXR W9, [X8]; ADD W10, W9, #1; STLXR W11, W10, [X8]) reached this on
+                     * a critical section a 64-bit .NET runtime keeps in its RWX memory.
+                     * The LL/SC pair becomes a compare-and-swap on the RW alias: the expected
+                     * value is the register the matching load filled, found by scanning back
+                     * at most 8 instructions for an LDXR/LDAXR of the same Rn and size. An
+                     * ADD/SUB(S) immediate between that updates that register in place (the
+                     * InterlockedDecrement shape LDAXR W9; SUBS W9, W9, #1; STLXR W10, W9 of
+                     * RtlLeaveCriticalSection) is undone to recover the loaded value; any
+                     * other instruction that may write it (anything but a branch on it)
+                     * refuses the emulation. Ws = 0 when the swap succeeds and
+                     * 1 when the value changed, so the guest's loop retries as on hardware.
+                     * Every write to such a page traps and is handled on the one Mach
+                     * exception thread, and the CAS is a real atomic on the shared pages. */
+                    else if ((insn & 0x3fe07c00) == 0x08007c00)
+                    {
+                        const unsigned size = insn >> 30;
+                        const int rs = (insn >> 16) & 0x1f, rn = (insn >> 5) & 0x1f, rt = insn & 0x1f;
+                        const uint64_t mask = size == 3 ? ~0ull : ((1ull << (8u << size)) - 1);
+                        const uint64_t ea = rn == 31 ? state.__sp : state.__x[rn];
+                        int ld_rt = -1, k, clobbered = 0;
+                        uint64_t delta = 0;   /* what in-place ADD/SUB immediates added to it */
+                        uint32_t prev;
+
+                        for (k = 1; k <= 8 && ld_rt < 0 && !clobbered; k++)
+                        {
+                            if (!ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc - 4u * k, &prev )) break;
+                            if ((prev & 0x3fff7c00) == 0x085f7c00 && (prev >> 30) == size
+                                && (int)((prev >> 5) & 0x1f) == rn)
+                                ld_rt = prev & 0x1f;                       /* LDXR / LDAXR */
+                        }
+                        if (ld_rt >= 0 && ld_rt != 31)
+                        {
+                            for (k = k - 2; k >= 1 && !clobbered; k--)  /* the instructions between */
+                            {
+                                if (!ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc - 4u * k, &prev )) { clobbered = 1; break; }
+                                if ((int)(prev & 0x1f) != ld_rt) continue;
+                                if ((prev & 0x7e000000) == 0x34000000          /* CBZ / CBNZ */
+                                    || (prev & 0x7e000000) == 0x36000000       /* TBZ / TBNZ */
+                                    || (prev & 0xff000010) == 0x54000000)      /* B.cond */
+                                    continue;
+                                /* ADD/SUB(S) immediate, Rd == Rn == the loaded register, at the
+                                 * load's width: sf op S 100010 sh imm12 Rn Rd */
+                                if ((prev & 0x1f800000) == 0x11000000 && (int)((prev >> 5) & 0x1f) == ld_rt
+                                    && (prev >> 31) == (size == 3))
+                                {
+                                    uint64_t imm = (prev >> 10) & 0xfff;
+                                    if (prev & 0x400000) imm <<= 12;
+                                    delta += (prev & 0x40000000) ? (uint64_t)0 - imm : imm;
+                                    continue;
+                                }
+                                clobbered = 1;
+                            }
+                        }
+                        if (ld_rt >= 0 && ld_rt != 31 && !clobbered && rw_addr && !(ea & ((1u << size) - 1))
+                            && (uint64_t)fault_addr == ea)
+                        {
+                            const uint64_t expect = (state.__x[ld_rt] - delta) & mask, val = IOS_STORE_SRC(rt) & mask;
+                            int ok = 0;
+                            switch (size)
+                            {
+                            case 0: { uint8_t  e = (uint8_t)expect;  ok = __atomic_compare_exchange_n( (uint8_t  *)rw_addr, &e, (uint8_t)val,  0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            case 1: { uint16_t e = (uint16_t)expect; ok = __atomic_compare_exchange_n( (uint16_t *)rw_addr, &e, (uint16_t)val, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            case 2: { uint32_t e = (uint32_t)expect; ok = __atomic_compare_exchange_n( (uint32_t *)rw_addr, &e, (uint32_t)val, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            default:{ uint64_t e = expect;           ok = __atomic_compare_exchange_n( (uint64_t *)rw_addr, &e, val,           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            }
+                            if (rs != 31) state.__x[rs] = ok ? 0 : 1;
+                            emulated = 1;
+                        }
+                        {
+                            static int excl_n;
+                            if (excl_n < 8)
+                                dprintf(STDERR_FILENO,
+                                    "[excl-store] ml1284 #%d insn=0x%08x size=%u ea=0x%llx load-reg=%d delta=%lld%s %s\n",
+                                    ++excl_n, insn, 1u << size, (unsigned long long)ea, ld_rt,
+                                    (long long)delta, clobbered ? " (overwritten)" : "",
+                                    emulated ? (rs != 31 && state.__x[rs] ? "emulated: value changed, retry" : "emulated")
+                                             : "REFUSED: no matching LDXR/LDAXR");
+                        }
+                    }
+
+
+                    /* iOS-Madeira ml626: SWP{A}{L}{B,H} — ATOMIC SWAP.
+                     *
+                     * Encoding (atomic memory operation, o3=1 opc=000):
+                     *   size(2) 111 V=0 00 A R 1 Rs(5) o3=1 opc(3)=000 00 Rn(5) Rt(5)
+                     *   mask 0x3F20FC00, value 0x38208000
+                     * Semantics: old = mem[Rn]; mem[Rn] = Rs; Rt = old.
+                     *
+                     * ULTRAKILL/Mono reached this as `SWPAL X26, X26, [X6]`
+                     * (insn 0xf8fa80da) writing into its own JIT code buffer. The alias
+                     * resolved correctly (the ml350 discriminator said so) but there was
+                     * no decode, so the write never completed and the ml461 guard counted
+                     * 2,000 identical redeliveries before terminating the process.
+                     *
+                     * ⚠️ THIS MUST BE GENUINELY ATOMIC. FEX emits SWPAL precisely to
+                     * preserve an x86 LOCK XCHG; a read-then-write here would silently
+                     * drop that guarantee — the same defect already on record against the
+                     * #71 unaligned-atomic emulator. __ATOMIC_SEQ_CST is STRONGER than
+                     * SWPAL's acquire-release, which is safe rather than wrong. The RW
+                     * alias maps the SAME physical pages as the faulting RX view, so the
+                     * atomic applies to the memory the guest actually shares.
+                     *
+                     * ⛔ Deliberately NOT extended to LDADD/LDCLR/LDSET/CAS here. Those
+                     * encodings appear in this run only AFTER the SWPAL was mishandled,
+                     * inside FEX's exception path, so they are probably fallout. A wide
+                     * speculative decoder carries more correctness surface than this
+                     * blocker justifies — add families when they actually appear. */
+                    else if ((insn & 0x3F20FC00) == 0x38208000)
+                    {
+                        int size_lg2 = (insn >> 30) & 0x3;
+                        int rs = (insn >> 16) & 0x1f;   /* value to store  */
+                        int rt = insn & 0x1f;           /* old value lands here */
+                        uint64_t align_mask = (1ULL << size_lg2) - 1;
+
+                        /* An unaligned atomic cannot be emulated atomically. Fall through
+                         * to the discriminator rather than quietly doing something weaker. */
+                        if (rw_addr & align_mask)
+                        {
+                            static int swp_unalign_n;
+                            if (swp_unalign_n < 4)
+                                dprintf(STDERR_FILENO,
+                                    "[swp-emul] ml626 #%d REFUSING unaligned atomic: insn=0x%08x size=%d "
+                                    "addr=0x%llx rw=0x%llx\n",
+                                    ++swp_unalign_n, insn, 1 << size_lg2,
+                                    (unsigned long long)fault_addr, (unsigned long long)rw_addr);
+                        }
+                        else
+                        {
+                            uint64_t in = (rs == 31) ? 0 : state.__x[rs];
+                            uint64_t old;
+                            switch (size_lg2)
+                            {
+                            case 0:  old = __atomic_exchange_n((uint8_t  *)rw_addr, (uint8_t )in, __ATOMIC_SEQ_CST); break;
+                            case 1:  old = __atomic_exchange_n((uint16_t *)rw_addr, (uint16_t)in, __ATOMIC_SEQ_CST); break;
+                            case 2:  old = __atomic_exchange_n((uint32_t *)rw_addr, (uint32_t)in, __ATOMIC_SEQ_CST); break;
+                            default: old = __atomic_exchange_n((uint64_t *)rw_addr,           in, __ATOMIC_SEQ_CST); break;
+                            }
+                            if (rt != 31) state.__x[rt] = old;  /* XZR discards the result */
+                            emulated = 1;
+
+                            /* ml648: THIS is Mono's backpatcher, and this is the fault
+                             * FEX has never been allowed to see.
+                             *
+                             * On Windows the write traps, HandleRWXAccessViolation runs,
+                             * DetectMonoBackpatcherBlock recognises the XCHG and recompiles
+                             * the block so the store becomes a direct MonoBackpatcherWrite
+                             * call — no fault at all. On iOS we emulate here first, so that
+                             * optimisation has never once fired: [mono-cfg] says HOOKS
+                             * ARMED yet "Detected mono backpatcher" appears zero times,
+                             * and the bill is 40,639 exceptions/sec mean, 88,064 peak.
+                             *
+                             * Record RAW FACTS ONLY. No guest-RIP reconstruction, no opcode
+                             * decode, no allocation, no formatting, no locks, and above all
+                             * no call into ARM64EC code (ml613 crashed every launch doing
+                             * that). x28 is FEX's state frame, x18 the TEB; both are just
+                             * numbers here and are treated as untrusted. Everything is
+                             * interpreted later at the FEX safe point. */
+                            if (size_lg2 == 3)
+                                ios_mono_bridge_capture( state.__x[18], state.__x[28],
+                                                         (uint64_t)state.__pc,
+                                                         (uint64_t)fault_addr );
+                            {
+                                static int swp_n;
+                                if (swp_n < 8)
+                                    dprintf(STDERR_FILENO,
+                                        "[swp-emul] ml626 #%d insn=0x%08x size=%d Rs=x%d Rt=x%d addr=0x%llx "
+                                        "rw=0x%llx in=0x%llx old=0x%llx\n",
+                                        ++swp_n, insn, 1 << size_lg2, rs, rt,
+                                        (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                        (unsigned long long)in, (unsigned long long)old);
+                            }
+                        }
+                    }
+                    /* FEX's native backpatch lock uses CASAL on the pool RX
+                     * view. Handle it before Mach-to-guest delivery; otherwise
+                     * a host-runtime fault escapes into the guest's VEH.
+                     * Deliberately limited to full-width accesses within the
+                     * existing pool alias; no new mapping or permission grant. */
+                    if (!emulated && in_jit &&
+                        (insn & 0xbfa07c00u) == 0x88a07c00u)
+                    {
+                        unsigned cas_width = (insn & 0x40000000u) ? 8 : 4;
+                        if (sz >= cas_width && fault_addr - rx <= sz - cas_width &&
+                            ios_mach_emulate_cas(insn, rw_addr, state.__x))
+                        {
+                            static unsigned cas_mach_logs;
+                            emulated = 1;
+                            if (cas_mach_logs++ < 16)
+                                dprintf(STDERR_FILENO,
+                                        "[mach-cas] insn=%08x pc=%llx addr=%llx rw=%llx width=%u\n",
+                                        insn, (unsigned long long)fault_pc,
+                                        (unsigned long long)fault_addr,
+                                        (unsigned long long)rw_addr, cas_width);
+                        }
+                    }
                     /* ml350 DISCRIMINATOR: alias EXISTS but the instruction is not
                      * in this decode list — every such miss previously cost a full
                      * run to name (ml349's STRB-reg took one). Print the insn so

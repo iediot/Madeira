@@ -1,11 +1,11 @@
 diff --git a/LICENSE-MADEIRA.md b/LICENSE-MADEIRA.md
-index df45a9e6..8e8d72c0 100644
+index fd2bc64a..60ee828d 100644
 --- a/LICENSE-MADEIRA.md
 +++ b/LICENSE-MADEIRA.md
-@@ -55,6 +55,18 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
-     above and came first; it is recorded as merged with no change of its own.
-   - Author bahacan16, merged on 2026-10-06: `67b8c8bed51` (xinput1_3 iOS:
-     send XInputSetState motors to the host pad, pull request #20).
+@@ -58,6 +58,18 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
+   - Author spitefulowl, merged on 2026-10-06: `000cac48452` (mscoree iOS:
+     cooperative thread suspend and keep-delegates for Wine Mono, pull request
+     #26).
 +  - opengl32: OpenGL ES contexts for Madeira's winios WGL driver
 +    (`dlls/opengl32/unix_wgl.c`) and the fixed low image base limited to x86
 +    builds (`dlls/opengl32/Makefile.in`). Author: Connor Gow, written with AI
@@ -22,10 +22,10 @@ index df45a9e6..8e8d72c0 100644
  The LGPL permits combining this library with proprietary components (such
  as Apple's Metal Shader Converter) subject to LGPL-2.1 section 6; see the
 diff --git a/dlls/mscoree/metahost.c b/dlls/mscoree/metahost.c
-index 0e34d738..9cd4b962 100644
+index 143915d3..bfee8251 100644
 --- a/dlls/mscoree/metahost.c
 +++ b/dlls/mscoree/metahost.c
-@@ -711,7 +711,9 @@ HRESULT ICLRRuntimeInfo_GetRuntimeHost(ICLRRuntimeInfo *iface, RuntimeHost **res
+@@ -791,7 +791,9 @@ HRESULT ICLRRuntimeInfo_GetRuntimeHost(ICLRRuntimeInfo *iface, RuntimeHost **res
  
  #ifdef __i386__
  static const WCHAR libmono2_arch_dll[] = {'\\','b','i','n','\\','l','i','b','m','o','n','o','-','2','.','0','-','x','8','6','.','d','l','l',0};

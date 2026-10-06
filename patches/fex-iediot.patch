@@ -1,5 +1,5 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index be54311..bc15a58 100644
+index 26a039f..c5adc89 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -121,6 +121,160 @@ static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
@@ -173,40 +173,7 @@ index be54311..bc15a58 100644
  
  #ifdef FEX_IOS_HOST
    /* ml648: consume any pending Mono-backpatcher event.
-@@ -1464,6 +1621,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
-   }
- #endif
- 
-+#ifdef FEX_IOS_HOST
-   /* iOS-Madeira ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.
-    *
-    * ml302 proved the JITCallback prologue writes the bad State.rip, and ml303 added an LR witness --
-@@ -1514,6 +1672,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
-                         IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);
-     }
-   }
-+#endif
- 
-   /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
-    * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
-@@ -1966,6 +2125,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
-        * automatically healthy contention — it can equally be page reuse or a
-        * foreign writer, so check block_index/list_size against block_count before
-        * concluding anything. */
-+#ifndef __APPLE__
-+      /* rpmalloc is only linked into the Windows modules; FEX's CMake disables it on Apple hosts. */
-       {
-         rpm_cas_snapshot Snap;
-         if (rpm_cas_snapshot_take(&Snap)) {
-@@ -1979,6 +2140,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
-                             Snap.fail_changed, Snap.fail_unchanged, Snap.fail_invalid);
-         }
-       }
-+#endif
-     }
-   }
- 
-@@ -2148,6 +2310,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+@@ -2154,6 +2311,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
  
    // iOS-Madeira: cache miss reached — count as true compile.
    __sync_add_and_fetch(&g_cb_real_compiles, 1);
@@ -216,7 +183,7 @@ index be54311..bc15a58 100644
  
    // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
-@@ -2435,6 +2600,27 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
+@@ -2441,6 +2601,27 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
  void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
    auto Thread = Frame->Thread;
    auto CTX = static_cast<ContextImpl*>(Thread->CTX);
@@ -244,7 +211,7 @@ index be54311..bc15a58 100644
    {
      auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
  
-@@ -2457,6 +2643,15 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
+@@ -2463,6 +2644,15 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
        Dest = RW;
      }
      ios_fex_mono_count_helper(RW ? 0 : 1);
@@ -521,29 +488,10 @@ index ffa2709..19ddcf2 100644
      L1Entry.HostCode = Entry.HostCode;
  
 diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
-index b2eca70..9760560 100644
+index 3342190..7c18d01 100644
 --- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
 +++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
-@@ -704,6 +704,7 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
-    * which we DUAL-MAP (RW alias + RX alias). Aliased mappings are exactly where atomics
-    * can fault despite correct alignment. Report what the region actually is, so "guest
-    * data in a dual-mapped pool page" is distinguishable from ordinary private memory. */
-+#ifdef _WIN32
-   MEMORY_BASIC_INFORMATION mbi {};
-   const char* type = "?";
-   if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
-@@ -714,6 +715,10 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
-                     Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
-                     (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
-                     mbi.Protect, type, mbi.State);
-+#else
-+  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={}",
-+                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15);
-+#endif
- }
- 
- static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
-@@ -2322,13 +2327,14 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+@@ -2329,13 +2329,14 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
    // thread identity into the word (waiters only ever test zero/nonzero); on
    // timeout, emulate this one access with the same helpers the !IsJIT path
    // uses and leave the code unpatched.
@@ -645,7 +593,7 @@ index fbaf76f..4af7c0f 100644
      OvercommitTracker->MarkRange(Start, Length);
    }
 diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
-index 081d7cb..37bedd6 100644
+index 7f0ed3d..3edd414 100644
 --- a/Source/Windows/Common/InvalidationTracker.cpp
 +++ b/Source/Windows/Common/InvalidationTracker.cpp
 @@ -109,6 +109,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
@@ -663,7 +611,7 @@ index 081d7cb..37bedd6 100644
  
      if (EffectiveExec) {
        XIntervals.Insert(ProtInterval);
-@@ -491,6 +499,26 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+@@ -513,6 +521,26 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
    const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
      std::shared_lock Lock(IntervalsLock);
      if (!RWXIntervals.Query(Address).Enclosed) {
@@ -690,7 +638,7 @@ index 081d7cb..37bedd6 100644
        return {false, 0};
      }
      return {true, GetUntrapProt(Address)};
-@@ -507,7 +535,16 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+@@ -529,7 +557,16 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
        ULONG TmpProt;
        void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
        SIZE_T TmpSize = 1;
@@ -708,7 +656,7 @@ index 081d7cb..37bedd6 100644
      }
      DetectMonoBackpatcherBlock(Thread, HostPc);
      return true;
-@@ -819,7 +856,18 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+@@ -856,7 +893,18 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
        void* TmpAddress = reinterpret_cast<void*>(Address);
        SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
        ULONG TmpProt;
