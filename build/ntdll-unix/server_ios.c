@@ -2955,6 +2955,7 @@ static struct ios_fd_cache *ios_get_fd_cache(void)
  * its cached fds and pinned the unlinked inodes behind them. */
 void ios_fd_cache_release( void *peb )
 {
+    { extern void ios_dir_cache_release( void *peb ); ios_dir_cache_release( peb ); }
     { extern void ios_inproc_cache_release( void *peb ); ios_inproc_cache_release( peb ); }   /* ml1058 */
     int i, j, n, closed = 0;
     struct ios_fd_cache *c = NULL;

@@ -83,6 +83,194 @@ index 3f8a7549..3361f1e3 100644
      {
          WARN( "Could not allocate %#Ix bytes, status %#lx\n", *region_size, status );
          return NULL;
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index b2f445e0..4746d432 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -238,8 +238,21 @@ static const unsigned int dir_data_buffer_initial_size = 4096;
+ static const unsigned int dir_data_cache_initial_size  = 256;
+ static const unsigned int dir_data_names_initial_size  = 64;
+ 
++#ifdef WINE_IOS
++/* Server cache indexes belong to a Windows process, not the host process.
++ * All threads of a pseudo-process must share its scan positions. */
++struct ios_dir_cache
++{
++    struct ios_dir_cache *next;
++    void *peb;
++    struct dir_data **entries;
++    unsigned int size;
++};
++static struct ios_dir_cache *ios_dir_caches;
++#else
+ static struct dir_data **dir_data_cache;
+ static unsigned int dir_data_cache_size;
++#endif
+ 
+ static BOOL show_dot_files;
+ static mode_t start_umask;
+@@ -583,6 +596,53 @@ static void free_dir_data( struct dir_data *data )
+     free( data );
+ }
+ 
++#ifdef WINE_IOS
++/* Child boot runs before it has a TEB. Serialize its host cwd change with
++ * enumeration's opendir(".") / relative stat / cwd restoration sequence. */
++int ios_set_child_unix_cwd( int fd )
++{
++    int ret, error;
++    pthread_mutex_lock( &dir_mutex );
++    ret = fchdir( fd );
++    error = errno;
++    pthread_mutex_unlock( &dir_mutex );
++    errno = error;
++    return ret;
++}
++
++/* Caller holds dir_mutex, including throughout each enumeration. */
++static struct ios_dir_cache *ios_get_dir_cache( void )
++{
++    void *peb = NtCurrentTeb()->Peb;
++    struct ios_dir_cache *cache;
++    for (cache = ios_dir_caches; cache; cache = cache->next)
++        if (cache->peb == peb) return cache;
++    if (!(cache = calloc( 1, sizeof(*cache) ))) return NULL;
++    cache->peb = peb;
++    cache->next = ios_dir_caches;
++    ios_dir_caches = cache;
++    return cache;
++}
++
++void ios_dir_cache_release( void *peb )
++{
++    struct ios_dir_cache **link, *cache;
++    unsigned int i;
++    pthread_mutex_lock( &dir_mutex );
++    for (link = &ios_dir_caches; (cache = *link); link = &cache->next)
++        if (cache->peb == peb)
++        {
++            *link = cache->next;
++            for (i = 0; i < cache->size; i++) free_dir_data( cache->entries[i] );
++            free( cache->entries );
++            free( cache );
++            break;
++        }
++    pthread_mutex_unlock( &dir_mutex );
++}
++#endif
++
++
+ 
+ /* support for a directory queue for filesystem searches */
+ 
+@@ -2828,6 +2888,12 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
+     int entry = -1, free_entries[16];
+     unsigned int status;
+     BOOLEAN fresh_handle;
++#ifdef WINE_IOS
++    struct ios_dir_cache *cache = ios_get_dir_cache();
++    if (!cache) return STATUS_NO_MEMORY;
++#define dir_data_cache (cache->entries)
++#define dir_data_cache_size (cache->size)
++#endif
+ 
+     SERVER_START_REQ( get_directory_cache_entry )
+     {
+@@ -2885,6 +2951,11 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
+     if (restart_scan && *data_ret) (*data_ret)->pos = 0;
+     return status;
+ }
++#ifdef WINE_IOS
++#undef dir_data_cache
++#undef dir_data_cache_size
++#endif
++
+ 
+ 
+ /******************************************************************************
+@@ -2897,8 +2968,14 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
+ {
+     int cwd, fd, needs_close;
+     enum server_fd_type type;
+-    struct dir_data *data;
++    struct dir_data *data = NULL;
+     unsigned int status;
++#ifdef WINE_IOS
++    sigset_t sigset;
++    char content_path[PATH_MAX];
++    BOOL trace_content = FALSE;
++    unsigned int returned = 0;
++#endif
+ 
+     TRACE("(%p %p %p %p %p %p 0x%08x 0x%08x 0x%08x %s 0x%08x\n",
+           handle, event, apc_routine, apc_context, io, buffer,
+@@ -2945,10 +3022,20 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
+         return STATUS_INVALID_PARAMETER;
+     }
+ 
++#ifdef WINE_IOS
++    if (fcntl( fd, F_GETPATH, content_path ) != -1)
++        trace_content = strcasestr( content_path, "/Content" ) != NULL;
++#endif
+     io->Information = 0;
+     if (mask && mask->Length == 0) mask = NULL;
+ 
++#ifdef WINE_IOS
++    /* A closed server pipe must not strand this shared lock or the temporary
++     * Unix cwd. Defer thread exit until both have been restored. */
++    server_enter_uninterrupted_section( &dir_mutex, &sigset );
++#else
+     mutex_lock( &dir_mutex );
++#endif
+ 
+     cwd = open( ".", O_RDONLY );
+     if (fchdir( fd ) != -1)
+@@ -2959,7 +3046,20 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
+ 
+             while (!status && data->pos < data->count)
+             {
++#ifdef WINE_IOS
++                ULONG_PTR before = io->Information;
++#endif
+                 status = get_dir_data_entry( data, buffer, io, length, info_class, &last_info );
++#ifdef WINE_IOS
++                if (io->Information != before)
++                {
++                    returned++;
++                    if (trace_content && !strcasecmp( data->names[data->pos].unix_name, "PixelShader.xnb" ))
++                        ERR( "[content-enum] pid=%lx handle=%p returned name=%s\n",
++                             (unsigned long)GetCurrentProcessId(), handle,
++                             debugstr_w(data->names[data->pos].long_name) );
++                }
++#endif
+                 if (!status || status == STATUS_BUFFER_OVERFLOW) data->pos++;
+                 if (single_entry && last_info) break;
+             }
+@@ -2972,11 +3072,24 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
+     else status = errno_to_status( errno );
+ 
+     if (status != STATUS_NO_SUCH_FILE) io->Status = status;
++#ifdef WINE_IOS
++    if (trace_content)
++        ERR( "[content-enum] pid=%lx peb=%p handle=%p path=%s mask=%s cached_mask=%s class=%u single=%u restart=%u length=%lu status=%08x bytes=%lu returned=%u cached=%u pos=%u\n",
++             (unsigned long)GetCurrentProcessId(), NtCurrentTeb()->Peb, handle, content_path,
++             debugstr_us(mask), data ? debugstr_us(&data->mask) : "(none)", info_class,
++             single_entry, restart_scan, (unsigned long)length, status,
++             (unsigned long)io->Information, returned, data ? data->count : 0, data ? data->pos : 0 );
++#endif
+ 
++#ifndef WINE_IOS
+     mutex_unlock( &dir_mutex );
++#endif
+ 
+     if (needs_close) close( fd );
+     if (cwd != -1) close( cwd );
++#ifdef WINE_IOS
++    server_leave_uninterrupted_section( &dir_mutex, &sigset );
++#endif
+     TRACE( "=> %x (%ld)\n", status, io->Information );
+     return status;
+ }
 diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
 index e617138e..ea201969 100644
 --- a/dlls/ntdll/unix/socket.c
@@ -15516,6 +15704,58 @@ index 00dfd96a..3264a844 100644
          .max_formats = params32->max_formats,
      };
      NTSTATUS status;
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index e57e32a7..299c6e35 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1113,6 +1113,26 @@ static VkResult win32u_vkGetMemoryWin32HandlePropertiesKHR( VkDevice client_devi
+     return VK_SUCCESS;
+ }
+ 
++#ifdef WINE_IOS
++/* Raw stderr survives Madeira's quiet Wine-channel filter. Log every map so
++ * an allocation later involved in a fault is not lost to a sampling cap. */
++static void ios_vulkan_note_map( struct device_memory *memory, const VkMemoryMapInfoKHR *info,
++                                VkResult result, void *data, const char *path )
++{
++    MEMORY_BASIC_INFORMATION mbi = {0};
++    NTSTATUS status = data ? NtQueryVirtualMemory( GetCurrentProcess(), data, MemoryBasicInformation,
++                                                   &mbi, sizeof(mbi), NULL ) : STATUS_INVALID_PARAMETER;
++    fprintf( stderr, "[vulkan-map] tid=%04x memory=%#llx host=%#llx offset=%#llx size=%#llx "
++             "allocation=%#llx path=%s result=%d ptr=%p query=%#x base=%p region=%#lx state=%#lx protect=%#lx\n",
++             (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
++             (unsigned long long)info->memory, (unsigned long long)memory->obj.host.device_memory,
++             (unsigned long long)info->offset, (unsigned long long)info->size,
++             (unsigned long long)memory->size, path, result, data, (unsigned)status,
++             mbi.BaseAddress, (unsigned long)mbi.RegionSize, (unsigned long)mbi.State,
++             (unsigned long)mbi.Protect );
++}
++#endif
++
+ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMapInfoKHR *map_info, void **data )
+ {
+     struct vulkan_device *device = vulkan_device_from_handle( client_device );
+@@ -1130,6 +1150,9 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
+     {
+         *data = (char *)memory->vm_map + info.offset;
+         TRACE( "returning %p\n", *data );
++#ifdef WINE_IOS
++        ios_vulkan_note_map( memory, map_info, VK_SUCCESS, *data, "wine-vm" );
++#endif
+         return VK_SUCCESS;
+     }
+ 
+@@ -1183,6 +1206,10 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
+     }
+ #endif
+ 
++#ifdef WINE_IOS
++    ios_vulkan_note_map( memory, map_info, res, res == VK_SUCCESS ? *data : NULL,
++                         placed_info.pPlacedAddress ? "placed" : "driver" );
++#endif
+     return res;
+ }
+ 
 diff --git a/dlls/windows.gaming.input/main.c b/dlls/windows.gaming.input/main.c
 index 39c0540a..bab12b1b 100644
 --- a/dlls/windows.gaming.input/main.c
@@ -15562,6 +15802,158 @@ index 39c0540a..bab12b1b 100644
      else
      {
          WaitForSingleObject( start_event, INFINITE );
+diff --git a/dlls/winevulkan/vulkan_thunks.c b/dlls/winevulkan/vulkan_thunks.c
+index e7d394fa..0558cbde 100644
+--- a/dlls/winevulkan/vulkan_thunks.c
++++ b/dlls/winevulkan/vulkan_thunks.c
+@@ -25,6 +25,35 @@
+ 
+ #include "vulkan_private.h"
+ 
++#if defined(WINE_IOS) && defined(_WIN64)
++#include <stdio.h>
++#include <time.h>
++/* [vk-pipe] time spent creating pipelines in the driver (MoltenVK's SPIR-V to
++ * MSL conversion plus Metal's compile), to tell it apart from the game's own
++ * translated CPU work during shader warm-up. Summary every 64 creations. */
++static void ios_pipe_time( const char *kind, uint32_t count, VkPipelineCache cache,
++                           VkResult result, struct timespec *t0 )
++{
++    static LONG calls, pipes, slow;
++    static LONGLONG total_us, max_us;
++    struct timespec t1;
++    LONGLONG us;
++    LONG n;
++    clock_gettime( CLOCK_MONOTONIC, &t1 );
++    us = (t1.tv_sec - t0->tv_sec) * 1000000LL + (t1.tv_nsec - t0->tv_nsec) / 1000;
++    InterlockedExchangeAdd( &pipes, count );
++    InterlockedExchangeAdd64( &total_us, us );
++    if (us > max_us) max_us = us;
++    if (us > 100000) InterlockedIncrement( &slow );
++    n = InterlockedIncrement( &calls );
++    if (n <= 4 || !(n % 64) || result < 0)
++        fprintf( stderr, "[vk-pipe] %s #%d count=%u cache=%d result=%d took=%lldms | total pipelines=%d "
++                 "driver=%lldms avg=%lldms max=%lldms over100ms=%d\n", kind, (int)n, count, cache != 0,
++                 result, us / 1000, (int)pipes, total_us / 1000, total_us / 1000 / (pipes ? pipes : 1),
++                 max_us / 1000, (int)slow );
++}
++#endif
++
+ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+ 
+ typedef struct VkGeometryAABBNV32
+@@ -52232,7 +52261,16 @@ static NTSTATUS thunk64_vkCreateComputePipelines(void *args)
+ 
+     TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
+ 
++#ifdef WINE_IOS
++    {
++    struct timespec t0;
++    clock_gettime( CLOCK_MONOTONIC, &t0 );
++#endif
+     params->result = vulkan_device_from_handle(params->device)->p_vkCreateComputePipelines(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
++#ifdef WINE_IOS
++    ios_pipe_time( "compute", params->createInfoCount, params->pipelineCache, params->result, &t0 );
++    }
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -52791,7 +52829,16 @@ static NTSTATUS thunk64_vkCreateGraphicsPipelines(void *args)
+ 
+     TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
+ 
++#ifdef WINE_IOS
++    {
++    struct timespec t0;
++    clock_gettime( CLOCK_MONOTONIC, &t0 );
++#endif
+     params->result = vulkan_device_from_handle(params->device)->p_vkCreateGraphicsPipelines(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
++#ifdef WINE_IOS
++    ios_pipe_time( "graphics", params->createInfoCount, params->pipelineCache, params->result, &t0 );
++    }
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+diff --git a/dlls/wow64/process.c b/dlls/wow64/process.c
+index 3f39b74d..1c2f0d36 100644
+--- a/dlls/wow64/process.c
++++ b/dlls/wow64/process.c
+@@ -947,11 +947,22 @@ NTSTATUS WINAPI wow64_NtResumeProcess( UINT *args )
+ /**********************************************************************
+  *           wow64_NtResumeThread
+  */
++/* CPU hooks are local-process only. Preserve native self-suspend semantics. */
++static BOOL is_other_local_thread( HANDLE handle )
++{
++    THREAD_BASIC_INFORMATION info;
++    return !NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL ) &&
++           info.ClientId.UniqueProcess == NtCurrentTeb()->ClientId.UniqueProcess &&
++           info.ClientId.UniqueThread != NtCurrentTeb()->ClientId.UniqueThread;
++}
++
+ NTSTATUS WINAPI wow64_NtResumeThread( UINT *args )
+ {
+     HANDLE handle = get_handle( &args );
+     ULONG *count = get_ptr( &args );
+ 
++    if (pBTCpuResumeLocalThread && is_other_local_thread( handle ))
++        return pBTCpuResumeLocalThread( handle, count );
+     return NtResumeThread( handle, count );
+ }
+ 
+@@ -1183,6 +1194,8 @@ NTSTATUS WINAPI wow64_NtSuspendThread( UINT *args )
+     HANDLE handle = get_handle( &args );
+     ULONG *count = get_ptr( &args );
+ 
++    if (pBTCpuSuspendLocalThread && is_other_local_thread( handle ))
++        return pBTCpuSuspendLocalThread( handle, count );
+     return NtSuspendThread( handle, count );
+ }
+ 
+diff --git a/dlls/wow64/syscall.c b/dlls/wow64/syscall.c
+index 2fd5918d..6fbcc4a0 100644
+--- a/dlls/wow64/syscall.c
++++ b/dlls/wow64/syscall.c
+@@ -174,6 +174,8 @@ NTSTATUS (WINAPI *pBTCpuResetToConsistentState)( EXCEPTION_POINTERS * ) = NULL;
+ void     (WINAPI *pBTCpuUpdateProcessorInformation)( SYSTEM_CPU_INFORMATION * ) = NULL;
+ void     (WINAPI *pBTCpuProcessTerm)( HANDLE, BOOL, NTSTATUS ) = NULL;
+ void     (WINAPI *pBTCpuThreadTerm)( HANDLE, LONG ) = NULL;
++NTSTATUS (WINAPI *pBTCpuSuspendLocalThread)( HANDLE, ULONG * ) = NULL;
++NTSTATUS (WINAPI *pBTCpuResumeLocalThread)( HANDLE, ULONG * ) = NULL;
+ 
+ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
+ {
+@@ -1188,6 +1190,8 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
+     GET_PTR( BTCpuUpdateProcessorInformation );
+     GET_PTR( BTCpuProcessTerm );
+     GET_PTR( BTCpuThreadTerm );
++    GET_PTR( BTCpuSuspendLocalThread );
++    GET_PTR( BTCpuResumeLocalThread );
+     GET_PTR( __wine_get_unix_opcode );
+ 
+     module = load_64bit_module( L"wow64win.dll" );
+@@ -1225,6 +1229,8 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
+     XLATE_PTR( BTCpuUpdateProcessorInformation );
+     XLATE_PTR( BTCpuProcessTerm );
+     XLATE_PTR( BTCpuThreadTerm );
++    XLATE_PTR( BTCpuSuspendLocalThread );
++    XLATE_PTR( BTCpuResumeLocalThread );
+     XLATE_PTR( __wine_get_unix_opcode );
+ #undef XLATE_PTR
+     init_syscall_table_pool_copy( 0, "ntdll.dll" );
+diff --git a/dlls/wow64/wow64_private.h b/dlls/wow64/wow64_private.h
+index b52e22ae..a451b8f8 100644
+--- a/dlls/wow64/wow64_private.h
++++ b/dlls/wow64/wow64_private.h
+@@ -346,3 +346,6 @@ extern void put_vm_counters( VM_COUNTERS_EX32 *info32, const VM_COUNTERS_EX *inf
+                              ULONG size );
+ 
+ #endif /* __WOW64_PRIVATE_H */
++
++extern NTSTATUS (WINAPI *pBTCpuSuspendLocalThread)( HANDLE, ULONG * );
++extern NTSTATUS (WINAPI *pBTCpuResumeLocalThread)( HANDLE, ULONG * );
 diff --git a/server/console.c b/server/console.c
 index 0ee1110b..1122ff2a 100644
 --- a/server/console.c
@@ -15628,3 +16020,23 @@ index 0ee1110b..1122ff2a 100644
      if (!(ioctl = mem_alloc( sizeof(*ioctl) ))) return 0;
      ioctl->code   = code;
      ioctl->output = output;
+diff --git a/server/thread.c b/server/thread.c
+index 02930423..47f8870b 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -2721,6 +2721,15 @@ DECL_HANDLER(get_thread_context)
+             native_flags = req->native_flags;
+             wow_flags = req->flags & ~native_flags;
+         }
++#ifdef WINE_IOS
++        if (thread_context->regs[CTX_WOW].machine == IMAGE_FILE_MACHINE_I386 &&
++            (wow_flags & ~thread_context->regs[CTX_WOW].flags))
++        {
++            set_error( STATUS_UNSUCCESSFUL );
++            release_object( thread_context );
++            return;
++        }
++#endif
+         if ((context = set_reply_data_size( (!!native_flags + !!wow_flags) * sizeof(struct context_data) )))
+         {
+             if (native_flags)

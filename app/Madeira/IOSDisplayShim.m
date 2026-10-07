@@ -163,6 +163,8 @@ extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
 // Game sessions: the window a swapchain presents from is the game's own;
 // Winios.m's game-mode window overlay must not draw its GDI bits.
 extern void winios_note_game_metal_hwnd(void *hwnd);
+// Winios.m: a Vulkan surface presents to hwnd; match its layer scale to pixels.
+extern void winios_note_vulkan_hwnd(void *hwnd);
 
 static macdrv_metal_device my_create_metal_device(void) {
     // DXMT also has a separate code path that creates its own MTLDevice;
@@ -219,7 +221,9 @@ static void my_view_release_metal_view(macdrv_metal_view v) {
 /* Share the existing per-HWND/fullscreen layer selection and ownership rules.
  * These are strong references from the optional Wine Vulkan driver. */
 void *madeira_vulkan_layer_lease_create(void *hwnd) {
-    return (void *)my_view_create_metal_view((macdrv_view)hwnd, NULL);
+    void *lease = (void *)my_view_create_metal_view((macdrv_view)hwnd, NULL);
+    if (lease && madeira_desktop_mode()) winios_note_vulkan_hwnd(hwnd);
+    return lease;
 }
 
 void madeira_vulkan_layer_lease_release(void *lease) {

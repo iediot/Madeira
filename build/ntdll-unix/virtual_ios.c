@@ -22502,7 +22502,18 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
              * ceiling. Serving from wherever we have room lets PA take its
              * aligned pool from the top hole instead of dying in the 32GB
              * fallback. Jumbo-only, loudly logged. */
-            if (st && *ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE))
+            /* Only hints beyond the 512GB iOS VA ceiling are relocated: they can
+             * never be honoured. A hint inside the address space is a real fixed
+             * request and fails as on Windows. Detroit probes 0x40000000,
+             * 0x80000000, ... upward in 1GB steps and, handed 0x370000000 for its
+             * 0x100000000 probe, commits a separately computed address and dies. */
+            if (st && *ret && (ULONG_PTR)*ret < 0x8000000000ULL &&
+                *size_ptr >= 0x40000000 && (type & MEM_RESERVE))
+                dprintf( 2, "[fixed-reserve] kept failure base=%p size=0x%lx status=0x%x tid=%04x\n",
+                         *ret, (unsigned long)*size_ptr, (unsigned)st,
+                         (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
+            if (st && *ret && (ULONG_PTR)*ret >= 0x8000000000ULL &&
+                *size_ptr >= 0x40000000 && (type & MEM_RESERVE))
             {
                 void *hint = *ret;
                 void *pick = NULL;

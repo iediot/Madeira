@@ -550,7 +550,12 @@ static void *ios_child_thread_entry( void *arg )
     if (setjmp(wine_ios_exit_jmpbuf) == 0) {
         /* Change working directory if requested */
         if (args->unixdir != -1) {
-            fchdir( args->unixdir );
+            extern int ios_set_child_unix_cwd( int fd );
+            int result = ios_set_child_unix_cwd( args->unixdir );
+            int error = result == -1 ? errno : 0;
+            char path[PATH_MAX];
+            dprintf( STDERR_FILENO, "[child-cwd] unix fd=%d result=%d errno=%d target=%s\n",
+                     args->unixdir, result, error, fcntl( args->unixdir, F_GETPATH, path ) != -1 ? path : "(unavailable)" );
             close( args->unixdir );
         }
 
@@ -632,6 +637,10 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 
     ERR("spawn_process: creating child thread for %s (fd=%d, unixdir=%d, dup_unixdir=%d)\n",
         debugstr_us(&params->CommandLine), socketfd, unixdir, args->unixdir);
+
+    ERR( "[child-cwd] spawn parent_pid=%lx image=%s requested=%s unixdir=%d\n",
+         (unsigned long)GetCurrentProcessId(), debugstr_us(&params->ImagePathName),
+         debugstr_us(&params->CurrentDirectory.DosPath), args->unixdir );
 
     ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );
     if (ret) {

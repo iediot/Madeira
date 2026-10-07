@@ -715,18 +715,32 @@ static uint64_t ios_wow_cpu_context( struct thread *thread, uint64_t *cpu_out )
     return (cpu + IOS_WOW_CPURESERVED_SZ + 3) & ~(uint64_t)3;   /* TYPE_ALIGNMENT(I386_CONTEXT) */
 }
 
+/* FEX publishes its CPU area before release-clearing IN_JIT. PAUSED prevents
+ * reentry until the final resume; slot 17 is the module's atomic control word.
+ * The caller has temporarily halted the native thread while reading it. */
+#define IOS_WOW_PARKED_FRAME (~(uint64_t)0)
+static int ios_wow_is_parked( struct thread *thread )
+{
+    unsigned int control = 0;
+    return thread->teb &&
+           ios_safe_read( (uint64_t)thread->teb + IOS_TEB_TLS_SLOTS_OFF + 17 * 8,
+                          &control, sizeof(control) ) && (control & 3) == 2;
+}
+
 /* Called with the target halted, from ios_fill_thread_context(). */
 static void ios_wow_capture( struct thread *thread, uint64_t sp, struct context_data *wow )
 {
     unsigned char c[IOS_X86_CTXLEN];
     uint64_t frame = ios_wow_syscall_frame( thread, sp ), ctx;
 
-    thread->ios_ctx_frame = frame;
-    thread->ios_ctx_seq   = ios_wow_frame_seq( frame );
+    int parked = ios_wow_is_parked( thread );
+    thread->ios_ctx_frame = parked ? IOS_WOW_PARKED_FRAME : frame;
+    thread->ios_ctx_seq   = parked ? 1 : ios_wow_frame_seq( frame );
     if (!wow) return;
     wow->machine = IMAGE_FILE_MACHINE_I386;
-    if (!frame || !(ctx = ios_wow_cpu_context( thread, NULL )) || !ios_safe_read( ctx, c, sizeof(c) ))
+    if ((!parked && !frame) || !(ctx = ios_wow_cpu_context( thread, NULL )) || !ios_safe_read( ctx, c, sizeof(c) ))
         return;   /* running 32-bit code: the CPU area is not current, report nothing */
+    if (!IOS_X86_U32( c, IOS_X86_EIP ) || !IOS_X86_U32( c, IOS_X86_ESP )) return;
 
     wow->flags |= SERVER_CTX_CONTROL | SERVER_CTX_INTEGER | SERVER_CTX_SEGMENTS |
                   SERVER_CTX_FLOATING_POINT | SERVER_CTX_DEBUG_REGISTERS | SERVER_CTX_EXTENDED_REGISTERS;
@@ -763,7 +777,7 @@ int ios_apply_resume_context( struct thread *thread, const struct context_data *
     arm_thread_state64_t arm;
     mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
     uint64_t frame, ctx, cpu = 0;
-    int applied = 0;
+    int applied = 0, parked;
 
     if (!ios_process_is_wow64( thread->process )) return 0;
     if (!thread->ios_ctx_frame || !thread->ios_ctx_seq) return 0;
@@ -775,11 +789,12 @@ int ios_apply_resume_context( struct thread *thread, const struct context_data *
 
     if (thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&arm, &count )) goto done;
     frame = ios_wow_syscall_frame( thread, arm.__sp );
-    if (!frame || frame != thread->ios_ctx_frame || ios_wow_frame_seq( frame ) != thread->ios_ctx_seq)
+    parked = thread->ios_ctx_frame == IOS_WOW_PARKED_FRAME && ios_wow_is_parked( thread );
+    if (!parked && (!frame || frame != thread->ios_ctx_frame || ios_wow_frame_seq( frame ) != thread->ios_ctx_seq))
         goto done;   /* the thread left the syscall the capture came from */
 
     /* native side: into the syscall frame, x18 (the TEB) never overwritten */
-    if (native && (native->flags & SERVER_CTX_CONTROL) && native->machine == native_machine)
+    if (!parked && native && (native->flags & SERVER_CTX_CONTROL) && native->machine == native_machine)
     {
         unsigned char f[IOS_SCF_SIZE];
         unsigned int i;
@@ -883,6 +898,8 @@ int ios_fill_thread_context( struct thread *thread,
     mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
     kern_return_t kr;
     int have_native = 0;
+    uint64_t diag_bb = 0;
+    unsigned int diag_control = 0;
 
     if (thread->unix_pid == -1 || thread->unix_tid == (unsigned int)-1) return 0;
     if (mach_port_extract_right( mach_task_self(), thread->unix_tid,
@@ -1028,33 +1045,13 @@ int ios_fill_thread_context( struct thread *thread,
         }
     }
 
-    /* ml715: BOTH VIEWS OF THE SAME THREAD, SIDE BY SIDE.
-     *
-     * We capture a native ARM64 context AND the guest x86-64 context out of
-     * TEB->ChpeV2CpuAreaInfo->ContextAmd64 -- but the ARM64EC NtGetContextThread wrapper
-     * always asks for the NATIVE one and runs it through context_arm_to_x64(), which maps
-     * Pc straight into Rip. For a translated thread parked in ordinary Mach-O code (e.g.
-     * libsystem_kernel __ulock_wait2) that hands the caller a "RIP" that is a Mach-O
-     * address and ARM ABI registers reinterpreted as x64 ones -- while the saved AMD64
-     * view sitting right here holds the real guest RIP.
-     *
-     * That is the suspected Marvel Cosmic Invasion window blocker: Mono suspends a thread,
-     * cannot classify the context it gets back, resumes, and retries forever while holding
-     * the critical section its target needs. Pair this with the [ec-getctx] record on the
-     * ntdll side; correlate on tid/teb + native pc, NOT on line order, because the two
-     * counters live in different modules. Log-only, capped. */
+    /* Only fault-safe reads while halted. Symbolication and output below must
+     * run after dropping our temporary hold: the target can own libc locks. */
+    if (have_native && ios_process_is_wow64( thread->process ))
     {
-        static int n_ctx;
-        if (n_ctx++ < 48)
-            fprintf( stderr, "[srv-getctx] ml715 #%d tid=%04x teb=%p native_pc=%p native_sp=%p | "
-                     "saved_amd64 flags=%08x rip=%p rsp=%p | have_native=%d\n",
-                     n_ctx, thread->id, (void *)(uintptr_t)thread->teb,
-                     (void *)(uintptr_t)(have_native ? native->ctl.arm64_regs.pc : 0),
-                     (void *)(uintptr_t)(have_native ? native->ctl.arm64_regs.sp : 0),
-                     wow ? wow->flags : 0,
-                     (void *)(uintptr_t)(wow ? wow->ctl.x86_64_regs.rip : 0),
-                     (void *)(uintptr_t)(wow ? wow->ctl.x86_64_regs.rsp : 0),
-                     have_native );
+        ios_safe_read( arm.__x[28], &diag_bb, sizeof(diag_bb) );
+        ios_safe_read( thread->teb + IOS_TEB_TLS_SLOTS_OFF + 17 * 8,
+                       &diag_control, sizeof(diag_control) );
     }
 
     /* ml730: if this capture IS the first logical suspend, keep the halt we
@@ -1076,6 +1073,51 @@ int ios_fill_thread_context( struct thread *thread,
         thread_resume( port );
     }
     mach_port_deallocate( mach_task_self(), port );
+
+    if (!ios_process_is_wow64(thread->process) && !thread->ios_mach_suspended)
+    {
+        static int n_ctx;
+        if (n_ctx++ < 48)
+            fprintf( stderr, "[srv-getctx] ml715 #%d tid=%04x teb=%p native_pc=%p native_sp=%p | "
+                     "saved_amd64 flags=%08x rip=%p rsp=%p | have_native=%d\n",
+                     n_ctx, thread->id, (void *)(uintptr_t)thread->teb,
+                     (void *)(uintptr_t)(have_native ? native->ctl.arm64_regs.pc : 0),
+                     (void *)(uintptr_t)(have_native ? native->ctl.arm64_regs.sp : 0),
+                     wow ? wow->flags : 0,
+                     (void *)(uintptr_t)(wow ? wow->ctl.x86_64_regs.rip : 0),
+                     (void *)(uintptr_t)(wow ? wow->ctl.x86_64_regs.rsp : 0),
+                     have_native );
+    }
+
+    /* A retained opt-in hold can still own stdio locks; don't log under it. */
+    if (have_native && wow && ios_process_is_wow64( thread->process ) &&
+        !thread->ios_mach_suspended)
+    {
+        static unsigned int serial;
+        static int all = -1;
+        unsigned int n = ++serial;
+        if (all < 0) { const char *e = getenv("MADEIRA_SUSPEND_TRACE"); all = e && e[0] == '1'; }
+        if (all || n <= 32 || !(n % 128))
+        {
+            extern uint64_t ios_native_rip_from_hostpc(uint64_t, uint64_t, const char **);
+            const char *why = "no-block";
+            uint64_t rip = diag_bb ? ios_native_rip_from_hostpc(diag_bb, arm.__pc, &why) : 0;
+            fprintf(stderr, "[wow-suspend] capture=%u target=%04x by=%04x count=%d held=%d "
+                    "host_pc=%llx host_sp=%llx frame=%llx seq=%x jit_rip=%llx resolve=%s "
+                    "fex_control=%x flags=%x eip=%08x esp=%08x ebp=%08x "
+                    "eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x "
+                    "source=%s\n", n, thread->id, current ? current->id : 0,
+                    thread->suspend, thread->ios_mach_suspended,
+                    (unsigned long long)arm.__pc, (unsigned long long)arm.__sp,
+                    (unsigned long long)thread->ios_ctx_frame, thread->ios_ctx_seq,
+                    (unsigned long long)rip, why, diag_control, wow->flags,
+                    wow->ctl.i386_regs.eip, wow->ctl.i386_regs.esp, wow->ctl.i386_regs.ebp,
+                    wow->integer.i386_regs.eax, wow->integer.i386_regs.ebx,
+                    wow->integer.i386_regs.ecx, wow->integer.i386_regs.edx,
+                    wow->integer.i386_regs.esi, wow->integer.i386_regs.edi,
+                    wow->flags ? (thread->ios_ctx_frame == IOS_WOW_PARKED_FRAME ? "parked-cpu-area" : "syscall-cpu-area") : "unavailable");
+        }
+    }
 
     return have_native;
 }

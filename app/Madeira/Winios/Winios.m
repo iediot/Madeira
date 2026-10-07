@@ -835,6 +835,7 @@ static NSMutableDictionary<NSNumber *, CALayer *> *g_layers;
 static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last px rect */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
+static NSMutableSet<NSNumber *> *g_vulkan_layer_keys;  /* of those, Vulkan surfaces */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
 /* Desktop fit state (winios_desktop_fit below), main thread only. */
 static NSNumber *g_fit_key;
@@ -1264,6 +1265,7 @@ static void winios_remove_layer(HWND hwnd) {
         if (ml) {
             [ml removeFromSuperlayer];
             [g_metal_layers removeObjectForKey:key];
+            [g_vulkan_layer_keys removeObject:key];
             [g_client_rects removeObjectForKey:key];
             if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
             fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
@@ -1336,6 +1338,14 @@ static BOOL winios_desktop_fit_map(CGFloat x, CGFloat y, CGPoint *pt, CGFloat *s
 /* main thread only — frame the metal sublayer to the client rect in the
  * parent (window) layer's coordinate space. Parent bounds are the window
  * rect in points, so client offset = (client_px - window_px) * scale. */
+/* HWNDs whose layer backs a Vulkan surface. MoltenVK reports a swapchain
+ * SUBOPTIMAL whenever bounds * contentsScale differs from its extent, and Wine
+ * sizes the swapchain to the client rect in desktop pixels, so the layer's
+ * scale must turn its point bounds back into exactly those pixels. Without it
+ * Detroit: Become Human recreated its swapchain every frame. DXMT sets the
+ * scale itself and is left alone. Main thread only. g_vulkan_layer_keys
+ * is declared with g_metal_layers. */
+
 static void winios_place_metal_layer(NSNumber *key) {
     CAMetalLayer *ml = g_metal_layers[key];
     if (!ml) return;
@@ -1347,6 +1357,23 @@ static void winios_place_metal_layer(NSNumber *key) {
                           (c.origin.y - w.origin.y) * WINIOS_PX_TO_PT_Y,
                           c.size.width * s, c.size.height * WINIOS_PX_TO_PT_Y);
     winios_desktop_fit(key, ml, c);
+    if ([g_vulkan_layer_keys containsObject:key] && ml.bounds.size.width > 0 && c.size.width > 0)
+        ml.contentsScale = c.size.width / ml.bounds.size.width;
+}
+
+/* IOSDisplayShim.m, wine thread: a Vulkan surface now presents to hwnd. */
+void winios_note_vulkan_hwnd(void *hwnd) {
+    void (^mark)(void) = ^{
+        if (!g_vulkan_layer_keys) g_vulkan_layer_keys = [NSMutableSet new];
+        NSNumber *key = @((uintptr_t)hwnd);
+        [g_vulkan_layer_keys addObject:key];
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_place_metal_layer(key);
+        [CATransaction commit];
+    };
+    if ([NSThread isMainThread]) mark();
+    else dispatch_sync(dispatch_get_main_queue(), mark);
 }
 
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain

@@ -16,8 +16,8 @@
  * The producers are DXMT's winemetal_unix.c hooks (ios_frame_*), which were
  * stubs in virtual_ios.c; they run only while ios_frame_stats_on is set, so
  * with the profile off nothing here runs. Thread CPU comes from
- * THREAD_EXTENDED_INFO, which reads counters and never suspends a thread
- * (unlike the ml2105 samplers).
+ * THREAD_EXTENDED_INFO. Threads consuming over one CPU second per report
+ * also get a bounded stack snapshot, with symbolication only after resume.
  */
 
 #include <stdatomic.h>
@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include <mach/thread_info.h>
+#include <dlfcn.h>
 
 int ios_frame_stats_on = 0;
 
@@ -135,6 +136,64 @@ struct perf_busy
     uint64_t id;
 };
 
+/* Sample hot threads once per report. Never symbolize, allocate or print while
+ * stopped: the sampled thread may own dyld, malloc or stdio locks. */
+static int perf_read(uint64_t address, void *out, size_t size)
+{
+    vm_size_t got = 0;
+    return address > 0x10000 && !vm_read_overwrite(mach_task_self(), address, size,
+                                                  (vm_address_t)out, &got) && got == size;
+}
+
+static void perf_hot_stack(thread_t port, uint64_t id, const char *name)
+{
+    extern int ios_thread_registry_count(void);
+    extern uintptr_t ios_thread_registry_teb(int);
+    extern thread_t ios_thread_registry_mach(int);
+    extern uint64_t ios_native_rip_from_hostpc(uint64_t, uint64_t, const char **);
+    arm_thread_state64_t st;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    uint64_t pcs[14], fp, pair[2], bb = 0, teb = 0, rip;
+    unsigned int tid = 0, n = 0, i;
+    const char *why = "no-block";
+    kern_return_t status;
+    for (i = 0; i < (unsigned)ios_thread_registry_count(); i++)
+        if (ios_thread_registry_mach(i) == port) { teb = ios_thread_registry_teb(i); break; }
+    if (thread_suspend(port)) return;
+    status = thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &count);
+    if (!status)
+    {
+        pcs[n++] = arm_thread_state64_get_pc(st);
+        pcs[n++] = arm_thread_state64_get_lr(st);
+        fp = arm_thread_state64_get_fp(st);
+        perf_read(st.__x[28], &bb, sizeof(bb));
+        if (teb) perf_read(teb + 0x48, &tid, sizeof(tid));
+        while (n < 14 && !(fp & 15) && perf_read(fp, pair, sizeof(pair)))
+        {
+            pcs[n++] = pair[1];
+            if (pair[0] <= fp || pair[0] - fp > 1024 * 1024) break;
+            fp = pair[0];
+        }
+    }
+    thread_resume(port);
+    if (status) return;
+    rip = bb ? ios_native_rip_from_hostpc(bb, pcs[0], &why) : 0;
+    dprintf(2, "[perf-stack] id=%llx name=%s wine_tid=%04x teb=%llx host_pc=%llx "
+            "guest_rip=%llx resolve=%s\n", (unsigned long long)id, name, tid,
+            (unsigned long long)teb, (unsigned long long)pcs[0], (unsigned long long)rip, why);
+    for (i = 0; i < n; i++)
+    {
+        Dl_info di = {0};
+        /* Strip arm64e return-address authentication before dladdr. */
+        uint64_t pc = pcs[i] & 0x0000007fffffffffull;
+        dladdr((void *)(uintptr_t)pc, &di);
+        dprintf(2, "[perf-stack] id=%llx #%u pc=%llx %s %s+%llx\n",
+                (unsigned long long)id, i, (unsigned long long)pc,
+                di.dli_fname ? di.dli_fname : "?", di.dli_sname ? di.dli_sname : "?",
+                (unsigned long long)(pc - (uintptr_t)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)));
+    }
+}
+
 static int perf_busy_cmp( const void *a, const void *b )
 {
     const struct perf_busy *x = a, *y = b;
@@ -187,6 +246,8 @@ static unsigned perf_sample_threads( struct perf_busy *busy, unsigned max, uint3
             if (cpu > prev)
             {
                 *total_ns += cpu - prev;
+                if (cpu - prev > 1000000000ull && list[i] != pthread_mach_thread_np(pthread_self()))
+                    perf_hot_stack(list[i], ident.thread_id, ext.pth_name);
                 if (out < max)
                 {
                     busy[out].delta_ns = cpu - prev;

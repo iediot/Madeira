@@ -178,10 +178,21 @@ index 1e2a92f..90c59e2 100644
    }
  
 diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
-index aeb3673..de0567e 100644
+index aeb3673..188572a 100644
 --- a/src/d3d11/d3d11_swapchain.cpp
 +++ b/src/d3d11/d3d11_swapchain.cpp
-@@ -739,8 +739,9 @@ public:
+@@ -189,7 +189,9 @@ public:
+       .Format = desc_.Format,
+       .SampleDesc = desc_.SampleDesc,
+       .Usage = D3D11_USAGE_DEFAULT,
+-      .BindFlags = D3D11_BIND_RENDER_TARGET,
++      /* the presenter samples the backbuffer (fs_present_quad), so it is
++       * always a shader resource; Metal validation aborts on usage 0x04 */
++      .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+       .CPUAccessFlags = {},
+       .MiscFlags = {},
+       .TextureLayout = {},
+@@ -739,8 +741,9 @@ public:
      /* iOS-Madeira 2026-07-03: [PRESENT_GAP] — attribute the exactly-20-FPS
       * ceiling. Splits each frame into time spent INSIDE Present1 (our
       * present path: SyncFrame wait, Commit, PresentBoundary) vs OUTSIDE
@@ -193,7 +204,7 @@ index aeb3673..de0567e 100644
       * Also logs the SyncInterval the game passes (3 @60Hz would = 20). */
      {
        auto now = std::chrono::steady_clock::now();
-@@ -748,6 +749,8 @@ public:
+@@ -748,6 +751,8 @@ public:
          double gap_ms = std::chrono::duration<double, std::milli>(now - madeira_gap_last_entry_).count();
          madeira_gap_sum_ms_ += gap_ms;
          madeira_gap_max_ms_ = std::max(madeira_gap_max_ms_, gap_ms);
@@ -202,7 +213,7 @@ index aeb3673..de0567e 100644
        }
        madeira_gap_last_entry_ = now;
        madeira_gap_sync_min_ = std::min(madeira_gap_sync_min_, SyncInterval);
-@@ -755,11 +758,13 @@ public:
+@@ -755,11 +760,13 @@ public:
        if ((++madeira_gap_count_ % 64) == 0) {
          Logger::info(std::format(
              "[PRESENT_GAP] #{} gap_avg={:.1f}ms gap_max={:.1f}ms inside_avg={:.1f}ms "
@@ -218,7 +229,7 @@ index aeb3673..de0567e 100644
          madeira_inside_sum_ms_ = 0; madeira_inside_max_ms_ = 0;
          madeira_gap_sync_min_ = ~0u; madeira_gap_sync_max_ = 0;
        }
-@@ -1131,6 +1136,7 @@ private:
+@@ -1131,6 +1138,7 @@ private:
     * thread, so plain members are fine. */
    std::chrono::steady_clock::time_point madeira_gap_last_entry_{};
    uint64_t madeira_gap_count_ = 0;

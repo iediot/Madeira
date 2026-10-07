@@ -2412,6 +2412,11 @@ void unix_init_startup_info(void)
     }
     assert( (char *)src == (char *)info + info_size );
 
+#ifdef WINE_IOS
+    ERR( "[child-cwd] received pid=%lx peb=%p image=%s cwd=%s machine=%04x\n",
+         (unsigned long)GetCurrentProcessId(), NtCurrentTeb()->Peb,
+         debugstr_us(&params->ImagePathName), debugstr_us(&params->CurrentDirectory.DosPath), machine );
+#endif
     params->Environment = dst;
     params->EnvironmentSize = env_pos * sizeof(WCHAR);
     memcpy( dst, env, env_pos * sizeof(WCHAR) );

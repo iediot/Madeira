@@ -1,5 +1,5 @@
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 26a039f..c5adc89 100644
+index 26a039f..2eab8cb 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -121,6 +121,160 @@ static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
@@ -163,7 +163,21 @@ index 26a039f..c5adc89 100644
  #if defined(FEX_IOS_HOST) && defined(_WIN32)
  /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
   * frontend (Module.cpp) which owns the thread registry. extern "C" so the
-@@ -1439,6 +1593,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+@@ -547,8 +701,13 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
+    * The band is finite and a title with enough threads exhausts it, so this is
+    * an ordinary outcome, not a theoretical one. Placement-new after an explicit
+    * check makes the failure returnable. */
++#ifdef FEX_IOS_HOST
++  void* ThreadMem = FEXCore::Allocator::aligned_alloc(FEXCore::Core::IosInterruptPageAlign,
++                                                      sizeof(FEXCore::Core::InternalThreadState));
++#else
+   void* ThreadMem = FEXCore::Allocator::aligned_alloc(alignof(FEXCore::Core::InternalThreadState),
+                                                       sizeof(FEXCore::Core::InternalThreadState));
++#endif
+ #ifdef FEX_IOS_HOST
+   /* MADEIRA_FEX_FAIL_CALLRET=threadstate:N fails the Nth thread-state
+    * allocation, so this containment path can be proven rather than assumed --
+@@ -1439,6 +1598,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    auto Thread = Frame->Thread;
    FEXCORE_PROFILE_SCOPED("CompileBlock");
    FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
@@ -173,7 +187,7 @@ index 26a039f..c5adc89 100644
  
  #ifdef FEX_IOS_HOST
    /* ml648: consume any pending Mono-backpatcher event.
-@@ -2154,6 +2311,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+@@ -2154,6 +2316,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
  
    // iOS-Madeira: cache miss reached — count as true compile.
    __sync_add_and_fetch(&g_cb_real_compiles, 1);
@@ -183,7 +197,7 @@ index 26a039f..c5adc89 100644
  
    // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
-@@ -2441,6 +2601,27 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
+@@ -2441,6 +2606,27 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
  void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
    auto Thread = Frame->Thread;
    auto CTX = static_cast<ContextImpl*>(Thread->CTX);
@@ -211,7 +225,7 @@ index 26a039f..c5adc89 100644
    {
      auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
  
-@@ -2463,6 +2644,15 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
+@@ -2463,6 +2649,15 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
        Dest = RW;
      }
      ios_fex_mono_count_helper(RW ? 0 : 1);
@@ -509,6 +523,47 @@ index 3342190..7c18d01 100644
    uint32_t* BPFutex = FEXCore::DualMap::WriteAddr(&InlineTail->SpinLockFutex);
  #else
    uint32_t* BPFutex = &InlineTail->SpinLockFutex;
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index cbded16..de0cbae 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -87,7 +87,11 @@ struct UnalignedExclusiveStore {
+   uint8_t Size;
+ };
+ 
++#ifdef FEX_IOS_HOST
++struct alignas(8192) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
++#else
+ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
++#endif
+   FEXCore::Core::CpuStateFrame* const CurrentFrame = &BaseFrameState;
+ 
+   FEXCore::Context::Context* const CTX;
+@@ -159,9 +163,24 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   FEXCore::Core::CpuStateFrame BaseFrameState {};
+ 
+   // Can be reprotected as RO to trigger an interrupt at generated code block entrypoints
++#ifdef FEX_IOS_HOST
++  // iOS combines permissions over 16 KB. A 4 KB subpage next to writable
++  // state cannot fault reliably; never protect neighbouring allocator data.
++  // PE/COFF caps alignas at 8 KB, so the page is 8 KB aligned here, its offset
++  // is asserted to be a multiple of 16 KB below, and Core.cpp allocates the
++  // state 16 KB aligned (IosInterruptPageAlign).
++  uint8_t IosInterruptPagePad[8192];   // puts the page on a 16 KB offset
++  alignas(8192) uint8_t InterruptFaultPage[16384];
++#else
+   alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
++#endif
+ };
+ static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
++#ifdef FEX_IOS_HOST
++inline constexpr size_t IosInterruptPageAlign = 16384;
++static_assert(offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) % IosInterruptPageAlign == 0,
++              "the interrupt page must start a 16 KB host page");
++#endif
+ // Apple's libc++ has a larger std::shared_mutex (~200 bytes vs ~56 on Linux),
+ // which pushes InternalThreadState past the offsets/sizes these asserts check.
+ // They remain valid on Linux/Windows.
 diff --git a/FEXCore/include/FEXCore/HLE/SyscallHandler.h b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
 index d1f4dec..4d82092 100644
 --- a/FEXCore/include/FEXCore/HLE/SyscallHandler.h
@@ -676,3 +731,230 @@ index 7f0ed3d..3edd414 100644
      } else if (!Query.Size) {
        // No more regions past `Address` in the interval list
        break;
+diff --git a/Source/Windows/WOW64/BTInterface.h b/Source/Windows/WOW64/BTInterface.h
+index b1ffb94..51128ff 100644
+--- a/Source/Windows/WOW64/BTInterface.h
++++ b/Source/Windows/WOW64/BTInterface.h
+@@ -16,6 +16,7 @@ NTSTATUS STDMETHODCALLTYPE BTCpuGetContext(HANDLE Thread, HANDLE Process, void*
+ NTSTATUS STDMETHODCALLTYPE BTCpuSetContext(HANDLE Thread, HANDLE Process, void* Unknown, WOW64_CONTEXT* Context);
+ void STDMETHODCALLTYPE BTCpuSimulate();
+ NTSTATUS STDMETHODCALLTYPE BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count);
++NTSTATUS STDMETHODCALLTYPE BTCpuResumeLocalThread(HANDLE Thread, ULONG* Count);
+ NTSTATUS STDMETHODCALLTYPE BTCpuResetToConsistentState(EXCEPTION_POINTERS* Ptrs);
+ void STDMETHODCALLTYPE BTCpuFlushInstructionCache2(const void* Address, SIZE_T Size);
+ void STDMETHODCALLTYPE BTCpuFlushInstructionCacheHeavy(const void* Address, SIZE_T Size);
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 5c7dd86..5eb95aa 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -357,6 +357,11 @@ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
+ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
+ std::optional<FEX::Windows::ImageTracker> ImageTracker;
+ 
++#ifdef FEX_IOS_HOST
++// Serialize count changes and keep state alive through a cooperative park.
++// Never hold ThreadCreationMutex while waiting for JIT exit (compilation uses it).
++std::mutex WowSuspendMutex;
++#endif
+ std::mutex ThreadCreationMutex;
+ // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
+ std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
+@@ -765,11 +770,14 @@ void FlushCpuAreaForExit(TLS TLS) {
+ void LockJITContext(TLS TLS) {
+   uint32_t Expected = TLS.ControlWord().load(), New;
+ 
+-  // Spin until PAUSED is unset, setting IN_JIT when that occurs
++  // Wait until PAUSED is unset, setting IN_JIT atomically with that check
+   do {
++    if (Expected & ControlBits::PAUSED) {
++      __asm__ volatile("yield" ::: "memory");
++    }
+     Expected = Expected & ~ControlBits::PAUSED;
+     New = (Expected | ControlBits::IN_JIT) & ~ControlBits::WOW_CPU_AREA_DIRTY;
+-  } while (!TLS.ControlWord().compare_exchange_weak(Expected, New, std::memory_order::relaxed));
++  } while (!TLS.ControlWord().compare_exchange_weak(Expected, New, std::memory_order::acquire));
+   std::atomic_signal_fence(std::memory_order::seq_cst);
+ 
+ #ifdef FEX_IOS_HOST
+@@ -789,7 +797,7 @@ void LockJITContext(TLS TLS) {
+ 
+ void UnlockJITContext(TLS TLS) {
+   std::atomic_signal_fence(std::memory_order::seq_cst);
+-  TLS.ControlWord().fetch_and(~ControlBits::IN_JIT, std::memory_order::relaxed);
++  TLS.ControlWord().fetch_and(~ControlBits::IN_JIT, std::memory_order::release);
+ }
+ 
+ class ScopedJITContextLock {
+@@ -813,14 +821,17 @@ bool HandleSuspendInterrupt(TLS TLS, CONTEXT* Context, uint64_t FaultAddress) {
+   }
+ 
+   void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+-  SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
++  SIZE_T TmpSize = sizeof(TLS.ThreadState()->InterruptFaultPage);
+   ULONG TmpProt;
+   NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READWRITE, &TmpProt);
+ 
+   // Since interrupts only happen at the start of blocks, the reconstructed state should be entirely accurate
+   ReconstructThreadState(TLS, Context);
+ 
+-  // Yield to the suspender
++#ifdef FEX_IOS_HOST
++  FlushCpuAreaForExit(TLS);
++#endif
++  // Publish the reconstructed guest registers before acknowledging the park.
+   UnlockJITContext(TLS);
+   LockJITContext(TLS);
+ 
+@@ -1495,6 +1506,9 @@ void BTCpuThreadInit() {
+ }
+ 
+ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
++#ifdef FEX_IOS_HOST
++  std::scoped_lock SuspendLock(WowSuspendMutex);
++#endif
+   if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_TERMINATE)) {
+     return;
+   }
+@@ -1509,6 +1523,10 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
+   const auto ThreadTID = reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread);
+   bool Self = ThreadTID == GetCurrentThreadId();
+   if (!Self) {
++#ifdef FEX_IOS_HOST
++    auto [Status, TargetTLS] = GetThreadTLS(*ThreadDup);
++    if (!Status) TargetTLS.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
++#endif
+     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
+     RtlWow64SuspendThread(*ThreadDup, NULL);
+ #ifdef FEX_IOS_HOST
+@@ -1716,7 +1734,90 @@ extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
+   CTX->ExecuteThread(TLS.ThreadState());
+ }
+ 
++#ifdef FEX_IOS_HOST
++static void WowParkLog(const char* Action, uint64_t Tid, ULONG Previous, uint64_t WaitUs, NTSTATUS Status) {
++  static std::atomic<uint32_t> Serial {};
++  auto N = ++Serial;
++  if (N <= 32 || !(N % 128)) {
++    IosRawReport("[wow-park] #{} {} tid={:x} previous={} wait_us={} status={:x} source={}",
++                 N, Action, Tid, Previous, WaitUs, static_cast<uint32_t>(Status),
++                 Status ? "unavailable" : "parked-cpu-area");
++  }
++}
++
++static NTSTATUS IosSuspendLocalThread(HANDLE Thread, ULONG* Count) {
++  if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SUSPEND_RESUME)) return STATUS_ACCESS_DENIED;
++  auto Dup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
++  THREAD_BASIC_INFORMATION Info;
++  auto Status = NtQueryInformationThread(*Dup, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
++  if (Status) return Status;
++  auto Tid = reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread);
++  if (Tid == GetCurrentThreadId()) return NtSuspendThread(*Dup, Count);
++
++  std::scoped_lock SuspendLock(WowSuspendMutex);
++  auto [Err, Target] = GetThreadTLS(*Dup);
++  if (Err) return Err;
++  {
++    std::scoped_lock Lock(ThreadCreationMutex);
++    if (!Threads.contains(Tid)) return NtSuspendThread(*Dup, Count);
++  }
++  const auto Start = std::chrono::steady_clock::now();
++  const auto PreviousControl = Target.ControlWord().fetch_or(ControlBits::PAUSED, std::memory_order::acq_rel);
++  if (PreviousControl & ControlBits::IN_JIT) {
++    void* Address = &Target.ThreadState()->InterruptFaultPage;
++    SIZE_T Size = sizeof(Target.ThreadState()->InterruptFaultPage);
++    ULONG OldProtect;
++    Status = NtProtectVirtualMemory(NtCurrentProcess(), &Address, &Size, PAGE_READONLY, &OldProtect);
++  }
++  while (!Status && (Target.ControlWord().load(std::memory_order::acquire) & ControlBits::IN_JIT)) {
++    // A failed interrupt must fail the API, not deadlock a GC or claim success.
++    if (std::chrono::steady_clock::now() - Start > std::chrono::milliseconds(250)) {
++      Status = STATUS_UNSUCCESSFUL;
++      break;
++    }
++    __asm__ volatile("yield" ::: "memory");
++  }
++  ULONG Previous = 0;
++  if (!Status) {
++    // The owning thread flushed the CPU area before its release of IN_JIT.
++    // Do not flush remotely: that would overwrite a pending SetThreadContext.
++    Status = NtSuspendThread(*Dup, &Previous);
++    if (!Status && Count) *Count = Previous;
++  }
++  if (Status && !(PreviousControl & ControlBits::PAUSED))
++    Target.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
++  auto WaitUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - Start).count();
++  WowParkLog("park", Tid, Previous, WaitUs, Status);
++  return Status;
++}
++
++NTSTATUS BTCpuResumeLocalThread(HANDLE Thread, ULONG* Count) {
++  if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SUSPEND_RESUME)) return STATUS_ACCESS_DENIED;
++  auto Dup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
++  THREAD_BASIC_INFORMATION Info;
++  auto Status = NtQueryInformationThread(*Dup, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
++  if (Status) return Status;
++  std::scoped_lock SuspendLock(WowSuspendMutex);
++  ULONG Previous = 0;
++  Status = NtResumeThread(*Dup, &Previous);
++  if (!Status) {
++    if (Count) *Count = Previous;
++    // Native resume applies queued context writes before returning. Nested
++    // suspends, including those from different callers, retain PAUSED.
++    if (Previous <= 1) {
++      auto [Err, Target] = GetThreadTLS(*Dup);
++      if (!Err) Target.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
++    }
++  }
++  WowParkLog(Previous > 1 ? "retain" : "unpark", reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread), Previous, 0, Status);
++  return Status;
++}
++#endif
++
+ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
++#ifdef FEX_IOS_HOST
++  return IosSuspendLocalThread(Thread, Count);
++#else
+   if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SUSPEND_RESUME)) {
+     return STATUS_ACCESS_DENIED;
+   }
+@@ -1764,7 +1865,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
+ 
+     ULONG TmpProt;
+     void* TmpAddress = &TLS.ThreadState()->InterruptFaultPage;
+-    SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
++    SIZE_T TmpSize = sizeof(TLS.ThreadState()->InterruptFaultPage);
+     NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READONLY, &TmpProt);
+   }
+ 
+@@ -1809,6 +1910,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
+   TLS.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::relaxed);
+ 
+   return Err;
++#endif
+ }
+ 
+ // Returns true if exception dispatch should be halted and the execution context restored to Ptrs->Context
+diff --git a/Source/Windows/WOW64/libwow64fex.def b/Source/Windows/WOW64/libwow64fex.def
+index 4646bf7..785034d 100644
+--- a/Source/Windows/WOW64/libwow64fex.def
++++ b/Source/Windows/WOW64/libwow64fex.def
+@@ -19,6 +19,7 @@ EXPORTS
+   BTCpuSetContext
+   BTCpuSimulate
+   BTCpuSuspendLocalThread
++  BTCpuResumeLocalThread
+   BTCpuThreadInit
+   BTCpuProcessTerm
+   BTCpuThreadTerm
+diff --git a/Source/Windows/include/winternl.h b/Source/Windows/include/winternl.h
+index de9e287..43b9756 100644
+--- a/Source/Windows/include/winternl.h
++++ b/Source/Windows/include/winternl.h
+@@ -536,6 +536,7 @@ NTSTATUS WINAPI NtQueryVirtualMemory(HANDLE, LPCVOID, MEMORY_INFORMATION_CLASS,
+ NTSTATUS WINAPI NtReadFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+ NTSTATUS WINAPI NtSetContextThread(HANDLE, const CONTEXT*);
+ NTSTATUS WINAPI NtSuspendThread(HANDLE, PULONG);
++NTSTATUS WINAPI NtResumeThread(HANDLE, PULONG);
+ NTSTATUS WINAPI NtTerminateProcess(HANDLE, LONG);
+ NTSTATUS WINAPI NtWriteFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, const void*, ULONG, PLARGE_INTEGER, PULONG);
+ void WINAPI ProcessPendingCrossProcessEmulatorWork();

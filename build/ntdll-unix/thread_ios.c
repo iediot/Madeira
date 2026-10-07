@@ -2029,17 +2029,26 @@ NTSTATUS WINAPI NtOpenThread( HANDLE *handle, ACCESS_MASK access,
  */
 NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
 {
-    unsigned int ret;
+    unsigned int ret, previous = 0;
 
     SERVER_START_REQ( suspend_thread )
     {
         req->handle = wine_server_obj_handle( handle );
         if (!(ret = wine_server_call( req )))
         {
-            if (count) *count = reply->count;
+            previous = reply->count;
+            if (count) *count = previous;
         }
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    {
+        const char *e = getenv("MADEIRA_SUSPEND_TRACE");
+        if (e && e[0] == '1')
+            ERR("[wow-suspend-api] suspend by=%04x handle=%p status=%08x previous=%u\n",
+                (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, handle, ret, previous);
+    }
+#endif
     return ret;
 }
 
@@ -2049,17 +2058,26 @@ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
  */
 NTSTATUS WINAPI NtResumeThread( HANDLE handle, ULONG *count )
 {
-    unsigned int ret;
+    unsigned int ret, previous = 0;
 
     SERVER_START_REQ( resume_thread )
     {
         req->handle = wine_server_obj_handle( handle );
         if (!(ret = wine_server_call( req )))
         {
-            if (count) *count = reply->count;
+            previous = reply->count;
+            if (count) *count = previous;
         }
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    {
+        const char *e = getenv("MADEIRA_SUSPEND_TRACE");
+        if (e && e[0] == '1')
+            ERR("[wow-suspend-api] resume by=%04x handle=%p status=%08x previous=%u\n",
+                (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, handle, ret, previous);
+    }
+#endif
     return ret;
 }
 
@@ -2348,6 +2366,30 @@ NTSTATUS get_thread_context( HANDLE handle, void *context, BOOL *self, USHORT ma
         ret = context_from_server( context, &server_contexts[0], machine );
         if (!ret && count > 1) ret = context_from_server( context, &server_contexts[1], machine );
     }
+#ifdef WINE_IOS
+    if (machine == IMAGE_FILE_MACHINE_I386 && !*self)
+    {
+        static LONG serial;
+        LONG n = InterlockedIncrement(&serial);
+        const char *e = getenv("MADEIRA_SUSPEND_TRACE");
+        const I386_CONTEXT *wow = context;
+        if (!ret && (flags & SERVER_CTX_CONTROL) &&
+            (!count || !wow->Eip || !wow->Esp)) ret = STATUS_UNSUCCESSFUL;
+        if ((e && e[0] == '1') || n <= 32 || !(n % 128))
+        {
+            const I386_CONTEXT *c = context;
+            BOOL control = !ret && count && (flags & SERVER_CTX_CONTROL);
+            /* On failure the caller's output buffer is not initialized. */
+            ERR("[wow-getctx] call=%d by=%04x handle=%p status=%08x requested=%x "
+                "returned=%x eip=%08x esp=%08x ebp=%08x reason=%s\n",
+                n, (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                handle, ret, flags, !ret ? c->ContextFlags : 0,
+                control ? c->Eip : 0, control ? c->Esp : 0, control ? c->Ebp : 0,
+                ret ? "api-failure" : !control ? "no-control-request" :
+                (!c->Eip || !c->Esp) ? "zero-control" : "inspect-mono-state");
+        }
+    }
+#endif
     return ret;
 }
 
