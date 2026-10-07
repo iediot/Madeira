@@ -534,6 +534,10 @@ struct LibraryEntry: Codable, Identifiable {
     /// Runs on the launch worker, before the JIT pool is taken.
     func applyEnvironment() {
         configureLaunch()
+        // MoltenVK keeps compiled Metal pipelines in a binary archive per game
+        // (patches/moltenvk-iediot.patch); every game runs in this one process,
+        // so its process name cannot tell them apart.
+        setenv("MADEIRA_GAME_KEY", steamAppID.map { "steam-\($0)" } ?? "entry-\(id.uuidString)", 1)
         // Unset unless chosen: FEX's own default then applies, as for any other launch.
         if reducedX87 { setenv("FEX_X87REDUCEDPRECISION", "1", 1) } else { unsetenv("FEX_X87REDUCEDPRECISION") }
         // Exported only when chosen: unset keeps the engine's own default (and any

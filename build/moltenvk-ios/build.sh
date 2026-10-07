@@ -19,9 +19,23 @@ if [ ! -f "$SRC/fetchDependencies" ]; then
     exit 1
 fi
 
+PATCH="$R/patches/moltenvk-iediot.patch"
+if git -C "$SRC" apply --reverse --check "$PATCH" 2>/dev/null; then
+    echo "Madeira MoltenVK patch already applied"
+elif git -C "$SRC" apply --check "$PATCH"; then
+    git -C "$SRC" apply "$PATCH"
+else
+    echo "MoltenVK patch does not apply cleanly to $SRC" >&2
+    exit 1
+fi
+
 cd "$SRC"
 [ -d External/build ] || ./fetchDependencies --ios
-make ios
+# Equivalent to `make ios`, with build intermediates kept in the workspace.
+xcodebuild build -project MoltenVKPackaging.xcodeproj \
+    -scheme 'MoltenVK Package (iOS only)' -destination 'generic/platform=iOS' \
+    -derivedDataPath "$SRC/External/build/DerivedData-ios" \
+    CLANG_MODULE_CACHE_PATH="$SRC/External/build/DerivedData-ios/ModuleCache.noindex" -quiet
 
 BIN="$SRC/Package/Release/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework/MoltenVK"
 mkdir -p "$OUT" "$LIC"

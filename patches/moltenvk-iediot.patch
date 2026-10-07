@@ -1,0 +1,509 @@
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 7d16b94..6229e46 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1446,6 +1446,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+ 	} else {
+ 		bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageVertex,   MVKMetalGraphicsStage::Vertex);
+ 		bindVertexBuffers(encoder, vk, _exists.vertex(), _bindings.vertex(), MVKVertexBufferBinder::Vertex());
++		if (id<MTLBuffer> dummy = pipeline->getDummyVertexBuffer()) {
++			uint32_t index = pipeline->getDummyVertexBufferIndex();
++			[encoder setVertexBuffer:dummy offset:0 atIndex:index];
++			// The next pipeline may use this slot for a real resource. Keep the
++			// binding tracker in sync so it cannot skip restoring that resource.
++			_exists.vertex().buffers.set(index);
++			_exists.vertex().descriptorSetData.reset();
++			_bindings.vertex().buffers[index] = MVKStageResourceBindings::InvalidBuffer();
++		}
++
+ 	}
+ 	bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageFragment, MVKMetalGraphicsStage::Fragment);
+ 	mvkEncoder.getState().mtlShared()._useResource.bindAndResetGraphics(encoder);
+@@ -1647,8 +1657,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+ 	}
+ 
+ 	bindVulkanGraphicsToMetalCompute(encoder, mvkEncoder, vk, vkShared, *this, pipeline, stage);
+-	if (stage == kMVKShaderStageVertex)
++	if (stage == kMVKShaderStageVertex) {
+ 		bindVertexBuffers(encoder, vk, _exists, _bindings, MVKVertexBufferBinder::Compute());
++		if (id<MTLBuffer> dummy = pipeline->getDummyVertexBuffer()) {
++			uint32_t index = pipeline->getDummyVertexBufferIndex();
++			[encoder setBuffer:dummy offset:0 atIndex:index];
++			_exists.buffers.set(index);
++			_exists.descriptorSetData.reset();
++			_bindings.buffers[index] = MVKStageResourceBindings::InvalidBuffer();
++		}
++	}
+ 	mvkEncoder.getState().mtlShared()._useResource.bindAndResetCompute(encoder);
+ }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 534a414..001c089 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -651,9 +651,16 @@ public:
+ };
+ 
+ /** Represents a Vulkan logical GPU device, associated with a physical device. */
++class MVKBinaryArchiveCache;
++extern const char kMVKArchiveShaderKey;
++
+ class MVKDevice : public MVKDispatchableVulkanAPIObject {
+ 
+ public:
++	// Optional iOS backend pipeline cache. A nil result always permits normal compilation.
++	id<MTLRenderPipelineState> newArchivedPipeline(MTLRenderPipelineDescriptor* descriptor);
++	id<MTLComputePipelineState> newArchivedPipeline(MTLComputePipelineDescriptor* descriptor);
++
+ 
+ 	/** Returns the Vulkan type of this object. */
+ 	VkObjectType getVkObjectType() override { return VK_OBJECT_TYPE_DEVICE; }
+@@ -1051,6 +1058,8 @@ public:
+ 	}
+ 
+ protected:
++	MVKBinaryArchiveCache* _binaryArchiveCache = nullptr;
++
+ 	friend class MVKDeviceTrackingMixin;
+ 
+ 	void propagateDebugName() override  {}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 9772757..bbd72dc 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -38,6 +38,8 @@
+ 
+ #include <sys/stat.h>
+ #include <cmath>
++#include <atomic>
++#import <objc/runtime.h>
+ 
+ using namespace std;
+ 
+@@ -5130,6 +5132,209 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	}
+ }
+ 
++// The archive caches backend code only. MSL libraries and specialized functions still
++// go through the normal shader-module path. The shader hash only selects a shard;
++// Metal, not this hash, decides whether the complete pipeline matches.
++const char kMVKArchiveShaderKey = 0;
++
++class MVKBinaryArchiveCache {
++public:
++	MVKBinaryArchiveCache(id<MTLDevice> device) : _device(device) {
++		_queue = dispatch_queue_create("MoltenVK.binary-archive", DISPATCH_QUEUE_SERIAL);
++		NSString* root = NSProcessInfo.processInfo.environment[@"MVK_CONFIG_IOS_BINARY_ARCHIVE_DIR"];
++		if (!root.length) { root = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"mvk-binary-archive"]; }
++		NSString* game = NSProcessInfo.processInfo.environment[@"MADEIRA_GAME_KEY"];
++		if (!game.length) { game = NSProcessInfo.processInfo.processName; }
++		NSString* identity = [NSString stringWithFormat:@"v1-%llu-%@-%@", device.registryID, device.name, game];
++		// Stable path component; never interpret a game key as a relative path.
++		uint64_t hash = 14695981039346656037ull;
++		for (const unsigned char* p = (const unsigned char*)identity.UTF8String; *p; ++p) { hash = (hash ^ *p) * 1099511628211ull; }
++		_directory = [[root stringByAppendingPathComponent:[NSString stringWithFormat:@"%016llx", (unsigned long long)hash]] retain];
++		NSError* error = nil;
++		_enabled = [NSFileManager.defaultManager createDirectoryAtPath:_directory withIntermediateDirectories:YES attributes:nil error:&error];
++		NSUInteger loaded = 0;
++		if (_enabled) {
++			NSArray* files = [NSFileManager.defaultManager contentsOfDirectoryAtPath:_directory error:nil];
++			for (unsigned i = 0; i < kShardCount; ++i) {
++				auto& shard = _shards[i];
++				NSString* prefix = [NSString stringWithFormat:@"%02u-", i];
++				for (NSString* file in [files sortedArrayUsingSelector:@selector(compare:)]) {
++					if ([file hasPrefix:prefix] && [file hasSuffix:@".metalarc"]) {
++						shard.pages.push_back([[NSURL fileURLWithPath:[_directory stringByAppendingPathComponent:file]] retain]);
++						// Kept open: an archive loaded from a URL is mapped from its file, and one
++						// lookup then searches every page in a single pipeline creation instead of
++						// reopening and probing them one at a time (hundreds of pages for a game
++						// with ~100k pipelines, under the shard lock).
++						id<MTLBinaryArchive> archive = load(shard.pages.back());
++						if (archive) { ++loaded; [shard.frozen addObject:archive]; [archive release]; }
++					}
++				}
++				appendPage(shard, i); // Existing pages are immutable across processes.
++			}
++		}
++		fprintf(stderr, "[mvk-archive] load enabled=%d pages=%lu hits=0 misses=0 dir=%s error=%s\n", _enabled, (unsigned long)loaded, _directory.UTF8String, error ? error.localizedDescription.UTF8String : "none");
++	}
++
++	~MVKBinaryArchiveCache() {
++		// Drain queued writes before releasing Metal objects or the device.
++		dispatch_sync(_queue, ^{});
++		for (unsigned i = 0; i < kShardCount; ++i) {
++			auto& shard = _shards[i];
++			std::lock_guard<std::mutex> lock(shard.lock);
++			flush(shard, i);
++			[shard.archive release];
++			for (NSURL* url : shard.pages) { [url release]; }
++			[shard.frozen release];
++		}
++		fprintf(stderr, "[mvk-archive] close hits=%llu misses=%llu\n", (unsigned long long)_hits.load(), (unsigned long long)_misses.load());
++		dispatch_release(_queue);
++		[_directory release];
++	}
++
++	template<class Descriptor> id newPipeline(Descriptor* descriptor, id<MTLFunction> function) {
++		if (!_enabled) { return nil; }
++		uint64_t hash = [objc_getAssociatedObject(function, &kMVKArchiveShaderKey) unsignedLongLongValue];
++		hash ^= hash >> 32;
++		unsigned index = hash % kShardCount;
++		auto& shard = _shards[index];
++		std::lock_guard<std::mutex> lock(shard.lock);
++		// Every finished page stays open (shard.frozen); the current page is this
++		// process's writer, reopened from its file after a flush released it. One
++		// pipeline creation searches them all.
++		if (!shard.archive && !shard.pages.empty()) { shard.archive = load(shard.pages.back()); }
++		if (shard.frozen.count || shard.archive) { @autoreleasepool {
++			NSMutableArray* archives = [NSMutableArray arrayWithArray:shard.frozen];
++			if (shard.archive) { [archives addObject:shard.archive]; }
++			descriptor.binaryArchives = archives;
++			NSError* error = nil;
++			id state = compile(descriptor, MTLPipelineOptionFailOnBinaryArchiveMiss, &error);
++			descriptor.binaryArchives = nil;
++			if (state) { ++_hits; return state; }
++		} }
++		++_misses;
++		if (shard.dirty >= 128) { return nil; } // Bound pending additions while the writer catches up.
++		if (!shard.archive) {
++			if (!shard.pages.empty()) {
++				shard.archive = load(shard.pages.back());
++			}
++			if (!shard.archive) {
++				MTLBinaryArchiveDescriptor* desc = [MTLBinaryArchiveDescriptor new];
++				shard.archive = [_device newBinaryArchiveWithDescriptor:desc error:nil];
++				[desc release];
++				if (shard.pages.empty()) { appendPage(shard, index); }
++			}
++		}
++		if (!shard.archive) { return nil; }
++		NSError* error = nil;
++		if (!add(shard.archive, descriptor, &error)) {
++			if (_errors.fetch_add(1) < 8) { fprintf(stderr, "[mvk-archive] add failed: %s\n", error.localizedDescription.UTF8String); }
++			return nil;
++		}
++		++shard.dirty;
++		descriptor.binaryArchives = @[shard.archive];
++		id state = compile(descriptor, MTLPipelineOptionNone, &error);
++		descriptor.binaryArchives = nil;
++		if (shard.dirty >= 128 && !shard.queued) {
++			shard.queued = true;
++			dispatch_async(_queue, ^{ @autoreleasepool {
++				auto& pending = _shards[index];
++				std::lock_guard<std::mutex> writeLock(pending.lock);
++				flush(pending, index);
++				pending.queued = false;
++			} });
++		}
++		return state; // retained, or nil to let the existing compiler report the error
++	}
++
++private:
++	static constexpr unsigned kShardCount = 16;
++	struct Shard {
++		std::mutex lock;
++		std::vector<NSURL*> pages;
++		NSMutableArray* frozen = [NSMutableArray new];   // finished pages, kept open
++		id<MTLBinaryArchive> archive = nil;
++		unsigned dirty = 0;
++		bool queued = false;
++	};
++	Shard _shards[kShardCount];
++	id<MTLDevice> _device;
++	NSString* _directory;
++	dispatch_queue_t _queue;
++	bool _enabled = false;
++	std::atomic<uint64_t> _hits{0}, _misses{0}, _errors{0};
++
++	void appendPage(Shard& shard, unsigned index) {
++		// UUID avoids replacing another process's page. Concurrent processes may
++		// duplicate cache entries, but cannot truncate each other's archive files.
++		NSString* file = [NSString stringWithFormat:@"%02u-%@.metalarc", index, NSUUID.UUID.UUIDString];
++		shard.pages.push_back([[NSURL fileURLWithPath:[_directory stringByAppendingPathComponent:file]] retain]);
++	}
++
++	id<MTLBinaryArchive> load(NSURL* url) {
++		if (![NSFileManager.defaultManager fileExistsAtPath:url.path]) { return nil; }
++		MTLBinaryArchiveDescriptor* desc = [MTLBinaryArchiveDescriptor new];
++		desc.url = url;
++		NSError* error = nil;
++		id<MTLBinaryArchive> archive = [_device newBinaryArchiveWithDescriptor:desc error:&error];
++		[desc release];
++		if (!archive) {
++			fprintf(stderr, "[mvk-archive] discard file=%s error=%s\n", url.path.UTF8String, error.localizedDescription.UTF8String);
++			[NSFileManager.defaultManager removeItemAtURL:url error:nil];
++		}
++		return archive;
++	}
++
++	void flush(Shard& shard, unsigned index) {
++		if (!shard.dirty) { return; }
++		NSURL* url = shard.pages.back();
++		NSURL* temp = [NSURL fileURLWithPath:[url.path stringByAppendingString:@".tmp"]];
++		NSError* error = nil;
++		bool ok = [shard.archive serializeToURL:temp error:&error];
++		// Rename on the same filesystem leaves the last good archive intact on failure.
++		if (ok) { ok = rename(temp.path.fileSystemRepresentation, url.path.fileSystemRepresentation) == 0; }
++		fprintf(stderr, "[mvk-archive] serialize shard=%u additions=%u hits=%llu misses=%llu ok=%d file=%s error=%s\n", index, shard.dirty, (unsigned long long)_hits.load(), (unsigned long long)_misses.load(), ok, url.path.UTF8String, error ? error.localizedDescription.UTF8String : (ok ? "none" : strerror(errno)));
++		if (!ok) {
++			// Do not grow memory indefinitely if storage is full or unavailable.
++			[NSFileManager.defaultManager removeItemAtURL:temp error:nil];
++			shard.dirty = 0;
++			[shard.archive release];
++			shard.archive = nil;
++			return;
++		}
++		shard.dirty = 0;
++		[shard.archive release];
++		shard.archive = nil;
++		// Bound the size of a resident page, allowing one batch of overshoot. Disk
++		// storage has no total size limit; old pages remain available for lookup.
++		if ([[NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil] fileSize] >= 8 * 1024 * 1024) {
++			id<MTLBinaryArchive> done = load(url);   // finished: searched from now on
++			if (done) { [shard.frozen addObject:done]; [done release]; }
++			appendPage(shard, index);
++		}
++	}
++
++	id compile(MTLRenderPipelineDescriptor* d, MTLPipelineOption options, NSError** error) {
++		return [_device newRenderPipelineStateWithDescriptor:d options:options reflection:nil error:error];
++	}
++	id compile(MTLComputePipelineDescriptor* d, MTLPipelineOption options, NSError** error) {
++		return [_device newComputePipelineStateWithDescriptor:d options:options reflection:nil error:error];
++	}
++	bool add(id<MTLBinaryArchive> archive, MTLRenderPipelineDescriptor* d, NSError** error) {
++		return [archive addRenderPipelineFunctionsWithDescriptor:d error:error];
++	}
++	bool add(id<MTLBinaryArchive> archive, MTLComputePipelineDescriptor* d, NSError** error) {
++		return [archive addComputePipelineFunctionsWithDescriptor:d error:error];
++	}
++};
++
++id<MTLRenderPipelineState> MVKDevice::newArchivedPipeline(MTLRenderPipelineDescriptor* descriptor) {
++	return _binaryArchiveCache ? _binaryArchiveCache->newPipeline(descriptor, descriptor.vertexFunction) : nil;
++}
++
++id<MTLComputePipelineState> MVKDevice::newArchivedPipeline(MTLComputePipelineDescriptor* descriptor) {
++	return _binaryArchiveCache ? _binaryArchiveCache->newPipeline(descriptor, descriptor.computeFunction) : nil;
++}
++
+ MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
+ 
+ 	// If the physical device is lost, bail.
+@@ -5140,6 +5345,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	}
+ 
+ 	initPhysicalDevice(physicalDevice, pCreateInfo);
++	#if MVK_IOS
++	if (@available(iOS 14.0, *)) {
++		const char* enabled = getenv("MVK_CONFIG_IOS_BINARY_ARCHIVE");
++		if (!enabled || strcmp(enabled, "0")) { _binaryArchiveCache = new MVKBinaryArchiveCache(physicalDevice->getMTLDevice()); }
++	}
++	#endif
+ 	initPerformanceTracking();
+ 	enableExtensions(pCreateInfo);
+ 	enableFeatures(pCreateInfo);
+@@ -5532,6 +5743,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ }
+ 
+ MVKDevice::~MVKDevice() {
++	delete _binaryArchiveCache;
+ 	if (_isPerformanceTracking) {
+ 		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
+ 		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index e385e9b..c8e3deb 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -315,6 +315,9 @@ public:
+ 	/** Returns a list of the vertex buffers used by this pipeline by Vulkan buffer ID */
+ 	const MVKStaticBitSet<kMVKMaxBufferCount>& getVkVertexBuffers() const { return _vkVertexBuffers; }
+ 	/** Returns a list of the vertex buffers used by this pipeline by Metal buffer ID */
++	id<MTLBuffer> getDummyVertexBuffer() const { return _dummyVertexBuffer; }
++	uint32_t getDummyVertexBufferIndex() const { return _dummyVertexBufferIndex; }
++
+ 	const MVKStaticBitSet<kMVKMaxBufferCount>& getMtlVertexBuffers() const { return _mtlVertexBuffers; }
+ 	const VkViewport* getViewports() const { return _viewports; }
+ 	const VkRect2D* getScissors() const { return _scissors; }
+@@ -362,6 +365,8 @@ protected:
+     bool isRenderingPoints();
+     bool isRasterizationDisabled(const VkGraphicsPipelineCreateInfo* pCreateInfo);
+     bool isDepthClipNegativeOneToOne(const VkGraphicsPipelineCreateInfo* pCreateInfo);
++	template<class T>
++	bool addMissingVertexAttributes(T* inputDesc, id<MTLFunction> function);
+ 	bool verifyImplicitBuffers(MVKShaderStage stage);
+ 	uint32_t getTranslatedVertexBinding(uint32_t binding, uint32_t translationOffset, uint32_t maxBinding);
+ 	uint32_t getImplicitBufferIndex(MVKShaderStage stage, uint32_t bufferIndexOffset);
+@@ -392,6 +397,8 @@ protected:
+ 	id<MTLComputePipelineState> _mtlTessVertexStageIndex16State = nil;
+ 	id<MTLComputePipelineState> _mtlTessVertexStageIndex32State = nil;
+ 	id<MTLComputePipelineState> _mtlTessControlStageState = nil;
++	id<MTLBuffer> _dummyVertexBuffer = nil;
++	uint32_t _dummyVertexBufferIndex = UINT32_MAX;
+ 	id<MTLRenderPipelineState> _mtlPipelineState = nil;
+ 
+ 	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7eae64c..075172b 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "MVKPipeline.h"
++#include <atomic>
+ #include "MVKCommandBuffer.h"
+ #include "MVKInlineObjectConstructor.h"
+ #include "MVKImage.h"
+@@ -1190,7 +1191,9 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 
+ 	// Vertex input
+ 	// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
++	if (!plDesc.vertexDescriptor) { plDesc.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor]; }
+ 	if (!addVertexInputToPipeline(plDesc.vertexDescriptor, pCreateInfo->pVertexInputState, shaderConfig)) { return nil; }
++	if (!addMissingVertexAttributes(plDesc.vertexDescriptor, plDesc.vertexFunction)) { return nil; }
+ 
+ 	// Fragment shader - only add if rasterization is enabled
+ 	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pFragmentSS, pFragmentFB)) { return nil; }
+@@ -1236,6 +1239,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 	// Vertex input
+ 	plDesc.stageInputDescriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+ 	if (!addVertexInputToPipeline(plDesc.stageInputDescriptor, pCreateInfo->pVertexInputState, shaderConfig)) { return nil; }
++	// All index variants consume the same vertex inputs. Reserve the index
++	// buffer before selecting a spare slot, even if every input was omitted.
++	if (pVtxFunctions[2].getMTLFunction().stageInputAttributes.count) {
++		_stageResources[kMVKShaderStageVertex].implicitBuffers.needed.add(MVKImplicitBuffer::Index);
++		if (!verifyImplicitBuffers(kMVKShaderStageVertex)) { return nil; }
++	}
++	for (uint32_t i = 0; i < 3; ++i) {
++		if (!addMissingVertexAttributes(plDesc.stageInputDescriptor, pVtxFunctions[i].getMTLFunction())) { return nil; }
++	}
+ 	plDesc.stageInputDescriptor.indexBufferIndex = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids[MVKImplicitBuffer::Index];
+ 
+ 	plDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+@@ -1872,6 +1884,68 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	return true;
+ }
+ 
++// Desktop drivers tolerate undeclared vertex inputs. Metal requires a descriptor
++// for every active stage-in attribute, including when Vulkan provides no inputs.
++template<class T>
++bool MVKGraphicsPipeline::addMissingVertexAttributes(T* inputDesc, id<MTLFunction> function) {
++	for (MTLAttribute* attr in function.stageInputAttributes) {
++		if (!attr.active) { continue; }
++		NSUInteger location = attr.attributeIndex;
++		if (location >= 31 || (NSUInteger)inputDesc.attributes[location].format != MTLVertexFormatInvalid) { continue; }
++		if (!_dummyVertexBuffer) {
++			// Descriptor buffers occupy the low indices, vertex buffers the high
++			// indices. Exclude implicit shader buffers as well as translated inputs.
++			auto used = _mtlVertexBuffers;
++			const auto& resources = _stageResources[kMVKShaderStageVertex];
++			for (auto buffer : resources.implicitBuffers.needed) { used.set(resources.implicitBuffers.ids[buffer]); }
++			for (uint32_t i = _descriptorBufferCounts.stages[kMVKShaderStageVertex]; i < 31; ++i) {
++				if (!used.get(i)) { _dummyVertexBufferIndex = i; break; }
++			}
++			if (_dummyVertexBufferIndex == UINT32_MAX) {
++				setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "No spare Metal buffer index for missing vertex attributes."));
++				return false;
++			}
++			uint32_t zeros[4] = {};
++			_dummyVertexBuffer = [getMTLDevice() newBufferWithBytes:zeros length:sizeof(zeros) options:MTLResourceStorageModeShared];
++			if (!_dummyVertexBuffer) {
++				setConfigurationResult(reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "Could not allocate missing vertex attribute buffer."));
++				return false;
++			}
++		}
++		// Supply four components so the usual missing-component default (w=1)
++		// cannot leak into an input that must read entirely as zero.
++		MTLVertexFormat format;
++		switch (attr.attributeType) {
++			case MTLDataTypeFloat: case MTLDataTypeFloat2: case MTLDataTypeFloat3: case MTLDataTypeFloat4: format = MTLVertexFormatFloat4; break;
++			case MTLDataTypeHalf: case MTLDataTypeHalf2: case MTLDataTypeHalf3: case MTLDataTypeHalf4: format = MTLVertexFormatHalf4; break;
++			case MTLDataTypeInt: case MTLDataTypeInt2: case MTLDataTypeInt3: case MTLDataTypeInt4: format = MTLVertexFormatInt4; break;
++			case MTLDataTypeUInt: case MTLDataTypeUInt2: case MTLDataTypeUInt3: case MTLDataTypeUInt4: format = MTLVertexFormatUInt4; break;
++			case MTLDataTypeShort: case MTLDataTypeShort2: case MTLDataTypeShort3: case MTLDataTypeShort4: format = MTLVertexFormatShort4; break;
++			case MTLDataTypeUShort: case MTLDataTypeUShort2: case MTLDataTypeUShort3: case MTLDataTypeUShort4: format = MTLVertexFormatUShort4; break;
++			case MTLDataTypeChar: case MTLDataTypeChar2: case MTLDataTypeChar3: case MTLDataTypeChar4: format = MTLVertexFormatChar4; break;
++			case MTLDataTypeUChar: case MTLDataTypeUChar2: case MTLDataTypeUChar3: case MTLDataTypeUChar4: format = MTLVertexFormatUChar4; break;
++			default:
++				setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Unsupported missing vertex attribute type %lu.", (unsigned long)attr.attributeType));
++				return false;
++		}
++		auto desc = inputDesc.attributes[location];
++		desc.format = (decltype(desc.format))format;
++		desc.offset = 0;
++		desc.bufferIndex = _dummyVertexBufferIndex;
++		auto layout = inputDesc.layouts[_dummyVertexBufferIndex];
++		layout.stepFunction = (decltype(layout.stepFunction))MTLStepFunctionConstant;
++		layout.stepRate = 0;
++		// Metal requires a nonzero stride even for constant stepping; no draw
++		// index ever advances this buffer (same convention as Vulkan stride 0).
++		layout.stride = 16;
++		static std::atomic<unsigned> logged{0};
++		if (logged.fetch_add(1) < 8) {
++			fprintf(stderr, "[mvk-dummy-attr] location=%lu type=%lu buffer=%u zero-filled\n", (unsigned long)location, (unsigned long)attr.attributeType, _dummyVertexBufferIndex);
++		}
++	}
++	return true;
++}
++
+ // Adjusts step rates for per-instance vertex buffers based on the number of views to be drawn.
+ void MVKGraphicsPipeline::adjustVertexInputForMultiview(MTLVertexDescriptor* inputDesc, const VkPipelineVertexInputStateCreateInfo* pVI, uint32_t viewCount, uint32_t oldViewCount) {
+ 	uint32_t vbCnt = pVI->vertexBindingDescriptionCount;
+@@ -2392,6 +2466,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ }
+ 
+ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
++	[_dummyVertexBuffer release];
+ 	@synchronized (getMTLDevice()) {
+ 		[_mtlTessVertexStageState release];
+ 		[_mtlTessVertexStageIndex16State release];
+@@ -3096,6 +3171,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
++		if (id<MTLRenderPipelineState> state = getDevice()->newArchivedPipeline(mtlRPLDesc)) {
++			bool isLate = compileComplete(state, nil);
++			[state release];
++			if (isLate) { destroy(); }
++			return;
++		}
+ 		auto mtlDev = getMTLDevice();
+ 		@synchronized (mtlDev) {
+ 			[mtlDev newRenderPipelineStateWithDescriptor: mtlRPLDesc
+@@ -3130,6 +3211,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
++		if (id<MTLComputePipelineState> state = getDevice()->newArchivedPipeline(plDesc)) {
++			bool isLate = compileComplete(state, nil);
++			[state release];
++			if (isLate) { destroy(); }
++			return;
++		}
+ 		auto mtlDev = getMTLDevice();
+ 		@synchronized (mtlDev) {
+ 			[mtlDev newComputePipelineStateWithDescriptor: plDesc
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a4..4cf218b 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "MVKShaderModule.h"
++#import <objc/runtime.h>
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+ #include <sys/stat.h>
+@@ -166,6 +167,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 			if ( !dbName ) { dbName = _owner->getDebugName(); }
+ 			_owner->setMetalObjectLabel(mtlFunc, dbName);
+ 
++			// Routing hint only: Metal still validates the complete pipeline and function identity.
++			if (mtlFunc) { objc_setAssociatedObject(mtlFunc, &kMVKArchiveShaderKey,
++				@(shaderModule->getKey().codeHash), OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
++
+ 			auto& wgSize = _shaderConversionResultInfo.entryPoint.workgroupSize;
+ 			return MVKMTLFunction(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
+ 																					getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
