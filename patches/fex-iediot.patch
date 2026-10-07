@@ -744,7 +744,7 @@ index b1ffb94..51128ff 100644
  void STDMETHODCALLTYPE BTCpuFlushInstructionCache2(const void* Address, SIZE_T Size);
  void STDMETHODCALLTYPE BTCpuFlushInstructionCacheHeavy(const void* Address, SIZE_T Size);
 diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
-index 5c7dd86..5eb95aa 100644
+index 5c7dd86..af1b242 100644
 --- a/Source/Windows/WOW64/Module.cpp
 +++ b/Source/Windows/WOW64/Module.cpp
 @@ -357,6 +357,11 @@ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
@@ -821,12 +821,12 @@ index 5c7dd86..5eb95aa 100644
    if (!Self) {
 +#ifdef FEX_IOS_HOST
 +    auto [Status, TargetTLS] = GetThreadTLS(*ThreadDup);
-+    if (!Status) TargetTLS.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
++    if (!Status && TargetTLS.TEB) TargetTLS.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
 +#endif
      // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
      RtlWow64SuspendThread(*ThreadDup, NULL);
  #ifdef FEX_IOS_HOST
-@@ -1716,7 +1734,90 @@ extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
+@@ -1716,7 +1734,97 @@ extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
    CTX->ExecuteThread(TLS.ThreadState());
  }
  
@@ -854,8 +854,10 @@ index 5c7dd86..5eb95aa 100644
 +  auto [Err, Target] = GetThreadTLS(*Dup);
 +  if (Err) return Err;
 +  {
++    // A thread created suspended has no TEB address yet on this host
++    // (GetThreadTLS succeeds with null) and never entered the JIT.
 +    std::scoped_lock Lock(ThreadCreationMutex);
-+    if (!Threads.contains(Tid)) return NtSuspendThread(*Dup, Count);
++    if (!Target.TEB || !Threads.contains(Tid)) return NtSuspendThread(*Dup, Count);
 +  }
 +  const auto Start = std::chrono::steady_clock::now();
 +  const auto PreviousControl = Target.ControlWord().fetch_or(ControlBits::PAUSED, std::memory_order::acq_rel);
@@ -901,8 +903,13 @@ index 5c7dd86..5eb95aa 100644
 +    // Native resume applies queued context writes before returning. Nested
 +    // suspends, including those from different callers, retain PAUSED.
 +    if (Previous <= 1) {
++      // Only threads this module parked: resuming a thread created suspended
++      // (the usual CreateThread path) found a null TEB and faulted at 0x1508.
 +      auto [Err, Target] = GetThreadTLS(*Dup);
-+      if (!Err) Target.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
++      const auto Tid = static_cast<DWORD>(reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread));
++      std::scoped_lock Lock(ThreadCreationMutex);
++      if (!Err && Target.TEB && Threads.contains(Tid))
++        Target.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
 +    }
 +  }
 +  WowParkLog(Previous > 1 ? "retain" : "unpark", reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread), Previous, 0, Status);
@@ -917,7 +924,7 @@ index 5c7dd86..5eb95aa 100644
    if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SUSPEND_RESUME)) {
      return STATUS_ACCESS_DENIED;
    }
-@@ -1764,7 +1865,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
+@@ -1764,7 +1872,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
  
      ULONG TmpProt;
      void* TmpAddress = &TLS.ThreadState()->InterruptFaultPage;
@@ -926,7 +933,7 @@ index 5c7dd86..5eb95aa 100644
      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READONLY, &TmpProt);
    }
  
-@@ -1809,6 +1910,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
+@@ -1809,6 +1917,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
    TLS.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::relaxed);
  
    return Err;

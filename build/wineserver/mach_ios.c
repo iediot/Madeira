@@ -945,15 +945,19 @@ int ios_fill_thread_context( struct thread *thread,
      * RtlIsEcCode() is deliberately not called here: that is a PE-side export and this is
      * native Unix code (ml613). The frame PC is classified later, in the EC wrapper.
      *
-     * Opt-in via MADEIRA_CTX_FRAME=1 while it is unproven. Every validation failure falls
-     * through to the old behaviour rather than inventing state. */
+     * On by default since 2026-10-06 (jakub's RimWorld fork). RimWorld's quit wedged in
+     * Mono's suspend_sync_nolock: it suspended a thread parked in read(), got that
+     * thread's unix-side sp, found it outside the thread's stack bounds, treated it as a
+     * critical region and retried forever. MADEIRA_CTX_FRAME=0 restores the Mach
+     * registers. Every validation failure falls through to them rather than inventing
+     * state. */
     if (have_native)
     {
         static int ctx_frame_env = -1;
         if (ctx_frame_env < 0)
         {
             const char *e = getenv( "MADEIRA_CTX_FRAME" );
-            ctx_frame_env = (e && e[0] == '1') ? 1 : 0;
+            ctx_frame_env = (e && e[0] == '0') ? 0 : 1;
         }
         if (ctx_frame_env && thread->teb)
         {

@@ -15803,10 +15803,10 @@ index 39c0540a..bab12b1b 100644
      {
          WaitForSingleObject( start_event, INFINITE );
 diff --git a/dlls/winevulkan/vulkan_thunks.c b/dlls/winevulkan/vulkan_thunks.c
-index e7d394fa..0558cbde 100644
+index e7d394fa..db902305 100644
 --- a/dlls/winevulkan/vulkan_thunks.c
 +++ b/dlls/winevulkan/vulkan_thunks.c
-@@ -25,6 +25,35 @@
+@@ -25,6 +25,58 @@
  
  #include "vulkan_private.h"
  
@@ -15816,6 +15816,27 @@ index e7d394fa..0558cbde 100644
 +/* [vk-pipe] time spent creating pipelines in the driver (MoltenVK's SPIR-V to
 + * MSL conversion plus Metal's compile), to tell it apart from the game's own
 + * translated CPU work during shader warm-up. Summary every 64 creations. */
++/* MoltenVK keeps every shader library (MSL plus compiled MTLLibrary) it builds
++ * through a VkPipelineCache for the cache's whole life, so a game that warms
++ * up through one long-lived cache grows without bound: Detroit: Become Human
++ * reached 12 GB after 81k pipelines and was killed. Without a cache the
++ * libraries live with their shader modules and go when those are destroyed.
++ * Metal keeps its own on-disk cache, so the driver-side cache only saves
++ * SPIR-V to MSL conversion. MADEIRA_VK_PIPELINE_CACHE=1 passes it through. */
++static VkPipelineCache ios_pipeline_cache( VkPipelineCache cache )
++{
++    static int keep = -1;
++    if (keep < 0)
++    {
++        const char *e = getenv( "MADEIRA_VK_PIPELINE_CACHE" );
++        keep = e && *e == '1';
++    }
++    return keep ? cache : VK_NULL_HANDLE;
++}
++
++/* object lifetimes behind [vk-pipe]: is the game freeing what it builds? */
++static LONG ios_vk_pipes_destroyed, ios_vk_modules_live, ios_vk_caches_live;
++
 +static void ios_pipe_time( const char *kind, uint32_t count, VkPipelineCache cache,
 +                           VkResult result, struct timespec *t0 )
 +{
@@ -15833,25 +15854,34 @@ index e7d394fa..0558cbde 100644
 +    n = InterlockedIncrement( &calls );
 +    if (n <= 4 || !(n % 64) || result < 0)
 +        fprintf( stderr, "[vk-pipe] %s #%d count=%u cache=%d result=%d took=%lldms | total pipelines=%d "
-+                 "driver=%lldms avg=%lldms max=%lldms over100ms=%d\n", kind, (int)n, count, cache != 0,
++                 "driver=%lldms avg=%lldms max=%lldms over100ms=%d destroyed=%d modules_live=%d caches_live=%d\n",
++                 kind, (int)n, count, cache != 0,
 +                 result, us / 1000, (int)pipes, total_us / 1000, total_us / 1000 / (pipes ? pipes : 1),
-+                 max_us / 1000, (int)slow );
++                 max_us / 1000, (int)slow, (int)ios_vk_pipes_destroyed, (int)ios_vk_modules_live,
++                 (int)ios_vk_caches_live );
 +}
 +#endif
 +
  WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
  
  typedef struct VkGeometryAABBNV32
-@@ -52232,7 +52261,16 @@ static NTSTATUS thunk64_vkCreateComputePipelines(void *args)
+@@ -52232,7 +52284,22 @@ static NTSTATUS thunk64_vkCreateComputePipelines(void *args)
  
      TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
  
+-    params->result = vulkan_device_from_handle(params->device)->p_vkCreateComputePipelines(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
 +#ifdef WINE_IOS
 +    {
 +    struct timespec t0;
 +    clock_gettime( CLOCK_MONOTONIC, &t0 );
 +#endif
-     params->result = vulkan_device_from_handle(params->device)->p_vkCreateComputePipelines(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
++    params->result = vulkan_device_from_handle(params->device)->p_vkCreateComputePipelines(vulkan_device_from_handle(params->device)->host.device,
++#ifdef WINE_IOS
++        ios_pipeline_cache( params->pipelineCache ),
++#else
++        params->pipelineCache,
++#endif
++        params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
 +#ifdef WINE_IOS
 +    ios_pipe_time( "compute", params->createInfoCount, params->pipelineCache, params->result, &t0 );
 +    }
@@ -15859,19 +15889,76 @@ index e7d394fa..0558cbde 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -52791,7 +52829,16 @@ static NTSTATUS thunk64_vkCreateGraphicsPipelines(void *args)
+@@ -52791,7 +52858,22 @@ static NTSTATUS thunk64_vkCreateGraphicsPipelines(void *args)
  
      TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
  
+-    params->result = vulkan_device_from_handle(params->device)->p_vkCreateGraphicsPipelines(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
 +#ifdef WINE_IOS
 +    {
 +    struct timespec t0;
 +    clock_gettime( CLOCK_MONOTONIC, &t0 );
 +#endif
-     params->result = vulkan_device_from_handle(params->device)->p_vkCreateGraphicsPipelines(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
++    params->result = vulkan_device_from_handle(params->device)->p_vkCreateGraphicsPipelines(vulkan_device_from_handle(params->device)->host.device,
++#ifdef WINE_IOS
++        ios_pipeline_cache( params->pipelineCache ),
++#else
++        params->pipelineCache,
++#endif
++        params->createInfoCount, params->pCreateInfos, NULL, params->pPipelines);
 +#ifdef WINE_IOS
 +    ios_pipe_time( "graphics", params->createInfoCount, params->pipelineCache, params->result, &t0 );
 +    }
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -53158,6 +53240,9 @@ static NTSTATUS thunk64_vkCreatePipelineCache(void *args)
+     TRACE("%p, %p, %p, %p\n", params->device, params->pCreateInfo, params->pAllocator, params->pPipelineCache);
+ 
+     params->result = vulkan_device_from_handle(params->device)->p_vkCreatePipelineCache(vulkan_device_from_handle(params->device)->host.device, params->pCreateInfo, NULL, params->pPipelineCache);
++#ifdef WINE_IOS
++    if (!params->result) InterlockedIncrement( &ios_vk_caches_live );
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -53649,6 +53734,9 @@ static NTSTATUS thunk64_vkCreateShaderModule(void *args)
+     TRACE("%p, %p, %p, %p\n", params->device, params->pCreateInfo, params->pAllocator, params->pShaderModule);
+ 
+     params->result = vulkan_device_from_handle(params->device)->p_vkCreateShaderModule(vulkan_device_from_handle(params->device)->host.device, params->pCreateInfo, NULL, params->pShaderModule);
++#ifdef WINE_IOS
++    if (!params->result) InterlockedIncrement( &ios_vk_modules_live );
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -54817,6 +54905,9 @@ static NTSTATUS thunk64_vkDestroyPipeline(void *args)
+     TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->pipeline), params->pAllocator);
+ 
+     vulkan_device_from_handle(params->device)->p_vkDestroyPipeline(vulkan_device_from_handle(params->device)->host.device, params->pipeline, NULL);
++#ifdef WINE_IOS
++    if (params->pipeline) InterlockedIncrement( &ios_vk_pipes_destroyed );
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -54871,6 +54962,9 @@ static NTSTATUS thunk64_vkDestroyPipelineCache(void *args)
+     TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->pAllocator);
+ 
+     vulkan_device_from_handle(params->device)->p_vkDestroyPipelineCache(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, NULL);
++#ifdef WINE_IOS
++    if (params->pipelineCache) InterlockedDecrement( &ios_vk_caches_live );
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -55168,6 +55262,9 @@ static NTSTATUS thunk64_vkDestroyShaderModule(void *args)
+     TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->shaderModule), params->pAllocator);
+ 
+     vulkan_device_from_handle(params->device)->p_vkDestroyShaderModule(vulkan_device_from_handle(params->device)->host.device, params->shaderModule, NULL);
++#ifdef WINE_IOS
++    if (params->shaderModule) InterlockedDecrement( &ios_vk_modules_live );
 +#endif
      return STATUS_SUCCESS;
  }

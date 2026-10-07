@@ -212,6 +212,12 @@ static int extract_tar(reader *r, const char *dest_dir, const char *strip, const
         if (strip && !strncmp(relname, strip, strip_len) && (relname[strip_len] == '/' || !relname[strip_len]))
             relname += strip_len + (relname[strip_len] == '/');
 
+        if (relname[0] == '/') {                 // nor at an absolute path
+            fprintf(stderr, "[%s] refusing absolute path: %s\n", tag, name);
+            if (skip_blocks(r, size) != 0) return -1;
+            continue;
+        }
+
         char outpath[NAME_MAX_LEN + 1200];
         if (*relname) snprintf(outpath, sizeof(outpath), "%s/%s", dest_dir, relname);
         else snprintf(outpath, sizeof(outpath), "%s", dest_dir);

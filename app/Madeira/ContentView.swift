@@ -2834,7 +2834,7 @@ struct ContentView: View {
             // ml716: syscall-frame context A/B. Documents/madeira-ctx-frame.txt == "1"
             // makes ios_fill_thread_context() report a thread parked inside a syscall
             // using its saved Wine syscall frame (TEB+0x378) instead of the Mach-O
-            // registers it happens to be executing. Off by default; native code reads
+            // registers it happens to be executing. On by default ("0" turns it off); native code reads
             // only the environment variable.
             if let txt = MadeiraConfig.get("ctx-frame") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
