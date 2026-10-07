@@ -196,6 +196,8 @@ enum SteamGamesRules {
         direct(appID)
         if let parent = owned(appID)?.parentID, parent != appID { direct(parent) }
         add(asset(appID, owned(appID)?.headerImage))
+        // Every game has a store header and capsule even without the tall library art.
+        for url in SteamCatalog.coverFallbacks(appID) { add(url) }
         return urls
     }
 }
@@ -721,14 +723,22 @@ struct SteamGameArtwork: View {
         .accessibilityHidden(true)
         // Decoded once at card size and cached (ArtworkCache); the first URL that loads wins.
         .task(id: appID) {
-            let urls = SteamGamesRules.artwork(appID: appID) { steam.game($0) }
+            var urls = SteamGamesRules.artwork(appID: appID) { steam.game($0) }
             if let hit = urls.lazy.compactMap({ ArtworkCache.cached($0) }).first { image = hit }
-            for url in urls {
-                if image == nil { image = await ArtworkCache.image(url) }
-                if image != nil {
-                    if notDownloaded { blurred = await ArtworkCache.blur(url, fraction: 0.03) }
-                    break
+            // Last, the store service's real (hashed) addresses: newer games have none
+            // of the guessed ones (SteamStore.artwork).
+            var tried = false
+            while true {
+                for url in urls {
+                    if image == nil { image = await ArtworkCache.image(url) }
+                    if image != nil {
+                        if notDownloaded { blurred = await ArtworkCache.blur(url, fraction: 0.03) }
+                        return
+                    }
                 }
+                guard !tried, !Task.isCancelled else { return }
+                tried = true
+                urls = await SteamStore.shared.artwork(appID)
             }
         }
     }

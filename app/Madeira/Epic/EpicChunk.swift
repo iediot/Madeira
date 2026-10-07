@@ -110,9 +110,17 @@ struct EpicSHA1 {
         let file = try FileHandle(forReadingFrom: url)
         defer { try? file.close() }
         var hash = Self()
-        while let data = try file.read(upToCount: 256 * 1024), !data.isEmpty {
+        // Each read is an autoreleased NSData; on a background task nothing drained
+        // them, so checking an install's existing files kept every byte read in memory
+        // (resuming a large Epic game reached iOS's 6 GB limit in "Preparing download").
+        while true {
             try Task.checkCancellation()
-            hash.update(data)
+            let more = try autoreleasepool { () throws -> Bool in
+                guard let data = try file.read(upToCount: 256 * 1024), !data.isEmpty else { return false }
+                hash.update(data)
+                return true
+            }
+            if !more { break }
         }
         return hash.finish()
     }

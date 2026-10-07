@@ -16352,6 +16352,60 @@ index 0ee1110b..1122ff2a 100644
      if (!(ioctl = mem_alloc( sizeof(*ioctl) ))) return 0;
      ioctl->code   = code;
      ioctl->output = output;
+diff --git a/server/event.c b/server/event.c
+index ef1e1ea4..b9e73e36 100644
+--- a/server/event.c
++++ b/server/event.c
+@@ -1068,6 +1068,41 @@ DECL_HANDLER(open_event)
+ }
+ 
+ /* do an event operation */
++#ifdef WINE_IOS
++#include <stdio.h>
++/* [event-census] (MADEIRA_PERF=1): who sets, pulses, resets or wakes which event,
++ * by thread, printed every 4000 operations with the object addresses
++ * [wait-census] prints, so a waited-on event nobody signals stands out. Detroit:
++ * Become Human's loading thread polls one unnamed event at 98% for ever. */
++static void ios_event_census( int op, struct event *event )
++{
++    static int enabled = -1;
++    static struct { thread_id_t tid; void *obj; int op; unsigned n; } table[64];
++    static unsigned used, total;
++    static const char *names[] = { "pulse", "set", "reset" };
++    unsigned i;
++
++    if (enabled < 0) { const char *e = getenv( "MADEIRA_PERF" ); enabled = e && *e == '1'; }
++    if (!enabled) return;
++    for (i = 0; i < used; i++)
++        if (table[i].tid == current->id && table[i].obj == event && table[i].op == op) break;
++    if (i == used && used < 64) { table[used].tid = current->id; table[used].obj = event; table[used].op = op; table[used].n = 0; used++; }
++    if (i < used) table[i].n++;
++    if (++total % 4000) return;
++    fprintf( stderr, "[event-census] last 4000 event ops:\n" );
++    for (unsigned shown = 0; shown < 14; shown++)
++    {
++        unsigned best = used, j;
++        for (j = 0; j < used; j++) if (table[j].n && (best == used || table[j].n > table[best].n)) best = j;
++        if (best == used) break;
++        fprintf( stderr, "[event-census]   %6u tid=%04x %s (unnamed %p)\n", table[best].n, table[best].tid,
++                 table[best].op >= 0 && table[best].op < 3 ? names[table[best].op] : "wake", table[best].obj );
++        table[best].n = 0;
++    }
++    used = 0;
++}
++#endif
++
+ DECL_HANDLER(event_op)
+ {
+     struct event_sync *sync;
+@@ -1114,6 +1149,7 @@ DECL_HANDLER(event_op)
+ 
+ #ifdef WINE_IOS
+     reply->state = event_sync_state( sync );
++    ios_event_census( req->op, event );
+ #else
+     reply->state = sync->signaled;
+ #endif
 diff --git a/server/thread.c b/server/thread.c
 index 02930423..6a03ede9 100644
 --- a/server/thread.c

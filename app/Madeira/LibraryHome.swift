@@ -49,6 +49,11 @@ struct LibraryShelf<Item: Identifiable, Cell: View, Trailing: View>: View {
     var seeAll: (() -> Void)? = nil
     @ViewBuilder let trailing: () -> Trailing
     @ViewBuilder let cell: (Item) -> Cell
+    /// The row is still gliding or snapping (iOS 18+): its cards take no taps then.
+    /// A tap during the snap was matched against where the cards had been and opened
+    /// the game that slid away from under the finger (two to the left). The first tap
+    /// just stops the row, as everywhere in iOS; the next opens what is under it.
+    @State private var moving = false
 
     var body: some View {
         let margin = LibraryLayout.margin(width)
@@ -79,7 +84,9 @@ struct LibraryShelf<Item: Identifiable, Cell: View, Trailing: View>: View {
                 .scrollTargetLayout()
                 // New cards are placed at once, never slid in (LibraryCells does the same).
                 .transaction { $0.animation = nil }
+                .allowsHitTesting(!moving)
             }
+            .modifier(LibraryShelfMotion(moving: $moving))
             .contentMargins(.horizontal, margin, for: .scrollContent)
             .scrollTargetBehavior(.viewAligned)
             // The cards' shadows and press spring are not cut at the row's edges.
@@ -479,6 +486,23 @@ extension View {
             Button(hidden ? "Show in library" : "Hide from library", systemImage: hidden ? "eye" : "eye.slash") {
                 withAnimation(.snappy(duration: 0.25)) { LibraryHidden.shared.toggle(key) }
             }
+        }
+    }
+}
+
+
+/// Reports whether a shelf's row is moving (scroll phase, iOS 18+). On iOS 17 it is
+/// never reported, and the row keeps taking taps as before.
+private struct LibraryShelfMotion: ViewModifier {
+    @Binding var moving: Bool
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { _, phase in
+                let now = phase == .decelerating || phase == .animating
+                if now != moving { moving = now }
+            }
+        } else {
+            content
         }
     }
 }

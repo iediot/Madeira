@@ -251,6 +251,20 @@ actor SteamStore {
               let resolved = try? await request(url: browse) else { return [] }
         return (try? StoreDecoding.browse(resolved, order: ids)) ?? []
     }
+    /// A game's real artwork addresses from Steam's store service. Newer games keep
+    /// their art under hashed paths (apps/<id>/<hash>/header.jpg), so the plain
+    /// addresses the library guesses 404 for them (Bills Must Be Paid). The tall
+    /// capsule first, then the header.
+    func artwork(_ id: Int, wide: Bool = false) async -> [URL] {
+        let input: [String: Any] = ["ids": [["appid": id]],
+            "context": ["language": "english", "country_code": Self.country.uppercased()],
+            "data_request": ["include_assets": true, "include_basic_info": true]]
+        guard let url = try? webURL("IStoreBrowseService/GetItems/v1/", input: input),
+              let data = try? await request(url: url),
+              let game = (try? StoreDecoding.browse(data, order: [id]))?.first else { return [] }
+        return (wide ? [game.header, game.capsule] : [game.capsule, game.header]).compactMap { $0 }
+    }
+
     /// Steam's "Popular Upcoming", ranked by wishlists.
     func popularUpcoming() async -> [StoreGame] { await ranked("filter=popularcomingsoon", count: 40) }
 

@@ -555,7 +555,7 @@ index f086337..5814ff4 100644
  // device-teardown high-water reports.
  inline bool
 diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
-index 2515624..a2c2143 100644
+index 2515624..5e1b8d3 100644
 --- a/src/d3d9/d3d9_device.cpp
 +++ b/src/d3d9/d3d9_device.cpp
 @@ -834,6 +834,9 @@ MTLD3D9Device::releaseBufferBacking(
@@ -598,7 +598,7 @@ index 2515624..a2c2143 100644
  }
  
  bool
-@@ -1607,6 +1633,151 @@ MTLD3D9Device::waitForGpuOrDeviceError(uint64_t value) {
+@@ -1607,6 +1633,162 @@ MTLD3D9Device::waitForGpuOrDeviceError(uint64_t value) {
    return true;
  }
  
@@ -693,7 +693,11 @@ index 2515624..a2c2143 100644
 +  FlushDrawBatch();
 +  flushOpenWork();
 +  const uint64_t signal = m_currentCmdSeq;
-+  auto span = tryRingAllocate(m_uploadRing, signal, m_cachedSignaled.load(std::memory_order_acquire), 512, 256);
++  // A 32x16 grid of single-pixel copies: a coarse picture of the whole target, so a
++  // frame whose sprites miss the centre and corner still shows what it holds.
++  constexpr unsigned kCols = 32, kRows = 16;
++  auto span = tryRingAllocate(m_uploadRing, signal, m_cachedSignaled.load(std::memory_order_acquire),
++                              kCols * kRows * 4, 256);
 +  if (!span) { Logger::warn("[smb] readback allocation failed"); return; }
 +  auto texture = surface->dxmtTexture();
 +  const uint32_t mip = surface->mipLevel(), slice = surface->arraySlice();
@@ -704,18 +708,18 @@ index 2515624..a2c2143 100644
 +  m_dxmtQueue->CurrentChunk()->emitcc([texture, mip, slice, width, height, buffer, offset, event, signal](ArgumentEncodingContext &ctx) {
 +    ctx.startBlitPass();
 +    auto view = ctx.access<false>(texture, mip, slice, DXMT_ENCODER_RESOURCE_ACESS_READ);
-+    for (unsigned i = 0; i < 2; ++i) {
++    for (unsigned i = 0; i < kCols * kRows; ++i) {
 +      auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
 +      cmd.type = WMTBlitCommandCopyFromTextureToBuffer;
 +      cmd.src = view.handle;
 +      cmd.slice = slice;
 +      cmd.level = mip;
-+      cmd.origin = WMTOrigin{i ? width / 2 : 0, i ? height / 2 : 0, 0};
++      cmd.origin = WMTOrigin{(2 * (i % kCols) + 1) * width / (2 * kCols), (2 * (i / kCols) + 1) * height / (2 * kRows), 0};
 +      cmd.size = WMTSize{1, 1, 1};
 +      cmd.dst = buffer;
-+      cmd.offset = offset + i * 256;
-+      cmd.bytes_per_row = 256;
-+      cmd.bytes_per_image = 256;
++      cmd.offset = offset + i * 4;
++      cmd.bytes_per_row = 4;
++      cmd.bytes_per_image = 4;
 +    }
 +    ctx.endPass();
 +    ctx.signalEventByHandle(event, signal);
@@ -727,12 +731,19 @@ index 2515624..a2c2143 100644
 +  if (!waitForGpuOrDeviceError(signal)) { Logger::warn("[smb] readback GPU failed"); return; }
 +  // Read before another ring allocation can recycle this completed span.
 +  const auto *bytes = static_cast<const uint8_t *>(span.host);
-+  for (unsigned i = 0; i < 2; ++i) {
-+    const auto *p = bytes + i * 256;
-+    Logger::info(str::format("[smb] pixels frame=", m_smbFrame, " ", label,
-+        i ? " center RGBA=" : " corner(0,0) RGBA=", unsigned(p[2]), ",", unsigned(p[1]), ",",
-+        unsigned(p[0]), ",", d.Format == D3DFMT_X8R8G8B8 ? 255u : unsigned(p[3])));
++  unsigned lit = 0;
++  for (unsigned y = 0; y < kRows; ++y) {
++    char row[kCols + 1];
++    for (unsigned x = 0; x < kCols; ++x) {
++      const auto *p = bytes + (y * kCols + x) * 4;   // BGRA
++      const unsigned luma = (unsigned(p[2]) * 3 + unsigned(p[1]) * 6 + unsigned(p[0])) / 10;
++      row[x] = char('0' + std::min(9u, luma / 26));
++      if (luma > 8) ++lit;
++    }
++    row[kCols] = 0;
++    Logger::info(str::format("[smb] map frame=", m_smbFrame, " ", label, " ", width, "x", height, " row=", y, " ", row));
 +  }
++  Logger::info(str::format("[smb] pixels frame=", m_smbFrame, " ", label, " lit=", lit, "/", kCols * kRows));
 +}
 +
 +void
@@ -750,7 +761,7 @@ index 2515624..a2c2143 100644
  void
  MTLD3D9Device::noteReadback(unsigned kind, const D3DSURFACE_DESC &desc) {
    static const bool enabled = [] { const auto v = env::getEnvVar("DXMT_D9_READBACK_STATS"); return !v.empty() && v != "0"; }();
-@@ -3990,6 +4161,11 @@ MTLD3D9Device::UpdateSurface(
+@@ -3990,6 +4172,11 @@ MTLD3D9Device::UpdateSurface(
  ) {
    D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_UpdateSurface);
    D9DeviceLock lock = LockDevice();
@@ -762,7 +773,7 @@ index 2515624..a2c2143 100644
    settleUploadPressure(); // ml1490, as in UpdateTexture
    if (!pSourceSurface || !pDestinationSurface)
      return D3DERR_INVALIDCALL;
-@@ -4168,6 +4344,9 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
+@@ -4168,6 +4355,9 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
      return D3DERR_INVALIDCALL;
    if (pSourceTexture == pDestinationTexture)
      return D3DERR_INVALIDCALL;
@@ -772,7 +783,7 @@ index 2515624..a2c2143 100644
    // Identify both textures without calling through their app-visible vtables (see
    // SetTexture); read each type from its own internal common-texture vtable.
    MTLD3D9CommonTexture *src_common = commonTextureFromBound(pSourceTexture);
-@@ -4210,6 +4389,11 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
+@@ -4210,6 +4400,11 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
      // untouched: levels_to_copy caps at the source's remaining count, so the
      // wider-dst case native accepts needs no gate. Native and PRIMARY wined3d both
      // accept it; only DXVK rejects.
@@ -784,7 +795,7 @@ index 2515624..a2c2143 100644
      const UINT src_levels = src->levelCount();
      const UINT dst_levels = dst->levelCount();
      // Mip-tail correspondence: when src has a larger base than dst, dst maps
-@@ -5212,6 +5396,11 @@ MTLD3D9Device::stretchRectImpl(
+@@ -5212,6 +5407,11 @@ MTLD3D9Device::stretchRectImpl(
      D3DTEXTUREFILTERTYPE Filter, bool from_readback
  ) {
    D9DeviceLock lock = LockDevice();
@@ -796,7 +807,7 @@ index 2515624..a2c2143 100644
    // No autorelease pool needed here post-chunk-migration. The body
    // only does validation, rect parsing, and QueueBlitOp (a vector
    // push_back); every Metal-touching call moved into the chunk
-@@ -6003,6 +6192,15 @@ MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRend
+@@ -6003,6 +6203,15 @@ MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRend
    // ref and AddRefPrivate's the new one. surface=nullptr is the
    // unbind path (idx>0).
    m_renderTargets[RenderTargetIndex] = surface;
@@ -812,7 +823,7 @@ index 2515624..a2c2143 100644
    // Flag an AUTOGENMIPMAP render target for mip regen on bind, matching
    // DXVK (SetRenderTargetInternal: IsAutomaticMip -> SetNeedsMipGen).
    // dxmt already flags on Clear/StretchRect/ColorFill but not the
-@@ -6188,6 +6386,11 @@ HRESULT STDMETHODCALLTYPE
+@@ -6188,6 +6397,11 @@ HRESULT STDMETHODCALLTYPE
  MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) {
    D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_Clear);
    D9DeviceLock lock = LockDevice();
@@ -824,7 +835,7 @@ index 2515624..a2c2143 100644
    // DXVK: Count==0 with a non-null rect array is a documented
    // no-op, not an error.
    if (Count == 0 && pRects != nullptr)
-@@ -6206,8 +6409,11 @@ MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR C
+@@ -6206,8 +6420,11 @@ MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR C
    // dropped whole ("mismatching sizes"), returning OK.
    if (ds && (Flags & D3DCLEAR_TARGET) && (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))) {
      MTLD3D9Surface *rt0 = m_renderTargets[0].ptr();
@@ -837,7 +848,7 @@ index 2515624..a2c2143 100644
    }
    // Drop stencil if the bound DS format has no stencil aspect; D3D9
    // silently masks; Metal would reject the encoder. DXVK does
-@@ -7514,6 +7720,13 @@ MTLD3D9Device::BuildDrawCapture() {
+@@ -7514,6 +7731,13 @@ MTLD3D9Device::BuildDrawCapture() {
  
  void
  MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
@@ -851,7 +862,7 @@ index 2515624..a2c2143 100644
    // Regenerate any bound AUTOGENMIPMAP texture's dirty mip chain before this
    // draw is pushed, so the mip-gen op precedes the draws that sample it in the
    // op stream (DXVK PrepareDraw shape). The hot path pays a single relaxed load
-@@ -8816,8 +9029,11 @@ MTLD3D9Device::PackDrawConstants(
+@@ -8816,8 +9040,11 @@ MTLD3D9Device::PackDrawConstants(
  
    constexpr size_t kSubAlign = 256;
    auto align_up = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
@@ -865,7 +876,7 @@ index 2515624..a2c2143 100644
    // ~20 PS registers against the 256/224 maxes; full-extent uploads are
    // mostly memcpying zeros. DXVK's maxChangedConstF is the literal
    // reference. A relative-addressing shader instead uploads the whole
-@@ -8833,8 +9049,12 @@ MTLD3D9Device::PackDrawConstants(
+@@ -8833,8 +9060,12 @@ MTLD3D9Device::PackDrawConstants(
    // 256 and the hot path is unchanged.
    const uint32_t vs_file_size =
        pod.vs_const_F_overflow ? (D3D9_MAX_VS_CONST_F + pod.vs_const_F_overflow_count) : D3D9_MAX_VS_CONST_F;
@@ -880,7 +891,7 @@ index 2515624..a2c2143 100644
    // A generated vertex shader reads the fixed-function uniforms block
    // through this slot; size it for the full layout contract (matrix,
    // fog, point-scale and lighting blocks) rather than the register
-@@ -10605,16 +10825,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
+@@ -10605,16 +10836,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
    // snapshot, so a shader<->fixed-function transition inside one cluster
    // would otherwise reuse the other kind's upload verbatim. A
    // relative-addressing shader also keys here: its upload differs from a
@@ -902,7 +913,7 @@ index 2515624..a2c2143 100644
  
    // Reuse prior draw's uploads if pod_snapshot pointer equals (implies byte-equality)
    // and the def-stamping shaders match. VS/PS constants, clip planes
-@@ -10757,6 +10978,7 @@ MTLD3D9Device::FlushDrawBatch() {
+@@ -10757,6 +10989,7 @@ MTLD3D9Device::FlushDrawBatch() {
            // reset was missing.
            res = D9ResolvedDraw{};
            if (!this->ResolveBatchedDrawForChunk(bd, res, chunk_seq, chunk_coherent_id, const_cache, resolve_cache)) {
@@ -910,7 +921,7 @@ index 2515624..a2c2143 100644
              continue;
            }
          }
-@@ -10791,6 +11013,7 @@ MTLD3D9Device::FlushDrawBatch() {
+@@ -10791,6 +11024,7 @@ MTLD3D9Device::FlushDrawBatch() {
            }
            res.resolved_pso = res.resolved_pso_task->state().handle;
            if (res.resolved_pso == 0) {

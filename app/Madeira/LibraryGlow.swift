@@ -375,8 +375,10 @@ enum AmbientArtwork {
             if let name = entry.coverFile {
                 image = UIImage(contentsOfFile: LibraryModel.documents
                     .appendingPathComponent("madeira-art/" + URL(fileURLWithPath: name).lastPathComponent).path)
-            } else if let id = entry.steamID ?? entry.steamAppID, let url = SteamCatalog.cover(id) {
-                image = await fetch(url)
+            } else if let id = entry.steamID ?? entry.steamAppID {
+                for url in [SteamCatalog.cover(id)].compactMap({ $0 }) + SteamCatalog.coverFallbacks(id) {
+                    if let found = await fetch(url) { image = found; break }
+                }
             } else if let url = entry.epicArtworkURL {
                 image = await fetch(url)
             }

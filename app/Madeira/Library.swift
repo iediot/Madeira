@@ -1720,17 +1720,36 @@ enum SteamCatalog {
     }
     static func cover(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_600x900.jpg") }
     static func hero(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_hero.jpg") }
+    /// The store page's header and wide capsule: every game has these, even small ones
+    /// whose developer never made the tall library cover or the hero.
+    static func header(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/header.jpg") }
+    static func capsule(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/capsule_616x353.jpg") }
+    /// Card art in order of fit, for a game missing some of it (Bills Must Be Paid has
+    /// no tall cover): the tall cover, then the header, the wide capsule, the hero.
+    static func coverFallbacks(_ id: Int) -> [URL] { [header(id), capsule(id), hero(id)].compactMap { $0 } }
+    static func heroFallbacks(_ id: Int) -> [URL] { [header(id), capsule(id)].compactMap { $0 } }
 }
 
 /// A web image through ArtworkCache: shown from the cache on the first frame when it
 /// is there, else fetched once; nothing while it loads.
 struct CachedArtworkImage: View {
     let url: URL?
+    /// Tried in order when `url` has no image (a game without that piece of art).
+    var fallbacks: [URL] = []
     @State private var image: UIImage?
 
-    init(url: URL?) {
+    /// A Steam game's ID: when every address fails, the store service's real ones
+    /// (SteamStore.artwork; newer games keep their art under hashed paths).
+    var steamAppID: Int? = nil
+    /// A wide slot (a hero or backdrop): the store's header before its tall capsule.
+    var wide = false
+
+    init(url: URL?, fallbacks: [URL] = [], steamAppID: Int? = nil, wide: Bool = false) {
         self.url = url
-        _image = State(initialValue: url.flatMap { ArtworkCache.cached($0) })
+        self.fallbacks = fallbacks
+        self.steamAppID = steamAppID
+        self.wide = wide
+        _image = State(initialValue: ([url].compactMap { $0 } + fallbacks).lazy.compactMap { ArtworkCache.cached($0) }.first)
     }
 
     var body: some View {
@@ -1741,8 +1760,15 @@ struct CachedArtworkImage: View {
             }
         }
         .task(id: url) {
-            guard image == nil, let url else { return }
-            image = await ArtworkCache.image(url)
+            guard image == nil else { return }
+            for candidate in [url].compactMap({ $0 }) + fallbacks {
+                if Task.isCancelled { return }
+                if let found = await ArtworkCache.image(candidate) { image = found; return }
+            }
+            guard let steamAppID, !Task.isCancelled else { return }
+            for candidate in await SteamStore.shared.artwork(steamAppID, wide: wide) {
+                if let found = await ArtworkCache.image(candidate) { image = found; return }
+            }
         }
     }
 }
@@ -1764,7 +1790,9 @@ struct LibraryArtwork: View {
             } else if let id = entry.steamID ?? entry.steamAppID {   // a store match, else the Steam game itself
                 // Through ArtworkCache (memory and disk), not AsyncImage, which kept
                 // nothing: every launch fetched and decoded every cover again.
-                CachedArtworkImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id))
+                CachedArtworkImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id),
+                                   fallbacks: backdrop ? SteamCatalog.heroFallbacks(id) : SteamCatalog.coverFallbacks(id),
+                                   steamAppID: id, wide: backdrop)
                     .frame(width: geometry.size.width, height: geometry.size.height)
             }
         }
