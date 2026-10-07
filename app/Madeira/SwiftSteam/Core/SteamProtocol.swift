@@ -63,6 +63,8 @@ enum SteamServiceMethod: String {
     case cloudClientBeginFileUpload = "Cloud.ClientBeginFileUpload#1"
     case cloudClientCommitFileUpload = "Cloud.ClientCommitFileUpload#1"
     case cloudCompleteAppUploadBatch = "Cloud.CompleteAppUploadBatchBlocking#1"
+    /// Workshop items' details, with a collection's items and a mod's required items.
+    case publishedFileGetDetails = "PublishedFile.GetDetails#1"
 }
 
 // MARK: - Result codes

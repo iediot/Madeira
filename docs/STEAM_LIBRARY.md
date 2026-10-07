@@ -131,8 +131,13 @@ opens again when needed.
 account that owns the depot, so ownership is Steam's decision, not Madeira's.
 
 1. Product info of the app (and of the apps whose depots it shares) selects the
-   Windows, English, 64-bit (else 32-bit) depots, without DLC, redistributables
-   or regional alternates.
+   Windows, English, 64-bit (else 32-bit) depots, without redistributables or
+   regional alternates. DLC depots (`dlcappid`) are included when the account's
+   licenses list them, as Valve's client installs owned DLC with its game; a DLC
+   depot Steam does not serve (key or manifest refused) is left out and the
+   game installs without it. The install record lists each DLC depot with its
+   `dlcappid`, and an installed game missing an owned DLC depot is offered as an
+   update.
 2. For each depot: the depot key, the manifest request code, a per-server
    authorization token, then the manifest from a content server (a single-entry
    zip; older depots encrypt the manifest as a whole). File names in a manifest
@@ -188,6 +193,30 @@ game session never overlap (`SteamConnectionGate`):
 Any other session also pauses downloads and closes the connection
 (`runWineFullSequence`). Madeira does not start more than one session per app
 run (`docs/LIBRARY.md`).
+
+## Workshop collections
+
+A game's page has a **Steam Workshop** section. Paste a Workshop collection link (or item number) there, and Madeira installs that collection's mods with the game's downloads.
+
+- **Reading the collection.** Madeira calls `PublishedFile.GetDetails#1` over the logged-on connection, with `includechildren`, at most 100 items per call (`SteamWorkshop.swift`).
+  - Nested collections are expanded.
+  - Each mod's required items (its children) are followed transitively and marked "required by".
+  - Every item is visited once, so cycles end.
+  - Items for another app, banned, unreadable, or not mods (art, guides) are left out, and the page lists each with its reason.
+  - A link to a single mod gives that mod and what it requires.
+  - Your own private or friends-only collection may not be readable this way. Public and unlisted collections are, whoever made them.
+- **Downloading an item.** The content is a manifest (`hcontent_file`) in the app's Workshop depot: PICS `depots/workshopdepot`, or the app ID when there is none. It is fetched like any depot: key, request code (no branch), CDN auth, chunks. Steam requires only that the account owns the game; nothing is subscribed. A legacy item without a manifest is the single file at its `file_url`.
+  - Each item stages into `downloading/workshop/<id>/content`, with its own journal, apart from any game download. It is then swapped into place: the old copy is moved aside, the new one renamed in, and the old one deleted. So an update leaves no stale files.
+- **Where items go.**
+  - RimWorld: `<game>/Mods/<id>`. Without Steam running, it loads mods only from there.
+  - Any other game: Valve's layout, `steamapps/workshop/content/<app>/<id>`.
+  - Madeira never writes Valve's `appworkshop_<app>.acf`.
+- **The record.** `steamapps/workshop/madeira_<appid>.json` lists each installed item: its manifest, its folder (relative to `steamapps`), and the mod that required it. It is saved after every item. A sync replaces or deletes only folders listed there, never a mod you installed yourself. When a mod you installed by hand declares the same `packageId` as a Workshop item (`About/About.xml`), the page says so.
+- **Updates.**
+  - A library refresh and "Check for changes" compare the collection with the record. New or changed items, and items taken out of the collection, count as an available update.
+  - Update runs the game's download only when the game itself needs it (not installed, a newer build, missing DLC, or Repair), then the Workshop sync.
+  - A Workshop failure shows on the page and does not fail the game's download.
+- **Enabling mods** stays in the game: Madeira does not edit its mod list. In RimWorld, turn the mods on in Mods. Most mods also need Harmony, which is in most collections.
 
 ## Downloads in the background
 
@@ -412,9 +441,9 @@ Madeira Dock or as The game).
 
 ## Not included, and limits
 
-- No Steam Cloud, no achievements, no workshop content, no DLC installation,
-  no branch (beta) selection, no language selection: English, the public
-  branch.
+- No achievements, no Workshop subscriptions (a collection you name is
+  synced instead), no per-DLC choice (every owned DLC installs), no branch
+  (beta) selection, no language selection: English, the public branch.
 - A file that a newer build no longer contains is not deleted by an update
   (the install keeps it); **Uninstall** removes the whole folder.
 - Only the account's licenses are read; family sharing and free-on-demand

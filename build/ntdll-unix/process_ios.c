@@ -633,7 +633,10 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     args->pe_info = *pe_info;
     args->slot = ios_child_slot_take( &params->ImagePathName );
 
-    if (winedebug) putenv( winedebug );
+    /* This is the host's own environment, and NtCreateUserProcess frees winedebug
+     * when this returns: putenv would leave environ pointing at freed memory.
+     * setenv copies the value. */
+    if (winedebug) setenv( "WINEDEBUG", winedebug + strlen( "WINEDEBUG=" ), 1 );
 
     ERR("spawn_process: creating child thread for %s (fd=%d, unixdir=%d, dup_unixdir=%d)\n",
         debugstr_us(&params->CommandLine), socketfd, unixdir, args->unixdir);

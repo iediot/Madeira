@@ -1000,6 +1000,44 @@ index 0000000..1a1db2a
 +  }
 +}
 +} // namespace dxmt
+diff --git a/src/util/wsi_monitor_headless.cpp b/src/util/wsi_monitor_headless.cpp
+index 311c32d..bbbb4fc 100644
+--- a/src/util/wsi_monitor_headless.cpp
++++ b/src/util/wsi_monitor_headless.cpp
+@@ -60,19 +60,24 @@ static void getScreenSize(uint32_t *w, uint32_t *h) {
+ }
+ #endif
+ 
+-/* MADEIRA (ml1190): DXMT_WSI_MONITOR_IDENTITY, opt-in. With it set,
+- * DXGI_OUTPUT_DESC::Monitor carries user32's primary monitor handle instead of
+- * the private sentinel, so an application can match the output against
+- * user32. Every HMONITOR this backend hands out or accepts goes through this
+- * function -- including wsi::getWindowMonitor() in wsi_window_headless.cpp,
+- * which the swapchain's fullscreen transition compares against
+- * DXGI_OUTPUT_DESC::Monitor -- so both sides always agree. Unset, this is the
+- * upstream sentinel exactly. */
++/* MADEIRA (ml1190): DXMT_WSI_MONITOR_IDENTITY. DXGI_OUTPUT_DESC::Monitor
++ * carries user32's primary monitor handle instead of the private sentinel, so
++ * an application can match the output against user32, as on Windows. Every
++ * HMONITOR this backend hands out or accepts goes through this function --
++ * including wsi::getWindowMonitor() in wsi_window_headless.cpp, which the
++ * swapchain's fullscreen transition compares against DXGI_OUTPUT_DESC::Monitor
++ * -- so both sides always agree.
++ *
++ * On by default on every architecture, unlike the other Madeira switches
++ * (util_madeira_switch.hpp): Unity's WinScreenSetup::GetResolutions matches
++ * DXGI_OUTPUT_DESC::Monitor against MonitorFromWindow(), so with the sentinel
++ * every Unity game gets an empty fullscreen mode list and falls back to a
++ * decorated window. "0" restores the upstream sentinel exactly. */
+ HMONITOR getDefaultMonitor() {
+ #ifndef DXMT_MADEIRA
+   /* The native frontend (DXMT_MADEIRA) has no user32 boundary and always
+    * uses the internal singleton. */
+-  static const bool useIdentity = madeiraSwitch("DXMT_WSI_MONITOR_IDENTITY");
++  static const bool useIdentity = env::getEnvVar("DXMT_WSI_MONITOR_IDENTITY") != "0";
+   if (useIdentity) {
+     HMONITOR monitor = ::MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+     if (monitor) {
 diff --git a/src/winemetal/Metal.hpp b/src/winemetal/Metal.hpp
 index 9f90cc5..b894b05 100644
 --- a/src/winemetal/Metal.hpp

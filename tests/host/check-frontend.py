@@ -451,12 +451,19 @@ c_src = r'''
 start = bridge.index('static uint64_t g_launch_exit')
 end = bridge.index('static char *g_prefix_path')
 c_src += 'void wine_launched_process_did_exit(int status);\nvoid wine_exit_status_reset(void);\nint wine_crash_exit_status(uint32_t *status);\n'
+# the hook also ends the session when another thread ends the process
+# (check-session-end.py); here every call comes from the first thread
+c_src += '#include <pthread.h>\n#include <unistd.h>\n'
+c_src += 'static _Thread_local pthread_t wine_ios_main_thread;\nstatic _Thread_local int wine_ios_exit_initialized;\n'
+c_src += 'static unsigned g_session_gen;\nstatic void wine_session_end(unsigned gen) { (void)gen; }\n'
 c_src += bridge[start:end]
 c_src += r'''
 static int failed;
 static void expect(int cond, const char *what) { printf("%s: %s\n", cond ? "PASS" : "FAIL", what); if (!cond) failed++; }
 int main(void) {
     uint32_t status = 0;
+    wine_ios_main_thread = pthread_self();
+    wine_ios_exit_initialized = 1;
     wine_exit_status_reset();
     expect(!wine_crash_exit_status(&status), "nothing recorded at the start of a session");
     wine_launched_process_did_exit(0);
@@ -524,7 +531,7 @@ check(0 <= snap < loop and 'getenv(per_launch[i])' not in bridge[loop:bridge.ind
 # ml1184: every switch a game's page exports is one of those keys, and is cleared when the session ends.
 per_launch = set(re.findall(r'"([A-Z0-9_]+)"', block(bridge, 'static const char *const per_launch[] =')))
 exported = set(re.findall(r'setenv\("([A-Z0-9_]+)"', block(lib, 'func applyEnvironment()')))
-ended = bridge[bridge.index('g_wine_running = 0;\n        /* ml1184'):]
+ended = bridge[bridge.index('/* ml1184: these belong to the launch that just ended'):]
 ended = set(re.findall(r'unsetenv\("([A-Z0-9_]+)"\)', ended[:ended.index('stopping wineserver')]))
 check(exported and exported <= per_launch and per_launch <= ended,
       "ml1184: the per-launch list holds every key applyEnvironment exports, and the session's end unsets them "

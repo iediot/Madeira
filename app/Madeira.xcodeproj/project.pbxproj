@@ -33,6 +33,7 @@
 		A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060A /* DepotDownloader.swift */; };
 		A100060B /* SwiftSteam/Content/DepotManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060B /* DepotManifest.swift */; };
 		A100060E /* SwiftSteam/Install/AppManifestWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060E /* AppManifestWriter.swift */; };
+		A1000905 /* SwiftSteam/Install/WorkshopInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000905 /* WorkshopInstall.swift */; };
 		A100060F /* SwiftSteam/chunk_zip.c in Sources */ = {isa = PBXBuildFile; fileRef = A200060F /* chunk_zip.c */; };
 		A1000610 /* SwiftSteam/lzma_shim.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000610 /* lzma_shim.c */; };
 		A1000611 /* SwiftSteam/zstd_edu.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000611 /* zstd_edu.c */; settings = {COMPILER_FLAGS = "-O3"; }; };
@@ -44,6 +45,7 @@
 		A1000608 /* SwiftSteam/Core/SteamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000608 /* SteamSession.swift */; };
 		A1000616 /* SwiftSteam/Core/SteamCMSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000616 /* SteamCMSession.swift */; };
 		A100060C /* SwiftSteam/Library/SteamAppInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060C /* SteamAppInfo.swift */; };
+		A1000901 /* SwiftSteam/Library/SteamWorkshop.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000901 /* SteamWorkshop.swift */; };
 		A100060D /* SwiftSteam/Library/SteamLibraryFetcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060D /* SteamLibraryFetcher.swift */; };
 		A1000522 /* SteamKeyValues.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000522 /* SteamKeyValues.swift */; };
 		A1000523 /* SteamRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000523 /* SteamRuntime.swift */; };
@@ -108,6 +110,7 @@
 		A1000080 /* arm64ec-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000080 /* arm64ec-windows */; };
 		A1000210 /* i386-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000210 /* i386-windows */; };
 		A1000081 /* x86_64-vcruntime in Resources */ = {isa = PBXBuildFile; fileRef = A2000081 /* x86_64-vcruntime */; };
+		A1000082 /* x86_64-opengl in Resources */ = {isa = PBXBuildFile; fileRef = A2000082 /* x86_64-opengl */; };
 		A1000090 /* libgnutls.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000090 /* libgnutls.a */; };
 		A1000091 /* libhogweed.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000091 /* libhogweed.a */; };
 		A1000092 /* libnettle.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000092 /* libnettle.a */; };
@@ -124,6 +127,7 @@
 		A1000094 /* cacert.pem in Resources */ = {isa = PBXBuildFile; fileRef = A2000094 /* cacert.pem */; };
 		A10000D1 /* d3d12 in Resources */ = {isa = PBXBuildFile; fileRef = A20000D1 /* d3d12 */; };
 		A10000D2 /* licenses in Resources */ = {isa = PBXBuildFile; fileRef = A20000D2 /* licenses */; };
+		A10000E7 /* arial-fonts in Resources */ = {isa = PBXBuildFile; fileRef = A20000E7 /* arial-fonts */; };
 		A10000F1 /* legal in Resources */ = {isa = PBXBuildFile; fileRef = A20000F1 /* legal */; };
 		A1000200 /* LogPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000200 /* LogPattern.swift */; };
 		A1000201 /* LogTail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000201 /* LogTail.swift */; };
@@ -171,6 +175,7 @@
 		A200060A /* DepotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotDownloader.swift"; sourceTree = "<group>"; };
 		A200060B /* DepotManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotManifest.swift"; sourceTree = "<group>"; };
 		A200060E /* AppManifestWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Install/AppManifestWriter.swift"; sourceTree = "<group>"; };
+		A2000905 /* WorkshopInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Install/WorkshopInstall.swift"; sourceTree = "<group>"; };
 		A200060F /* chunk_zip.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "SwiftSteam/chunk_zip.c"; sourceTree = "<group>"; };
 		A2000610 /* lzma_shim.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "SwiftSteam/lzma_shim.c"; sourceTree = "<group>"; };
 		A2000611 /* zstd_edu.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "SwiftSteam/zstd_edu.c"; sourceTree = "<group>"; };
@@ -185,6 +190,7 @@
 		A2000608 /* SteamSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/SteamSession.swift"; sourceTree = "<group>"; };
 		A2000616 /* SteamCMSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/SteamCMSession.swift"; sourceTree = "<group>"; };
 		A200060C /* SteamAppInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Library/SteamAppInfo.swift"; sourceTree = "<group>"; };
+		A2000901 /* SteamWorkshop.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Library/SteamWorkshop.swift"; sourceTree = "<group>"; };
 		A200060D /* SteamLibraryFetcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Library/SteamLibraryFetcher.swift"; sourceTree = "<group>"; };
 		A2000522 /* SteamKeyValues.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamKeyValues.swift"; sourceTree = "<group>"; };
 		A2000523 /* SteamRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamRuntime.swift"; sourceTree = "<group>"; };
@@ -261,6 +267,7 @@
 		A2000080 /* arm64ec-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "arm64ec-windows"; sourceTree = "<group>"; };
 		A2000210 /* i386-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "i386-windows"; sourceTree = "<group>"; };
 		A2000081 /* x86_64-vcruntime */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "x86_64-vcruntime"; sourceTree = "<group>"; };
+		A2000082 /* x86_64-opengl */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "x86_64-opengl"; sourceTree = "<group>"; };
 		A2000090 /* libgnutls.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libgnutls.a; sourceTree = "<group>"; };
 		A2000091 /* libhogweed.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libhogweed.a; sourceTree = "<group>"; };
 		A2000092 /* libnettle.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libnettle.a; sourceTree = "<group>"; };
@@ -277,6 +284,7 @@
 		A2000094 /* cacert.pem */ = {isa = PBXFileReference; lastKnownFileType = text; path = cacert.pem; sourceTree = "<group>"; };
 		A20000D1 /* d3d12 */ = {isa = PBXFileReference; lastKnownFileType = folder; path = d3d12; sourceTree = "<group>"; };
 		A20000D2 /* licenses */ = {isa = PBXFileReference; lastKnownFileType = folder; path = licenses; sourceTree = "<group>"; };
+		A20000E7 /* arial-fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "arial-fonts"; sourceTree = "<group>"; };
 		A20000F1 /* legal */ = {isa = PBXFileReference; lastKnownFileType = folder; path = legal; sourceTree = "<group>"; };
 		A2000200 /* LogPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogPattern.swift; sourceTree = "<group>"; };
 		A2000201 /* LogTail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTail.swift; sourceTree = "<group>"; };
@@ -377,6 +385,7 @@
 				A200060A /* DepotDownloader.swift */,
 				A200060B /* DepotManifest.swift */,
 				A200060E /* AppManifestWriter.swift */,
+				A2000905 /* WorkshopInstall.swift */,
 				A200060F /* chunk_zip.c */,
 				A2000610 /* lzma_shim.c */,
 				A2000611 /* zstd_edu.c */,
@@ -391,6 +400,7 @@
 				A2000608 /* SteamSession.swift */,
 				A2000616 /* SteamCMSession.swift */,
 				A200060C /* SteamAppInfo.swift */,
+				A2000901 /* SteamWorkshop.swift */,
 				A200060D /* SteamLibraryFetcher.swift */,
 				A2000522 /* SteamKeyValues.swift */,
 				A2000523 /* SteamRuntime.swift */,
@@ -449,7 +459,9 @@
 				A2000210 /* i386-windows */,
 				A20000D1 /* d3d12 */,
 				A20000D2 /* licenses */,
+				A20000E7 /* arial-fonts */,
 				A2000081 /* x86_64-vcruntime */,
+				A2000082 /* x86_64-opengl */,
 				A2000040 /* prefix-template.tar.gz */,
 				A2000621 /* wine-mono-11.0.0-x86.tar.xz */,
 				A2000094 /* cacert.pem */,
@@ -588,7 +600,9 @@
 				A10000D1 /* d3d12 in Resources */,
 				A1000705 /* gl in Resources */,
 				A10000D2 /* licenses in Resources */,
+				A10000E7 /* arial-fonts in Resources */,
 				A1000081 /* x86_64-vcruntime in Resources */,
+				A1000082 /* x86_64-opengl in Resources */,
 				A1000040 /* prefix-template.tar.gz in Resources */,
 				A1000621 /* wine-mono-11.0.0-x86.tar.xz in Resources */,
 				A1000094 /* cacert.pem in Resources */,
@@ -658,6 +672,7 @@
 				A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */,
 				A100060B /* SwiftSteam/Content/DepotManifest.swift in Sources */,
 				A100060E /* SwiftSteam/Install/AppManifestWriter.swift in Sources */,
+				A1000905 /* SwiftSteam/Install/WorkshopInstall.swift in Sources */,
 				A100060F /* SwiftSteam/chunk_zip.c in Sources */,
 				A1000610 /* SwiftSteam/lzma_shim.c in Sources */,
 				A1000611 /* SwiftSteam/zstd_edu.c in Sources */,
@@ -669,6 +684,7 @@
 				A1000608 /* SwiftSteam/Core/SteamSession.swift in Sources */,
 				A1000616 /* SwiftSteam/Core/SteamCMSession.swift in Sources */,
 				A100060C /* SwiftSteam/Library/SteamAppInfo.swift in Sources */,
+				A1000901 /* SwiftSteam/Library/SteamWorkshop.swift in Sources */,
 				A100060D /* SwiftSteam/Library/SteamLibraryFetcher.swift in Sources */,
 				A1000522 /* SteamKeyValues.swift in Sources */,
 				A1000523 /* SteamRuntime.swift in Sources */,

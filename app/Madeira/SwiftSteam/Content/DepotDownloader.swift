@@ -66,6 +66,9 @@ final class DepotDownloader {
     /// Replaces the content server directory (host tests only): the servers
     /// to fetch from, as `https://host` or `http://host:port` URLs.
     var contentHosts: ((_ appID: UInt32) async throws -> [String])?
+    /// The owned DLC depots the last install could not get (key or manifest
+    /// refused): not missing content to download again.
+    private(set) var lastDLCSkipped: [UInt32] = []
 
     init(session: SteamCMSession) {
         self.session = session
@@ -79,10 +82,14 @@ final class DepotDownloader {
     func install(_ app: SteamAppInfo, steamApps: URL,
                  ownedDepots: @escaping () async -> Set<UInt32>? = { nil },
                  progress report: @escaping (SteamDownloadProgress) -> Void) async throws -> URL {
-        let depots = app.installDepots()
+        // The account's licensed depots: they choose which DLC depots to take,
+        // and tell a refused key for content the account does not own apart
+        // from a real failure. nil when they could not be read: no DLC then.
+        let owned = await ownedDepots()
+        let depots = app.installDepots(ownedDepots: owned)
         guard !depots.isEmpty else { throw SteamError.depotNotFound(app.appID) }
         // Before the key requests, so a refused depot still has its selection logged.
-        SteamLog.event("[steam-depot] selection app=\(app.appID) build=\(app.buildID) \(app.depotSelectionSummary())")
+        SteamLog.event("[steam-depot] selection app=\(app.appID) build=\(app.buildID) \(app.depotSelectionSummary(ownedDepots: owned))")
 
         let folderName = SteamInstallFiles.safeFolderName(app.installDir.isEmpty ? "app_\(app.appID)" : app.installDir)
         let installURL = steamApps.appendingPathComponent("common", isDirectory: true)
@@ -105,6 +112,9 @@ final class DepotDownloader {
         let pool = Array(hosts.prefix(hostPoolSize))
         var plans: [DepotPlan] = []
         var licenseSkipped: [UInt32] = []
+        // DLC is best effort: a DLC depot whose key or manifest Steam does not
+        // give is left out, and the game installs without it.
+        var dlcSkipped: [UInt32] = []
         // The logged-on account, for the install record. Read while the session
         // is connected: it idles out during a long download.
         var accountID: UInt64 = 0
@@ -115,11 +125,12 @@ final class DepotDownloader {
             do {
                 key = try await depotKey(depotID: depot.depotID, appID: app.appID)
             } catch SteamError.depotKeyNotFound(let refused) {
+                if depot.dlcAppID != nil { dlcSkipped.append(refused); continue }
                 // A depot Steam refuses AND the account's licenses do not
                 // include is content this account does not own (another
                 // edition, extra content): it is left out. Any other refusal
                 // still fails.
-                if let owned = await ownedDepots(), !owned.isEmpty, !owned.contains(refused) {
+                if let owned, !owned.isEmpty, !owned.contains(refused) {
                     licenseSkipped.append(refused)
                     continue
                 }
@@ -127,15 +138,28 @@ final class DepotDownloader {
             }
             if session.steamID != 0 { accountID = session.steamID }
             let contentAppID = !app.freeToDownload ? (depot.fromApp ?? app.appID) : app.appID
-            let manifest = try await fetchManifest(depotID: depot.depotID, appID: contentAppID,
+            let manifest: DepotManifest
+            do {
+                manifest = try await fetchManifest(depotID: depot.depotID, appID: contentAppID,
                                                    manifestGID: gid, key: key, hosts: hosts)
+            } catch where depot.dlcAppID != nil && !(error is CancellationError) {
+                SteamLog.event("[steam-depot] dlc depot=\(depot.depotID) manifest failed: \(error.localizedDescription)")
+                dlcSkipped.append(depot.depotID)
+                continue
+            }
             var auth: [String: String] = [:]
             for host in pool {
                 auth[host] = await cdnAuthFragment(depotID: depot.depotID, appID: contentAppID, host: host)
             }
             plans.append(DepotPlan(depotID: depot.depotID, manifestGID: gid, key: key, manifest: manifest,
                                    hosts: pool, auth: auth,
-                                   declaredSize: depot.publicSizeBytes, health: health))
+                                   declaredSize: depot.publicSizeBytes, health: health,
+                                   dlcAppID: depot.dlcAppID))
+        }
+        lastDLCSkipped = dlcSkipped
+        let dlcKept = plans.filter { $0.dlcAppID != nil }
+        if !dlcKept.isEmpty || !dlcSkipped.isEmpty {
+            SteamLog.event("[steam-depot] dlc app=\(app.appID) kept=\(dlcKept.map { "\($0.depotID)<\($0.dlcAppID ?? 0)" }.joined(separator: ",")) skipped=\(dlcSkipped.map(String.init).joined(separator: ","))")
         }
         if !licenseSkipped.isEmpty {
             SteamLog.event("[steam-depot] license app=\(app.appID) skipped=\(licenseSkipped.map(String.init).joined(separator: ",")) kept=\(plans.map { String($0.depotID) }.joined(separator: ","))")
@@ -145,70 +169,19 @@ final class DepotDownloader {
             throw SteamError.depotNotFound(app.appID)
         }
 
-        // 2. Prepare files and load journals off the main actor.
-        let prepared = try await Task.detached(priority: .userInitiated) {
-            try Self.prepare(plans: plans, installURL: installURL, journalDir: journalDir)
-        }.value
-        state.totalBytes = prepared.totalBytes
-        state.doneBytes = prepared.doneBytes
-        state.phase = .downloading
-        report(state)
-        SteamLog.event("[steam-depot] install begin app=\(app.appID) depots=\(plans.count) files=\(prepared.fileCount) resume=\(prepared.doneBytes > 0 ? 1 : 0)")
-
-        let remaining = prepared.remainingUncompressed
-        if remaining > 0 {
-            let values = try? installURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            let available = UInt64(max(0, values?.volumeAvailableCapacityForImportantUsage ?? Int64.max))
-            if available < remaining { throw SteamError.insufficientDiskSpace(needed: remaining, available: available) }
-        }
-
-        // 3. Chunks.
+        // 2-3. Files, journals and chunks.
         let started = Date()
-        let resumedBytes = state.doneBytes
-        var lastReport = Date.distantPast
-        for (index, plan) in plans.enumerated() {
-            let journal = try JournalWriter(url: prepared.journals[index])
-            defer { journal.close() }
-            let work = prepared.pending[index]
-            let paths = prepared.paths[index]
-            let existing = prepared.existing[index]
-            let maximum = maxConcurrentChunks, attempts = attemptsPerChunk
-            try await withThrowingTaskGroup(of: (UInt64, UInt64).self) { group in
-                var next = 0
-                func enqueue() {
-                    guard next < work.count else { return }
-                    let item = work[next]; next += 1
-                    let chunk = plan.manifest.files[item.file].chunks[item.chunk]
-                    let path = paths[item.file]
-                    let verify = existing[item.file]
-                    group.addTask {
-                        if verify, Self.chunkAlreadyPresent(chunk, path: path) { return (item.key, UInt64(chunk.compressedSize)) }
-                        try await Self.fetchChunk(chunk, plan: plan, path: path, attempts: attempts, seed: item.file &+ item.chunk)
-                        return (item.key, UInt64(chunk.compressedSize))
-                    }
-                }
-                for _ in 0..<min(maximum, work.count) { enqueue() }
-                for try await (key, bytes) in group {
-                    journal.append(key)
-                    state.doneBytes += bytes
-                    let now = Date()
-                    if now.timeIntervalSince(lastReport) >= 0.25 {
-                        lastReport = now
-                        let elapsed = now.timeIntervalSince(started)
-                        if elapsed > 1 { state.bytesPerSecond = Double(state.doneBytes - resumedBytes) / elapsed }
-                        report(state)
-                    }
-                    enqueue()
-                }
-            }
-        }
+        let prepared = try await run(plans: plans, into: installURL, journalDir: journalDir, state: &state, began: { prepared in
+            SteamLog.event("[steam-depot] install begin app=\(app.appID) depots=\(plans.count) files=\(prepared.fileCount) resume=\(prepared.doneBytes > 0 ? 1 : 0)")
+        }, report: report)
 
         // 4. Install record. Sizes come from the manifests; no tree walk.
         state.phase = .finishing
         report(state)
         let installed = plans.map { plan in
             AppManifestWriter.InstalledDepot(depotID: Int(plan.depotID), manifestGID: plan.manifestGID,
-                                             size: Int64(plan.manifest.totalUncompressedSize))
+                                             size: Int64(plan.manifest.totalUncompressedSize),
+                                             dlcAppID: plan.dlcAppID.map(Int.init))
         }
         // Depots taken from another app are that app's content. Valve's client
         // refuses a launch until the owner app has its own record, so both
@@ -253,6 +226,139 @@ final class DepotDownloader {
         return installURL
     }
 
+    /// The working folder of one Workshop item's download: `journal/` and the
+    /// `content/` it is staged in, apart from every game download's journal.
+    nonisolated static func workshopWorkFolder(itemID: UInt64, steamApps: URL) -> URL {
+        steamApps.appendingPathComponent("downloading/workshop/\(itemID)", isDirectory: true)
+    }
+
+    /// Downloads one Workshop item's content into its staging folder and
+    /// returns that folder; the caller moves it into place. The content is the
+    /// manifest `item.manifestID` in the app's Workshop depot, fetched like any
+    /// depot (key, request code, CDN auth, chunks); a legacy item without one is
+    /// the single file at its `fileURL`. Resumable: the staging folder and
+    /// journal persist until the caller removes the work folder.
+    func downloadWorkshopItem(_ item: WorkshopItem, app: SteamAppInfo, steamApps: URL,
+                              progress report: @escaping (SteamDownloadProgress) -> Void) async throws -> (folder: URL, bytes: UInt64) {
+        let work = Self.workshopWorkFolder(itemID: item.id, steamApps: steamApps)
+        let journalDir = work.appendingPathComponent("journal", isDirectory: true)
+        let content = work.appendingPathComponent("content", isDirectory: true)
+        // The staging folder resumes only the same content. Another manifest (the
+        // author updated the item while it was paused) or an emptied folder
+        // starts over: the old files would otherwise ship with the new ones,
+        // and a journal without its files would mark chunks done that are not.
+        let fm = FileManager.default
+        let marker = work.appendingPathComponent("content-id")
+        let wanted = item.manifestID != 0 ? "manifest \(item.manifestID)" : "legacy \(item.timeUpdated)"
+        let stagedEmpty = ((try? fm.contentsOfDirectory(atPath: content.path)) ?? []).isEmpty
+        if (try? String(contentsOf: marker, encoding: .utf8)) != wanted || stagedEmpty {
+            try? fm.removeItem(at: journalDir)
+            try? fm.removeItem(at: content)
+        }
+        try fm.createDirectory(at: journalDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: content, withIntermediateDirectories: true)
+        try wanted.write(to: marker, atomically: true, encoding: .utf8)
+        var state = SteamDownloadProgress()
+        report(state)
+
+        guard item.manifestID != 0 else {
+            guard !item.fileURL.isEmpty else { throw SteamError.chunkDownloadFailed("Workshop item \(item.id) has no content.") }
+            let data = try await Self.download(item.fileURL)
+            let leaf = URL(fileURLWithPath: item.filename.replacingOccurrences(of: "\\", with: "/")).lastPathComponent
+            let name = SteamInstallFiles.safeFolderName(leaf.isEmpty ? "\(item.id).bin" : leaf)
+            try data.write(to: content.appendingPathComponent(name), options: .atomic)
+            SteamLog.event("[steam-workshop] legacy item=\(item.id) bytes=\(data.count)")
+            return (content, UInt64(data.count))
+        }
+
+        depotCache = steamApps.appendingPathComponent("depotcache", isDirectory: true)
+        let hosts: [String]
+        if let provider = contentHosts { hosts = try await provider(app.appID) } else { hosts = try await contentServers(appID: app.appID) }
+        guard !hosts.isEmpty else { throw SteamError.chunkDownloadFailed("No content servers are available.") }
+        let depotID = app.workshopContentDepot
+        let key = try await depotKey(depotID: depotID, appID: app.appID)
+        let manifest = try await fetchManifest(depotID: depotID, appID: app.appID, manifestGID: item.manifestID,
+                                               key: key, hosts: hosts)
+        let pool = Array(hosts.prefix(hostPoolSize))
+        var auth: [String: String] = [:]
+        for host in pool { auth[host] = await cdnAuthFragment(depotID: depotID, appID: app.appID, host: host) }
+        let plan = DepotPlan(depotID: depotID, manifestGID: item.manifestID, key: key, manifest: manifest,
+                             hosts: pool, auth: auth, declaredSize: item.fileSize, health: ContentHostHealth(),
+                             dlcAppID: nil)
+        let prepared = try await run(plans: [plan], into: content, journalDir: journalDir, state: &state, began: { prepared in
+            SteamLog.event("[steam-workshop] download begin item=\(item.id) app=\(app.appID) depot=\(depotID) files=\(prepared.fileCount) resume=\(prepared.doneBytes > 0 ? 1 : 0)")
+        }, report: report)
+        return (content, prepared.totalUncompressed)
+    }
+
+    // MARK: - Run
+
+    /// Steps 2 and 3 of a download: size the files and load the journals off
+    /// the main actor, check the disk, then fetch every pending chunk into
+    /// `installURL`, journaling each so an interrupted download resumes.
+    private func run(plans: [DepotPlan], into installURL: URL, journalDir: URL,
+                     state: inout SteamDownloadProgress, began: (Prepared) -> Void,
+                     report: @escaping (SteamDownloadProgress) -> Void) async throws -> Prepared {
+        let prepared = try await Task.detached(priority: .userInitiated) {
+            try Self.prepare(plans: plans, installURL: installURL, journalDir: journalDir)
+        }.value
+        state.totalBytes = prepared.totalBytes
+        state.doneBytes = prepared.doneBytes
+        state.phase = .downloading
+        report(state)
+        began(prepared)
+
+        let remaining = prepared.remainingUncompressed
+        if remaining > 0 {
+            let values = try? installURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            let available = UInt64(max(0, values?.volumeAvailableCapacityForImportantUsage ?? Int64.max))
+            if available < remaining { throw SteamError.insufficientDiskSpace(needed: remaining, available: available) }
+        }
+
+        // Chunks.
+        let started = Date()
+        let resumedBytes = state.doneBytes
+        var lastReport = Date.distantPast
+        for (index, plan) in plans.enumerated() {
+            let journal = try JournalWriter(url: prepared.journals[index])
+            defer { journal.close() }
+            let work = prepared.pending[index]
+            let paths = prepared.paths[index]
+            let existing = prepared.existing[index]
+            let maximum = maxConcurrentChunks, attempts = attemptsPerChunk
+            try await withThrowingTaskGroup(of: (UInt64, UInt64).self) { group in
+                var next = 0
+                func enqueue() {
+                    guard next < work.count else { return }
+                    let item = work[next]; next += 1
+                    let chunk = plan.manifest.files[item.file].chunks[item.chunk]
+                    let path = paths[item.file]
+                    let verify = existing[item.file]
+                    group.addTask {
+                        if verify, Self.chunkAlreadyPresent(chunk, path: path) { return (item.key, UInt64(chunk.compressedSize)) }
+                        try await Self.fetchChunk(chunk, plan: plan, path: path, attempts: attempts, seed: item.file &+ item.chunk)
+                        return (item.key, UInt64(chunk.compressedSize))
+                    }
+                }
+                for _ in 0..<min(maximum, work.count) { enqueue() }
+                for try await (key, bytes) in group {
+                    journal.append(key)
+                    state.doneBytes += bytes
+                    let now = Date()
+                    if now.timeIntervalSince(lastReport) >= 0.25 {
+                        lastReport = now
+                        let elapsed = now.timeIntervalSince(started)
+                        if elapsed > 1 { state.bytesPerSecond = Double(state.doneBytes - resumedBytes) / elapsed }
+                        report(state)
+                    }
+                    enqueue()
+                }
+            }
+        }
+
+        return prepared
+    }
+
     /// Whether a previous attempt left resumable progress for this app.
     static func hasPartialDownload(appID: UInt32, steamApps: URL) -> Bool {
         let dir = steamApps.appendingPathComponent("downloading/\(appID)", isDirectory: true)
@@ -270,6 +376,8 @@ final class DepotDownloader {
         let auth: [String: String]
         let declaredSize: UInt64
         let health: ContentHostHealth
+        /// The DLC app this depot delivers, recorded as the depot's `dlcappid`.
+        let dlcAppID: UInt32?
     }
 
     struct WorkItem: Sendable {

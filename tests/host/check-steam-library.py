@@ -86,7 +86,8 @@ library_swift = [
     'SwiftSteam/Core/SteamConnection.swift', 'SwiftSteam/Core/SteamMessageCodec.swift', 'SwiftSteam/Core/SteamProtocol.swift',
     'SwiftSteam/Core/SteamSession.swift', 'SwiftSteam/Content/ContentDecryptor.swift', 'SwiftSteam/Content/DepotDownloader.swift',
     'SwiftSteam/Content/DepotManifest.swift', 'SwiftSteam/Library/SteamAppInfo.swift',
-    'SwiftSteam/Library/SteamLibraryFetcher.swift', 'SwiftSteam/Install/AppManifestWriter.swift']
+    'SwiftSteam/Library/SteamLibraryFetcher.swift', 'SwiftSteam/Library/SteamWorkshop.swift',
+    'SwiftSteam/Install/AppManifestWriter.swift', 'SwiftSteam/Install/WorkshopInstall.swift']
 c_files = ['SwiftSteam/chunk_zip.c', 'SwiftSteam/chunk_zip.h', 'SwiftSteam/lzma_shim.c', 'SwiftSteam/lzma_shim.h',
            'SwiftSteam/zstd_edu.c', 'SwiftSteam/zstd_edu.h']
 project = (root / 'app/Madeira.xcodeproj/project.pbxproj').read_text()
@@ -795,6 +796,137 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
     require(info.buildID == 4242 && info.installableOnWindows && info.installDir == "Fixture Game", "build id, install folder and Windows installability")
     require(info.libraryCapsule == "cap/1.jpg" && info.parentID == nil, "artwork name; a parent equal to itself is not kept")
     require(info.depotSelectionSummary().contains("103[-]lang") && info.depotSelectionSummary().contains("107[-]dlc"), "the selection log names the rule that left a depot out")
+    require(info.installDepots(ownedDepots: [107]).map(\.depotID) == [101, 102, 105, 107], "an owned DLC depot installs with its game")
+    require(info.installDepots(ownedDepots: [999, 103]).map(\.depotID) == [101, 102, 105], "DLC is owned by depot, and ownership does not lift the other rules")
+    require(info.ownedDLCDepots([107, 101]) == [107] && info.ownedDLCDepots([]).isEmpty, "ownedDLCDepots lists owned DLC depots only")
+    require(info.depotSelectionSummary(ownedDepots: [107]).contains("107[-]sel"), "the selection log shows an owned DLC depot as selected")
+    let dlcArch = SteamAppInfo.parse(appID: 30, from: appVDF(#"""
+    "common" { "name" "D" "type" "game" "oslist" "windows" } "config" { "installdir" "D" }
+    "depots" { "301" { "manifests" { "public" { "gid" "3001" } } } "302" { "dlcappid" "39" "config" { "osarch" "32" } "manifests" { "public" { "gid" "3002" } } } "303" { "dlcappid" "39" "config" { "osarch" "64" } "manifests" { "public" { "gid" "3003" } } } }
+    """#))!
+    require(dlcArch.installDepots(ownedDepots: [302, 303]).map(\.depotID) == [301, 303], "an owned DLC takes its 64-bit depot")
+    require(dlcArch.depotSelectionSummary(ownedDepots: [302, 303]).contains("302[32]arch") && dlcArch.depotSelectionSummary().contains("302[32]dlc"), "the log blames an owned DLC depot's architecture, an unowned one's ownership")
+
+    // ---- Workshop: GetDetails codec and the collection walk
+    func wsDetail(_ id: UInt64, result: UInt32 = 1, app: UInt32 = 294100, type: UInt32 = 0, manifest: UInt64 = 0,
+                  banned: Bool = false, children: [(UInt64, UInt32)] = []) -> Data {
+        var e = ProtobufEncoder()
+        e.writeUInt32(fieldNumber: 1, value: result); e.writeUInt64(fieldNumber: 2, value: id); e.writeUInt32(fieldNumber: 5, value: app)
+        if manifest != 0 { e.writeFixed64(fieldNumber: 14, value: manifest) }
+        e.writeString(fieldNumber: 16, value: "item \(id)")
+        if banned { e.writeBool(fieldNumber: 28, value: true) }
+        e.writeUInt32(fieldNumber: 34, value: type)
+        for (cid, order) in children {
+            var c = ProtobufEncoder(); c.writeUInt64(fieldNumber: 1, value: cid); c.writeUInt32(fieldNumber: 2, value: order)
+            e.writeSubmessage(fieldNumber: 53, value: c.data)
+        }
+        return e.data
+    }
+    func wsResponse(_ items: [Data]) -> Data { var e = ProtobufEncoder(); for i in items { e.writeSubmessage(fieldNumber: 1, value: i) }; return e.data }
+    let wsParsed = try SteamWorkshop.parseDetails(wsResponse([wsDetail(5, manifest: 0xDEADBEEF12345678, children: [(9, 2), (8, 1), (7, 1)])]))
+    require(wsParsed.count == 1 && wsParsed[0].manifestID == 0xDEADBEEF12345678 && wsParsed[0].children == [8, 7, 9], "workshop details: fixed64 manifest, children in sort order")
+    require(SteamWorkshop.itemID(from: "https://steamcommunity.com/sharedfiles/filedetails/?id=2009463077") == 2009463077 && SteamWorkshop.itemID(from: "x") == nil, "workshop item IDs from links")
+    let wsWorld: [UInt64: Data] = [
+        100: wsDetail(100, type: 2, children: [(1, 0), (200, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)]),
+        200: wsDetail(200, type: 2, children: [(10, 0), (100, 1)]),
+        1: wsDetail(1, manifest: 11), 2: wsDetail(2, manifest: 12, children: [(20, 0), (1, 1)]),
+        20: wsDetail(20, manifest: 13, children: [(21, 0)]), 21: wsDetail(21, manifest: 14, children: [(2, 0)]),
+        3: wsDetail(3, app: 4000), 4: wsDetail(4, banned: true), 5: wsDetail(5, result: 9), 6: wsDetail(6, type: 3), 10: wsDetail(10, manifest: 16),
+    ]
+    let wsResolved = try await SteamWorkshop.resolve(collection: 100, appID: 294100) { batch in
+        try SteamWorkshop.parseDetails(wsResponse(batch.compactMap { wsWorld[$0] }))
+    }
+    require(wsResolved.mods.map(\.id) == [1, 2, 10, 20, 21] && wsResolved.requiredBy == [20: 2, 21: 20], "a collection resolves nested collections and required items once each, cycles included")
+    require(wsResolved.skipped.count == 4, "items for another game, banned, unreadable or not mods are left out with a reason")
+    require(wsResolved.listed.isSuperset(of: [1, 2, 10, 20, 21, 3, 4, 5, 6]), "the walk lists every item reached, skipped ones included")
+    let wsNoNested = try await SteamWorkshop.resolve(collection: 100, appID: 294100) { batch in
+        try SteamWorkshop.parseDetails(wsResponse(batch.filter { $0 != 200 }.compactMap { wsWorld[$0] }))
+    }
+    require(wsNoNested.incomplete && !wsNoNested.mods.contains { $0.id == 10 }, "a nested collection Steam does not answer makes the answer incomplete")
+    require(!wsResolved.incomplete && wsResolved.unavailable.contains(5), "an item Steam reports gone for good (result 9) does not make the answer incomplete")
+    do { _ = try await SteamWorkshop.resolve(collection: 6, appID: 294100) { batch in try SteamWorkshop.parseDetails(wsResponse(batch.compactMap { wsWorld[$0] })) }; require(false, "a root that is not a collection or mod is refused") }
+    catch let e as WorkshopError { if case .unsuitable = e { require(true, "a root that is not a collection or mod is refused") } else { require(false, "a root that is not a collection or mod is refused") } }
+
+    // ---- Workshop: plan and apply against Madeira's record
+    let wsFM = FileManager.default
+    let wsRoot = wsFM.temporaryDirectory.appendingPathComponent("madeira-ws-\(getpid())")
+    try? wsFM.removeItem(at: wsRoot)
+    let wsApps = wsRoot.appendingPathComponent("steamapps")
+    let wsMods = wsApps.appendingPathComponent("common/RimWorld/Mods")
+    try wsFM.createDirectory(at: wsMods.appendingPathComponent("Harmony/About"), withIntermediateDirectories: true)
+    try "<ModMetaData><packageId>brrainz.harmony</packageId></ModMetaData>".write(to: wsMods.appendingPathComponent("Harmony/About/About.xml"), atomically: true, encoding: .utf8)
+    try wsFM.createDirectory(at: wsMods.appendingPathComponent("42"), withIntermediateDirectories: true)
+    try "mine".write(to: wsMods.appendingPathComponent("42/note.txt"), atomically: true, encoding: .utf8)
+    // A mod's About.xml lists its requirements' packageIds before its own.
+    func wsAbout(_ id: String) -> String {
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ModMetaData>\n  <name>mod</name>\n  <modDependencies>\n    <li><packageId>Ludeon.RimWorld.Odyssey</packageId></li>\n  </modDependencies>\n  <!-- <packageId>commented.out</packageId> -->\n  <packageId>\(id)</packageId>\n</ModMetaData>\n"
+    }
+    require(WorkshopInstall.packageID(aboutXML: Data(wsAbout("Brrainz.Harmony").utf8)) == "brrainz.harmony", "a mod's own packageId is read, not a dependency's listed before it")
+    require(WorkshopInstall.packageID(aboutXML: Data("<ModMetaData><modDependencies><li><packageId>brrainz.harmony</packageId></li></modDependencies></ModMetaData>".utf8)) == nil, "an About.xml declaring only dependencies has no packageId")
+    func wsItem(_ id: UInt64, _ manifest: UInt64) -> WorkshopItem {
+        var i = WorkshopItem(id: id); i.result = 1; i.consumerAppID = 294100; i.manifestID = manifest; i.title = "mod \(id)"; return i
+    }
+    var wsFiles: [UInt64: [String: String]] = [1: ["About/About.xml": wsAbout("brrainz.harmony"), "old.dll": "1"], 2: ["a": "1"]]
+    let wsDownload: (WorkshopItem) async throws -> (folder: URL, bytes: UInt64) = { it in
+        if it.id == 9 { throw SteamError.chunkDownloadFailed("refused") }
+        let content = wsApps.appendingPathComponent("downloading/workshop/\(it.id)/content")
+        for (path, text) in wsFiles[it.id] ?? ["x": "x"] {
+            let url = content.appendingPathComponent(path)
+            try wsFM.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        }
+        return (content, 1)
+    }
+    let wsExists: (String) -> Bool = { wsFM.fileExists(atPath: wsApps.appendingPathComponent($0).path) }
+    var wsColl = WorkshopItem(id: 100); wsColl.result = 1; wsColl.fileType = 2
+    var wsRes = SteamWorkshop.Resolution(collection: wsColl, mods: [wsItem(1, 11), wsItem(2, 21), wsItem(42, 420), wsItem(9, 90)], listed: [1, 2, 42, 9])
+    var wsRec = WorkshopRecord.load(appID: 294100, steamApps: wsApps)
+    let wsPlan1 = WorkshopInstall.plan(wsRes, record: wsRec, installFolder: "RimWorld", folderExists: wsExists)
+    require(wsPlan1.install.map(\.id) == [1, 2, 9] && wsPlan1.conflicts.map(\.id) == [42], "a folder Madeira did not install is a conflict, not work")
+    let wsR1 = try await WorkshopInstall.apply(wsPlan1, resolution: wsRes, record: &wsRec, installFolder: "RimWorld", steamApps: wsApps, download: wsDownload) { _, _, _ in }
+    require(wsR1.installed == 2 && wsR1.failed == 1 && wsFM.fileExists(atPath: wsMods.appendingPathComponent("1/old.dll").path), "a failing item is reported and the others install")
+    require(wsFM.fileExists(atPath: wsMods.appendingPathComponent("42/note.txt").path) && wsRec.items["42"] == nil, "a hand-made Mods/<id> is never replaced")
+    require(WorkshopInstall.secondCopies(wsRec, steamApps: wsApps).first?.contains("Mods/Harmony") == true && WorkshopRecord.load(appID: 294100, steamApps: wsApps) == wsRec, "a hand-installed second copy is reported; the record persists")
+    wsFiles[1] = ["About/About.xml": wsAbout("brrainz.harmony"), "new.dll": "2"]
+    wsRes.mods[0] = wsItem(1, 12)
+    let wsPlan2 = WorkshopInstall.plan(wsRes, record: wsRec, installFolder: "RimWorld", folderExists: wsExists)
+    _ = try await WorkshopInstall.apply(wsPlan2, resolution: wsRes, record: &wsRec, installFolder: "RimWorld", steamApps: wsApps, download: wsDownload) { _, _, _ in }
+    require(wsFM.fileExists(atPath: wsMods.appendingPathComponent("1/new.dll").path) && !wsFM.fileExists(atPath: wsMods.appendingPathComponent("1/old.dll").path), "an update replaces the folder, leaving no stale files")
+    var wsSkip = wsRes; wsSkip.mods = [wsItem(1, 12)]; wsSkip.skipped = [2: "not available (result 0)"]
+    require(WorkshopInstall.plan(wsSkip, record: wsRec, installFolder: "RimWorld", folderExists: wsExists).remove.isEmpty, "a listed but skipped item is kept")
+    var wsDrop = wsRes; wsDrop.mods = [wsItem(1, 12)]; wsDrop.listed = [1]
+    wsRec.items["5"] = WorkshopRecord.Entry(title: "tampered", manifest: "1", timeUpdated: 0, folder: ".", requiredBy: nil, bytes: 0)
+    let wsPlan3 = WorkshopInstall.plan(wsDrop, record: wsRec, installFolder: "RimWorld", folderExists: wsExists)
+    _ = try await WorkshopInstall.apply(wsPlan3, resolution: wsDrop, record: &wsRec, installFolder: "RimWorld", steamApps: wsApps, download: wsDownload) { _, _, _ in }
+    require(!wsFM.fileExists(atPath: wsMods.appendingPathComponent("2").path) && wsFM.fileExists(atPath: wsMods.path) && wsRec.items.keys.sorted() == ["1"], "dropped items' own folders are removed; a tampered record path deletes nothing")
+    var wsPart = wsDrop; wsPart.incomplete = true
+    wsRec.items["7"] = WorkshopRecord.Entry(title: "seven", manifest: "70", timeUpdated: 0, folder: "common/RimWorld/Mods/7", requiredBy: nil, bytes: 0)
+    let wsPlan4 = WorkshopInstall.plan(wsPart, record: wsRec, installFolder: "RimWorld", folderExists: wsExists)
+    require(wsPlan4.remove.isEmpty && wsPlan4.removalsDeferred, "nothing is removed while Steam's answer is incomplete")
+    try wsFM.createDirectory(at: wsMods.appendingPathComponent("3"), withIntermediateDirectories: true)
+    wsRec.items["3"] = WorkshopRecord.Entry(title: "three", manifest: "0", timeUpdated: 0, folder: "common/RimWorld/Mods/3", requiredBy: nil, bytes: 0)
+    var wsProv = wsDrop; wsProv.mods = [wsItem(1, 12), wsItem(3, 30)]; wsProv.listed = [1, 3]
+    let wsPlan5 = WorkshopInstall.plan(wsProv, record: wsRec, installFolder: "RimWorld", folderExists: wsExists)
+    require(wsPlan5.install.map(\.id) == [3] && wsPlan5.conflicts.isEmpty, "a provisionally recorded folder (the app died mid-swap) is reinstalled, not a conflict")
+    require(WorkshopInstall.plan(wsProv, record: wsRec, installFolder: "rimworld", folderExists: wsExists).conflicts.isEmpty, "a game folder whose name changed case is still Madeira's")
+    try wsFM.removeItem(at: wsMods.appendingPathComponent("Harmony"))
+    require(WorkshopInstall.secondCopies(wsRec, steamApps: wsApps).isEmpty, "the second-copy warning clears once that copy is deleted")
+    var wsGone = wsProv; wsGone.unavailable = [3]; wsGone.mods = [wsItem(1, 12)]; wsGone.listed = [1, 3]
+    wsRec.items["8"] = WorkshopRecord.Entry(title: "needed by 3", manifest: "80", timeUpdated: 0, folder: "common/RimWorld/Mods/8", requiredBy: 3, bytes: 0)
+    let wsPlan6 = WorkshopInstall.plan(wsGone, record: wsRec, installFolder: "RimWorld", folderExists: wsExists)
+    require(!wsPlan6.remove.contains("8") && !wsPlan6.removalsDeferred, "what an unavailable mod required is kept, without deferring other removals")
+    try wsFM.createDirectory(at: wsApps.appendingPathComponent("common/RIMWORLD/Mods/6"), withIntermediateDirectories: true)
+    try wsFM.createDirectory(at: wsMods.appendingPathComponent("6"), withIntermediateDirectories: true)
+    var wsCase = WorkshopRecord(appID: 294100)
+    wsCase.items["6"] = WorkshopRecord.Entry(title: "six", manifest: "60", timeUpdated: 0, folder: "common/RIMWORLD/Mods/6", requiredBy: nil, bytes: 0)
+    var wsNone = wsDrop; wsNone.mods = []; wsNone.listed = []
+    _ = try await WorkshopInstall.apply(WorkshopInstall.plan(wsNone, record: wsCase, installFolder: "RimWorld", folderExists: wsExists), resolution: wsNone, record: &wsCase, installFolder: "RimWorld", steamApps: wsApps, download: wsDownload) { _, _, _ in }
+    // On a case-sensitive file system the record's spelling is another folder, which must survive.
+    let wsCaseSensitive = !wsFM.fileExists(atPath: wsApps.appendingPathComponent("COMMON").path)
+    require(!wsFM.fileExists(atPath: wsMods.appendingPathComponent("6").path)
+            && (!wsCaseSensitive || wsFM.fileExists(atPath: wsApps.appendingPathComponent("common/RIMWORLD/Mods/6").path)),
+            "removal deletes the item's own place, not the record's spelling of it")
+    try? wsFM.removeItem(at: wsRoot)
     let legacy = SteamAppInfo.parse(appID: 10, from: appVDF(#"""
     "common" { "name" "Old" "type" "Game" "oslist" "windows" } "config" { "installdir" "Old" }
     "depots" { "201" { "config" { "oslist" "windows" "osarch" "32" } "manifests" { "public" "2001" } } "202" { "manifests" { "public" "2002" } } }
@@ -1052,7 +1184,9 @@ try:
                   steam / 'Core/SteamMessageCodec.swift', steam / 'Core/SteamCMSession.swift',
                   steam / 'Content/ContentDecryptor.swift', steam / 'Content/DepotManifest.swift',
                   steam / 'Library/SteamAppInfo.swift', steam / 'Library/SteamLibraryFetcher.swift',
-                  steam / 'Install/AppManifestWriter.swift', app / 'SteamInstall.swift', app / 'SteamKeyValues.swift']
+                  steam / 'Library/SteamWorkshop.swift',
+                  steam / 'Install/AppManifestWriter.swift', steam / 'Install/WorkshopInstall.swift',
+                  app / 'SteamInstall.swift', app / 'SteamKeyValues.swift']
     exe = work / 'check'
     build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-g', '-o', str(exe),
                             '-I', str(shim / 'CommonCrypto'), '-I', str(shim / 'Compression'), '-I', str(shim / 'zlib'),

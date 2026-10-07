@@ -223,6 +223,10 @@ enum SaveBackup {
 
     struct BackupResult { let url: URL; let files: Int; let bytes: UInt64; let leftOut: Int }
 
+    /// Backups and restores in progress, counted on the main thread: a finished
+    /// session's exit (LibraryModel) waits for them.
+    @MainActor static var running = 0
+
     /// Writes the zip into the temporary directory; entries are named from
     /// drive_c ("users/<name>/Documents/..."), which is where restore puts them.
     static func backup() throws -> BackupResult {
@@ -308,12 +312,12 @@ struct SavesSection: View {
     var body: some View {
         Section {
             Button {
-                busy = true
+                busy = true; SaveBackup.running += 1
                 message = nil
                 DispatchQueue.global(qos: .userInitiated).async {
                     let r = Swift.Result { try SaveBackup.backup() }
                     DispatchQueue.main.async {
-                        busy = false
+                        busy = false; SaveBackup.running -= 1
                         switch r {
                         case .success(let b):
                             message = "\(b.files) files, \(ByteCountFormatter.string(fromByteCount: Int64(b.bytes), countStyle: .file))"
@@ -363,11 +367,11 @@ struct SavesSection: View {
             Button("Restore", role: .destructive) {
                 guard let url = pendingRestore else { return }
                 pendingRestore = nil
-                busy = true
+                busy = true; SaveBackup.running += 1
                 DispatchQueue.global(qos: .userInitiated).async {
                     let r = Swift.Result { try SaveBackup.restore(from: url) }
                     DispatchQueue.main.async {
-                        busy = false
+                        busy = false; SaveBackup.running -= 1
                         switch r {
                         case .success(let n): message = "\(n) files restored."
                         case .failure(let e): message = e.localizedDescription

@@ -14,6 +14,10 @@ int wine_process_start(const char *prefix_path);
 // Check if Wine process is running
 int wine_process_is_running(void);
 
+// Whether a Wine process was started in this app run, running or not. Its
+// memory stays with the app after it ends (LibraryModel's finished session).
+int wine_process_has_run(void);
+
 // Session exit report (the library front end). ntdll calls
 // wine_launched_process_did_exit() when the program the app launched (the
 // session's initial process) exits; other processes are not reported.

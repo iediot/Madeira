@@ -359,6 +359,8 @@ enum SteamDirectStart {
     @Published private(set) var games: [DockGame] = []
     /// `buildid` of each install in Madeira's own library folder, by App ID.
     @Published private(set) var builds: [Int: Int] = [:]
+    /// The depot IDs each of those install records lists, by App ID.
+    @Published private(set) var depots: [Int: Set<Int>] = [:]
     private var scanning = false
     /// A refresh was asked for while a scan ran (an install record was just
     /// written): scan again once it ends.
@@ -374,18 +376,24 @@ enum SteamDirectStart {
         Task.detached(priority: .utility) {
             let found = MadeiraDock.games(drive: drive)
             var builds: [Int: Int] = [:]
+            var depots: [Int: Set<Int>] = [:]
             for game in found where SteamInstallPaths.isManaged(library: game.library) && game.installed {
-                if let build = SteamInstallFiles.buildID(appID: game.id, steamApps: SteamInstallPaths.steamApps(drive: drive)) {
+                let steamApps = SteamInstallPaths.steamApps(drive: drive)
+                if let build = SteamInstallFiles.buildID(appID: game.id, steamApps: steamApps) {
                     builds[game.id] = build
                 }
+                if let installed = SteamInstallFiles.installedDepots(appID: game.id, steamApps: steamApps) {
+                    depots[game.id] = installed
+                }
             }
-            let recorded = builds
+            let recorded = builds, recordedDepots = depots
             await MainActor.run {
                 self.scanning = false
                 let again = self.rescan
                 self.rescan = false
                 if self.games != found { self.games = found }
                 if self.builds != recorded { self.builds = recorded }
+                if self.depots != recordedDepots { self.depots = recordedDepots }
                 if found.count != self.lastCount {
                     self.lastCount = found.count
                     LogStore.shared.log("[steam-games] installed=\(found.count) ready=\(found.filter(\.installed).count)")
@@ -761,7 +769,7 @@ struct SteamGameCell: View {
     var body: some View {
         let download = steam.downloads[item.id]
         let status = SteamGamesRules.status(installed: item.installed, transfer: download?.transfer,
-                                            updateAvailable: steam.updateAvailable(appID: item.id, installedBuild: games.builds[item.id]))
+                                            updateAvailable: steam.updateAvailable(appID: item.id, installedBuild: games.builds[item.id], installedDepots: games.depots[item.id]))
         // An installed game's format (bits, graphics API, size) is kept on its library entry.
         let entry = library.entries.first { $0.steamAppID == item.id }
         let notDownloaded = item.installed?.installed != true && download == nil
@@ -1278,7 +1286,7 @@ struct SteamEntrySection: View {
                 case .active, .queued: Button("Pause update") { steam.pause(appID) }
                 case .paused, .failed: Button("Resume update") { steam.install(appID) }
                 }
-            } else if downloads, steam.updateAvailable(appID: appID, installedBuild: games.builds[appID]) {
+            } else if downloads, steam.updateAvailable(appID: appID, installedBuild: games.builds[appID], installedDepots: games.depots[appID]) {
                 Button { steam.install(appID) } label: { Label("Update available — download", systemImage: "arrow.down.circle") }
                     .disabled(!steam.signedIn)
             }
@@ -1588,5 +1596,67 @@ struct LibraryAllGames<OtherCell: View>: View {
         case .other(let e):
             otherCell(e, list, dense)
         }
+    }
+}
+
+/// A Steam game's Workshop collection (docs/STEAM_LIBRARY.md, "Workshop
+/// collections"): the link, what it resolves to, and the last sync. Madeira
+/// installs the collection's mods and the mods they require with the game's
+/// downloads; Update fetches changes, and mods taken out of the collection are
+/// removed.
+struct SteamWorkshopSection: View {
+    let appID: Int
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @State private var link = ""
+    @State private var invalid = false
+
+    private var current: String { steam.workshopCollections[appID].map(String.init) ?? "" }
+
+    var body: some View {
+        let status = steam.workshop[appID]
+        Section {
+            TextField("Collection link or number", text: $link)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .onSubmit(save)
+            if invalid {
+                Text("That is not a Steam Workshop link or item number.").font(.caption).foregroundStyle(.orange)
+            }
+            if link != current {
+                Button("Use this collection", action: save)
+            } else if !current.isEmpty {
+                Button("Check for changes") { Task { await steam.checkWorkshop(appID) } }
+                    .disabled(!steam.signedIn || status?.checking == true)
+            }
+            if let status {
+                if status.checking { LabeledContent("Reading the collection") { ProgressView() } }
+                if !status.collectionTitle.isEmpty { LabeledContent("Collection", value: status.collectionTitle) }
+                if status.items > 0 { LabeledContent("Mods", value: String(status.items)) }
+                if !status.activity.isEmpty { Text(status.activity).font(.footnote) }
+                if status.pending > 0 {
+                    Text("\(status.pending) change\(status.pending == 1 ? "" : "s") to download: use Update in the Steam section.")
+                        .font(.footnote)
+                }
+                ForEach(status.warnings, id: \.self) { Text($0).font(.caption).foregroundStyle(.orange) }
+                if let error = status.error { Text(error).font(.caption).foregroundStyle(.red) }
+                if !status.skipped.isEmpty {
+                    DisclosureGroup("\(status.skipped.count) item\(status.skipped.count == 1 ? "" : "s") left out") {
+                        ForEach(status.skipped, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                    }
+                }
+            }
+        } header: {
+            Text("Steam Workshop")
+        } footer: {
+            Text("Paste a Workshop collection link. Madeira installs its mods, and the mods they require, into the game's mod folder and keeps them updated; mods taken out of the collection are removed. Turn them on in the game's own mod list.")
+        }
+        .onAppear { link = current }
+    }
+
+    private func save() {
+        invalid = !steam.setWorkshopCollection(appID, link: link)
+        guard !invalid else { return }
+        link = current
+        Task { await steam.checkWorkshop(appID) }
     }
 }

@@ -21,6 +21,130 @@ index fd2bc64a..60ee828d 100644
  
  The LGPL permits combining this library with proprietary components (such
  as Apple's Metal Shader Converter) subject to LGPL-2.1 section 6; see the
+diff --git a/dlls/combase/apartment.c b/dlls/combase/apartment.c
+index 85e06a6f..d3f1d9e1 100644
+--- a/dlls/combase/apartment.c
++++ b/dlls/combase/apartment.c
+@@ -365,7 +365,8 @@ static struct apartment *apartment_construct(DWORD model)
+ 
+     TRACE("creating new apartment, model %ld\n", model);
+ 
+-    apt = calloc(1, sizeof(*apt));
++    if (!(apt = calloc(1, sizeof(*apt))))
++        return NULL;
+     apt->tid = GetCurrentThreadId();
+ 
+     list_init(&apt->proxies);
+@@ -561,6 +562,11 @@ static struct apartment *apartment_get_or_create(DWORD model)
+             EnterCriticalSection(&apt_cs);
+ 
+             apt = apartment_construct(model);
++            if (!apt)
++            {
++                LeaveCriticalSection(&apt_cs);
++                return NULL;
++            }
+             if (!main_sta)
+             {
+                 main_sta = apt;
+@@ -592,6 +598,12 @@ static struct apartment *apartment_get_or_create(DWORD model)
+             else
+                 mta = apartment_construct(model);
+ 
++            if (!mta)
++            {
++                LeaveCriticalSection(&apt_cs);
++                return NULL;
++            }
++
+             data->flags |= OLETLS_MULTITHREADED | OLETLS_DISABLE_OLE1DDE;
+ 
+             apt = mta;
+@@ -1187,6 +1199,12 @@ HRESULT apartment_increment_mta_usage(CO_MTA_USAGE_COOKIE *cookie)
+         apartment_addref(mta);
+     else
+         mta = apartment_construct(COINIT_MULTITHREADED);
++    if (!mta)
++    {
++        LeaveCriticalSection(&apt_cs);
++        free(mta_cookie);
++        return E_OUTOFMEMORY;
++    }
+     list_add_head(&mta->usage_cookies, &mta_cookie->entry);
+ 
+     LeaveCriticalSection(&apt_cs);
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index b16828fb..02c69797 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -1751,6 +1751,40 @@ HRESULT WINAPI CoCreateInstanceFromApp(REFCLSID rclsid, IUnknown *outer, DWORD c
+             count, results);
+ }
+ 
++/* Some game audio plugins create MMDeviceEnumerator on an uninitialized asset
++ * worker, then dereference the failed result. Madeira opts into a narrow
++ * compatibility policy: retain an implicit MTA using the existing TLS cookie,
++ * without assigning the worker an explicit apartment or changing its init count.
++ * Thread detach / leave_apartment already release this cookie. Other classes
++ * and explicitly initialized STA/MTA callers keep Wine's normal behavior. */
++static struct apartment *madeira_audio_get_apartment(REFCLSID clsid, DWORD context)
++{
++    static const CLSID mmdevice = {0xbcde0395, 0xe52f, 0x467c,
++            {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
++    struct apartment *apt = apartment_get_current_or_mta();
++    struct tlsdata *data;
++    WCHAR policy[2];
++    HRESULT hr;
++
++    if (apt || !(context & CLSCTX_INPROC_SERVER) || !IsEqualCLSID(clsid, &mmdevice))
++        return apt;
++    if (GetEnvironmentVariableW(L"MADEIRA_MMDEVICE_IMPLICIT_MTA", policy, ARRAY_SIZE(policy)) != 1
++            || policy[0] != L'1')
++        return NULL;
++    if (FAILED(hr = com_get_tlsdata(&data)))
++        return NULL;
++    if (!data->implicit_mta_cookie)
++    {
++        if (FAILED(hr = apartment_increment_mta_usage(&data->implicit_mta_cookie)))
++        {
++            ERR("[madeira-audio-com] implicit MTA allocation failed: %#lx\n", hr);
++            return NULL;
++        }
++        ERR("[madeira-audio-com] MMDeviceEnumerator implicit MTA retained until worker teardown\n");
++    }
++    return apartment_get_current_or_mta();
++}
++
+ static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
+         COSERVERINFO *server_info, REFIID riid, void **obj)
+ {
+@@ -1764,7 +1798,7 @@ static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
+ 
+     *obj = NULL;
+ 
+-    if (!(apt = apartment_get_current_or_mta()))
++    if (!(apt = madeira_audio_get_apartment(rclsid, clscontext)))
+     {
+         ERR("apartment not initialised\n");
+         return CO_E_NOTINITIALIZED;
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 11d20f29..537da9bd 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -619,8 +619,12 @@ HRESULT load_devices_from_reg(void)
+         }
+         if (ret != ERROR_SUCCESS)
+             continue;
++        /* The interface friendly name holds the driver's own device name;
++         * DEVPKEY_Device_FriendlyName is "Speakers (<name>)", and passing it
++         * back in nested another "Speakers (...)" around a device that is no
++         * longer present on every load. */
+         if (SUCCEEDED(CLSIDFromString(guidvalue, &guid))
+-            && SUCCEEDED(MMDevice_GetPropValue(&guid, curflow, (const PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &pv))
++            && SUCCEEDED(MMDevice_GetPropValue(&guid, curflow, (const PROPERTYKEY*)&DEVPKEY_DeviceInterface_FriendlyName, &pv))
+             && pv.vt == VT_LPWSTR)
+         {
+             MMDevice_Create(pv.pwszVal, &guid, curflow,
 diff --git a/dlls/mscoree/metahost.c b/dlls/mscoree/metahost.c
 index 143915d3..bfee8251 100644
 --- a/dlls/mscoree/metahost.c

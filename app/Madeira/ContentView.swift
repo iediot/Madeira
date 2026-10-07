@@ -215,6 +215,7 @@ final class MetalBackedView: UIView {
         // so Aspect / Fill / Stretch / Fit apply to desktop sessions as well.
         winios_set_desktop_rect(r.minX - bounds.minX, r.minY - bounds.minY, r.width, r.height, 1)
         let guest = guestSize(), mode = effectiveDisplayMode()
+        HardwareInput.shared.setGuestPixelsPerPoint(Double(guest.width / max(r.width, 1)))
         let line = String(format: "mode=%@ guest=%.0fx%.0f bounds=%.0fx%.0f -> rect=(%.0f,%.0f %.0fx%.0f)",
                           mode.rawValue, guest.width, guest.height, bounds.width, bounds.height,
                           r.minX, r.minY, r.width, r.height)
@@ -315,6 +316,14 @@ final class MetalBackedView: UIView {
             Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad cursor in step
             return (px, py)
         }
+        return gamePoint(p)
+    }
+
+    /// A point on this view (view-local points) as the guest pixel it covers
+    /// on the game surface, through the GameSurfaceLayout math that sizes the
+    /// presented layer. Direct (non-desktop) sessions; the absolute pointer
+    /// route uses it too, so touch and trackpad land on the same pixel.
+    func gamePoint(_ p: CGPoint) -> (Int32, Int32) {
         let guest = guestSize()
         let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
                                       bounds: bounds, mode: effectiveDisplayMode())
@@ -870,7 +879,7 @@ enum JoystickPadHost {
             w.windowLevel = .normal + 100
             w.backgroundColor = .clear
             w.isHidden = false                 // never becomes key: see PassthroughWindow
-            let host = UIHostingController(rootView: JoystickPadOverlay())
+            let host = OverlayHostingController(rootView: JoystickPadOverlay())
             host.view.backgroundColor = .clear
             host.view.isUserInteractionEnabled = false
             w.rootViewController = host
@@ -885,6 +894,61 @@ enum JoystickPadHost {
 /// steal input from the game surface or the SwiftUI controls.
 final class PassthroughWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+}
+
+/// The status bar, home indicator and edge-gesture preferences of a game
+/// session (and pointer lock, HardwareInput's). UIKit reads them from the root controller of the topmost
+/// full-screen window, which during a game is one of Madeira's overlay windows
+/// (joystick pad, touch controls, the text keyboard), not the app window whose
+/// sessionBody asks for them in SwiftUI. So those roots answer from here.
+enum GameSessionChrome {
+    static var active = false {
+        didSet { if active != oldValue { refresh() } }
+    }
+
+    /// Re-ask every window's root controller, then log what iPadOS did.
+    static func refresh() {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        for vc in scenes.flatMap(\.windows).compactMap(\.rootViewController) {
+            vc.setNeedsStatusBarAppearanceUpdate()
+            vc.setNeedsUpdateOfHomeIndicatorAutoHidden()
+            vc.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { log(scenes) }
+    }
+
+    /// "[chrome] ..." : whether iPadOS hid the status bar, the scene's size
+    /// against the screen's (a windowed scene can be smaller, and iPadOS
+    /// honours these preferences only full screen), and the window stack.
+    private static func log(_ scenes: [UIWindowScene]) {
+        for scene in scenes {
+            let hidden = scene.statusBarManager.map { $0.isStatusBarHidden ? "yes" : "no" } ?? "n/a"
+            let b = scene.coordinateSpace.bounds, screen = scene.screen.bounds
+            let windows = scene.windows.map { w in
+                "\(Int(w.windowLevel.rawValue)):\(type(of: w))\(w.isKeyWindow ? "*" : "")\(w.isHidden ? "-hidden" : "")"
+            }.joined(separator: ",")
+            fputs("[chrome] session=\(active ? "on" : "off") statusBarHidden=\(hidden) "
+                  + "scene=\(Int(b.width))x\(Int(b.height)) screen=\(Int(screen.width))x\(Int(screen.height)) "
+                  + "windows=[\(windows)]\n", stderr)
+        }
+    }
+}
+
+/// Root controller of an overlay window: hosts its SwiftUI content and gives
+/// the game session's system-chrome preferences (GameSessionChrome).
+final class OverlayHostingController<Content: View>: UIHostingController<Content> {
+    override var prefersStatusBarHidden: Bool { GameSessionChrome.active }
+    override var prefersPointerLocked: Bool { HardwareInput.shared.pointerLocked }
+    override var prefersHomeIndicatorAutoHidden: Bool { GameSessionChrome.active }
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { GameSessionChrome.active ? .all : [] }
+}
+
+/// The same, for an overlay window without SwiftUI content.
+final class OverlayController: UIViewController {
+    override var prefersStatusBarHidden: Bool { GameSessionChrome.active }
+    override var prefersPointerLocked: Bool { HardwareInput.shared.pointerLocked }
+    override var prefersHomeIndicatorAutoHidden: Bool { GameSessionChrome.active }
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { GameSessionChrome.active ? .all : [] }
 }
 
 /// The expanded pad, drawn in window space at the button's location.
@@ -1453,6 +1517,16 @@ struct ContentView: View {
         .ignoresSafeArea()
         .background(Color.black)
         .statusBarHidden(true)
+        // An edge swipe reaches the game first; a second one opens the Dock,
+        // Control Center or notifications. The home indicator fades while the
+        // game is touched. iPadOS honours both, like the hidden status bar,
+        // only while the app runs full screen.
+        .defersSystemGestures(on: .all)
+        .persistentSystemOverlays(.hidden)
+        // The overlay windows above this one answer for the same preferences
+        // (OverlayHostingController) while a session is up.
+        .onAppear { GameSessionChrome.active = true; SessionMemoryLog.start() }
+        .onDisappear { GameSessionChrome.active = false; SessionMemoryLog.stop() }
     }
 
     /// Portrait: classic tooling layout — header, badges, 240pt game strip,
@@ -2633,6 +2707,16 @@ struct ContentView: View {
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
     /// `profile` is a library entry whose launch profile applies to this run.
+    /// Whether a library launch runs no Chromium: a program started directly,
+    /// other than the Windows Steam client and its web helper. The desktop, a
+    /// script (which can start anything) and the unprofiled debug sequences
+    /// may run CEF.
+    static func launchRunsNoChromium(_ profile: LibraryEntry?) -> Bool {
+        guard let profile, profile.desktop != true else { return false }
+        let program = (profile.launchWindowsPath.split(separator: "\\").last.map(String.init) ?? "").lowercased()
+        return program.hasSuffix(".exe") && program != "steam.exe" && program != "steamwebhelper.exe"
+    }
+
     private func runWineFullSequence(profile: LibraryEntry? = nil) {
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
@@ -2785,12 +2869,17 @@ struct ContentView: View {
             } else {
                 unsetenv("MADEIRA_DOCK_SESSION")
             }
-            // A Dock session runs Valve's client headless, with no Chromium, so
-            // nothing claims the 8 GB V8 cage holdback (virtual_ios.c). Let ntdll
-            // hand it to the allocator when the guest band runs out. madeira.cfg
-            // env.MADEIRA_CAGE_RELEASE, exported later, wins.
-            if dockLaunch.dock {
+            // A session with no Chromium leaves the 8 GB V8 cage holdback and the
+            // PartitionAlloc pool slots unclaimed (virtual_ios.c): ntdll hands the
+            // holdback to the allocator when the guest band runs out and steers big
+            // reserves into the pool slots. A Dock session runs Valve's client
+            // headless; a library game started directly (not the desktop, not the
+            // Windows Steam client, not a script that could start it) runs no CEF.
+            // madeira.cfg env.MADEIRA_CAGE_RELEASE, exported later, wins: 0 for a
+            // game that embeds Chromium.
+            if dockLaunch.dock || Self.launchRunsNoChromium(profile) {
                 setenv("MADEIRA_CAGE_RELEASE", "1", 1)
+                logStore.log("[cage] no-Chromium session (\(dockLaunch.dock ? "dock" : "direct game")): cage release and pool-slot steering on")
             } else {
                 unsetenv("MADEIRA_CAGE_RELEASE")
             }
@@ -4074,7 +4163,7 @@ enum TouchControlsHost {
             w.windowLevel = .normal + 101
             w.backgroundColor = .clear
             w.isHidden = false        // deliberately never made key
-            let host = UIHostingController(rootView: TouchControlsOverlay())
+            let host = OverlayHostingController(rootView: TouchControlsOverlay())
             host.view.backgroundColor = .clear
             w.rootViewController = host
             window = w

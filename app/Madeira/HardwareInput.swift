@@ -87,7 +87,7 @@ import ObjectiveC
 // everywhere; MADEIRA_POINTER_LOCK=0 never locks the pointer;
 // MADEIRA_POINTER_AUTOLOCK=0 locks it only on request (Ctrl+Alt+P or the lock
 // button). Documents/madeira-input.json holds the settings: `sensMouse` (mouse
-// gain, default 1.0), `padRightStickMouse` (default false) and
+// gain over one screen point per delta unit, default 1.0), `padRightStickMouse` (default false) and
 // `ignoreTouchesWithMouse` (default true; false disables the AssistiveTouch
 // click filter). The driver side has MADEIRA_NAV_KEYS_E0. Log tag:
 // `[hwinput]`. See docs/KEYBOARD_MOUSE.md.
@@ -348,11 +348,10 @@ enum StickVelocity {
 }
 
 
-/// Where a point on the game view lands on the Windows screen. The screen is
-/// drawn aspect-fit and centred in the view: MetalBackedView.gameRect for a
-/// program on the game view (its touch mapping, mapTouch, is the same
-/// arithmetic) and the desktop compositor (Winios.m) for the desktop
-/// session. A point in the letterbox clamps to the nearest edge.
+/// Where a point on the game view lands on the desktop session's Windows
+/// screen, which the desktop compositor (Winios.m) draws aspect-fit and
+/// centred in the view. A point in the letterbox clamps to the nearest edge.
+/// A program on the game view maps through MetalBackedView.gamePoint instead.
 enum ScreenMap {
     static func fit(viewW: Double, viewH: Double, screenW: Int, screenH: Int)
         -> (originX: Double, originY: Double, scale: Double) {
@@ -625,6 +624,18 @@ final class HardwareInput: ObservableObject {
     private let mouseQueue = DispatchQueue(label: "madeira.hwinput.mouse", qos: .userInteractive)
     private let motionLock = NSLock()
     private var carry = MotionCarry()
+    /// Guest pixels per screen point across the game surface. Relative deltas
+    /// are screen points; scaling them by this moves the program's cursor the
+    /// same distance on screen at any guest resolution (1048x720 and 2816x1940
+    /// alike), leaving `sensMouse` a pure preference. MetalBackedView publishes
+    /// it whenever it lays the surface out; guarded by motionLock.
+    private var pixelsPerPoint = 1.0
+
+    /// Main thread, from the display layout.
+    func setGuestPixelsPerPoint(_ value: Double) {
+        guard value.isFinite, value > 0 else { return }
+        motionLock.lock(); pixelsPerPoint = value; motionLock.unlock()
+    }
     private var wheel = WheelAccumulator()
     /// `currentRoute`, for the mouse queue.
     private var route: PointerRoute = .relative
@@ -1075,9 +1086,9 @@ final class HardwareInput: ObservableObject {
     /// and the same carry. Callable from either queue.
     private func postMotion(_ dx: Double, _ dy: Double) {
         // One aligned Double read of a value only the slider writes.
-        let gain = InputSettings.shared.sensMouse
+        let sens = InputSettings.shared.sensMouse
         motionLock.lock()
-        let d = carry.add(dx, dy, gain: gain)
+        let d = carry.add(dx, dy, gain: sens * pixelsPerPoint)
         motionLock.unlock()
         postRelative(d.dx, d.dy)
     }
@@ -1125,11 +1136,18 @@ final class HardwareInput: ObservableObject {
     /// the game view. Main thread.
     private func postAbsolute(_ p: CGPoint, in view: UIView) {
         let desktop = Self.desktopMode
-        let desk = Self.desktopSize()
-        let sw = desktop ? desk.w : DirectCursorOverlay.screenW
-        let sh = desktop ? desk.h : DirectCursorOverlay.screenH
-        let s = ScreenMap.toScreen(x: Double(p.x), y: Double(p.y), viewW: Double(view.bounds.width),
-                                   viewH: Double(view.bounds.height), screenW: sw, screenH: sh)
+        let s: (x: Int32, y: Int32)
+        if desktop {
+            let desk = Self.desktopSize()
+            s = ScreenMap.toScreen(x: Double(p.x), y: Double(p.y), viewW: Double(view.bounds.width),
+                                   viewH: Double(view.bounds.height), screenW: desk.w, screenH: desk.h)
+        } else {
+            // The game surface: the live guest size and the session's Aspect &
+            // scaling choice, exactly as a touch maps (MetalBackedView.gamePoint).
+            guard let game = view as? MetalBackedView else { return }
+            let g = game.gamePoint(p)
+            s = (g.0, g.1)
+        }
         setMouseInUse(true)
         if let last = lastAbsolute, last.x == s.x, last.y == s.y { return }
         lastAbsolute = s
@@ -1638,8 +1656,29 @@ enum PointerLock {
     static func refresh() {
         DispatchQueue.main.async {
             install()
-            keyWindow()?.rootViewController?.setNeedsUpdateOfPrefersPointerLocked()
+            // UIKit takes the preference from the topmost full-screen window's
+            // root, an overlay window during a game (OverlayHostingController),
+            // so every window's root is asked, not only the key window's.
+            UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap { $0.windows }
+                .compactMap { $0.rootViewController }
+                .forEach { $0.setNeedsUpdateOfPrefersPointerLocked() }
+            // The preference is a request: iPadOS grants it only to a full-screen
+            // scene and posts no notification when it declines. Report what the
+            // scene actually did once UIKit has had a moment to apply it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { logGrant(why: "requested") }
         }
+    }
+
+    private static var grantObserver: NSObjectProtocol?
+
+    /// "[hwinput] pointer lock granted=..." from the scene's own lock state, next
+    /// to what Madeira asked for, on each request and each change UIKit reports.
+    private static func logGrant(why: String) {
+        let scene = keyWindow()?.windowScene
+        let granted = scene?.pointerLockState.map { $0.isLocked ? "yes" : "no" } ?? "n/a"
+        fputs("[hwinput] pointer lock granted=\(granted) requested=\(HardwareInput.shared.pointerLocked ? "yes" : "no") (\(why))\n", stderr)
     }
 
     private static func keyWindow() -> UIWindow? {
@@ -1668,6 +1707,10 @@ enum PointerLock {
         }
         installed = true
         fputs("[hwinput] pointer lock installed on \(NSStringFromClass(cls))\n", stderr)
+        grantObserver = NotificationCenter.default.addObserver(
+            forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { _ in
+            logGrant(why: "changed")
+        }
     }
 }
 
@@ -1847,11 +1890,12 @@ final class PointerFallback: NSObject {
 /// it moves and scales with it; created the first time a mouse is used there.
 /// The image and hotspot are the program's (driver_ios.c extracts them exactly
 /// as for the desktop compositor); positions are Wine screen pixels on the
-/// 1024x768 surface that MetalBackedView.mapTouch also maps to. Main thread.
+/// guest surface (winios_screen_size), which MetalHostView's frame covers
+/// exactly, so one guest pixel is bounds/guest points on each axis. Main thread.
 final class DirectCursorOverlay {
     static let shared = DirectCursorOverlay()
-    static let screenW = 1024
-    static let screenH = 768
+    /// The smallest on-screen size of one cursor image pixel, in points.
+    static let minPointsPerCursorPixel: CGFloat = 1
 
     private var layer: CALayer?
     private var image = winios_direct_cursor_state()
@@ -1887,13 +1931,23 @@ final class DirectCursorOverlay {
         CATransaction.setDisableActions(true)
         l.isHidden = !visible
         if visible {
-            let k = MetalHostView.shared.bounds.width / CGFloat(Self.screenW)
+            var gw: Int32 = 0, gh: Int32 = 0
+            winios_screen_size(&gw, &gh)
+            let host = MetalHostView.shared.bounds
+            let kx = host.width / CGFloat(max(gw, 1))
+            let ky = host.height / CGFloat(max(gh, 1))
+            // The image itself is drawn at least one point per cursor pixel: at
+            // a high guest resolution (2816x1940 on an iPad) guest pixels are
+            // half a point, and a Windows cursor at that size is hard to find.
+            // The hotspot is scaled with the image, so its pixel stays on the
+            // cursor's position.
+            let cs = max(min(kx, ky), Self.minPointsPerCursorPixel)
             let w = serial != 0 ? Int(image.w) : Self.arrowSize.w
             let h = serial != 0 ? Int(image.h) : Self.arrowSize.h
             let hx = serial != 0 ? Int(image.hot_x) : 0
             let hy = serial != 0 ? Int(image.hot_y) : 0
-            l.bounds = CGRect(x: 0, y: 0, width: CGFloat(w) * k, height: CGFloat(h) * k)
-            l.position = CGPoint(x: CGFloat(Int(x) - hx) * k, y: CGFloat(Int(y) - hy) * k)
+            l.bounds = CGRect(x: 0, y: 0, width: CGFloat(w) * cs, height: CGFloat(h) * cs)
+            l.position = CGPoint(x: CGFloat(x) * kx - CGFloat(hx) * cs, y: CGFloat(y) * ky - CGFloat(hy) * cs)
         }
         CATransaction.commit()
     }

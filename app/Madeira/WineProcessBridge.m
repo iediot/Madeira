@@ -291,18 +291,41 @@ extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
+static volatile int g_wine_has_run = 0;
+/* One generation per wine_process_start; g_session_ended holds the last one
+ * wine_session_end ran for. */
+static unsigned g_session_gen = 0;
+static unsigned g_session_ended = 0;
+static void wine_session_end(unsigned gen);
 
 /* Session exit report for the library front end. The app marks one process as
  * its own: the program it hands to __wine_main below, which is the session's
  * initial process. ntdll's common exit wrapper (build/ntdll-unix/server_ios.c)
  * calls wine_launched_process_did_exit() for that process only, on whichever
- * thread ends it. Only the status is kept: no names, no allocation, no
- * logging. g_launch_exit holds (1 << 32) | status when the program ended with
- * an NTSTATUS error (0xC...), else 0. */
+ * thread ends it, after it has closed the process's master socket. ntdll
+ * passes only the status. g_launch_exit holds (1 << 32) | status when the
+ * program ended with an NTSTATUS error (0xC...), else 0.
+ *
+ * The same call ends the session when the process ends on a thread other
+ * than the one __wine_main runs on. Only that thread's exit() longjmps back
+ * to wine_process_thread (shims/wine_ios_exit.h); any other thread's exit()
+ * is pthread_exit. Nothing stops the first thread in that case: the server
+ * kills a process's other threads with SIGQUIT, which never reaches a thread
+ * here (send_thread_signal has no port), so a killed thread runs on until a
+ * server request finds its pipe closed and then leaves through pthread_exit,
+ * or it stays parked in an in-process wait. Seen on a device: RimWorld's
+ * Mono hit an unhandled exception on a worker, the worker terminated the
+ * process, the first thread died on its next request, and the session never
+ * ended (wine_process_is_running() stayed 1, the library never came back). */
 static uint64_t g_launch_exit = 0;
 void wine_launched_process_did_exit(int status) {
     if ((uint32_t)status >= 0xC0000000u)
         __atomic_store_n(&g_launch_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
+    /* the first thread: exit() longjmps home next and ends the session there */
+    if (wine_ios_exit_initialized && pthread_equal(pthread_self(), wine_ios_main_thread)) return;
+    dprintf(STDERR_FILENO, "[WineProc] the main process ended with code %d on one of its other threads; "
+            "ending the session from that thread\n", status);
+    wine_session_end(__atomic_load_n(&g_session_gen, __ATOMIC_ACQUIRE));
 }
 void wine_exit_status_reset(void) {
     __atomic_store_n(&g_launch_exit, 0, __ATOMIC_RELEASE);
@@ -395,6 +418,43 @@ static void madeira_ensure_locallow(NSString *prefix)
     ws_log( "[profile] users/%s/AppData/LocalLow %s", name, made ? "created" : "could NOT be created" );
 }
 
+/* Unity dynamic fonts that name an OS font "Arial" (RimWorld's Arial_small and
+ * Arial_medium) look it up themselves: Unity scans C:\windows\Fonts and keys
+ * each face by its FreeType family name, matched exactly, ignoring file names,
+ * the registry and Wine's FontSubstitutes/Replacements (Arial -> Tahoma). The
+ * template prefix has no Arial, so every glyph comes back 2x2 with a zero
+ * advance, every label measures 0 px and no text draws.
+ *
+ * Ship Liberation Sans (SIL OFL 1.1, metric-compatible with Arial) with its
+ * family renamed to "Arial" (tools/fonts/make-arial.py) and copy each style in
+ * when that arial*.ttf is missing or empty -- an Arial the user installed is
+ * never replaced. Idempotent and cheap, so it runs on every launch. */
+static void madeira_ensure_arial_fonts(NSString *prefix)
+{
+    static const char *const files[] = { "arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf" };
+    NSFileManager *fm = [NSFileManager defaultManager];
+    /* Not "fonts": Wine loads <bundle>/fonts as its data-dir font folder. */
+    NSString *bundled = [[NSBundle mainBundle] pathForResource:@"arial-fonts" ofType:nil];
+    NSString *fontsDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/Fonts"];
+    int copied = 0;
+
+    if (!bundled) { LOG( "arial: bundled fonts folder missing" ); return; }
+    [fm createDirectoryAtPath:fontsDir withIntermediateDirectories:YES attributes:nil error:nil];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+    {
+        NSString *dst = [fontsDir stringByAppendingPathComponent:@(files[i])];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:dst error:nil];
+        if (attrs && [attrs fileSize] > 0) continue;
+        [fm removeItemAtPath:dst error:nil];
+        if ([fm copyItemAtPath:[bundled stringByAppendingPathComponent:@(files[i])] toPath:dst error:nil])
+            copied++;
+        else
+            LOG( "arial: could not copy %{public}s", files[i] );
+    }
+    if (copied)
+        dprintf( 2, "[arial] installed %d Arial (Liberation Sans) file(s)\n", copied );
+}
+
 /***********************************************************************
  *           madeira_seed_prefix_if_needed
  *
@@ -450,6 +510,7 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
         madeira_ensure_locallow( prefix );
+        madeira_ensure_arial_fonts( prefix );
     }
 }
 
@@ -836,8 +897,69 @@ static void madeira_publish_host_probe(void)
     dprintf(STDERR_FILENO, "[WineProc] FEX host feature probe: %s\n", buf);
 }
 
+/* End the session whose initial process has ended: wait for the game a
+ * launcher started (below), mark it not running, stop the wineserver. It runs
+ * once per session, on the first of two threads to get here: the session's
+ * first thread once its exit() has longjmped home (wine_process_thread), or
+ * the thread that ended the process when that is another one
+ * (wine_launched_process_did_exit). A call for an older session does nothing,
+ * so a thread of a finished session cannot end the next one. */
+static void wine_session_end(unsigned gen) {
+    if (gen != __atomic_load_n(&g_session_gen, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_exchange_n(&g_session_ended, gen, __ATOMIC_ACQ_REL) == gen) return;
+
+    /* A launcher stub that starts the game and exits at once (GTA V
+     * Enhanced: PlayGTAV.exe -> GTA5_Enhanced.exe) must not end the
+     * session -- stopping the wineserver here killed the game while it
+     * loaded. If a child process that is not a crash reporter / helper was
+     * started in the last 60 s and still runs, the session goes on until
+     * no such child is left (process_ios.c, madeira_live_game_children).
+     * A game that exits normally long after starting its helpers is not
+     * affected. Opt-in, MADEIRA_WAIT_CHILDREN=1 (madeira.cfg, or a game's
+     * own config): a child that ends from a worker thread never releases its
+     * slot (process_ios.c), and the session would then wait forever. */
+    {
+        extern int madeira_live_game_children(char *buf, int len, double max_age);
+        const char *wc = getenv("MADEIRA_WAIT_CHILDREN");
+        char names[256];
+        int n = madeira_live_game_children(names, sizeof names, 60.0);
+        if (n > 0 && !(wc && wc[0] == '1')) {
+            dprintf(STDERR_FILENO, "[WineProc] the main process exited while %d child process(es) it started "
+                    "still run (%s); the session ends with it (MADEIRA_WAIT_CHILDREN=1 keeps it while they run)\n",
+                    n, names);
+        } else if (n > 0) {
+            dprintf(STDERR_FILENO, "[WineProc] the main process exited but %d child process(es) "
+                    "it started still run (%s) -- a launcher started the game; the session goes on until "
+                    "they exit (MADEIRA_WAIT_CHILDREN=1)\n", n, names);
+            unsigned ticks = 0;
+            while ((n = madeira_live_game_children(names, sizeof names, -1.0)) > 0) {
+                usleep(200 * 1000);
+                if ((++ticks % 300) == 0)
+                    dprintf(STDERR_FILENO, "[WineProc] still running: %d child process(es) (%s), %u s\n",
+                            n, names, ticks / 5);
+            }
+            dprintf(STDERR_FILENO, "[WineProc] the last child process exited after %u s\n", ticks / 5);
+        }
+    }
+
+    __atomic_store_n(&g_wine_running, 0, __ATOMIC_RELEASE);
+    /* ml1184: these belong to the launch that just ended; a later session in this app
+     * run gets its own from its game, or madeira.cfg's. */
+    unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM");
+    unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
+    unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
+    unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
+    unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
+    unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
+
+    // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
+    dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");
+    wineserver_stop();
+}
+
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
+        const unsigned gen = __atomic_load_n(&g_session_gen, __ATOMIC_ACQUIRE);   /* this session's */
         /* Perf: the guest main thread runs ON this pthread. Promote to
          * USER_INTERACTIVE so it schedules on P-cores with minimal kernel
          * timer coalescing (same rationale as start_thread in
@@ -1316,6 +1438,12 @@ static void *wine_process_thread(void *arg) {
             }
         }
 
+        // Enable the narrowly scoped MMDeviceEnumerator worker compatibility
+        // policy. A madeira.cfg env override of 0 preserves standard COM rules.
+        setenv("MADEIRA_MMDEVICE_IMPLICIT_MTA", "1", 0);
+        dprintf(STDERR_FILENO, "[audio-com-policy] MMDevice implicit MTA=%s\n",
+                getenv("MADEIRA_MMDEVICE_IMPLICIT_MTA") ?: "0");
+
         // Steam S0: root CA trust. iOS has no API to enumerate system
         // roots, so crypt32's unix rootstore (crypt32_unixlib_ios.c)
         // reads the bundled Mozilla CA set from this path instead.
@@ -1592,6 +1720,37 @@ static void *wine_process_thread(void *arg) {
                 LOG("Symlinked %d MS VC++ Runtime DLLs (x86_64 native) over arm64ec builtins, skipped %d", vcrtLinked, vcrtSkipped);
                 dprintf(STDERR_FILENO, "[WineProc] Symlinked %d MS VC++ Runtime DLLs over arm64ec builtins (skipped %d for native EC SEH)\n", vcrtLinked, vcrtSkipped);
             }
+
+            /* Desktop OpenGL for x64 games: Mesa's opengl32.dll and its
+             * libgallium_wgl.dll run OpenGL on D3D12 (madeira_d3d12, then
+             * Metal), with Microsoft's dxil.dll validating the shaders.
+             * build/mesa-d3d12/build.sh writes them to x86_64-opengl/; an
+             * empty folder changes nothing. Wine's builtin opengl32 here is a
+             * stub whose every call fails, so the overlay is on by default;
+             * env.MADEIRA_OPENGL = 0 keeps the builtin. The loop above has
+             * already restored the builtin opengl32 for this session, so off
+             * only has to drop the overlay's other files. A game folder that
+             * ships its own opengl32.dll still comes first. */
+            if (use_arm64ec) {
+                NSString *glSource = [bundlePath stringByAppendingPathComponent:@"x86_64-opengl"];
+                const char *glSwitch = getenv("MADEIRA_OPENGL");
+                const BOOL glOn = !(glSwitch && glSwitch[0] == '0');
+                int glLinked = 0;
+                for (NSString *dll in [fm contentsOfDirectoryAtPath:glSource error:nil]) {
+                    if (![[[dll pathExtension] lowercaseString] isEqualToString:@"dll"]) continue;
+                    NSString *src = [glSource stringByAppendingPathComponent:dll];
+                    NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
+                    if (glOn) {
+                        [fm removeItemAtPath:dst error:nil];
+                        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil]) glLinked++;
+                    } else if ([[fm destinationOfSymbolicLinkAtPath:dst error:nil] isEqualToString:src] &&
+                               ![fm fileExistsAtPath:[dllSource stringByAppendingPathComponent:dll]]) {
+                        [fm removeItemAtPath:dst error:nil];
+                    }
+                }
+                dprintf(STDERR_FILENO, "[WineProc] OpenGL: %s (%d Mesa DLLs linked over the builtin)\n",
+                        glOn ? "Mesa on D3D12" : "Wine builtin (MADEIRA_OPENGL=0)", glLinked);
+            }
         }
 
         // Build the launch path for Wine's PE loader.
@@ -1744,54 +1903,11 @@ static void *wine_process_thread(void *arg) {
             dprintf(STDERR_FILENO, "[WineProc] Wine exited with code %d (caught by longjmp)\n", wine_ios_exit_code);
         }
 
-        /* A launcher stub that starts the game and exits at once (GTA V
-         * Enhanced: PlayGTAV.exe -> GTA5_Enhanced.exe) must not end the
-         * session -- stopping the wineserver here killed the game while it
-         * loaded. If a child process that is not a crash reporter / helper was
-         * started in the last 60 s and still runs, the session goes on until
-         * no such child is left (process_ios.c, madeira_live_game_children).
-         * A game that exits normally long after starting its helpers is not
-         * affected. Opt-in, MADEIRA_WAIT_CHILDREN=1 (madeira.cfg, or a game's
-         * own config): a child that ends from a worker thread never releases its
-         * slot (process_ios.c), and the session would then wait forever. */
-        {
-            extern int madeira_live_game_children(char *buf, int len, double max_age);
-            const char *wc = getenv("MADEIRA_WAIT_CHILDREN");
-            char names[256];
-            int n = madeira_live_game_children(names, sizeof names, 60.0);
-            if (n > 0 && !(wc && wc[0] == '1')) {
-                dprintf(STDERR_FILENO, "[WineProc] the main process exited while %d child process(es) it started "
-                        "still run (%s); the session ends with it (MADEIRA_WAIT_CHILDREN=1 keeps it while they run)\n",
-                        n, names);
-            } else if (n > 0) {
-                dprintf(STDERR_FILENO, "[WineProc] the main process exited but %d child process(es) "
-                        "it started still run (%s) -- a launcher started the game; the session goes on until "
-                        "they exit (MADEIRA_WAIT_CHILDREN=1)\n", n, names);
-                unsigned ticks = 0;
-                while ((n = madeira_live_game_children(names, sizeof names, -1.0)) > 0) {
-                    usleep(200 * 1000);
-                    if ((++ticks % 300) == 0)
-                        dprintf(STDERR_FILENO, "[WineProc] still running: %d child process(es) (%s), %u s\n",
-                                n, names, ticks / 5);
-                }
-                dprintf(STDERR_FILENO, "[WineProc] the last child process exited after %u s\n", ticks / 5);
-            }
-        }
+        wine_session_end(gen);
 
-        g_wine_running = 0;
-        /* ml1184: these belong to the launch that just ended; a later session in this app
-         * run gets its own from its game, or madeira.cfg's. */
-        unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM");
-        unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
-        unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
-        unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
-        unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
-        unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
-
-        // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
-        dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");
-        wineserver_stop();
-
+        /* The host's name must outlive this thread, so it must not point at
+         * exe_path on this stack (env_ios.c, set_process_name). */
+        dprintf(STDERR_FILENO, "[WineProc] host progname=%s\n", getprogname());
         dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
 
         // Steam S0: this thread's TEB was mirrored into pthread TSD slot
@@ -1822,6 +1938,7 @@ int wine_process_start(const char *prefix_path) {
     LOG("Starting Wine process with prefix: %{public}s", prefix_path);
 
     g_wine_running = 1;
+    __atomic_add_fetch(&g_session_gen, 1, __ATOMIC_ACQ_REL);   /* before the thread reads it */
 
     // Create socketpair to bypass broken iOS UDS accept()
     // pair[0] = wineserver side (injected as client fd)
@@ -1864,12 +1981,19 @@ int wine_process_start(const char *prefix_path) {
     }
 
     pthread_detach(g_wine_thread);
+    g_wine_has_run = 1;
     LOG("Wine process thread created");
     return 0;
 }
 
 int wine_process_is_running(void) {
-    return g_wine_running;
+    /* acquire: pairs with wine_session_end's release, so a 0 here also shows
+     * the exit status wine_launched_process_did_exit stored before it */
+    return __atomic_load_n(&g_wine_running, __ATOMIC_ACQUIRE);
+}
+
+int wine_process_has_run(void) {
+    return g_wine_has_run;
 }
 
 int madeira_write_continue_flag(void) {

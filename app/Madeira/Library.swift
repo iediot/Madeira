@@ -714,6 +714,7 @@ final class LibraryModel: ObservableObject {
 
     private init() {
         refreshFlag()
+        observeFinishedSession()
         // The session's settings used to be written only when it ended (finish), and
         // closing Madeira from the app switcher ends the process without that: every
         // change made during the game was lost. Leaving the app saves them too.
@@ -1224,6 +1225,84 @@ final class LibraryModel: ObservableObject {
         MetalHostView.shared.isHidden = true
         ProMotionIntent.shared.setActive(false)
         fputs("[frontend] returned to library\n", stderr)
+    }
+
+    // MARK: finished session
+
+    /// A finished session's memory stays with the process: Wine cannot be torn
+    /// down in place, so the game's address space (8.2 GB after a long RimWorld
+    /// run) remains resident in a process that cannot start another game
+    /// (sessionsThisRun). Suspended in the background, it was the largest
+    /// process on the device and kept the system under memory pressure until
+    /// jetsam killed it, with others (2026-10-06). So once Wine has run and
+    /// stopped, leaving the foreground ends the process, and opening Madeira
+    /// again starts a fresh one with the library. Work an exit would cut short
+    /// holds it for as long as iOS lets Madeira run in the background; if iOS
+    /// suspends Madeira first, it stays suspended as before.
+    /// MADEIRA_ONE_SESSION_PER_RUN=0 (a second session allowed) keeps the
+    /// process. Log tag: [session-exit].
+    private var exitGrace: UIBackgroundTaskIdentifier = .invalid
+    private var exitTimer: Timer?
+
+    /// Wine ran in this process, nothing of it runs any more, and no other
+    /// session may start in it.
+    private var sessionSpent: Bool {
+        wine_process_has_run() != 0 && wine_process_is_running() == 0 && wineserver_is_running() == 0
+            && current == nil && MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN")
+    }
+
+    private func observeFinishedSession() {
+        let center = NotificationCenter.default
+        center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.exitWhenIdle() }
+        }
+        center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.cancelExit() }
+        }
+    }
+
+    /// What an exit now would cut short, or nil.
+    @MainActor private func exitHold() -> String? {
+        if SteamOwnedLibrary.shared.holdsProcess { return "steam" }
+        if EpicInstaller.shared.installs.values.contains(where: { $0.download != nil }) { return "epic" }
+        if SaveBackup.running > 0 { return "saves" }
+        return nil
+    }
+
+    @MainActor private func exitWhenIdle() {
+        guard UIApplication.shared.applicationState == .background, sessionSpent else { cancelExit(); return }
+        // A download paused for the session resumes now, in the background
+        // (SteamDownloadBackground), and holds the exit until it is done.
+        SteamOwnedLibrary.shared.reconcileSession()
+        if let hold = exitHold() {
+            guard exitTimer == nil else { return }
+            LogStore.shared.log("[session-exit] held by \(hold)")
+            exitGrace = UIApplication.shared.beginBackgroundTask(withName: "Madeira finished session") { [weak self] in
+                MainActor.assumeIsolated {
+                    LogStore.shared.log("[session-exit] background time over: suspended")
+                    self?.endExitGrace()
+                }
+            }
+            // Continued processing (a Steam download) can keep Madeira running
+            // past the grace period; the check goes on while it does.
+            exitTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+                MainActor.assumeIsolated { LibraryModel.shared.exitWhenIdle() }
+            }
+            return
+        }
+        LogStore.shared.log("[session-exit] the session ended and Madeira left the foreground: exiting")
+        exit(0)
+    }
+
+    @MainActor private func endExitGrace() {
+        guard exitGrace != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(exitGrace)
+        exitGrace = .invalid
+    }
+
+    @MainActor private func cancelExit() {
+        exitTimer?.invalidate(); exitTimer = nil
+        endExitGrace()
     }
 }
 
@@ -2986,6 +3065,7 @@ struct LibraryDetail: View {
                 if let appID = entry.steamAppID {
                     SteamCloudSection(appID: appID)
                     SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
+                    if SteamOwnedLibrary.enabled { SteamWorkshopSection(appID: appID) }
                 }
                 // An installed Epic game's version, prerequisites and Uninstall (Epic/).
                 if let epic = entry.epicAppName {
@@ -4314,7 +4394,7 @@ enum LibraryKeyboard {
         previous = scene.windows.first(where: { $0.isKeyWindow })
         let w = LibraryKeyboardWindow(windowScene: scene)
         w.windowLevel = .normal + 102; w.backgroundColor = .clear
-        let controller = UIViewController(); controller.view.backgroundColor = .clear
+        let controller = OverlayController(); controller.view.backgroundColor = .clear
         w.rootViewController = controller
         let v = LibraryKeyInput(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
         controller.view.addSubview(v); input = v; window = w

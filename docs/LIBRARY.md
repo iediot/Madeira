@@ -291,6 +291,16 @@ process (the wineserver's permanent objects from the first session remain and
 the registry initialisation aborts). The library asks to restart Madeira
 instead.
 
+A finished session's memory stays with the process, because Wine cannot be
+torn down in place: after a long RimWorld session that is more than 8 GB,
+resident in a process that cannot start another game. So once Wine has run
+and stopped, Madeira exits when it leaves the foreground, and opening it again
+starts a fresh process with the library (`[session-exit]` in the log). A Steam
+download, a cloud save transfer, in-app pairing or a save backup or restore
+holds the exit while iOS lets Madeira run in the background; if iOS suspends
+Madeira first, it stays suspended. `MADEIRA_ONE_SESSION_PER_RUN = 0` keeps the
+process.
+
 ## First-run setup
 
 The code is `app/Madeira/Onboarding.swift`. It uses `JITCoordinator` for

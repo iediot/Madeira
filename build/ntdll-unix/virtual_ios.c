@@ -5552,6 +5552,18 @@ static void *address_space_start = (void *)0x100010000; /* above iOS 4GB __PAGEZ
 #else
 static void *address_space_start = (void *)0x10000;
 #endif
+/* The lowest address any view can get on iOS: the 4 GB __PAGEZERO covers
+ * [0, 0x100000000), so every placement, the unclamped kernel pick included,
+ * satisfies a limit_low at or below this. A request whose limit_low is that low
+ * is not constrained by it (see ceiling_relaxable in map_view). */
+static const ULONG_PTR ios_lowest_placement = 0x100010000;
+
+/* Whether a caller's limit_low leaves the furniture ceiling relaxable: true
+ * when every placement satisfies it anyway (see map_view). */
+static inline int ios_limit_low_is_free( ULONG_PTR limit_low )
+{
+    return limit_low <= ios_lowest_placement;
+}
 #ifdef _WIN64
 static void *address_space_limit = (void *)0x7fffffff0000;  /* top of the total available address space */
 static void *user_space_limit    = (void *)0x7fffffff0000;  /* top of the user address space */
@@ -8587,6 +8599,34 @@ static ULONG_PTR ios_wow_extend_holdback_tail( unsigned *guard_owned )
     return ios_wow_window_try( base, guard_owned ) ? base : 0;
 }
 
+/* MADEIRA_CAGE_RELEASE=1: this session runs no Chromium, so neither the V8 cage
+ * holdback nor the PartitionAlloc pool slots [0x7400000000, 0x7C00000000) will
+ * be claimed. The app sets it for a Madeira Dock session (headless Steam
+ * client) and for a library game started directly; madeira.cfg can override it
+ * (0 for a game that embeds CEF). It enables the holdback release below and
+ * pool-slot steering of big reserves (allocate_virtual_memory). */
+static int ios_chromium_seen;
+
+static int ios_session_no_chromium( void )
+{
+    const char *e = getenv( "MADEIRA_CAGE_RELEASE" );
+    return e && *e == '1' && !ios_chromium_seen;
+}
+
+/* The launch-time classification can be wrong: a launcher .exe or a game may
+ * embed CEF. Chromium announces itself with a reserve of 8 GB or more (the V8
+ * cage, 8 GB; PartitionAlloc pools, 16 GB), which nothing else in these
+ * sessions asks for. From then on the session is treated as running Chromium:
+ * no more pool-slot steering or holdback release. A false positive (some other
+ * runtime's huge reserve) only restores the default layout. */
+static void ios_note_chromium_reserve( size_t size, ULONG type )
+{
+    if (ios_chromium_seen || !(type & MEM_RESERVE) || size < 0x200000000ULL) return;
+    ios_chromium_seen = 1;
+    dprintf( 2, "[cage] a 0x%lx reserve looks like Chromium: no-Chromium steering and "
+                "holdback release are off for the rest of the session\n", (unsigned long)size );
+}
+
 /* Give the unclaimed [cage] holdback to Wine's allocator when the band is
  * exhausted.
  *
@@ -8608,20 +8648,16 @@ static ULONG_PTR ios_wow_extend_holdback_tail( unsigned *guard_owned )
  * ios_cage_holdback_live is cleared, which disables the cage grant (it munmaps
  * the whole range) and the carve.
  *
- * Off unless MADEIRA_CAGE_RELEASE=1, which the app sets for a Madeira Dock
- * session (headless Steam client, no CEF). Called with virtual_mutex held.
- * Returns 1 if the holdback was handed over. */
+ * Off unless the session runs no Chromium (ios_session_no_chromium). Called
+ * with virtual_mutex held. Returns 1 if the holdback was handed over. */
 static int ios_cage_release_on_exhaustion( void *start, void *end, size_t want )
 {
-    /* 1: when the guest band is exhausted, hand the unclaimed 8 GB V8 cage
-     * holdback to it. Set by the app for a Madeira Dock session; off otherwise. */
-    const char *e = getenv( "MADEIRA_CAGE_RELEASE" );
     const ULONG_PTR lo = IOS_CAGE_BASE + ios_wow_guard_size();
     const ULONG_PTR hi = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
     ULONG_PTR s = (ULONG_PTR)start > lo ? (ULONG_PTR)start : lo;
     ULONG_PTR t = (ULONG_PTR)end < hi ? (ULONG_PTR)end : hi;
 
-    if (!ios_cage_holdback_live || !e || *e != '1') return 0;
+    if (!ios_cage_holdback_live || !ios_session_no_chromium()) return 0;
     if (t <= s || t - s < want) return 0;
     mmap_add_reserved_area( (void *)lo, hi - lo );
     ios_cage_holdback_live = 0;
@@ -13644,7 +13680,23 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             }
             else
             {
-                ERR("iOS JIT: NOT marking jit %p+0x%lx as EC (no .hexpthk section, pure x86_64)\n",
+                /* Pure x86_64 images must explicitly clear the destination
+                 * pool bitmap. The pool is reused across pseudo-processes, so
+                 * "do not mark" is not sufficient: an old ARM64EC bit can
+                 * survive at the same pool address and make DispatchJump treat
+                 * x86_64 bytes as native ARM64. */
+                if (arm64ec_view)
+                {
+                    char *jit_base = (char *)jit_rx_base + offset;
+                    size_t bm_start = ((size_t)jit_base >> 12) / 8;
+                    size_t bm_end   = (((size_t)jit_base + image_size) >> 12) / 8;
+                    size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
+                    void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
+                    set_vprot(arm64ec_view, bm_page, bm_size,
+                              VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
+                    clear_arm64ec_range(jit_base, image_size);
+                }
+                ERR("iOS JIT: cleared EC bitmap for jit %p+0x%lx (no .hexpthk section, pure x86_64)\n",
                     (char *)jit_rx_base + offset, (unsigned long)image_size);
             }
 
@@ -15004,8 +15056,17 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
              * anyway, so treat it as absent: the floor is above it, and
              * relaxing reproduces exactly what a ceiling-disabled build does
              * for the same call. (top_down is a hint, not a contract, and is
-             * knowingly dropped on the relax path.) */
-            ceiling_relaxable = (limit_low <= (ULONG_PTR)address_space_start);
+             * knowingly dropped on the relax path.)
+             *
+             * Compare against the lowest address a placement can ever have, not
+             * address_space_start: a native win64 process lowers that to
+             * 0x10000 (virtual_init), and then the thread stacks' limit_4g
+             * (kernel and ChpeV2 stacks, thread_ios.c) counted as a real
+             * constraint. They got no floor raise and no relax, and failed
+             * hard with STATUS_NO_MEMORY once the band was full, while 32 GB
+             * above the ceiling stayed free: RimWorld with mods lost its
+             * threads to "Couldn't create thread. Error 0x8". */
+            ceiling_relaxable = ios_limit_low_is_free( limit_low );
         }
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
@@ -15915,9 +15976,11 @@ static void ios_swap_free_add( uint64_t off, uint64_t len )
     if (ios_swap_nfree < 8192) { ios_swap_free[ios_swap_nfree].off = off; ios_swap_free[ios_swap_nfree].len = len; ios_swap_nfree++; }
     else ios_swap_free_drop++;   /* leaked offset space: later backings may be refused, never wrong */
 }
+static int ios_swap_punch_defer( uint64_t off, size_t len );   /* ml1291, below */
 static void ios_swap_give( uint64_t off, size_t len )
 {
     struct fpunchhole ph;
+    if (ios_swap_punch_defer( off, len )) return;   /* ml1291: punched and freed off the virtual lock */
     memset( &ph, 0, sizeof(ph) );
     ph.fp_offset = (off_t)off; ph.fp_length = (off_t)len;
     if (fcntl( ios_swap_fd, F_PUNCHHOLE, &ph ))
@@ -15936,6 +15999,115 @@ static uint64_t ios_swap_now_ns( void )
     clock_gettime( CLOCK_MONOTONIC, &ts );
 #endif
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* ml1291: the swap file's F_PUNCHHOLE off the virtual lock.
+ *
+ * Ori and the Will of the Wisps, 2026-10-07: two freezes of 18 s and 13 s with
+ * every game thread idle, the main thread in fcntl() in both thread samples, a
+ * job worker waiting on a mutex, the swap file's disk use growing meanwhile, and
+ * each freeze ending exactly when the tier's release counter went up. A release
+ * (ios_swap_release_range, a failed map) gives the file range back with
+ * F_PUNCHHOLE, and APFS can hold that call for seconds behind the file's
+ * writeback; it ran under virtual_mutex, so every thread that allocates, frees,
+ * protects or faults through Wine waited for it.
+ *
+ * A given-back range is mapped by nothing any more (its view was replaced by
+ * anonymous memory or is being unmapped), so the punch itself needs no lock.
+ * ios_swap_give now queues it; a host thread punches it and only then, under
+ * virtual_mutex, returns the range to the free list, so it cannot be handed to a
+ * new backing before it reads as zero. A full queue or a thread that could not
+ * start falls back to the synchronous punch. MADEIRA_SWAP_PUNCH_DEFER=0 keeps
+ * every punch synchronous. Punches of 100 ms or more are logged, the in-place
+ * decommit punch (ios_swap_punch_resv, still synchronous) included. */
+#define IOS_SWAP_PQ 1024
+static struct { uint64_t off, len; } ios_swap_pq[IOS_SWAP_PQ];
+static unsigned ios_swap_pq_head, ios_swap_pq_n;
+static pthread_mutex_t ios_swap_pq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ios_swap_pq_cond = PTHREAD_COND_INITIALIZER;
+static int ios_swap_pq_state;   /* 0 not started, 1 running, -1 off */
+static unsigned long long ios_swap_pq_done, ios_swap_punch_slow, ios_swap_punch_max_ms;
+
+static int ios_swap_punch_timed( uint64_t off, uint64_t len, const char *why )
+{
+    struct fpunchhole ph;
+    uint64_t t0 = ios_swap_now_ns(), ms;
+    int rc;
+    memset( &ph, 0, sizeof(ph) );
+    ph.fp_offset = (off_t)off; ph.fp_length = (off_t)len;
+    if ((rc = fcntl( ios_swap_fd, F_PUNCHHOLE, &ph )))
+    {
+        static int said;
+        if (said++ < 8) dprintf( 2, "[swap] ml1291 F_PUNCHHOLE (%s) off=%llu len=%llu failed errno=%d\n",
+                                 why, (unsigned long long)off, (unsigned long long)len, errno );
+    }
+    ms = (ios_swap_now_ns() - t0) / 1000000;
+    if (ms > ios_swap_punch_max_ms) ios_swap_punch_max_ms = ms;
+    if (ms >= 100 && (++ios_swap_punch_slow <= 16 || (ios_swap_punch_slow % 64) == 0))
+        dprintf( 2, "[swap] ml1291 F_PUNCHHOLE (%s) off=%llu len=%llu took %llu ms (%llu slow, max %llu ms)\n",
+                 why, (unsigned long long)off, (unsigned long long)len, (unsigned long long)ms,
+                 ios_swap_punch_slow, ios_swap_punch_max_ms );
+    return rc;
+}
+
+static void *ios_swap_punch_thread( void *arg )
+{
+    sigset_t all;
+    sigfillset( &all );
+    pthread_sigmask( SIG_BLOCK, &all, NULL );
+    pthread_setname_np( "madeira-swap-punch" );
+    for (;;)
+    {
+        uint64_t off, len;
+        pthread_mutex_lock( &ios_swap_pq_lock );
+        while (!ios_swap_pq_n) pthread_cond_wait( &ios_swap_pq_cond, &ios_swap_pq_lock );
+        off = ios_swap_pq[ios_swap_pq_head].off;
+        len = ios_swap_pq[ios_swap_pq_head].len;
+        ios_swap_pq_head = (ios_swap_pq_head + 1) % IOS_SWAP_PQ;
+        ios_swap_pq_n--;
+        pthread_mutex_unlock( &ios_swap_pq_lock );
+
+        ios_swap_punch_timed( off, len, "deferred" );
+
+        pthread_mutex_lock( &virtual_mutex );   /* the free list and the bump live under it */
+        ios_swap_free_add( off, len );
+        ios_swap_pq_done++;
+        pthread_mutex_unlock( &virtual_mutex );
+    }
+    return NULL;
+}
+
+/* Called with virtual_mutex held (every ios_swap_give caller is). */
+static int ios_swap_punch_defer( uint64_t off, size_t len )
+{
+    int queued = 0;
+    if (!ios_swap_pq_state)
+    {
+        /* MADEIRA_SWAP_PUNCH_DEFER=0 keeps every swap file punch synchronous, under the virtual lock. */
+        const char *e = getenv( "MADEIRA_SWAP_PUNCH_DEFER" );
+        pthread_t t;
+        ios_swap_pq_state = -1;
+        if (!(e && e[0] == '0') && !pthread_create( &t, NULL, ios_swap_punch_thread, NULL ))
+        {
+            pthread_detach( t );
+            ios_swap_pq_state = 1;
+        }
+        dprintf( 2, "[swap] ml1291 deferred F_PUNCHHOLE %s\n",
+                 ios_swap_pq_state > 0 ? "on" : (e && e[0] == '0') ? "off (MADEIRA_SWAP_PUNCH_DEFER=0)" : "off (no thread)" );
+    }
+    if (ios_swap_pq_state < 0) return 0;
+    pthread_mutex_lock( &ios_swap_pq_lock );
+    if (ios_swap_pq_n < IOS_SWAP_PQ)
+    {
+        unsigned slot = (ios_swap_pq_head + ios_swap_pq_n) % IOS_SWAP_PQ;
+        ios_swap_pq[slot].off = off;
+        ios_swap_pq[slot].len = len;
+        ios_swap_pq_n++;
+        queued = 1;
+        pthread_cond_signal( &ios_swap_pq_cond );
+    }
+    pthread_mutex_unlock( &ios_swap_pq_lock );
+    return queued;
 }
 /* ml1258, broad only: a size whose backed blocks die young stays anonymous.
  * ml1226: "twice" was too eager. Ori and the Will of the Wisps freed 13 backed
@@ -16139,6 +16311,10 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
                 mprotect_range( oa, olen, 0, 0 );
                 ios_swap_unbacks++;
             }
+            /* ml1293: the range's contents are dead (decommit/release), but its dirty pages would
+             * still be written to the file by the pageout daemon -- I/O that slowed every other
+             * fault on the file and the punch behind it. Discard them first: no writeback. */
+            if (!copy_back) msync( oa, olen, MS_KILLPAGES );
             ios_swap_give( ooff, olen );
             ios_swap_bytes -= olen;
             ios_swap_releases++;
@@ -16182,12 +16358,9 @@ static int ios_swap_punch_resv( char *lo, size_t len )
     for (i = 0; i < ios_swap_n; i++)
     {
         char *a = ios_swap_ext[i].va;
-        struct fpunchhole ph;
         if (!ios_swap_ext[i].resv || lo < a || lo + len > a + ios_swap_ext[i].len) continue;
-        memset( &ph, 0, sizeof(ph) );
-        ph.fp_offset = (off_t)(ios_swap_ext[i].off + (lo - a));
-        ph.fp_length = (off_t)len;
-        if (fcntl( ios_swap_fd, F_PUNCHHOLE, &ph ))
+        msync( lo, len, MS_KILLPAGES );   /* ml1293: drop the dead dirty pages before the punch */
+        if (ios_swap_punch_timed( ios_swap_ext[i].off + (lo - a), len, "decommit" ))   /* ml1291: timed */
         {
             static int said;
             if (said++ < 8) dprintf( 2, "[swap] ml1257 hole %p+0x%zx failed errno=%d: releasing instead\n", lo, len, errno );
@@ -16220,6 +16393,8 @@ void ios_swap_stats_line( void )
              (unsigned long long)(ios_swap_logical >> 20), ios_swap_backs, ios_swap_releases, ios_swap_unbacks, ios_swap_refused,
              ios_swap_mode, disk >> 20, (unsigned long long)(ios_swap_cap >> 20), ios_swap_resv_n, ios_swap_holes,
              ios_swap_disk_refused, ios_swap_nchurny, ios_swap_churn_skips );
+    dprintf( 2, "[swap] ml1291 punches: %llu deferred done, %u queued, %llu slow (>=100 ms), max %llu ms\n",
+             ios_swap_pq_done, ios_swap_pq_n, ios_swap_punch_slow, ios_swap_punch_max_ms );
     /* ml1221: the census (bytes by reason) with every stats line, ~10 s, not only
      * after its own 30 s: Ori and the Will of the Wisps was jetsammed at 26 s and never printed one. */
     ios_swap_tick( 1 );
@@ -21135,7 +21310,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
                  * makes the negative readable: "no steer match" with ios_steer_n>0 means the table
                  * lacks the entry, whereas no lines at all means this code path is not on the path
                  * FEX's VirtualAlloc2 takes. */
-                if ((uint64_t)(uintptr_t)base >= 0x7C00000000ULL)
+                if ((uint64_t)(uintptr_t)base >= 0x7400000000ULL)   /* every steer slot */
                 {
                     static int ac;
                     uint64_t nb = (uint64_t)(uintptr_t)base, ne = nb + size;
@@ -21992,6 +22167,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         void  *jumbo_hint = *ret;
         size_t jumbo_size = *size_ptr;
         int    is_jumbo   = (jumbo_size >= 0x40000000 && (type & MEM_RESERVE));
+        ios_note_chromium_reserve( jumbo_size, type );
         /* ml125 [bigres]: settle the furniture attribution WITHOUT an FEX build.
          * The [window] probe found ~30 runs of ~511MB and I inferred FEXCore's
          * per-thread LookupCache (TotalCacheSize = VirtualMemSize/4096*8 +
@@ -22376,7 +22552,9 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             if (!ios_steered
                 && !*ret && !limit && (type & MEM_RESERVE) && !(type & MEM_COMMIT)
                 && *size_ptr >= 0x2000000 && *size_ptr < 0x40000000
-                && (ios_bigres_reserved_total > (8ull << 30) || ios_va_pressure))
+                && (ios_bigres_reserved_total > (8ull << 30) || ios_va_pressure
+                    || (ios_session_no_chromium()
+                        && (ULONG_PTR)host_addr_space_limit > ios_steer_slot)))
             {
                 SIZE_T want = *size_ptr;
                 void *saved = *ret;
@@ -22398,54 +22576,70 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 }
                 if (sslot == 0xffff) sslot = stid & 15;
                 if (steer_tid[sslot].tid != stid) { steer_tid[sslot].tid = stid; steer_tid[sslot].n = 0; }
-                if (steer_tid[sslot].n >= 24)
+                /* A no-Chromium session steers every big reserve, mostly into the pool
+                 * slots, so there the cap counts and refuses only steers into the steer
+                 * slot (the FEX band it was built to protect); the pool slots stay open. */
+                const int no_cef = ios_session_no_chromium();
+                const int capped = steer_tid[sslot].n >= 24;
+                if (capped && steer_tid[sslot].n == 24)
                 {
-                    if (steer_tid[sslot].n == 24)
-                    {
-                        steer_tid[sslot].n++;
-                        dprintf(2, "[steer] tid=%04x CAPPED at 24 steered arenas — refusing further FEX-band spill rev=ml462\n", stid);
-                    }
+                    steer_tid[sslot].n++;
+                    dprintf(2, "[steer] tid=%04x CAPPED at 24 steered arenas — refusing further FEX-band spill rev=ml462\n", stid);
                 }
-                else
+                if (!capped || no_cef)
                 {
-                steer_tid[sslot].n++;
+                if (!no_cef) steer_tid[sslot].n++;
                 /* ml169: `limit` is 0 here ("unconstrained"), so passing it as limit_high
                  * described the EMPTY range [ios_spill_cap, 0) and every steer failed with
                  * *ret = 0x0. The upper bound has to be a real address: use the host VA
-                 * ceiling, which is_beyond_limit treats as EXCLUSIVE. */
-                NTSTATUS sst = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                                        ios_steer_slot,
-                                                        (ULONG_PTR)host_addr_space_limit,
-                                                        0, 0 );
-                /* ml171: 16GB is not enough. Surviving longer spawns more threads, so
+                 * ceiling, which is_beyond_limit treats as EXCLUSIVE.
+                 *
+                 * ml171: 16GB is not enough. Surviving longer spawns more threads, so
                  * the reserve count went 27 -> 55 (28160MB) and BOTH the steer slot and
                  * furniture reported va-scan FAILED maxgap=0 before the NULL deref.
-                 * Fall back to the 0x7400000000 slot, which this run left UNGRANTED —
+                 * Fall back to the 0x7400000000 slot, which this run left UNGRANTED --
                  * pools landed on 0x7000000000, 0x73ffff0000 and 0x7800000000, matching
-                 * the 3-pool census. That doubles steer capacity to ~32GB. */
-                if (sst)
-                {
-                    *ret = saved; *size_ptr = want;
-                    sst = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                                   0x7400000000ULL, ios_spill_cap, 0, 0 );
-                }
-                /* ml173: both steer slots full -> reclaim ranges owned by threads that
+                 * the 3-pool census. That doubles steer capacity to ~32GB.
+                 *
+                 * A session with no Chromium (ios_session_no_chromium) has no pools to
+                 * keep the slots for, so it steers every big reserve from the first one
+                 * (the arm test above) and fills the pool slots before the steer slot:
+                 * [0x7800000000, 0x7C00000000), which nothing else uses, then
+                 * [0x7400000000, ios_spill_cap), where relaxed furniture also spills.
+                 * The steer slot is shared with the FEX arena, whose 16MB requests failed
+                 * once steered reserves filled it (RimWorld with 52 mods). Placement no
+                 * longer depends on when ios_va_pressure happened to latch. */
+                const ULONG_PTR steer_cef[][2] = {
+                    { ios_steer_slot, 0 }, { 0x7400000000ULL, ios_spill_cap } };
+                const ULONG_PTR steer_no_cef[][2] = {
+                    { 0x7800000000ULL, ios_steer_slot }, { 0x7400000000ULL, ios_spill_cap },
+                    { ios_steer_slot, 0 } };
+                const ULONG_PTR (*slots)[2] = no_cef ? steer_no_cef : steer_cef;
+                /* capped: drop the trailing steer slot */
+                const unsigned nslots = no_cef ? ARRAY_SIZE(steer_no_cef) - (capped ? 1 : 0)
+                                               : ARRAY_SIZE(steer_cef);
+                NTSTATUS sst = STATUS_NO_MEMORY;
+                unsigned pass, si;
+
+                /* ml173: all steer slots full -> reclaim ranges owned by threads that
                  * have since exited, then retry once. This is what makes the steer
                  * region sustainable: the reserves leak per-thread, so without this any
                  * fixed capacity is exhausted by a long enough run. */
-                if (sst && ios_steer_reclaim_dead())
+                for (pass = 0; pass < 2 && sst; pass++)
                 {
-                    *ret = saved; *size_ptr = want;
-                    sst = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                                   ios_steer_slot,
-                                                   (ULONG_PTR)host_addr_space_limit, 0, 0 );
-                    if (sst)
+                    if (pass && !ios_steer_reclaim_dead()) break;
+                    for (si = 0; si < nslots && sst; si++)
                     {
+                        /* a 63 GB map ends below the slot: nothing to try */
+                        if (slots[si][0] >= (ULONG_PTR)host_addr_space_limit) continue;
                         *ret = saved; *size_ptr = want;
-                        sst = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                                       0x7400000000ULL, ios_spill_cap, 0, 0 );
+                        sst = allocate_virtual_memory( ret, size_ptr, type, protect, slots[si][0],
+                                                       slots[si][1] ? slots[si][1]
+                                                                    : (ULONG_PTR)host_addr_space_limit,
+                                                       0, 0 );
                     }
                 }
+                if (no_cef && !sst && (ULONG_PTR)*ret >= ios_steer_slot) steer_tid[sslot].n++;
                 if (!sst && ios_steer_n < IOS_STEER_MAX)
                 {
                     ios_steer[ios_steer_n].base = (uint64_t)(uintptr_t)*ret;
@@ -22465,7 +22659,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                     dprintf(2, "[steer] #%u size=0x%lx reserved_total=%lluMB armed=%s -> %s %p\n",
                             steer_n, (unsigned long)want,
                             (unsigned long long)(ios_bigres_reserved_total >> 20),
-                            ios_va_pressure ? "va-pressure" : "8GB-total",
+                            no_cef ? "no-chromium" : ios_va_pressure ? "va-pressure" : "8GB-total",
                             sst ? "FAILED, falling back" : "above ceiling", *ret);
                 }
                 if (!sst) { st = sst; ios_steered = 1; }
@@ -22753,7 +22947,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
          * FEXMem_ThreadState allocation being hunted, which carries
          * MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN (0x103000). Reserving allocations are the only ones
          * that can CHOOSE an address, so they are the only ones that can collide. */
-        if (!st && *ret && (uint64_t)(uintptr_t)*ret >= 0x7C00000000ULL)
+        if (!st && *ret && (uint64_t)(uintptr_t)*ret >= 0x7400000000ULL)   /* every steer slot */
         {
             static int nc;
             uint64_t nb = (uint64_t)(uintptr_t)*ret;
@@ -23818,6 +24012,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         void  *jumbo_hint = *ret;
         size_t jumbo_size = *size_ptr;
         int    is_jumbo   = (jumbo_size >= 0x40000000 && (type & MEM_RESERVE));
+        ios_note_chromium_reserve( jumbo_size, type );
         /* ml125 [bigres]: settle the furniture attribution WITHOUT an FEX build.
          * The [window] probe found ~30 runs of ~511MB and I inferred FEXCore's
          * per-thread LookupCache (TotalCacheSize = VirtualMemSize/4096*8 +
@@ -23996,7 +24191,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
          * FEXMem_ThreadState allocation being hunted, which carries
          * MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN (0x103000). Reserving allocations are the only ones
          * that can CHOOSE an address, so they are the only ones that can collide. */
-        if (!st && *ret && (uint64_t)(uintptr_t)*ret >= 0x7C00000000ULL)
+        if (!st && *ret && (uint64_t)(uintptr_t)*ret >= 0x7400000000ULL)   /* every steer slot */
         {
             static int nc;
             uint64_t nb = (uint64_t)(uintptr_t)*ret;

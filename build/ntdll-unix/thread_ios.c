@@ -1798,11 +1798,15 @@ void abort_process( int status )
      * is how the server learns the process died and wakes its waiters), drop
      * its fd cache and reclaim its JIT-pool allocations.
      *
-     * Still owed: process_exit_wrapper's exit() only longjmps on a
-     * pseudo-process's MAIN thread; a non-main thread calling it falls back to
-     * pthread_exit and leaves that process's other threads running on a
-     * reclaimed pool. That hole predates this change and is shared with
-     * exit_process. */
+     * process_exit_wrapper's exit() only longjmps on a pseudo-process's MAIN
+     * thread; a non-main thread calling it falls back to pthread_exit. For
+     * the session's initial process, process_exit_wrapper ends the session
+     * from that thread itself (wine_launched_process_did_exit,
+     * WineProcessBridge.m). Still owed, shared with exit_process: the
+     * process's other threads are not stopped (the server's SIGQUIT never
+     * reaches a thread here), so they run on until a server request fails or
+     * stay parked, and a child that ends this way never returns to
+     * ios_child_thread_entry, which releases its child slot. */
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
     ERR( "abort_process: status=0x%x — tearing down this pseudo-process only (ml937; was _exit, which killed the app)\n",
          (unsigned int)status );

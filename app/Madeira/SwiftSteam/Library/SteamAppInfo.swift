@@ -18,6 +18,11 @@ struct SteamAppInfo {
     var depots: [DepotInfo] = []
     var buildID: UInt32 = 0
     var freeToDownload = false
+    /// The depot that holds the app's Workshop content (`depots/workshopdepot`);
+    /// 0 when PICS names none, and the app's own ID is that depot.
+    var workshopDepot: UInt32 = 0
+    /// The depot Workshop item manifests belong to.
+    var workshopContentDepot: UInt32 { workshopDepot != 0 ? workshopDepot : appID }
     /// Apps owning depots this app installs through `depotfromapp`, so the
     /// install record names them the way Valve's client does.
     var sharedOwners: [UInt32: SharedOwner] = [:]
@@ -154,14 +159,17 @@ struct SteamAppInfo {
 
     /// The depots a Windows install takes: matching OS, architecture-neutral
     /// or matching osarch, common or requested-language content, no
-    /// low-violence alternates, no DLC or shared redistributables, and only
-    /// depots that publish a public manifest. A 64-bit selection falls back
-    /// to 32-bit depots when the app only publishes those.
+    /// low-violence alternates or shared redistributables, and only depots
+    /// that publish a public manifest. DLC depots (`dlcappid`) are taken only
+    /// when `ownedDepots`, the depot IDs of the account's licenses, includes
+    /// them, as Valve's client installs owned DLC with its game. A 64-bit
+    /// selection falls back to 32-bit depots when the app only publishes those.
     func installDepots(os: String = "windows", arch: String = "64",
-                       language: String = "english") -> [DepotInfo] {
+                       language: String = "english", ownedDepots: Set<UInt32>? = nil) -> [DepotInfo] {
         func select(_ arch: String) -> [DepotInfo] {
             depots.filter { d in
-                d.supports(os: os) && d.dlcAppID == nil && !d.isSharedInstall &&
+                d.supports(os: os) && (d.dlcAppID == nil || ownedDepots?.contains(d.depotID) == true) &&
+                !d.isSharedInstall &&
                 d.publicManifestID != nil && !d.lowViolence &&
                 (d.osarch.isEmpty || d.osarch == arch) &&
                 (d.language.isEmpty || d.language.caseInsensitiveCompare(language) == .orderedSame)
@@ -178,25 +186,34 @@ struct SteamAppInfo {
     /// Every depot with why it was or was not selected, for the install log
     /// ("sel", or the first failing rule). IDs and flags only.
     func depotSelectionSummary(os: String = "windows", arch: String = "64",
-                               language: String = "english", limit: Int = 24) -> String {
-        let chosen = Set(installDepots(os: os, arch: arch, language: language).map(\.depotID))
+                               language: String = "english", ownedDepots: Set<UInt32>? = nil,
+                               limit: Int = 24) -> String {
+        let chosen = Set(installDepots(os: os, arch: arch, language: language, ownedDepots: ownedDepots).map(\.depotID))
         return depots.sorted { $0.depotID < $1.depotID }.prefix(limit).map { d in
-            let why = selectionRule(d, chosen: chosen, os: os, language: language)
+            let why = selectionRule(d, chosen: chosen, os: os, language: language, ownedDepots: ownedDepots)
             let from = d.fromApp.map { "<\($0)" } ?? ""
             return "\(d.depotID)[\(d.osarch.isEmpty ? "-" : d.osarch)]\(why)\(from)"
         }.joined(separator: ",")
     }
 
     /// "sel" or the first rule that left the depot out.
-    private func selectionRule(_ d: DepotInfo, chosen: Set<UInt32>, os: String, language: String) -> String {
+    private func selectionRule(_ d: DepotInfo, chosen: Set<UInt32>, os: String, language: String,
+                               ownedDepots: Set<UInt32>?) -> String {
         if chosen.contains(d.depotID) { return "sel" }
         if !d.supports(os: os) { return "os" }
-        if d.dlcAppID != nil { return "dlc" }
+        // "dlc": a DLC depot the account does not own; an owned one falls
+        // through to the rule that did leave it out (usually "arch").
+        if d.dlcAppID != nil, ownedDepots?.contains(d.depotID) != true { return "dlc" }
         if d.isSharedInstall { return "shared" }
         if d.publicManifestID == nil { return "nomanifest" }
         if d.lowViolence { return "lowviolence" }
         if !d.language.isEmpty && d.language.caseInsensitiveCompare(language) != .orderedSame { return "lang" }
         return "arch"
+    }
+
+    /// The DLC depots an install takes for an account owning `ownedDepots`.
+    func ownedDLCDepots(_ ownedDepots: Set<UInt32>) -> [UInt32] {
+        installDepots(ownedDepots: ownedDepots).filter { $0.dlcAppID != nil }.map(\.depotID)
     }
 
     /// Owned apps that can be installed for Windows at all.
@@ -285,6 +302,9 @@ struct SteamAppInfo {
 
         // Depots section
         if let depots = appInfo["depots"] as? [String: Any] {
+            if let workshop = (depots["workshopdepot"] as? String).flatMap(UInt32.init) {
+                info.workshopDepot = workshop
+            }
             for (key, depotData) in depots {
                 guard let depotID = UInt32(key),
                       let depot = depotData as? [String: Any] else { continue }

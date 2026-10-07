@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import QuartzCore
+import os
 
 /// Frame-rate intent for the ProMotion panel. CAMetalLayer presents alone
 /// don't express one: iOS parks the display at 60Hz and only promotes on
@@ -130,29 +131,16 @@ struct FPSOverlay: View {
     private let bufferCapacity = 50  // 5s @ 100ms
     /// ml606: live phys_footprint in MB, refreshed on the 250ms display tick.
     @State private var memMB: Int = 0
-
-    /// iOS jetsams this app at EXACTLY 4096MB of phys_footprint (memory:
-    /// "Jetsam = EXACTLY 4096MB"). task_info(TASK_VM_INFO) reports the very
-    /// same counter the kernel judges us on, so this is the real number and
-    /// not an approximation from resident size.
-    private static let jetsamLimitMB = 4096
-
-    private func readFootprintMB() -> Int {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
-        let kr = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return 0 }
-        return Int(info.phys_footprint / (1024 * 1024))
-    }
+    /// What remains before jetsam, in MB, on the same tick.
+    @State private var freeMB: Int = 0
 
     /// Headroom-based, because the absolute number means nothing without the
     /// ceiling: green >768MB free, yellow >384MB, orange >128MB, red below.
+    /// The ceiling is measured (ProcessMemory.availableMB), not assumed: it
+    /// depends on the device and the memory entitlement (12 GB on an M5 iPad
+    /// Pro with the increased-memory limit, 4 GB on smaller devices).
     private var memColor: Color {
-        let free = Self.jetsamLimitMB - memMB
+        let free = freeMB
         if memMB == 0 { return .secondary }
         if free > 768 { return .green }
         if free > 384 { return .yellow }
@@ -365,12 +353,12 @@ struct FPSOverlay: View {
         }
 
         // 250ms display refresh — computes adaptive-window FPS
-        memMB = readFootprintMB()
+        memMB = ProcessMemory.footprintMB(); freeMB = ProcessMemory.availableMB()
         displayTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
             fps = computeAdaptiveFPS()
             // ml606: piggybacks on the existing tick, so it costs one extra
             // task_info per 250ms and no additional SwiftUI invalidation.
-            memMB = readFootprintMB()
+            memMB = ProcessMemory.footprintMB(); freeMB = ProcessMemory.availableMB()
         }
     }
 
@@ -414,4 +402,54 @@ struct FPSOverlay: View {
 /// ml1137: process-wide fence-mode display state for the overlay pill.
 enum FPSOverlayFenceMode {
     static var current: Int = Int(MadeiraConfig.gameValue("fence-chain") ?? MadeiraConfig.get("fence-chain") ?? "1") ?? 1
+}
+
+/// This process's memory as jetsam judges it.
+enum ProcessMemory {
+    /// phys_footprint in MB: task_info(TASK_VM_INFO) reports the very counter
+    /// the kernel kills on, not an approximation from resident size.
+    static func footprintMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return 0 }
+        return Int(info.phys_footprint / (1024 * 1024))
+    }
+
+    /// What remains before jetsam, in MB (os_proc_available_memory).
+    static func availableMB() -> Int { Int(os_proc_available_memory() / (1024 * 1024)) }
+}
+
+/// "[mem]" lines in the game log while a game session runs: the footprint,
+/// the session's peak and the headroom every 10 s, and the peak when the
+/// session ends, whether or not the overlay is shown. For finding how much a
+/// game (and its mods) can load before iOS ends the app.
+enum SessionMemoryLog {
+    private static var timer: Timer?
+    private static var peak = 0
+    private static var started = Date()
+
+    static func start() {
+        guard timer == nil else { return }
+        peak = 0; started = Date()
+        sample()
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in sample() }
+    }
+
+    static func stop() {
+        guard let t = timer else { return }
+        t.invalidate(); timer = nil
+        sample()
+        fputs("[mem] session end peak=\(peak) MB after \(Int(Date().timeIntervalSince(started))) s\n", stderr)
+    }
+
+    private static func sample() {
+        let now = ProcessMemory.footprintMB(), free = ProcessMemory.availableMB()
+        peak = max(peak, now)
+        fputs("[mem] t=\(Int(Date().timeIntervalSince(started)))s footprint=\(now) MB peak=\(peak) MB available=\(free) MB limit=\(now + free) MB\n", stderr)
+    }
 }

@@ -504,7 +504,12 @@ static void set_process_name( const char *name )
 #endif
     if ((p = strrchr( name, '\\' ))) name = p + 1;
     if ((p = strrchr( name, '/' ))) name = p + 1;
-#ifdef HAVE_SETPROGNAME
+#if defined(HAVE_SETPROGNAME) && !defined(WINE_IOS)
+    /* Not on iOS: Wine runs inside Madeira, so this would rename the host app.
+     * Darwin's setprogname stores the pointer without copying, and name points
+     * into argv, which the bridge keeps on the Wine process thread's stack.
+     * Once that thread exits, getprogname() dangles, and libsystem_configuration
+     * caches it as the proc_name it sends to configd on every network change. */
     setprogname( name );
 #endif
 #ifdef HAVE_PRCTL

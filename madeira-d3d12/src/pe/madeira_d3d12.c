@@ -35,6 +35,8 @@
 
 #include "madeira_d3d12_stubs.h"
 #include "madeira_ir_abi.h"
+#include "mesh_null_ios.h"
+#include "mesh_null_macos.h"
 
 #define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " __DATE__ " " __TIME__
 
@@ -646,6 +648,7 @@ struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
     obj_handle_t rps;          /* Metal render pipeline state */
     obj_handle_t vs_lib, ps_lib, vs_fn, ps_fn;
+    obj_handle_t mesh_null_lib, mesh_null_fn; /* only PS-less mesh pipelines */
     int uses_depth, uses_stencil;
     UINT8 dbg_denable, dbg_dfunc, dbg_dwrite, dbg_wmask[8], dbg_senable, dbg_sfunc, dbg_srmask, dbg_swmask;   /* ml903/ml904: census only */
     obj_handle_t dsso;                              /* per-pipeline depth-stencil state */
@@ -5898,6 +5901,9 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
          * through it (mad_gpu_completed). Released first, a device created and
          * dropped straight away (Ghost of Tsushima's adapter probe) sent
          * signaledValue to a freed MTLSharedEvent. */
+        /* dre4moff r20: the argument rings' buffers were leaked with the device */
+        for (unsigned k = 0; k < d->nring_pool; k++) NSObject_release(d->ring_pool[k].buf);
+        for (unsigned k = 0; k < d->nring_retired; k++) NSObject_release(d->ring_retired[k].buf);
         if (d->gpu_event) { NSObject_release(d->gpu_event); d->gpu_event = 0; }
         DeleteCriticalSection(&d->fence_lock); DeleteCriticalSection(&d->ring_lock);
         free(d->fence_jobs); free(d->ring_pool); free(d->ring_retired);
@@ -6263,7 +6269,11 @@ static void mad_mheap_reclaim(struct mad_device *d, int all) {
     obj_handle_t done_list[64]; void *done_mem[64]; unsigned nd = 0, i = 0;
     UINT64 done;
     if (!d) return;
-    done = mad_gpu_completed(d);
+    /* Teardown drains everything; it must not query a timeline that may have
+     * already been removed. Normal reclamation still waits for GPU progress. */
+    done = all ? ~(UINT64)0 : mad_gpu_completed(d);
+    do {
+    nd = 0; i = 0;
     EnterCriticalSection(&d->heap_lock);
     while (i < d->nmhret && nd < 64) {
         if (all || d->mhret[i].serial + 2 <= done) { done_list[nd] = d->mhret[i].heap; done_mem[nd++] = d->mhret[i].mem; d->mhret[i] = d->mhret[--d->nmhret]; }
@@ -6274,6 +6284,7 @@ static void mad_mheap_reclaim(struct mad_device *d, int all) {
         if (done_list[i]) { mad_unresident(d, done_list[i]); NSObject_release(done_list[i]); }
         if (done_mem[i]) VirtualFree(done_mem[i], 0, MEM_RELEASE);   /* ml1154: a file-backed CPU-visible buffer's storage */
     }
+    } while (all && d->nmhret);  /* bounded batches, including more than 64 heaps */
 }
 static void mad_hp_reclaim_locked(struct mad_device *d) {
     UINT64 done = mad_gpu_completed(d); unsigned i = 0;
@@ -7822,6 +7833,8 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->ps_fn) NSObject_release(p->ps_fn);
         if (p->vs_lib) NSObject_release(p->vs_lib);
         if (p->ps_lib) NSObject_release(p->ps_lib);
+        if (p->mesh_null_fn) NSObject_release(p->mesh_null_fn);
+        if (p->mesh_null_lib) NSObject_release(p->mesh_null_lib);
         if (p->si_lib) NSObject_release(p->si_lib);   /* ml927 */
         if (p->gs_lib) NSObject_release(p->gs_lib);
         if (p->hs_lib) NSObject_release(p->hs_lib);   /* DXIL tessellation */
@@ -8846,10 +8859,10 @@ static void STDMETHODCALLTYPE device_CreateSampler(ID3D12Device *This,
 
 /* ---- pipeline state -------------------------------------------------------
  *
- * RUNTIME CONVERSION. The DXIL the application supplied is converted here, on
- * this machine, by Apple's Metal Shader Converter, using the root signature the
- * application actually created. No shader is embedded in this DLL and no
- * bytecode is recognised by hash.
+ * RUNTIME CONVERSION. The application's shaders are converted at runtime using
+ * its actual root signature. The only embedded graphics shader is a no-output
+ * fragment required by Metal for mesh pipelines that have no D3D pixel shader;
+ * application bytecode is never recognised by hash or replaced by it.
  *
  * The previous build matched supplied DXIL against preconverted libraries and
  * refused anything else. That proved the plumbing but could never run a shader
@@ -9585,6 +9598,58 @@ static void mad_build_input_layout(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *des
     for (i = 0; i < 16; i++) if (p->vb_mask & (1u << i)) p->vb_stride[i] = (running[i] + 3) & ~3u;
 }
 
+/* Unlike a classic Metal pipeline, a rasterizing mesh pipeline requires a
+ * fragment function even when D3D supplied none. Turning rasterization off
+ * would discard the depth/stencil writes that the game requested. This shader
+ * has no inputs, outputs, discard or resource access. Keep normal depth/stencil
+ * rasterization, disable color writes/alpha coverage, and own it with the PSO.
+ * Real pixel shaders (including failed conversions) never use this fallback. */
+static int mad_mesh_fragment(struct mad_device *d, struct mad_pso *p,
+                             struct WMTMeshRenderPipelineInfo *mp, struct WMTGeometryEmulationInfo *ge) {
+    if (p->ps_fn) {
+        mp->fragment_function = p->ps_fn;
+        if (ge) {
+            ge->fragment_library = p->ps_lib;
+            snprintf(ge->fragment_function, sizeof ge->fragment_function, "%s", p->ps_name);
+        }
+        return 1;
+    }
+    if (!p->mesh_null_fn) {
+        obj_handle_t dd, err = 0;
+        const unsigned char *bytes;
+        unsigned size;
+        mad_resolve_target(d);
+        bytes = g_target.os == MADEIRA_IR_OS_MACOS ? madeira_mesh_null_macos : madeira_mesh_null_ios;
+        size = g_target.os == MADEIRA_IR_OS_MACOS ? madeira_mesh_null_macos_len : madeira_mesh_null_ios_len;
+        dd = DispatchData_alloc_init((uint64_t)(uintptr_t)bytes, size);
+        if (dd) {
+            p->mesh_null_lib = MTLDevice_newLibrary(d->mtl_device, dd, &err);
+            NSObject_release(dd);
+        }
+        if (err) mad_log_nserror("mesh depth-only fragment library", err);
+        if (p->mesh_null_lib)
+            p->mesh_null_fn = MTLLibrary_newFunction(p->mesh_null_lib, "madeira_mesh_null_fragment");
+        if (!p->mesh_null_fn) {
+            if (p->mesh_null_lib) NSObject_release(p->mesh_null_lib);
+            p->mesh_null_lib = 0;
+            d3d12_log("[madeira-d3d12] mesh depth-only fragment unavailable; refusing invalid pipeline\n");
+            return 0;
+        }
+        d3d12_log("[madeira-d3d12] PS-less mesh pipeline: no-output fragment preserves depth/stencil rasterization\n");
+    }
+    mp->fragment_function = p->mesh_null_fn;
+    mp->alpha_to_coverage_enabled = false;
+    for (unsigned i = 0; i < 8; i++) {
+        mp->colors[i].write_mask = 0;
+        mp->colors[i].blending_enabled = false;
+    }
+    if (ge) {
+        ge->fragment_library = p->mesh_null_lib;
+        snprintf(ge->fragment_function, sizeof ge->fragment_function, "madeira_mesh_null_fragment");
+    }
+    return 1;
+}
+
 /* ml1083: build the object/mesh pipelines for a hull+domain pipeline state.
  * Returns 1 when at least one index-format variant exists; the pixel stage is
  * the one already compiled for this pipeline (never paired with the vertex
@@ -9645,6 +9710,7 @@ static int mad_tess_build(struct mad_device *d, struct mad_rootsig *rs, struct m
         mp.raster_sample_count = rp->raster_sample_count;
         mp.depth_pixel_format = rp->depth_pixel_format; mp.stencil_pixel_format = rp->stencil_pixel_format;
         mp.object_function = t->obj[fmt].fn; mp.mesh_function = t->ds_fn; mp.fragment_function = p->ps_fn;
+        if (!mad_mesh_fragment(d, p, &mp, NULL)) goto fail;
         /* The compiler's fixed bindings (DXMT d3d11_pipeline_ts.cpp): vertex-buffer
          * table 16, draw arguments 21, vertex tables 27/28, hull tables 29/30 on
          * the object stage; domain tables 29/30 on the mesh stage. */
@@ -9754,6 +9820,7 @@ static int mad_gsx_build(struct mad_device *d, struct mad_rootsig *rs, struct ma
         mp.raster_sample_count = rp->raster_sample_count;
         mp.depth_pixel_format = rp->depth_pixel_format; mp.stencil_pixel_format = rp->stencil_pixel_format;
         mp.object_function = t->obj[fmt].fn; mp.mesh_function = t->ds_fn; mp.fragment_function = p->ps_fn;
+        if (!mad_mesh_fragment(d, p, &mp, NULL)) goto fail;
         /* DXMT's fixed bindings for a geometry pipeline: vertex-buffer table 16,
          * draw arguments 21, vertex tables 29/30 on the object stage; geometry
          * tables 29/30 on the mesh stage; the pixel stage's 29/30. The payload
@@ -10245,7 +10312,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
         ge.stagein_library = p->si_lib; ge.vertex_library = p->vs_lib; ge.geometry_library = p->gs_lib; ge.fragment_library = p->ps_lib;
         snprintf(ge.vertex_function, sizeof ge.vertex_function, "%s", p->vs_name);
         snprintf(ge.geometry_function, sizeof ge.geometry_function, "%s", p->gs_name);
-        if (p->ps_fn) snprintf(ge.fragment_function, sizeof ge.fragment_function, "%s", p->ps_name);
+        if (!mad_mesh_fragment(d, p, &mp, &ge)) { pso_Release((ID3D12PipelineState *)p); return E_FAIL; }
         ge.gs_vertex_size_bytes = p->gs_vertex_size; ge.gs_max_input_primitives = p->gs_max_prims;
         if (p->gs_emu == 2) {   /* DXIL tessellation: winemetal builds the tessellation variant */
             ge.hull_library = p->hs_lib; ge.domain_library = p->gs_lib;
