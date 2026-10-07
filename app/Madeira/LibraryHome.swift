@@ -73,6 +73,8 @@ struct LibraryShelf<Item: Identifiable, Cell: View, Trailing: View>: View {
                     ForEach(items) { item in cell(item).frame(width: card) }
                     trailing()
                 }
+                // Card glow behind the shelf's cards (LibraryGlow.swift).
+                .backgroundPreferenceValue(AmbientGlowKey.self) { AmbientGlowLayer(items: $0) }
                 .padding(.vertical, 6)
                 .scrollTargetLayout()
                 // New cards are placed at once, never slid in (LibraryCells does the same).
@@ -102,7 +104,9 @@ struct LibraryEntryCard: View {
         VStack(alignment: .leading, spacing: 6) {
             LibraryArtwork(entry: entry).aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
-                .modifier(LibraryCardArtworkPress())
+                .modifier(LibraryCardArtworkPress { pressed, bounds in
+                    AmbientGlowItem(id: "entry-\(entry.id)", seed: entry.id.hashValue, art: .library(entry), pressed: pressed, bounds: bounds)
+                })
             // Fixed lines (two for the title, one for the pills), so loading details
             // never changes a card's height and moves the grid under the reader.
             Text(entry.title).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)

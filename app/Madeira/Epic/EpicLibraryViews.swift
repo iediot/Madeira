@@ -90,7 +90,10 @@ struct EpicGameCard: View {
                         .overlay { if notDownloaded { LibraryNotInstalledFace(font: .title) } }
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .overlay { downloadOverlay }
-                        .modifier(LibraryCardArtworkPress())
+                        .modifier(LibraryCardArtworkPress(glow: installer.installed[game.appName] == nil ? nil : { pressed, bounds in
+                            AmbientGlowItem(id: "epic-\(game.appName)", seed: game.appName.hashValue, art: .url(game.artworkURL),
+                                            pressed: pressed, bounds: bounds)
+                        }))
                     // Fixed lines (LibraryEntryCard); the art's overlay shows a download.
                     Text(game.title).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
                         .multilineTextAlignment(.leading)

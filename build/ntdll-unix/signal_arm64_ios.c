@@ -7113,14 +7113,50 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         if (ios_thread_registry[idx].mach_thread == pe_thread) break;
     if (idx == reg_count)
     {
-        idx = __sync_fetch_and_add(&ios_thread_count, 1);
-        if (idx >= IOS_MAX_WINE_THREADS)
+        /* Slots are never released when a thread exits, so a program that keeps
+         * creating short-lived workers filled all 512: Detroit: Become Human's
+         * shader warm-up did at 98% with ~120 threads alive, and every later
+         * thread's Mach events went to slot 0's TEB. Reuse a cleared slot, and
+         * once the array is full, reclaim slots whose Mach thread is gone (the
+         * same liveness test as ios_thread_registry_range_busy). Claimed by CAS
+         * on the TEB, so two registering threads cannot take the same slot. */
+        int i;
+        idx = -1;
+        for (i = 0; i < reg_count && idx < 0; i++)
+            if (!ios_thread_registry[i].mach_thread &&
+                __sync_bool_compare_and_swap( &ios_thread_registry[i].teb, 0, teb ))
+                idx = i;
+        if (idx < 0 && reg_count < IOS_MAX_WINE_THREADS)
         {
+            idx = __sync_fetch_and_add(&ios_thread_count, 1);
+            if (idx >= IOS_MAX_WINE_THREADS) idx = -1;
+        }
+        for (i = 0; i < reg_count && idx < 0; i++)
+        {
+            thread_t port = ios_thread_registry[i].mach_thread;
+            uintptr_t old = ios_thread_registry[i].teb;
+            struct thread_basic_info info;
+            mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
+            kern_return_t kr;
+
+            if (!port || port == pe_thread) continue;
+            kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
+            if (kr != KERN_INVALID_ARGUMENT && kr != MACH_SEND_INVALID_DEST && kr != KERN_TERMINATED) continue;
+            if (!__sync_bool_compare_and_swap( &ios_thread_registry[i].teb, old, teb )) continue;
+            ios_thread_registry[i].mach_thread = 0;
+            __sync_synchronize();
+            idx = i;
+            {
+                static int reclaimed;
+                if (reclaimed++ < 8)
+                    ERR("[thread-registry] reclaimed slot %d of exited thread 0x%x for 0x%x\n",
+                        i, port, pe_thread);
+            }
+        }
+        if (idx < 0)
             ERR("[thread-registry] FULL (%d slots) — thread 0x%x teb=%p NOT registered; "
                 "Mach events on it will resolve to the slot-0 TEB (wrong process!)\n",
                 IOS_MAX_WINE_THREADS, pe_thread, (void *)teb);
-            idx = -1;
-        }
     }
     if (idx >= 0)
     {

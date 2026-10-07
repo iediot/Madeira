@@ -914,3 +914,43 @@ struct CMsgClientPICSAccessTokenResponse {
         return msg
     }
 }
+
+// MARK: - Free licenses (CM; never purchases a paid package)
+
+struct CMsgClientRequestFreeLicense {
+    var appids: [UInt32] = []
+    func serialize() -> Data {
+        var encoder = ProtobufEncoder()
+        for id in appids { encoder.writeUInt32(fieldNumber: 2, value: id) }
+        return encoder.data
+    }
+}
+
+struct CMsgClientRequestFreeLicenseResponse {
+    var eresult: UInt32 = 2
+    var grantedPackageids: [UInt32] = []
+    var grantedAppids: [UInt32] = []
+
+    static func deserialize(from data: Data) throws -> Self {
+        var result = Self()
+        var decoder = ProtobufDecoder(data)
+        while let tag = try decoder.readTag() {
+            switch (tag.fieldNumber, tag.wireType) {
+            case (1, .varint): result.eresult = UInt32(truncatingIfNeeded: try decoder.readVarint())
+            case (2...3, .varint):
+                let id = UInt32(truncatingIfNeeded: try decoder.readVarint())
+                if tag.fieldNumber == 2 { result.grantedPackageids.append(id) }
+                else { result.grantedAppids.append(id) }
+            case (2...3, .lengthDelimited):
+                var packed = ProtobufDecoder(try decoder.readBytes())
+                while !packed.isAtEnd {
+                    let id = UInt32(truncatingIfNeeded: try packed.readVarint())
+                    if tag.fieldNumber == 2 { result.grantedPackageids.append(id) }
+                    else { result.grantedAppids.append(id) }
+                }
+            default: try decoder.skip(wireType: tag.wireType)
+            }
+        }
+        return result
+    }
+}

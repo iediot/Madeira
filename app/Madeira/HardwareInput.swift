@@ -1002,8 +1002,12 @@ final class HardwareInput: ObservableObject {
                 self?.gcButton(b, pressed)
             }
         }
+        // GCMouse's scroll pad reports the VERTICAL wheel first (negative = up)
+        // and horizontal second, as SDL reads it (SDL_uikitevents.m: vertical = -x,
+        // horizontal = y). Passed through as (x, y) every wheel turn reached
+        // Windows as MOUSEEVENTF_HWHEEL (upstream #190).
         m.scroll.valueChangedHandler = { [weak self] _, x, y in
-            self?.scrolled(Double(x), Double(y))
+            self?.scrolled(Double(y), Double(-x))
         }
         noteMousePresent()
         if fresh {

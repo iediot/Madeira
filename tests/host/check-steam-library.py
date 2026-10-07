@@ -121,7 +121,8 @@ for path in ['SteamOwnedLibrary.swift', 'SteamGames.swift', 'SteamInstall.swift'
     for word in ['SteamTokenStore', 'SecItem', 'kSecClass', 'saveTokens', 'clearTokens', 'loadTokens', 'UserDefaults', 'refreshToken']:
         if path == 'SwiftSteam/Core/SteamSession.swift' and word == 'refreshToken':
             continue  # it logs on with the token SteamSignIn hands out
-        if path == 'SteamGames.swift' and word == 'UserDefaults':
+        if path in ['SteamGames.swift', 'SteamOwnedLibrary.swift'] and word == 'UserDefaults':
+            # UI preferences and account-scoped manually added App IDs only.
             continue
         require(word not in text, f'{path}: no {word} (sign-in tokens stay in SteamSignIn)')
 require('SteamSignIn.credentialsForDock()' in sources['SwiftSteam/Core/SteamSession.swift'],

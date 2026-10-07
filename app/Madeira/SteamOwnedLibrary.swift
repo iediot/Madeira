@@ -47,8 +47,11 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     /// an install missing one of them has an update. nil in older caches or
     /// when the licenses could not be read.
     var dlcDepots: [Int]?
+    /// nil in older caches; explicit false prevents installing a manually added non-Windows app.
+    var windowsInstallable: Bool?
 
     init(_ info: SteamAppInfo, ownedDepots: Set<UInt32>? = nil) {
+        windowsInstallable = info.hasWindowsDownload
         id = Int(info.appID)
         name = info.name
         installDir = info.installDir
@@ -201,6 +204,7 @@ final class SteamOwnedLibrary: ObservableObject {
     @Published private(set) var signedIn = false
     @Published private(set) var owned: [SteamOwnedGame] = []
     @Published private(set) var refreshing = false
+    @Published private(set) var addingApp = false
     @Published private(set) var libraryUpdated: Date?
     /// Steam's playtime and last played, by App ID.
     @Published private(set) var playtime: [Int: SteamPlaytime] = [:]
@@ -357,22 +361,95 @@ final class SteamOwnedLibrary: ObservableObject {
         try? FileManager.default.removeItem(at: Self.playtimeURL)
     }
 
+    private var manualIDsKey: String? {
+        Self.accountKey(SteamSignIn.accountName).map { "madeiraSteamAddedApps." + $0 }
+    }
+    private var manualIDs: Set<UInt32> {
+        guard let key = manualIDsKey else { return [] }
+        return Set((UserDefaults.standard.stringArray(forKey: key) ?? []).compactMap(UInt32.init))
+    }
+
+    func resolveApp(_ input: String) async throws -> SteamAppInfo {
+        guard Self.enabled, signedIn, !inSession, gate.open else {
+            throw SteamError.authenticationFailed("Sign in to Steam and end the running game session first.")
+        }
+        guard let id = SteamAppInput.parse(input) else {
+            throw SteamError.authenticationFailed("Enter a valid Steam App ID or app link.")
+        }
+        guard let info = try await fetcher.fetchAppInfo(appID: id), !info.name.isEmpty else {
+            throw SteamError.appInfoNotFound(id)
+        }
+        return info
+    }
+
+    /// Reveals an owned app, or asks the CM for a free license. Public metadata
+    /// and manual IDs never establish ownership; only Valve's licenses do.
+    func addApp(_ info: SteamAppInfo) async throws -> Bool {
+        guard signedIn, !inSession, gate.open, !refreshing, !addingApp else {
+            throw SteamError.authenticationFailed("Wait for the Steam library refresh or game session to finish, then try again.")
+        }
+        addingApp = true
+        defer { addingApp = false }
+        let account = Self.accountKey(SteamSignIn.accountName)
+        let alreadyOwned = try await fetcher.owns(appID: info.appID)
+        try Task.checkCancellation()
+        guard signedIn, account == Self.accountKey(SteamSignIn.accountName), gate.open else {
+            throw SteamError.disconnected
+        }
+        var grant = CMsgClientRequestFreeLicenseResponse()
+        if !alreadyOwned {
+            grant = try await fetcher.requestFreeLicense(appID: info.appID)
+            guard grant.eresult == 1 else {
+                if info.freeToPlay || info.freeToDownload {
+                    throw SteamError.authenticationFailed("Steam could not grant the free license (code \(grant.eresult)). Try again later.")
+                }
+                return false
+            }
+        }
+        guard signedIn, account == Self.accountKey(SteamSignIn.accountName), gate.open else {
+            throw SteamError.disconnected
+        }
+        // Re-read licenses and PICS. The response's confirmed grants bridge the
+        // race with ClientLicenseList's asynchronous push, without reconnecting
+        // or interrupting an active download.
+        let ids = manualIDs.union([info.appID])
+        let apps = try await fetcher.fetchOwnedApps(including: ids,
+            grantedPackages: grant.grantedPackageids, grantedApps: grant.grantedAppids)
+        guard signedIn, account == Self.accountKey(SteamSignIn.accountName), gate.open else {
+            throw SteamError.disconnected
+        }
+        guard apps.contains(where: { $0.appID == info.appID }) else { return false }
+        guard let key = manualIDsKey else { throw SteamError.disconnected }
+        UserDefaults.standard.set(ids.sorted().map(String.init), forKey: key)
+        owned = apps.filter { ($0.installableOnWindows && $0.type == .game) || ids.contains($0.appID) }
+            .map { SteamOwnedGame($0) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        libraryUpdated = Date(); cachedAccount = account
+        writeCache()
+        let hidden = LibraryHidden.shared, hiddenKey = LibraryHidden.steam(Int(info.appID))
+        if hidden.contains(hiddenKey) { hidden.toggle(hiddenKey) }
+        UserDefaults.standard.set(true, forKey: "madeiraSteamShowUninstalled")
+        UserDefaults.standard.set(false, forKey: "madeiraLibraryHideInstalled")
+        return true
+    }
+
     // MARK: Library
 
     /// `interactive` refreshes (sign-in, the Refresh button) tell the user
     /// about failures; the automatic one only logs transient ones, so an
     /// offline start does not raise an alert.
     func refreshLibrary(interactive: Bool = true) async {
-        guard Self.enabled, signedIn, !refreshing, !inSession else { return }
+        guard Self.enabled, signedIn, !refreshing, !addingApp, !inSession else { return }
         refreshing = true
         defer { refreshing = false }
         do {
-            let apps = try await fetcher.fetchOwnedApps()
+            let apps = try await fetcher.fetchOwnedApps(including: manualIDs)
             // Games only: demos (many no longer downloadable), tools, servers and other
             // applications crowded the library. An installed one still shows (the
-            // install records come from the prefix, not from this list).
+            // install records come from the prefix, not from this list). Manually
+            // added IDs bypass these filters, but still need a license.
             let ownedDepots = try? await fetcher.ownedDepotIDs()
-            let games = apps.filter { $0.installableOnWindows && $0.type == .game }.map { SteamOwnedGame($0, ownedDepots: ownedDepots) }
+            let games = apps.filter { ($0.installableOnWindows && $0.type == .game) || manualIDs.contains($0.appID) }.map { SteamOwnedGame($0, ownedDepots: ownedDepots) }
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             owned = games
             libraryUpdated = Date()
@@ -1054,6 +1131,7 @@ final class SteamOwnedLibrary: ObservableObject {
     /// Installs or updates a game: queues it and starts when nothing else downloads.
     func install(_ appID: Int) {
         guard Self.enabled else { return }
+        guard game(appID)?.windowsInstallable != false else { error = "Steam has no Windows download for this game."; return }
         guard signedIn else { error = "Sign in to Steam to download games."; return }
         if active?.id == appID || queue.contains(appID) { return }
         if inSession {

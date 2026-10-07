@@ -18,6 +18,7 @@ struct SteamAppInfo {
     var depots: [DepotInfo] = []
     var buildID: UInt32 = 0
     var freeToDownload = false
+    var freeToPlay = false
     /// The depot that holds the app's Workshop content (`depots/workshopdepot`);
     /// 0 when PICS names none, and the app's own ID is that depot.
     var workshopDepot: UInt32 = 0
@@ -216,9 +217,12 @@ struct SteamAppInfo {
         installDepots(ownedDepots: ownedDepots).filter { $0.dlcAppID != nil }.map(\.depotID)
     }
 
-    /// Owned apps that can be installed for Windows at all.
+    /// Content availability independent of the default library type filter.
+    var hasWindowsDownload: Bool { supportsWindows && !installDepots().isEmpty }
+
+    /// Owned playable apps that can be installed for Windows.
     var installableOnWindows: Bool {
-        supportsWindows && type.isPlayable && !installDepots().isEmpty
+        hasWindowsDownload && type.isPlayable
     }
 
     /// Approximate compressed download size for a platform. Per depot it
@@ -273,6 +277,7 @@ struct SteamAppInfo {
             info.name = common["name"] as? String ?? ""
             info.type = AppType(pics: common["type"] as? String ?? "")
             info.oslist = common["oslist"] as? String ?? ""
+            info.freeToPlay = ["freetogame", "freetoplay", "isfreeapp"].contains { (common[$0] as? String) == "1" }
             info.freeToDownload = (common["freetodownload"] as? String) == "1"
             // Artwork names, English first, else any language.
             func asset(_ node: Any?) -> String? {
@@ -445,5 +450,30 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
                                              type: type, oslist: oslist, osarch: osarch, betaKey: betaKey))
         }
         return options
+    }
+}
+
+/// Strictly accepts app links, never package/bundle IDs or arbitrary hosts.
+enum SteamAppInput {
+    static func parse(_ input: String) -> UInt32? {
+        func number(_ text: String) -> UInt32? {
+            guard !text.isEmpty, text.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                  let id = UInt32(text), id > 0 else { return nil }
+            return id
+        }
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let id = number(text) { return id }
+        let link = text.contains("://") ? text : "https://" + text
+        guard let url = URLComponents(string: link), url.user == nil, url.password == nil,
+              url.port == nil, let host = url.host?.lowercased() else { return nil }
+        let parts = url.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        if url.scheme?.lowercased() == "steam" {
+            guard host == "run" || host == "install", parts.count == 1 else { return nil }
+            return number(parts[0])
+        }
+        guard ["https", "http"].contains(url.scheme?.lowercased() ?? ""), parts.count >= 2 else { return nil }
+        guard (host == "store.steampowered.com" && parts[0] == "app") ||
+              (host == "s.team" && parts[0] == "a" && parts.count == 2) else { return nil }
+        return number(parts[1])
     }
 }

@@ -246,7 +246,16 @@ static unsigned perf_sample_threads( struct perf_busy *busy, unsigned max, uint3
             if (cpu > prev)
             {
                 *total_ns += cpu - prev;
-                if (cpu - prev > 1000000000ull && list[i] != pthread_mach_thread_np(pthread_self()))
+                /* MADEIRA_PERF_STACK_MS: CPU per report above which a thread's stack is
+                 * sampled (default 1000). Lowered, it also catches threads that poll a
+                 * wait, which a hang's waiter usually is. */
+                static long long stack_ns = -1;
+                if (stack_ns < 0)
+                {
+                    const char *ms = getenv( "MADEIRA_PERF_STACK_MS" );
+                    stack_ns = (ms && atoi( ms ) > 0 ? atoi( ms ) : 1000) * 1000000ll;
+                }
+                if (cpu - prev > (unsigned long long)stack_ns && list[i] != pthread_mach_thread_np(pthread_self()))
                     perf_hot_stack(list[i], ident.thread_id, ext.pth_name);
                 if (out < max)
                 {

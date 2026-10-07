@@ -86,6 +86,7 @@
 		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036 /* StikJITHelper.swift */; };
 		B1000001 /* JITSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000001 /* JITSetup.swift */; };
 		B1000778 /* LibraryHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000778 /* LibraryHome.swift */; };
+		A1000911 /* LibraryGlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000911 /* LibraryGlow.swift */; };
 		B1000779 /* ControlEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000779 /* ControlEditor.swift */; };
 		B1000780 /* EpicAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000780 /* EpicAPI.swift */; };
 		B1000781 /* EpicAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000781 /* EpicAuth.swift */; };
@@ -239,6 +240,7 @@
 		A2000036 /* StikJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StikJITHelper.swift; sourceTree = "<group>"; };
 		B2000001 /* JITSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITSetup.swift; sourceTree = "<group>"; };
 		B2000778 /* LibraryHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryHome.swift; sourceTree = "<group>"; };
+		A2000911 /* LibraryGlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryGlow.swift; sourceTree = "<group>"; };
 		B2000779 /* ControlEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlEditor.swift; sourceTree = "<group>"; };
 		B2000780 /* EpicAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicAPI.swift; sourceTree = "<group>"; };
 		B2000781 /* EpicAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicAuth.swift; sourceTree = "<group>"; };
@@ -443,6 +445,7 @@
 				A2000036 /* StikJITHelper.swift */,
 				B2000001 /* JITSetup.swift */,
 				B2000778 /* LibraryHome.swift */,
+				A2000911 /* LibraryGlow.swift */,
 				B2000779 /* ControlEditor.swift */,
 				B2000780 /* EpicAPI.swift */,
 				B2000781 /* EpicAuth.swift */,
@@ -729,6 +732,7 @@
 				A1000035 /* StikJITHelper.swift in Sources */,
 				B1000001 /* JITSetup.swift in Sources */,
 				B1000778 /* LibraryHome.swift in Sources */,
+				A1000911 /* LibraryGlow.swift in Sources */,
 				B1000779 /* ControlEditor.swift in Sources */,
 				B1000780 /* EpicAPI.swift in Sources */,
 				B1000781 /* EpicAuth.swift in Sources */,

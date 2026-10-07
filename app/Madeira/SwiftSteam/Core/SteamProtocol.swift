@@ -33,6 +33,8 @@ enum EMsg: UInt32 {
     case clientLogonResponse = 5515
     case clientLogOff = 5516
     case clientLoggedOff = 5517
+    case clientRequestFreeLicense = 5572
+    case clientRequestFreeLicenseResponse = 5573
     case clientLicenseList = 780
     case clientPICSProductInfoRequest = 8903
     case clientPICSProductInfoResponse = 8904

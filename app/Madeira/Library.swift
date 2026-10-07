@@ -1843,16 +1843,25 @@ extension View {
 }
 
 /// A grid card's artwork: shrinks while its card is pressed and springs back on
-/// release, with a soft shadow under it (no glow: the art speaks for itself).
+/// release, with a soft shadow under it. A card given `glow` also reports its frame
+/// and press to the ambient light (AmbientGlowLayer, LibraryGlow.swift) while Card glow
+/// is on; the shadow then gives way to the light.
 struct LibraryCardArtworkPress: ViewModifier {
     static let pressedScale: CGFloat = 0.94
     @Environment(\.libraryCardPressed) private var pressed
+    @ObservedObject private var glowSetting = LibraryGlowSetting.shared
+    var glow: ((_ pressed: Bool, _ bounds: Anchor<CGRect>) -> AmbientGlowItem)? = nil
     func body(content: Content) -> some View {
+        let glowing = glow != nil && glowSetting.on
         content
-            .shadow(color: .black.opacity(0.22), radius: 8, y: 4)
+            .shadow(color: .black.opacity(glowing ? 0 : 0.22), radius: 8, y: 4)
             .scaleEffect(pressed ? Self.pressedScale : 1)
             .animation(pressed ? .spring(response: 0.26, dampingFraction: 0.86) : .spring(response: 0.42, dampingFraction: 0.58),
                        value: pressed)
+            .anchorPreference(key: AmbientGlowKey.self, value: .bounds) { bounds in
+                guard glowing, let glow else { return [] }
+                return [glow(pressed, bounds)]
+            }
     }
 }
 
@@ -2215,6 +2224,7 @@ struct LibraryView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
+    @ObservedObject private var cardGlow = LibraryGlowSetting.shared
     var play: (LibraryEntry) -> Void
     var enableJIT: () -> Void
     @ObservedObject private var jitState = LibraryJITState.shared
@@ -2477,10 +2487,13 @@ struct LibraryView: View {
             if SteamSettingsSection.shown, settingsShow("Accounts", "Steam", "Epic", "sign in", "sign out", "account") {
                 SteamSettingsSection(open: { settingsSheet = $0 })
             }
-            if settingsShow("appearance", "liquid metal", "metal", "glass") {
+            if settingsShow("appearance", "liquid metal", "metal", "glass", "glow", "light") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
-                } header: { Text("Appearance") }
+                    Toggle("Card glow", isOn: $cardGlow.on)
+                } header: { Text("Appearance") } footer: {
+                    Text("Liquid metal turns the app's glass buttons to flowing chrome. Card glow lights the page around installed games' artwork.")
+                }
             }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS"),
                settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
@@ -2593,6 +2606,7 @@ struct LibraryView: View {
                                 })
                 } else {
                     libraryContent(width: viewport.size.width, filter: .all)
+                        .backgroundPreferenceValue(AmbientGlowKey.self) { AmbientGlowLayer(items: $0) }
                         .padding(.horizontal, LibraryLayout.margin(viewport.size.width)).padding(.vertical, 16)
                         .frame(maxWidth: 1400).frame(maxWidth: .infinity)
                 }
@@ -2623,6 +2637,8 @@ struct LibraryView: View {
                 // before it the strip always shows).
                 LibraryEndMarker(atEnd: $libraryAtEnd)
             }
+            // Card glow behind the grid, in the content's own space so it scrolls with it.
+            .backgroundPreferenceValue(AmbientGlowKey.self) { AmbientGlowLayer(items: $0) }
             .padding(.horizontal, LibraryLayout.margin(viewport.size.width)).padding(.vertical, 16)
             .frame(maxWidth: 1400).frame(maxWidth: .infinity)
         }
@@ -3766,8 +3782,7 @@ struct LibraryPillGlass: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     func body(content: Content) -> some View {
         if reduceTransparency { content.background(Color(uiColor: .secondarySystemBackground), in: Capsule()) }
-        else if #available(iOS 26, *) { content.glassEffect(.regular.interactive(), in: Capsule()) }
-        else { content.background(.regularMaterial, in: Capsule()) }
+        else { content.modifier(LibraryMetalGlass(shape: Capsule())) }
     }
 }
 
@@ -4655,12 +4670,9 @@ extension View {
         }
     }
 
-    @ViewBuilder func libraryRowGlass<S: Shape>(_ shape: S) -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular.interactive(), in: shape)
-        } else {
-            self.background(.regularMaterial, in: shape)
-        }
+    /// With Liquid metal on, the app's own glass buttons are chrome too (LibraryMetalGlass).
+    func libraryRowGlass<S: Shape>(_ shape: S) -> some View {
+        modifier(LibraryMetalGlass(shape: shape))
     }
 }
 

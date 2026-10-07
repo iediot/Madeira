@@ -68,7 +68,7 @@ index 534a414..001c089 100644
  
  	void propagateDebugName() override  {}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 9772757..bbd72dc 100644
+index 9772757..6543c8f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -38,6 +38,8 @@
@@ -80,7 +80,7 @@ index 9772757..bbd72dc 100644
  
  using namespace std;
  
-@@ -5130,6 +5132,209 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5130,6 +5132,212 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -145,7 +145,10 @@ index 9772757..bbd72dc 100644
 +
 +	template<class Descriptor> id newPipeline(Descriptor* descriptor, id<MTLFunction> function) {
 +		if (!_enabled) { return nil; }
-+		uint64_t hash = [objc_getAssociatedObject(function, &kMVKArchiveShaderKey) unsignedLongLongValue];
++		uint64_t hash = 0;
++		@autoreleasepool {   // an atomic association is returned retained and autoreleased
++			hash = [objc_getAssociatedObject(function, &kMVKArchiveShaderKey) unsignedLongLongValue];
++		}
 +		hash ^= hash >> 32;
 +		unsigned index = hash % kShardCount;
 +		auto& shard = _shards[index];
@@ -290,7 +293,7 @@ index 9772757..bbd72dc 100644
  MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
  
  	// If the physical device is lost, bail.
-@@ -5140,6 +5345,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5140,6 +5348,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  
  	initPhysicalDevice(physicalDevice, pCreateInfo);
@@ -303,7 +306,7 @@ index 9772757..bbd72dc 100644
  	initPerformanceTracking();
  	enableExtensions(pCreateInfo);
  	enableFeatures(pCreateInfo);
-@@ -5532,6 +5743,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5532,6 +5746,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -344,7 +347,7 @@ index e385e9b..c8e3deb 100644
  
  	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 7eae64c..075172b 100644
+index 7eae64c..d5c8809 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -17,6 +17,7 @@
@@ -458,8 +461,16 @@ index 7eae64c..075172b 100644
  	@synchronized (getMTLDevice()) {
  		[_mtlTessVertexStageState release];
  		[_mtlTessVertexStageIndex16State release];
-@@ -3096,6 +3171,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3092,10 +3167,20 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+ #pragma mark -
+ #pragma mark MVKRenderPipelineCompiler
+ 
++uint64_t mvkTimeNow();
++void mvkTimeAdd(int kind, uint64_t start);
++
+ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(MTLRenderPipelineDescriptor* mtlRPLDesc) {
  	unique_lock<mutex> lock(_completionLock);
++	uint64_t mvkTimeStart = mvkTimeNow();
  
  	compile(lock, ^{
 +		if (id<MTLRenderPipelineState> state = getDevice()->newArchivedPipeline(mtlRPLDesc)) {
@@ -471,7 +482,15 @@ index 7eae64c..075172b 100644
  		auto mtlDev = getMTLDevice();
  		@synchronized (mtlDev) {
  			[mtlDev newRenderPipelineStateWithDescriptor: mtlRPLDesc
-@@ -3130,6 +3211,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3106,6 +3191,7 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+ 		}
+ 	});
+ 
++	mvkTimeAdd(2, mvkTimeStart);
+ 	return [_mtlRenderPipelineState retain];
+ }
+ 
+@@ -3130,6 +3216,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  	unique_lock<mutex> lock(_completionLock);
  
  	compile(lock, ^{
@@ -485,7 +504,7 @@ index 7eae64c..075172b 100644
  		@synchronized (mtlDev) {
  			[mtlDev newComputePipelineStateWithDescriptor: plDesc
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a4..4cf218b 100644
+index 3aa44a4..f137761 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -17,6 +17,7 @@
@@ -496,14 +515,95 @@ index 3aa44a4..4cf218b 100644
  #include "MVKPipeline.h"
  #include "MVKFoundation.h"
  #include <sys/stat.h>
-@@ -166,6 +167,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -166,6 +167,15 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			if ( !dbName ) { dbName = _owner->getDebugName(); }
  			_owner->setMetalObjectLabel(mtlFunc, dbName);
  
 +			// Routing hint only: Metal still validates the complete pipeline and function identity.
-+			if (mtlFunc) { objc_setAssociatedObject(mtlFunc, &kMVKArchiveShaderKey,
-+				@(shaderModule->getKey().codeHash), OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
++			// The library caches mtlFunc and pipelines on other threads read this while it is
++			// set: set it once, atomically (a nonatomic reset released the number another
++			// thread was reading, a use-after-free in CFNumberGetValue).
++			if (mtlFunc && !objc_getAssociatedObject(mtlFunc, &kMVKArchiveShaderKey)) {
++				objc_setAssociatedObject(mtlFunc, &kMVKArchiveShaderKey,
++					@(shaderModule->getKey().codeHash), OBJC_ASSOCIATION_RETAIN);
++			}
 +
  			auto& wgSize = _shaderConversionResultInfo.entryPoint.workgroupSize;
  			return MVKMTLFunction(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
  																					getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
+@@ -415,6 +425,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
+ }
+ 
++uint64_t mvkTimeNow();
++void mvkTimeAdd(int kind, uint64_t start);
++
+ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 							  SPIRVToMSLConversionResult& conversionResult) {
+ 	const auto& mvkCfg = getMVKConfig();
+@@ -422,7 +435,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
+ 
+ 	uint64_t startTime = getPerformanceTimestamp();
++	uint64_t mvkTimeStart = mvkTimeNow();
+ 	bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);
++	mvkTimeAdd(0, mvkTimeStart);
+ 	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
+ 
+ 	const char* dumpDir = getMVKConfig().shaderDumpDir;
+@@ -554,10 +569,47 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ #pragma mark -
+ #pragma mark MVKShaderLibraryCompiler
+ 
++
++#pragma mark Madeira timing
++
++// [mvk-time]: where pipeline creation spends its time (SPIR-V to MSL, MSL source
++// compile, pipeline state), and how many MSL sources are repeats of one already
++// compiled this run. A summary every 512 events of each kind.
++#include <chrono>
++#include <unordered_set>
++static std::atomic<uint64_t> g_mvkt_n[3], g_mvkt_ns[3], g_mvkt_repeat;
++static std::mutex g_mvkt_lock;
++static std::unordered_set<size_t>* g_mvkt_sources;
++uint64_t mvkTimeNow() {
++	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++void mvkTimeAdd(int kind, uint64_t start) {
++	static const char* names[3] = { "convert", "library", "pipeline" };
++	uint64_t n = ++g_mvkt_n[kind];
++	g_mvkt_ns[kind] += mvkTimeNow() - start;
++	if (n % 512 == 0) {
++		fprintf(stderr, "[mvk-time] %s#%llu | convert n=%llu avg=%.1fms | library n=%llu avg=%.1fms repeats=%llu | pipeline n=%llu avg=%.1fms\n",
++				names[kind], (unsigned long long)n,
++				(unsigned long long)g_mvkt_n[0].load(), g_mvkt_n[0] ? g_mvkt_ns[0] / 1e6 / g_mvkt_n[0] : 0.0,
++				(unsigned long long)g_mvkt_n[1].load(), g_mvkt_n[1] ? g_mvkt_ns[1] / 1e6 / g_mvkt_n[1] : 0.0,
++				(unsigned long long)g_mvkt_repeat.load(),
++				(unsigned long long)g_mvkt_n[2].load(), g_mvkt_n[2] ? g_mvkt_ns[2] / 1e6 / g_mvkt_n[2] : 0.0);
++	}
++}
++static void mvkTimeNoteSource(NSString* src, const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& macros) {
++	size_t h = (size_t)src.hash ^ (src.length * 0x9e3779b97f4a7c15ull);
++	for (auto& m : macros) { h = h * 1099511628211ull ^ std::hash<std::string>()(m.first.name) ^ (size_t)m.second.value.ui64 ^ ((size_t)m.second.size << 56); }
++	std::lock_guard<std::mutex> lock(g_mvkt_lock);
++	if (!g_mvkt_sources) { g_mvkt_sources = new std::unordered_set<size_t>(); }
++	if (!g_mvkt_sources->insert(h).second) { ++g_mvkt_repeat; }
++}
++
+ id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
+ 													   const SPIRVToMSLConversionResultInfo& shaderConversionResults,
+ 													   const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& specializationMacroDef) {
+ 	unique_lock<mutex> lock(_completionLock);
++	uint64_t mvkTimeStart = mvkTimeNow();
++	mvkTimeNoteSource(mslSourceCode, specializationMacroDef);
+ 
+ 	compile(lock, ^{
+ 		auto mtlDev = getMTLDevice();
+@@ -589,6 +641,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 		}
+ 	});
+ 
++	mvkTimeAdd(1, mvkTimeStart);
+ 	return [_mtlLibrary retain];
+ }
+ 

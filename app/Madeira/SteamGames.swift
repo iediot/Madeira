@@ -443,6 +443,7 @@ struct SteamGamesSection: View {
     @AppStorage("madeiraSteamShowUninstalled") private var showUninstalled = true
     @State private var selected: SteamGameSelection?
     @State private var showSignIn = false
+    @State private var showAddApp = false
 
     /// MADEIRA_LIBRARY_COLLAPSE=0: the section titles do not collapse.
     static var collapsible: Bool { MadeiraConfig.flag("MADEIRA_LIBRARY_COLLAPSE") }
@@ -523,6 +524,13 @@ struct SteamGamesSection: View {
             }
         }
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
+        .sheet(isPresented: $showAddApp) {
+            SteamAddAppSheet { id in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                    selected = SteamGameSelection(id: id)
+                }
+            }
+        }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
         } message: { Text(steam.error ?? "") }
@@ -537,6 +545,13 @@ struct SteamGamesSection: View {
             LibrarySectionHeader(title: "Steam", count: installed.count,
                                  collapsed: collapsible ? $hideInstalled : nil) {
                 if steam.refreshing { ProgressView().accessibilityLabel("Refreshing Steam library") }
+                if signedIn {
+                    Button { showAddApp = true } label: {
+                        Label("Add by App ID or link", systemImage: "plus")
+                            .font(.subheadline).padding(.horizontal, 12).padding(.vertical, 8)
+                            .libraryRowGlass(Capsule())
+                    }.buttonStyle(.plain)
+                }
             }
             // Signed out: the account's games need a sign-in; say so here rather
             // than hiding the section until someone finds Settings › Steam.
@@ -813,7 +828,9 @@ struct SteamGameCell: View {
                         .overlay { overlay(download) }
                         .overlay { if notDownloaded { notDownloadedFace(.title) } }
                         .clipShape(RoundedRectangle(cornerRadius: 10))
-                        .modifier(LibraryCardArtworkPress())
+                        .modifier(LibraryCardArtworkPress(glow: notDownloaded ? nil : { pressed, bounds in
+                            AmbientGlowItem(id: "steam-\(item.id)", seed: item.id, art: .steam(item.id), pressed: pressed, bounds: bounds)
+                        }))
                     // Fixed lines (LibraryEntryCard): the pills and playtime arrive later.
                     Text(item.name).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
                     pills(status, entry, oneRow: true).frame(height: LibraryLayout.pillRow, alignment: .leading)
@@ -1022,6 +1039,8 @@ struct SteamGameSheet: View {
                 Button { steam.install(appID) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }
                     .buttonStyle(.borderedProminent)
             }
+        } else if item.owned?.windowsInstallable == false {
+            Text("Steam has no Windows download for this game.").foregroundStyle(.secondary)
         } else if item.owned != nil {
             Button { steam.install(appID) } label: {
                 steamActionLabel(partial ? "Resume download" : "Install", symbol: "arrow.down.circle.fill")
@@ -1658,5 +1677,84 @@ struct SteamWorkshopSection: View {
         guard !invalid else { return }
         link = current
         Task { await steam.checkWorkshop(appID) }
+    }
+}
+
+/// Resolve and reveal a Steam app without leaving the library.
+private struct SteamAddAppSheet: View {
+    let openDownload: (Int) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @State private var input = ""
+    @State private var info: SteamAppInfo?
+    @State private var message: String?
+    @State private var busy = false
+    @State private var added = false
+    @State private var task: Task<Void, Never>?
+
+    private var headerURL: URL? {
+        guard let info else { return nil }
+        let file = info.headerImage.flatMap { SteamGamesRules.safeAssetName($0) ? $0 : nil } ?? "header.jpg"
+        return URL(string: SteamGamesRules.assetBase + "\(info.appID)/" + file)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    TextField("App ID or Steam link", text: $input)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .keyboardType(.URL).submitLabel(.go)
+                        .padding().libraryRowGlass(RoundedRectangle(cornerRadius: 16))
+                        .disabled(busy).onSubmit { add() }
+                        .onChange(of: input) { _, _ in info = nil; added = false; message = nil }
+                    Button(action: add) {
+                        Label("Add to library", systemImage: "plus")
+                            .frame(maxWidth: .infinity).padding(12)
+                            .libraryRowGlass(Capsule())
+                    }.buttonStyle(.plain)
+                        .disabled(busy || steam.refreshing || steam.addingApp || SteamAppInput.parse(input) == nil)
+                    if busy { ProgressView("Checking Steam…") }
+                    if let info {
+                        AsyncImage(url: headerURL) { image in
+                            image.resizable().aspectRatio(contentMode: .fit)
+                        } placeholder: {
+                            RoundedRectangle(cornerRadius: 16).fill(.secondary.opacity(0.12))
+                                .aspectRatio(460.0 / 215.0, contentMode: .fit)
+                        }.clipShape(RoundedRectangle(cornerRadius: 16))
+                        Text(info.name).font(.title2.bold())
+                        Text(info.hasWindowsDownload ? "Installable on Windows" : "No Windows download available")
+                            .foregroundStyle(.secondary)
+                        if added && info.hasWindowsDownload {
+                            Button("Install") {
+                                steam.install(Int(info.appID))
+                                dismiss(); openDownload(Int(info.appID))
+                            }.buttonStyle(.borderedProminent)
+                        }
+                    }
+                    if let message { Text(message).foregroundStyle(.secondary) }
+                }.padding()
+            }
+            .navigationTitle("Add Steam game")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .onDisappear { task?.cancel() }
+    }
+
+    private func add() {
+        guard !busy else { return }
+        busy = true; info = nil; message = nil; added = false
+        task = Task { @MainActor in
+            defer { busy = false }
+            do {
+                let resolved = try await steam.resolveApp(input)
+                try Task.checkCancellation()
+                info = resolved
+                added = try await steam.addApp(resolved)
+                message = added ? "Added to your Steam library." : "You don't own this game on this account"
+            } catch is CancellationError {
+            } catch { message = error.localizedDescription }
+        }
     }
 }

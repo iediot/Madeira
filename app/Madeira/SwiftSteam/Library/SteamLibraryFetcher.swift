@@ -20,20 +20,21 @@ class SteamLibraryFetcher {
     // MARK: - Fetch Owned Games
 
     /// Fetches the account's package IDs from the license list, resolves them
-    /// to app IDs and returns the playable apps' metadata.
-    func fetchOwnedApps() async throws -> [SteamAppInfo] {
+    /// to app IDs and returns playable or manually revealed apps. Optional grants
+    /// must come from a successful CM free-license response, never from user input.
+    func fetchOwnedApps(including manualIDs: Set<UInt32> = [], grantedPackages: [UInt32] = [], grantedApps: [UInt32] = []) async throws -> [SteamAppInfo] {
         try await session.ensureConnected()
 
         // Step 1: the license list (owned packages).
         SteamLog.trace("Fetching license list...")
-        let packageIDs = try await fetchLicenseList()
+        let packageIDs = Array(Set(try await fetchLicenseList()).union(grantedPackages))
         SteamLog.trace("Got \(packageIDs.count) owned packages")
 
         // Step 2: PICS access tokens for the packages.
         let packageTokens = try await fetchPICSAccessTokens(packageIDs: packageIDs)
 
         // Step 3: package info, to extract the app IDs.
-        let appIDs = try await fetchAppIDsFromPackages(packageIDs: packageIDs, tokens: packageTokens)
+        let appIDs = try await fetchAppIDsFromPackages(packageIDs: packageIDs, tokens: packageTokens).union(grantedApps)
         SteamLog.trace("Found \(appIDs.count) unique app IDs")
 
         // Step 4: PICS access tokens for the apps.
@@ -44,8 +45,8 @@ class SteamLibraryFetcher {
         SteamLog.trace("Got info for \(appInfos.count) apps")
 
         // Playable types only: games, demos and applications. This leaves out
-        // DLC, soundtracks and tools (redistributables, runtimes, SDKs, servers).
-        let games = appInfos.filter { $0.type.isPlayable }
+        // DLC, soundtracks and tools unless the user explicitly added their ID.
+        let games = appInfos.filter { $0.type.isPlayable || manualIDs.contains($0.appID) }
         SteamLog.trace("\(games.count) of \(appInfos.count) apps are playable (game/demo/application)")
         return games
     }
@@ -84,6 +85,26 @@ class SteamLibraryFetcher {
         try await session.ensureConnected()
         let tokens = try await fetchPICSAccessTokens(appIDs: [appID])
         return try await fetchAppInfo(appIDs: [appID], tokens: tokens).first
+    }
+
+    /// Ownership is checked against licenses, before the library's type filters.
+    func owns(appID: UInt32) async throws -> Bool {
+        try await session.ensureConnected()
+        let packages = try await fetchLicenseList()
+        let tokens = try await fetchPICSAccessTokens(packageIDs: packages)
+        return try await fetchAppIDsFromPackages(packageIDs: packages, tokens: tokens).contains(appID)
+    }
+
+    /// Steam decides whether a free package exists, including apps whose public
+    /// PICS flags omit it. This endpoint cannot buy a game or spend wallet funds.
+    func requestFreeLicense(appID: UInt32) async throws -> CMsgClientRequestFreeLicenseResponse {
+        try await session.ensureConnected()
+        let reply = try await session.sendAndWait(eMsg: .clientRequestFreeLicense,
+            body: CMsgClientRequestFreeLicense(appids: [appID]).serialize(),
+            responseEMsg: .clientRequestFreeLicenseResponse, timeout: 30)
+        let result = try CMsgClientRequestFreeLicenseResponse.deserialize(from: reply.body)
+        ownedDepotCache = nil
+        return result
     }
 
     // MARK: - Install metadata
