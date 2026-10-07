@@ -491,7 +491,6 @@ struct StoreReviewCard: View {
             // animation scoped to this card rather than the whole page's layout.
             Text(review.text).font(.subheadline).foregroundStyle(.secondary)
                 .lineLimit(open ? nil : 6).fixedSize(horizontal: false, vertical: true)
-                .animation(.easeOut(duration: 0.2), value: open)
             if long {
                 Button(open ? "Show less" : "Read more") { open.toggle() }
                     .font(.subheadline.weight(.medium)).buttonStyle(.plain).foregroundStyle(Color.accentColor)
@@ -500,6 +499,9 @@ struct StoreReviewCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+        // On the whole card, so the text, its button and the card's edge move together
+        // (on the text alone the button jumped ahead of it).
+        .animation(.easeOut(duration: 0.2), value: open)
     }
 }
 
