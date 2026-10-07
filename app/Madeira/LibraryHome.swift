@@ -347,7 +347,8 @@ struct LibrarySideMenu: View {
             .padding(.bottom, 10)
             item("Home", "house.fill", 0)
             item("Library", "square.grid.2x2.fill", 1)
-            item("Settings", "gearshape.fill", 2)
+            item("Store", "bag.fill", 2)
+            item("Settings", "gearshape.fill", 3)
             Spacer(minLength: 16)
             status
             Button(action: desktop) { row("Desktop", "desktopcomputer", selected: false) }

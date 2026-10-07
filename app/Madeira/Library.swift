@@ -1795,6 +1795,9 @@ struct LibraryArtwork: View {
 /// second; held still with Reduce Motion. Its callers draw their previous fill when liquid
 /// metal is off (LiquidMetalSetting).
 struct LiquidMetalFill: View {
+    /// Off: one still frame of the metal, for the many small buttons that should not
+    /// each run a 60 fps shader (LibraryMetalGlass).
+    var animated = true
     @ObservedObject private var scroll = LibraryScrollActivity.shared
     @Environment(\.displayScale) private var displayScale
     @Environment(\.colorScheme) private var scheme
@@ -1802,11 +1805,11 @@ struct LiquidMetalFill: View {
 
     var body: some View {
         GeometryReader { geometry in
-            TimelineView(.animation(minimumInterval: 1.0 / 60, paused: reduceMotion || scroll.scrolling)) { context in
+            TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !animated || reduceMotion || scroll.scrolling)) { context in
                 // Kept small, so the shader's float time stays precise.
                 let time = Float(context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 3600))
                 Rectangle()
-                    .colorEffect(ShaderLibrary.liquidMetal(.float2(geometry.size), .float(reduceMotion ? 0 : time),
+                    .colorEffect(ShaderLibrary.liquidMetal(.float2(geometry.size), .float(reduceMotion || !animated ? 0 : time),
                                                            .float(Float(displayScale)), .float(scheme == .light ? 1 : 0)))
             }
         }
@@ -2244,6 +2247,7 @@ struct LibraryView: View {
     @State private var search = ""
     /// The Settings tab's own search text, kept apart from the library's.
     @State private var settingsSearch = ""
+    @State private var storeSearch = ""
     @State private var focused: UUID?
     @ObservedObject private var controller = LibraryController.shared
     @ObservedObject private var input = InputSettings.shared
@@ -2296,7 +2300,7 @@ struct LibraryView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         // Settings places its own column (settings): a Form does not animate
                         // a changing safe area, and jumped under the menu as it folded.
-                        .safeAreaPadding(.leading, tab == 2 ? 0 : menuFolded ? LibrarySideMenu.foldedWidth : LibrarySideMenu.width)
+                        .safeAreaPadding(.leading, tab == 3 ? 0 : menuFolded ? LibrarySideMenu.foldedWidth : LibrarySideMenu.width)
                     LibrarySideMenu(tab: Binding(get: { tab }, set: { switchTab(to: $0) }), folded: $menuFolded,
                                     enableJIT: enableJIT,
                                     desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry })
@@ -2308,7 +2312,8 @@ struct LibraryView: View {
                 TabView(selection: Binding(get: { tab }, set: { switchTab(to: $0) })) {
                     page(0).tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
                     page(1).tabItem { Label("Library", systemImage: "square.grid.2x2.fill") }.tag(1)
-                    page(2).tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(2)
+                    page(2).tabItem { Label("Store", systemImage: "bag.fill") }.tag(2)
+                    page(3).tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(3)
                 }
             }
         }
@@ -2324,8 +2329,8 @@ struct LibraryView: View {
         // has no navigation bar: its pages carry their own field.
         .background {
             if !wide {
-                LibraryNavSearch(text: tab == 2 ? $settingsSearch : $search,
-                                 placeholder: tab == 2 ? "Search settings" : "Search your library")
+                LibraryNavSearch(text: tab == 3 ? $settingsSearch : tab == 2 ? $storeSearch : $search,
+                                 placeholder: tab == 3 ? "Search settings" : tab == 2 ? "Search the store" : "Search your library")
                     .frame(width: 0, height: 0)
             }
         }
@@ -2365,7 +2370,7 @@ struct LibraryView: View {
         .onAppear { GlassSkin.shared.start() }
         .onDisappear { GlassSkin.shared.stop() }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: (tab + 1) % 3) }
+            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: (tab + 1) % 4) }
         }
         // The details page and the executable browser open from Home and Library alike.
         .sheet(isPresented: $browser) {
@@ -2589,6 +2594,7 @@ struct LibraryView: View {
         switch index {
         case 0: home.background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         case 1: library.background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+        case 2: StoreView(search: $storeSearch, wide: wide, open: { selected = $0 })
         default: settings
         }
     }
@@ -3013,6 +3019,9 @@ struct LibraryDetail: View {
                 Section { header }
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
+                if let appID = entry.steamAppID {
+                    Section { StoreGameMedia(appID: appID) }
+                }
                 Section("Display") {   // first after Play: the setting changed most often, then On screen
                     // The Windows screen the game renders for (and the Desktop's size).
                     // ml1172: this device's choices (ResolutionChoices), grouped.

@@ -220,11 +220,13 @@ struct AmbientGlow: View {
         // A game that is not installed throws a fainter, less vivid light.
         let strength = (dark ? 0.92 : 0.8) * (dimmed ? 0.3 : 1)
         let plain = layer(0, false, frame: frame), turned = layer(180, false, frame: frame), mirrored = layer(0, true, frame: frame)
-        // Still while the library scrolls: each glow is six blurred draws, a shader and
-        // two masks, and redrawing every card's at 30 fps made scrolling stutter.
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || scroll.scrolling)) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            let f = movie.frame(at: reduceMotion ? 0 : t)
+        // Drawn once, still: each glow is six blurred draws, a shader and two masks, and
+        // redrawing every card's at 30 fps made the whole app lag even when idle (the
+        // original paused it only while scrolling). Each card holds its own frame of the
+        // film (a time from its seed), so the light still differs from card to card.
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: true)) { _ in
+            let t = reduceMotion ? 0 : Double(abs(seed) % 600)
+            let f = movie.frame(at: t)
             ZStack {
                 plain
                 turned.mask { AmbientMovie.mask(f.turned) }
@@ -305,17 +307,50 @@ struct AmbientGlowLayer: View {
 private struct AmbientGlowCard: View {
     let item: AmbientGlowItem
     let frame: CGRect
-    @State private var image: UIImage?
+    @Environment(\.colorScheme) private var scheme
+    @State private var baked: UIImage?
+    @State private var live = false
+    /// Each card's glow drawn once into a bitmap. Live, every glow is six blurs, a shader
+    /// and masks, and the shared layer re-evaluates all of them whenever a card enters or
+    /// leaves the lazy grid: that was the library's lag with Card glow on.
+    private static let bakes = NSCache<NSString, UIImage>()
+    private var key: NSString { "\(item.id)-\(Int(frame.width))x\(Int(frame.height))-\(scheme == .dark)" as NSString }
     var body: some View {
+        let spread = frame.width * 0.17
+        let outer = CGSize(width: frame.width + spread * 2, height: frame.height + spread * 2)
         ZStack {
-            if let image = image ?? AmbientArtwork.cached(item.id) {
-                AmbientGlow(image: Image(uiImage: image), size: frame.size, seed: item.seed, dimmed: item.dimmed, pressed: item.pressed)
+            if let glow = baked ?? Self.bakes.object(forKey: key) {
+                Image(uiImage: glow).resizable().frame(width: outer.width, height: outer.height)
+                    // Pressed, the light draws in behind the shrunken artwork and goes out.
+                    .scaleEffect(item.pressed ? LibraryCardArtworkPress.pressedScale * frame.width / outer.width : 1)
+                    .opacity(item.pressed ? 0 : 1)
+                    .animation(item.pressed ? .easeIn(duration: 0.45) : .easeOut(duration: 1.1), value: item.pressed)
+                    .blendMode(scheme == .dark ? .plusLighter : .normal)
+                    .allowsHitTesting(false).accessibilityHidden(true)
+            } else if live, let art = AmbientArtwork.cached(item.id) {
+                AmbientGlow(image: Image(uiImage: art), size: frame.size, seed: item.seed, dimmed: item.dimmed, pressed: item.pressed)
             } else {
                 Color.clear.frame(width: 1, height: 1)
             }
         }
         .position(x: frame.midX, y: frame.midY)
-        .task(id: item.id) { if image == nil { image = await AmbientArtwork.load(item) } }
+        .task(id: key) {
+            if let hit = Self.bakes.object(forKey: key) { baked = hit; return }
+            guard frame.width > 1, frame.height > 1 else { return }
+            var art = AmbientArtwork.cached(item.id)
+            if art == nil { art = await AmbientArtwork.load(item) }
+            guard let art, !Task.isCancelled else { return }
+            let renderer = ImageRenderer(content: AmbientGlow(image: Image(uiImage: art), size: frame.size, seed: item.seed,
+                                                              dimmed: item.dimmed, pressed: false)
+                .environment(\.colorScheme, scheme))
+            renderer.scale = 1   // light, blurred anyway
+            if let image = renderer.uiImage {
+                Self.bakes.setObject(image, forKey: key)
+                baked = image
+            } else {
+                live = true      // a renderer that cannot draw it: the live glow, as before
+            }
+        }
     }
 }
 
@@ -378,7 +413,9 @@ struct LibraryMetalGlass<S: Shape>: ViewModifier {
             content
                 .foregroundStyle(light ? Color.black : Color.white)
                 .shadow(color: (light ? Color.white : Color.black).opacity(0.75), radius: 2.5)
-                .background(LiquidMetalFill().clipShape(shape))
+                // A still frame: the app's own buttons and pills are many (a price pill
+                // under every store card), and a 60 fps shader behind each made it lag.
+                .background(LiquidMetalFill(animated: false).clipShape(shape))
                 .contentShape(shape)
         } else if #available(iOS 26.0, *) {
             content.glassEffect(.regular.interactive(), in: shape)

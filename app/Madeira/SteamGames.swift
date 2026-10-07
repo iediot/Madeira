@@ -963,6 +963,7 @@ struct SteamGameSheet: View {
                                     .clipped()
                             )
                     }
+                    Section { StoreGameMedia(appID: appID) }
                     if let download = steam.downloads[appID] {
                         Section("Download") {
                             SteamDownloadStatus(download: download)

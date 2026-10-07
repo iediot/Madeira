@@ -16353,10 +16353,77 @@ index 0ee1110b..1122ff2a 100644
      ioctl->code   = code;
      ioctl->output = output;
 diff --git a/server/thread.c b/server/thread.c
-index 02930423..47f8870b 100644
+index 02930423..6a03ede9 100644
 --- a/server/thread.c
 +++ b/server/thread.c
-@@ -2721,6 +2721,15 @@ DECL_HANDLER(get_thread_context)
+@@ -2395,6 +2395,56 @@ DECL_HANDLER(resume_thread)
+ }
+ 
+ /* select on a handle list */
++#ifdef WINE_IOS
++#include <stdio.h>
++/* [wait-census] (MADEIRA_PERF=1): which thread waits on which object, by type and
++ * name, how often and with what timeout. A game that polls (waits with a timeout,
++ * wakes, waits again) never shows in [srv-stuck], which only reports long waits;
++ * Detroit: Become Human's 98% stall was such a loop. Every 20000 waits the top
++ * entries are printed and the table starts over. */
++static void ios_wait_census( const union select_op *op, data_size_t op_size, abstime_t timeout )
++{
++    static int enabled = -1;
++    static struct { thread_id_t tid; char what[96]; unsigned n; int timed; } table[64];
++    static unsigned used, total;
++    struct object *obj;
++    char what[96];
++    unsigned i;
++
++    if (enabled < 0) { const char *e = getenv( "MADEIRA_PERF" ); enabled = e && *e == '1'; }
++    if (!enabled) return;
++    if ((op->op != SELECT_WAIT && op->op != SELECT_WAIT_ALL) || op_size < sizeof(op->wait.op) + sizeof(obj_handle_t)) return;
++    if (!(obj = get_handle_obj( current->process, op->wait.handles[0], 0, NULL ))) { clear_error(); return; }
++    {
++        data_size_t len = 0, k, o = 0;
++        const WCHAR *name = get_object_name( obj, &len );
++        const struct unicode_str *type = obj->ops->type ? &obj->ops->type->name : NULL;
++        for (k = 0; type && k < type->len / sizeof(WCHAR) && o < 30; k++) what[o++] = (char)type->str[k];
++        what[o++] = ' ';
++        for (k = 0; name && k < len / sizeof(WCHAR) && o < sizeof(what) - 1; k++) what[o++] = name[k] < 128 ? (char)name[k] : '?';
++        if (!name || !len) { snprintf( what + o, sizeof(what) - o, "(unnamed %p)", obj ); o = strlen( what ); }
++        what[o < sizeof(what) ? o : sizeof(what) - 1] = 0;
++    }
++    release_object( obj );
++    for (i = 0; i < used; i++)
++        if (table[i].tid == current->id && !strcmp( table[i].what, what )) break;
++    if (i == used && used < 64) { table[used].tid = current->id; strcpy( table[used].what, what ); table[used].n = 0; used++; }
++    if (i < used) { table[i].n++; table[i].timed = timeout != TIMEOUT_INFINITE; }
++    if (++total % 20000) return;
++    fprintf( stderr, "[wait-census] last 20000 waits (first handle of each):\n" );
++    for (unsigned shown = 0; shown < 12; shown++)
++    {
++        unsigned best = used, j;
++        for (j = 0; j < used; j++) if (table[j].n && (best == used || table[j].n > table[best].n)) best = j;
++        if (best == used) break;
++        fprintf( stderr, "[wait-census]   %6u tid=%04x %s%s\n", table[best].n, table[best].tid,
++                 table[best].what, table[best].timed ? " (timed)" : "" );
++        table[best].n = 0;
++    }
++    used = 0;
++}
++#endif
++
+ DECL_HANDLER(select)
+ {
+     union select_op select_op;
+@@ -2462,6 +2512,9 @@ DECL_HANDLER(select)
+     op_size = min( req->size, sizeof(select_op) );
+     memset( &select_op, 0, sizeof(select_op) );
+     memcpy( &select_op, result + 1, op_size );
++#ifdef WINE_IOS
++    ios_wait_census( &select_op, op_size, req->timeout );
++#endif
+ 
+     /* first store results of previous apc */
+     if (req->prev_apc)
+@@ -2721,6 +2774,15 @@ DECL_HANDLER(get_thread_context)
              native_flags = req->native_flags;
              wow_flags = req->flags & ~native_flags;
          }
