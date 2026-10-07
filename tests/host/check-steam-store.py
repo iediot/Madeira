@@ -69,6 +69,6 @@ with tempfile.TemporaryDirectory(prefix='steam-store-') as folder:
     work = Path(folder)
     (work / 'checks.swift').write_text(checks)
     subprocess.run([os.environ.get('SWIFTC') or shutil.which('swiftc'), '-parse-as-library', '-swift-version', '5',
-                    '-module-cache-path', str(work / 'cache'), str(ROOT / 'app/Madeira/Store/SteamStore.swift'),
+                    '-module-cache-path', str(work / 'cache'), str(ROOT / 'app/Madeira/Store/SteamStore.swift'), str(ROOT / 'app/Madeira/Store/EpicStore.swift'),
                     str(ROOT / 'app/Madeira/SwiftSteam/Auth/SteamTokenStore.swift'), str(work / 'checks.swift'), '-o', str(work / 'checks')], check=True)
     subprocess.run([str(work / 'checks')], check=True)

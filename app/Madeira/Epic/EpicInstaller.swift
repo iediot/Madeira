@@ -88,7 +88,7 @@ struct EpicInstalledGame: Codable {
             ?? LibraryEntry(title: record.game.title, relativePath: "", bits: 0)
         entry.epicAppName = record.appName
         entry.epicLaunchCommand = record.launchCommand
-        entry.relativePath = record.installDir + "/" + record.launchExe
+        entry.relativePath = record.installDir + "/" + EpicLaunchOverride.executable(appName: record.appName, launchExe: record.launchExe)
         entry.epicArtworkURL = record.game.artworkURL
         entry.epicHeroURL = record.game.heroURL
         LibraryModel.shared.save(entry)
@@ -381,5 +381,19 @@ private actor EpicInstallWorker {
         return EpicInstalledGame(game: job.game, appName: job.game.appName, installDir: job.installDir,
                                  buildVersion: manifest.meta.buildVersion, launchExe: launch, launchCommand: manifest.meta.launchCommand,
                                  prereqName: manifest.meta.prereqName, prereqPath: manifest.meta.prereqPath, prereqArgs: manifest.meta.prereqArgs)
+    }
+}
+
+/// Some Epic builds name a publisher launcher as their launch executable. 2K's .NET
+/// launcher for Borderlands 2 and The Pre-Sequel draws through Wine Mono's WPF and never
+/// reaches the game here; the game executable beside it takes the same Epic arguments,
+/// which is what Heroic's and Legendary's executable overrides do for these games.
+enum EpicLaunchOverride {
+    static let games = ["Turkey": "BorderlandsPreSequel.exe", "Dodo": "Borderlands2.exe"]
+    static func executable(appName: String, launchExe: String) -> String {
+        guard let game = games[appName] else { return launchExe }
+        let parts = launchExe.split(separator: "/", omittingEmptySubsequences: false)
+        guard let last = parts.last, last.caseInsensitiveCompare("Launcher.exe") == .orderedSame else { return launchExe }
+        return (parts.dropLast().map(String.init) + [game]).joined(separator: "/")
     }
 }

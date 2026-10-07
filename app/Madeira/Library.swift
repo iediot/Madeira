@@ -1572,6 +1572,9 @@ final class ReportingSearchBar: UISearchBar {
 struct LibraryNavSearch: UIViewControllerRepresentable {
     @Binding var text: String
     let placeholder: String
+    /// Hides the field at once, keeping its place. Removing this view instead left
+    /// it up for the length of the tab switch's animation.
+    var hidden = false
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeUIViewController(context: Context) -> Host {
@@ -1592,6 +1595,7 @@ struct LibraryNavSearch: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UISearchResultsUpdating, UISearchBarDelegate, UIGestureRecognizerDelegate {
         var parent: LibraryNavSearch
         let controller = ReportingSearchController(searchResultsController: nil)
+        var wasHidden = false
         private var outsideTap: UITapGestureRecognizer?
         var bar: UISearchBar { controller.searchBar }
 
@@ -1669,6 +1673,17 @@ struct LibraryNavSearch: UIViewControllerRepresentable {
         func apply() {
             guard let c = coordinator else { return }
             if c.bar.text != c.parent.text { c.bar.text = c.parent.text }
+            // Shown again (a store opened from the picker): appear already laid out,
+            // no squeeze, no crossfade. Animating here slid the magnifying glass
+            // across the field during the store's push.
+            let reappearing = c.wasHidden && !c.parent.hidden
+            c.wasHidden = c.parent.hidden
+            if reappearing || c.parent.hidden {
+                UIView.performWithoutAnimation {
+                    if c.bar.placeholder != c.parent.placeholder { c.bar.placeholder = c.parent.placeholder }
+                    c.bar.layoutIfNeeded()
+                }
+            }
             if c.bar.placeholder != c.parent.placeholder {
                 if c.bar.placeholder != nil {   // a tab switch: crossfade instead of jumping
                     let fade = CATransition(); fade.type = .fade; fade.duration = 0.25
@@ -1683,6 +1698,14 @@ struct LibraryNavSearch: UIViewControllerRepresentable {
             guard let target = vc else { return }
             owner = target
             let item = target.navigationItem
+            // Hidden keeps the field's place in the bar (invisible, untouchable): taking
+            // it out resized the space below and moved the store picker on the way back.
+            if c.parent.hidden { c.bar.resignFirstResponder() }
+            UIView.performWithoutAnimation {
+                c.bar.alpha = c.parent.hidden ? 0 : 1
+                c.bar.isUserInteractionEnabled = !c.parent.hidden
+                if reappearing { c.bar.layer.removeAllAnimations(); c.bar.searchTextField.layer.removeAllAnimations() }
+            }
             if item.searchController !== c.controller { item.searchController = c.controller }
             if item.preferredSearchBarPlacement != .stacked { item.preferredSearchBarPlacement = .stacked }
             if item.hidesSearchBarWhenScrolling { item.hidesSearchBarWhenScrolling = false }
@@ -2276,6 +2299,7 @@ struct LibraryView: View {
     /// The Settings tab's own search text, kept apart from the library's.
     @State private var settingsSearch = ""
     @State private var storeSearch = ""
+    @State private var storeDestination: StoreDestination?
     @State private var focused: UUID?
     @ObservedObject private var controller = LibraryController.shared
     @ObservedObject private var input = InputSettings.shared
@@ -2358,7 +2382,8 @@ struct LibraryView: View {
         .background {
             if !wide {
                 LibraryNavSearch(text: tab == 3 ? $settingsSearch : tab == 2 ? $storeSearch : $search,
-                                 placeholder: tab == 3 ? "Search settings" : tab == 2 ? "Search the store" : "Search your library")
+                                 placeholder: tab == 3 ? "Search settings" : tab == 2 ? "Search \(storeDestination?.rawValue ?? "store")" : "Search your library",
+                                 hidden: tab == 2 && storeDestination == nil)
                     .frame(width: 0, height: 0)
             }
         }
@@ -2622,7 +2647,7 @@ struct LibraryView: View {
         switch index {
         case 0: home.background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         case 1: library.background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
-        case 2: StoreView(search: $storeSearch, wide: wide, open: { selected = $0 })
+        case 2: StoreView(search: $storeSearch, destination: $storeDestination, wide: wide, open: { selected = $0 })
         default: settings
         }
     }

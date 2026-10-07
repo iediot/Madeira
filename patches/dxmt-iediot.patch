@@ -555,7 +555,7 @@ index f086337..5814ff4 100644
  // device-teardown high-water reports.
  inline bool
 diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
-index 2515624..5e1b8d3 100644
+index 2515624..56e2e4d 100644
 --- a/src/d3d9/d3d9_device.cpp
 +++ b/src/d3d9/d3d9_device.cpp
 @@ -834,6 +834,9 @@ MTLD3D9Device::releaseBufferBacking(
@@ -848,7 +848,40 @@ index 2515624..5e1b8d3 100644
    }
    // Drop stencil if the bound DS format has no stencil aspect; D3D9
    // silently masks; Metal would reject the encoder. DXVK does
-@@ -7514,6 +7731,13 @@ MTLD3D9Device::BuildDrawCapture() {
+@@ -6397,6 +6614,20 @@ MTLD3D9Device::SetViewport(const D3DVIEWPORT9 *pViewport) {
+   if (!pViewport)
+     return D3DERR_INVALIDCALL;
+   D3DVIEWPORT9 vp = *pViewport;
++  // The runtime fails a viewport that "describes a region that cannot exist within
++  // the render target surface" (SetViewport docs), keeping the previous one. Super
++  // Meat Boy letterboxes 16:9 into a wider screen and passes a negative top edge
++  // that arrives wrapped (Y=0x7FFFFFBA): accepted, every draw lands off screen.
++  // Only an origin past the target's edge is refused; oversized extents still pass.
++  if (auto *rt = m_renderTargets[0].ptr()) {
++    const auto &d = rt->desc();
++    if (vp.X >= d.Width || vp.Y >= d.Height) {
++      if (d9SmbTraceEnabled())
++        Logger::warn(str::format("[viewport] refused origin ", vp.X, ",", vp.Y, " size ", vp.Width, "x", vp.Height,
++            " outside ", d.Width, "x", d.Height));
++      return D3DERR_INVALIDCALL;
++    }
++  }
+   // DXVK normalises inverted Z (d3d9_device.cpp); Metal's
+   // viewport rejects MaxZ <= MinZ at draw time.
+   if (!(vp.MinZ < vp.MaxZ))
+@@ -6916,6 +7147,11 @@ MTLD3D9Device::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) {
+   // overlay may have wrapped, or an app deliberately corrupted): an unrecognised
+   // non-null pointer is treated as "no texture", matching wined3d.
+   MTLD3D9CommonTexture *common = commonTextureFromBound(pTexture);
++  if (smbTraceActive())
++    Logger::info(str::format("[smb] SetTexture frame=", m_smbFrame, " stage=", Stage, " slot=", slot,
++        " iface=", (void *)pTexture, " vtable=", pTexture ? *reinterpret_cast<const void *const *>(pTexture) : nullptr,
++        " common=", (void *)common, " tex=", common && common->dxmtTexture() ? (void *)common->dxmtTexture().ptr() : nullptr,
++        " record=", m_inStateBlockRecord));
+   if (common) {
+     // Cross-device check matches Set(RT|DepthStencilSurface). Same
+     // reasoning: deviceRaw() avoids an AddRef/Release cycle that
+@@ -7514,6 +7750,13 @@ MTLD3D9Device::BuildDrawCapture() {
  
  void
  MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
@@ -862,7 +895,7 @@ index 2515624..5e1b8d3 100644
    // Regenerate any bound AUTOGENMIPMAP texture's dirty mip chain before this
    // draw is pushed, so the mip-gen op precedes the draws that sample it in the
    // op stream (DXVK PrepareDraw shape). The hot path pays a single relaxed load
-@@ -8816,8 +9040,11 @@ MTLD3D9Device::PackDrawConstants(
+@@ -8816,8 +9059,11 @@ MTLD3D9Device::PackDrawConstants(
  
    constexpr size_t kSubAlign = 256;
    auto align_up = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
@@ -876,7 +909,7 @@ index 2515624..5e1b8d3 100644
    // ~20 PS registers against the 256/224 maxes; full-extent uploads are
    // mostly memcpying zeros. DXVK's maxChangedConstF is the literal
    // reference. A relative-addressing shader instead uploads the whole
-@@ -8833,8 +9060,12 @@ MTLD3D9Device::PackDrawConstants(
+@@ -8833,8 +9079,12 @@ MTLD3D9Device::PackDrawConstants(
    // 256 and the hot path is unchanged.
    const uint32_t vs_file_size =
        pod.vs_const_F_overflow ? (D3D9_MAX_VS_CONST_F + pod.vs_const_F_overflow_count) : D3D9_MAX_VS_CONST_F;
@@ -891,7 +924,7 @@ index 2515624..5e1b8d3 100644
    // A generated vertex shader reads the fixed-function uniforms block
    // through this slot; size it for the full layout contract (matrix,
    // fog, point-scale and lighting blocks) rather than the register
-@@ -10605,16 +10836,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
+@@ -10605,16 +10855,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
    // snapshot, so a shader<->fixed-function transition inside one cluster
    // would otherwise reuse the other kind's upload verbatim. A
    // relative-addressing shader also keys here: its upload differs from a
@@ -913,7 +946,7 @@ index 2515624..5e1b8d3 100644
  
    // Reuse prior draw's uploads if pod_snapshot pointer equals (implies byte-equality)
    // and the def-stamping shaders match. VS/PS constants, clip planes
-@@ -10757,6 +10989,7 @@ MTLD3D9Device::FlushDrawBatch() {
+@@ -10757,6 +11008,7 @@ MTLD3D9Device::FlushDrawBatch() {
            // reset was missing.
            res = D9ResolvedDraw{};
            if (!this->ResolveBatchedDrawForChunk(bd, res, chunk_seq, chunk_coherent_id, const_cache, resolve_cache)) {
@@ -921,7 +954,7 @@ index 2515624..5e1b8d3 100644
              continue;
            }
          }
-@@ -10791,6 +11024,7 @@ MTLD3D9Device::FlushDrawBatch() {
+@@ -10791,6 +11043,7 @@ MTLD3D9Device::FlushDrawBatch() {
            }
            res.resolved_pso = res.resolved_pso_task->state().handle;
            if (res.resolved_pso == 0) {
@@ -929,6 +962,17 @@ index 2515624..5e1b8d3 100644
              continue; // link failed: skip
            }
          }
+@@ -12272,6 +12525,10 @@ MTLD3D9Device::SetPixelShaderConstantF(UINT StartRegister, const float *pConstan
+     return D3D_OK;
+   if (!pConstantData)
+     return D3DERR_INVALIDCALL;
++  if (smbTraceActive())
++    Logger::info(str::format("[smb] SetPSConstF frame=", m_smbFrame, " start=", StartRegister, " count=", Vector4fCount,
++        " first=", pConstantData[0], ",", pConstantData[1], ",", pConstantData[2], ",", pConstantData[3],
++        " record=", m_inStateBlockRecord));
+   if (m_inStateBlockRecord) {
+     std::memcpy(
+         &m_recordingBlock->m_snapPsConstantsF[StartRegister][0], pConstantData,
 diff --git a/src/d3d9/d3d9_device.hpp b/src/d3d9/d3d9_device.hpp
 index f77f25a..96d8c18 100644
 --- a/src/d3d9/d3d9_device.hpp

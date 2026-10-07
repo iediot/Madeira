@@ -32,16 +32,14 @@ struct StoreExpandedShelf {
     let items: [StoreGame]
 }
 
-struct StoreView: View {
+struct SteamStorePage: View {
     @Binding var search: String
-    let wide: Bool
     let open: (LibraryEntry) -> Void
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var installed = SteamGamesModel.shared
     @State private var shelves: [String: [StoreGame]] = [:]
     @State private var recommendations: [StoreGame] = []
     @State private var recommendationRevision = 0
-    @State private var epic: [EpicStoreOffer] = []
     @State private var results: [StoreGame] = []
     @State private var selection: StoreGame?
     @State private var expanded: StoreExpandedShelf?
@@ -50,20 +48,14 @@ struct StoreView: View {
     @State private var error: String?
     @State private var searchError: String?
     @State private var retry = 0
-    @Environment(\.openURL) private var openURL
     private var query: String { search.trimmingCharacters(in: .whitespacesAndNewlines) }
+    /// Which content the page shows; a change crossfades it (shelves, a See all grid, search).
+    private var phase: String { !query.isEmpty ? "search" : expanded.map { "all:" + $0.title } ?? "shelves" }
 
     var body: some View {
         GeometryReader { geo in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 24) {
-                    if wide {
-                        HStack {
-                            Text("Store").font(.largeTitle.bold())
-                            Spacer()
-                            LibrarySearchField(text: $search, placeholder: "Search the store").frame(maxWidth: 340)
-                        }.padding(.horizontal, LibraryLayout.margin(geo.size.width))
-                    }
                     if query.isEmpty, let expanded {
                         HStack(spacing: 12) {
                             Button { withAnimation(.snappy) { self.expanded = nil } } label: {
@@ -90,21 +82,14 @@ struct StoreView: View {
                         shelf("New releases", key: "new_releases", width: geo.size.width)
                         shelf("Coming soon", key: "coming_soon", width: geo.size.width)
                         shelf("Free to play", key: "free_to_play", width: geo.size.width)
-                        if !epic.isEmpty {
-                            LibraryShelf(title: "Free on Epic", items: epic, width: geo.size.width) { offer in
-                                Button { openURL(offer.url) } label: {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        StoreArtwork(urls: [offer.image].compactMap { $0 }).aspectRatio(2.0 / 3, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 10))
-                                        Text(offer.title).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
-                                        Text(offer.upcoming ? "Free \(offer.start.formatted(date: .abbreviated, time: .omitted))" : "Free until \(offer.end.formatted(date: .abbreviated, time: .omitted))")
-                                            .font(.caption2).foregroundStyle(.secondary)
-                                    }.padding(4)
-                                }.libraryCardButtonStyle(grid: true)
-                            }
-                        }
                     }
                 }.padding(.vertical, 16).padding(.bottom, 24)
-            }.refreshable { recommendationRevision += 1; await load() }
+                .animation(.easeOut(duration: 0.25), value: loading)
+                .animation(.easeOut(duration: 0.2), value: searching)
+                .id(phase).transition(.opacity)
+            }
+            .animation(.easeOut(duration: 0.22), value: phase)
+            .refreshable { recommendationRevision += 1; await load() }
         }
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         .task { installed.refresh(); steam.start(); await load() }
@@ -175,7 +160,6 @@ struct StoreView: View {
     /// games each); Free to play still comes from featuredcategories.
     private func load() async {
         loading = shelves.isEmpty; error = nil
-        async let offers = try? SteamStore.shared.epic()
         async let carousel = try? SteamStore.shared.carousel()
         async let categories = try? SteamStore.shared.featured()
         async let top = SteamStore.shared.ranked("filter=topsellers")
@@ -196,7 +180,6 @@ struct StoreView: View {
         if next.values.allSatisfy(\.isEmpty) { error = "The Steam store could not load. Try again." }
         shelves = await keepWellRated(next)
         loading = false
-        epic = await offers ?? []
     }
     /// Steam's public lists carry paid placements and every new or discounted game,
     /// slop included; its own front page leans on reviews and the account. Here the
@@ -269,7 +252,7 @@ struct StoreGameSheet: View {
                         .aspectRatio(16.0 / 9, contentMode: .fit)
                         .frame(maxWidth: 1100)
                     VStack(alignment: .leading, spacing: 22) {
-                        header
+                        StoreGameHeader(game: current)
                         actionRow
                         if let failure {
                             HStack {
@@ -279,18 +262,14 @@ struct StoreGameSheet: View {
                         }
                         if details == nil && failure == nil { ProgressView().frame(maxWidth: .infinity) }
                         StoreMediaContent(game: current)
-                        if !current.description.isEmpty {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("About this game").font(.title3.bold())
-                                Text(current.description).font(.body).foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
-                            }
-                        }
+                        StoreGameAbout(game: current)
                         StoreReviewsView(appID: game.id)
                     }
                     .padding(.horizontal, 20).padding(.top, 20).padding(.bottom, 32)
                     // One readable column, centred on a wide screen.
                     .frame(maxWidth: 760)
+                    // Genres, media and the description fade in when the details arrive.
+                    .animation(.easeOut(duration: 0.25), value: details != nil)
                 }
                 .frame(maxWidth: .infinity)
             }.background(Color(uiColor: .systemGroupedBackground))
@@ -314,29 +293,6 @@ struct StoreGameSheet: View {
                 }
         }
     }
-    /// Title, then one wrapped line of credits and date, then the genres (wrapping, never
-    /// running off the edge).
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(current.name).font(.largeTitle.bold()).fixedSize(horizontal: false, vertical: true)
-            let credits = [current.developers.joined(separator: ", "),
-                           current.publishers.isEmpty || current.publishers == current.developers ? "" : "Published by " + current.publishers.joined(separator: ", "),
-                           current.release].filter { !$0.isEmpty }
-            if !credits.isEmpty {
-                Text(credits.joined(separator: " · ")).font(.subheadline).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if !current.genres.isEmpty {
-                StoreFlow(spacing: 6) {
-                    ForEach(current.genres, id: \.self) { genre in
-                        Text(genre).font(.caption.weight(.medium)).padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
-                    }
-                }
-            }
-        }
-    }
-
     /// The price and the button side by side, the button taking the room left.
     private var actionRow: some View {
         HStack(spacing: 12) {
@@ -453,6 +409,7 @@ struct StoreReviewsView: View {
                 ForEach(reviews.reviews.prefix(4)) { StoreReviewCard(review: $0) }
             }
         }
+        .animation(.easeOut(duration: 0.25), value: reviews != nil)
         .task(id: appID) { reviews = try? await SteamStore.shared.reviews(appID) }
         .sheet(isPresented: $all) { StoreAllReviews(appID: appID, summary: reviews) }
     }
@@ -592,6 +549,43 @@ private struct StoreTrailer: View {
             VideoPlayer(player: player).navigationTitle(movie.name).navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
                 .onDisappear { player.pause() }
+        }
+    }
+}
+
+struct StoreGameHeader: View {
+    let game: StoreGame
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(game.name).font(.largeTitle.bold()).fixedSize(horizontal: false, vertical: true)
+            let credits = [game.developers.joined(separator: ", "),
+                           game.publishers.isEmpty || game.publishers == game.developers ? "" : "Published by " + game.publishers.joined(separator: ", "),
+                           game.release].filter { !$0.isEmpty }
+            if !credits.isEmpty {
+                Text(credits.joined(separator: " · ")).font(.subheadline).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !game.genres.isEmpty {
+                StoreFlow(spacing: 6) {
+                    ForEach(game.genres, id: \.self) { genre in
+                        Text(genre).font(.caption.weight(.medium)).padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct StoreGameAbout: View {
+    let game: StoreGame
+    var body: some View {
+        if !game.description.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("About this game").font(.title3.bold())
+                Text(game.description).font(.body).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
         }
     }
 }

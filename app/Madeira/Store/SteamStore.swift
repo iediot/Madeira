@@ -144,44 +144,6 @@ enum StoreDecoding {
     }
 }
 
-struct EpicStoreOffer: Identifiable {
-    let id: String
-    let title: String
-    let image: URL?
-    let url: URL
-    let start: Date
-    let end: Date
-    var upcoming: Bool { start > Date() }
-    static func decode(_ data: Data, now: Date = Date()) throws -> [Self] {
-        let root = try StoreDecoding.object(data)
-        let catalog = (root["data"] as? [String: Any])?["Catalog"] as? [String: Any]
-        let search = catalog?["searchStore"] as? [String: Any]
-        let elements = search?["elements"] as? [[String: Any]] ?? []
-        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let simple = ISO8601DateFormatter()
-        func date(_ s: Any?) -> Date? { guard let s = s as? String else { return nil }; return formatter.date(from: s) ?? simple.date(from: s) }
-        var seen = Set<String>()
-        return elements.compactMap { row in
-            guard let id = row["id"] as? String, !seen.contains(id), let title = row["title"] as? String,
-                  let promotions = row["promotions"] as? [String: Any] else { return nil }
-            let groups = (promotions["promotionalOffers"] as? [[String: Any]] ?? []) + (promotions["upcomingPromotionalOffers"] as? [[String: Any]] ?? [])
-            let offers = groups.flatMap { $0["promotionalOffers"] as? [[String: Any]] ?? [] }
-            guard let offer = offers.first(where: {
-                let discount = $0["discountSetting"] as? [String: Any]
-                return discount?["discountPercentage"] as? Int == 0 && (date($0["endDate"]) ?? .distantPast) > now
-            }), let start = date(offer["startDate"]), let end = date(offer["endDate"]) else { return nil }
-            let mapping = row["catalogNs"] as? [String: Any]
-            let maps = mapping?["mappings"] as? [[String: Any]] ?? row["offerMappings"] as? [[String: Any]] ?? []
-            let slug = maps.first?["pageSlug"] as? String ?? row["productSlug"] as? String ?? row["urlSlug"] as? String ?? ""
-            guard !slug.isEmpty, let url = URL(string: "https://store.epicgames.com/en-US/p/" + slug) else { return nil }
-            let images = row["keyImages"] as? [[String: Any]] ?? []
-            let tall = images.first { ($0["type"] as? String ?? "").localizedCaseInsensitiveContains("tall") }
-            seen.insert(id)
-            return Self(id: id, title: title, image: StoreDecoding.url((tall ?? images.first)?["url"]), url: url, start: start, end: end)
-        }
-    }
-}
-
 /// Actor-owned disk/memory cache and one paced queue for appdetails, including coalescing.
 actor SteamStore {
     static let shared = SteamStore()
@@ -330,7 +292,6 @@ actor SteamStore {
     }
     func search(_ term: String) async throws -> [StoreGame] { try StoreDecoding.search(await request("storesearch/", query: [URLQueryItem(name: "term", value: term)])) }
     func details(_ id: Int) async throws -> StoreGame? { try StoreDecoding.details(await request("appdetails", query: [URLQueryItem(name: "appids", value: String(id))], detail: true), id: id) }
-    func epic() async throws -> [EpicStoreOffer] { try EpicStoreOffer.decode(await request("epic")) }
     func reviews(_ id: Int) async throws -> StoreReviews {
         try StoreReviews.decode(await request("appreviews/\(id)", query: [
             URLQueryItem(name: "json", value: "1"), URLQueryItem(name: "language", value: "english"),
@@ -347,11 +308,10 @@ actor SteamStore {
     }
 
     private func request(_ path: String, query: [URLQueryItem] = [], detail: Bool = false) async throws -> Data {
-        let base = path == "epic" ? "https://store-site-backend-static.epicgames.com/freeGamesPromotions"
-            : path.hasPrefix("appreviews/") ? "https://store.steampowered.com/" + path   // not under /api
+        let base = path.hasPrefix("appreviews/") ? "https://store.steampowered.com/" + path   // not under /api
             : "https://store.steampowered.com/api/" + path
         var c = URLComponents(string: base)!
-        c.queryItems = path == "epic" ? [URLQueryItem(name: "locale", value: "en-US"), URLQueryItem(name: "country", value: Self.country.uppercased())] : [URLQueryItem(name: "cc", value: Self.country), URLQueryItem(name: "l", value: "english")] + query
+        c.queryItems = [URLQueryItem(name: "cc", value: Self.country), URLQueryItem(name: "l", value: "english")] + query
         return try await request(url: c.url!, detail: detail)
     }
     private func request(url: URL, detail: Bool = false, cacheKey: String? = nil, privateResponse: Bool = false) async throws -> Data {

@@ -37,6 +37,7 @@
 #include <mach/thread_policy.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 #include <AudioToolbox/AudioToolbox.h>
 
 /* Struct/enum mirrors from wine/dlls/mmdevapi/unixlib.h. Repeating the
@@ -770,8 +771,35 @@ static OSStatus ios_audio_render_cb(void *refcon, AudioUnitRenderActionFlags *fl
         struct ios_stream *s = atomic_load_explicit(&g_mix[i], memory_order_acquire);
         if (s) ios_mix_stream(s, out, nframes, dev_ch, dev_rate);
     }
-    /* Summing independent clients can exceed full scale; clamp rather than
-     * letting it wrap into noise. */
+    /* A mix past full scale goes through a limiter, as in Windows' shared-mode
+     * engine: the gain drops at once to keep the frame's loudest channel at the
+     * ceiling and recovers over ~150 ms. A hard clip alone crackled (Super Meat
+     * Boy's XAudio2 mix peaks at 1.6, ~1,000 clipped samples a second). Below the
+     * ceiling with the gain recovered, samples pass untouched. The callback runs
+     * on one Core Audio thread, so the envelope is plain static state. */
+    {
+        static float gain = 1.0f;
+        static UINT32 release_rate;
+        static float release;
+        const float ceiling = 0.98f;
+        UINT32 f, c;
+        if (release_rate != dev_rate) {
+            release_rate = dev_rate;
+            release = 1.0f - expf(-1.0f / (0.15f * (float)dev_rate));
+        }
+        for (f = 0; f < nframes; f++) {
+            float *frame = out + (size_t)f * dev_ch, peak = 0.0f;
+            for (c = 0; c < dev_ch; c++) { float a = fabsf(frame[c]); if (a > peak) peak = a; }
+            if (peak * gain > ceiling) gain = ceiling / peak;
+            if (gain < 1.0f) {
+                for (c = 0; c < dev_ch; c++) frame[c] *= gain;
+                gain += (1.0f - gain) * release;
+                if (gain > 0.9999f) gain = 1.0f;
+            }
+        }
+    }
+    /* The limiter keeps the sum inside full scale; the clamp stays as the last guard
+     * (and its count, in the pacing line, shows when anything still got past). */
     for (k = 0; k < total; k++) {
         if (out[k] > 1.0f) { out[k] = 1.0f; clamped++; }
         else if (out[k] < -1.0f) { out[k] = -1.0f; clamped++; }
