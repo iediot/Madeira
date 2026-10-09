@@ -1,7 +1,143 @@
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 664276b..9efdf4b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -131,6 +131,8 @@
+ 
+ // Populates and encodes a MVKCmdDrawIndexedIndirect command, after populating indexed indirect buffers.
+ void MVKCmdDraw::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 
+ 	// Create an indexed indirect buffer and populate it from the draw arguments.
+ 	uint32_t indirectIdxBuffStride = sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
+@@ -170,6 +172,8 @@
+ }
+ 
+ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 
+ 	if (_vertexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
+ 
+@@ -376,6 +380,8 @@
+ 
+ // Populates and encodes a MVKCmdDrawIndexedIndirect command, after populating an indexed indirect buffer.
+ void MVKCmdDrawIndexed::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 
+ 	// Create an indexed indirect buffer and populate it from the draw arguments.
+ 	uint32_t indirectIdxBuffStride = sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
+@@ -443,6 +449,8 @@
+ }
+ 
+ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 
+ 	if (_indexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
+ 
+@@ -674,6 +682,8 @@
+ 
+ // Populates and encodes a MVKCmdDrawIndexedIndirect command, after populating indexed indirect buffers.
+ void MVKCmdDrawIndirect::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 
+ 	// Create an indexed indirect buffer to be populated from the non-indexed indirect buffer.
+ 	uint32_t indirectIdxBuffStride = sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
+@@ -720,6 +730,8 @@
+ }
+ 
+ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -1025,11 +1037,15 @@
+ }
+ 
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 	encode(cmdEncoder, cmdEncoder->getVkGraphics()._indexBuffer);
+ }
+ 
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKIndexMTLBufferBinding& ibbOrig) {
++	if (!cmdEncoder->getGraphicsPipeline() ||
++	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
+ 
+     cmdEncoder->_isIndexedDraw = true;
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
+index 5119f85..d47cb97 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.h
+@@ -107,6 +107,7 @@ class MVKCmdBindPipeline : public MVKCommand {
+ 
+ public:
+ 	VkResult setContent(MVKCommandBuffer* cmdBuff, VkPipeline pipeline);
++	static bool isValidPipeline(VkPipeline pipeline);
+ 
+ 	virtual bool isTessellationPipeline() { return false; };
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+index 9092954..86f58bf 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "MVKCmdPipeline.h"
++#include <atomic>
+ #include "MVKCommandBuffer.h"
+ #include "MVKCommandPool.h"
+ #include "MVKImage.h"
+@@ -237,7 +238,19 @@
+ #pragma mark -
+ #pragma mark MVKCmdBindPipeline
+ 
++bool MVKCmdBindPipeline::isValidPipeline(VkPipeline pipeline) {
++	auto* mvkPipeline = (MVKPipeline*)pipeline;
++	if (mvkPipeline && mvkPipeline->wasConfigurationSuccessful()) { return true; }
++	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
++	if (!warned.test_and_set()) {
++		fprintf(stderr, "[mvk-warn] Ignoring bind of a null or failed pipeline.\n");
++	}
++	return false;
++}
++
+ VkResult MVKCmdBindPipeline::setContent(MVKCommandBuffer* cmdBuff, VkPipeline pipeline) {
++	_pipeline = nullptr;
++	if (!isValidPipeline(pipeline)) { return VK_ERROR_INITIALIZATION_FAILED; }
+ 	_pipeline = (MVKPipeline*)pipeline;
+ 
+ 	cmdBuff->recordBindPipeline(this);
+@@ -254,7 +267,7 @@
+ }
+ 
+ bool MVKCmdBindGraphicsPipeline::isTessellationPipeline() {
+-	return ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
++	return _pipeline && ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
+ }
+ 
+ 
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
-index 7d16b94..6229e46 100644
+index 7d16b94..e164ebb 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1418,7 +1418,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+   const MVKVulkanGraphicsCommandEncoderState& vk,
+   const MVKVulkanSharedCommandEncoderState& vkShared) {
+ 	MVKGraphicsPipeline* pipeline = vk._pipeline;
+-	if (!pipeline->getMainPipelineState()) // Abort if pipeline could not be created.
++	if (!pipeline || !pipeline->getMainPipelineState()) // Abort if pipeline could not be created.
+ 		return;
+ 
+ 	// Pipeline
 @@ -1446,6 +1446,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	} else {
  		bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageVertex,   MVKMetalGraphicsStage::Vertex);
@@ -19,6 +155,15 @@ index 7d16b94..6229e46 100644
  	}
  	bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageFragment, MVKMetalGraphicsStage::Fragment);
  	mvkEncoder.getState().mtlShared()._useResource.bindAndResetGraphics(encoder);
+@@ -1609,7 +1619,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+ 	MVKShaderStage stage)
+ {
+ 	MVKGraphicsPipeline* pipeline = vk._pipeline;
+-	if (!pipeline->getMainPipelineState()) // Abort if pipeline could not be created.
++	if (!pipeline || !pipeline->getMainPipelineState()) // Abort if pipeline could not be created.
+ 		return;
+ 
+ 
 @@ -1647,8 +1657,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	}
  
@@ -37,6 +182,22 @@ index 7d16b94..6229e46 100644
  	mvkEncoder.getState().mtlShared()._useResource.bindAndResetCompute(encoder);
  }
  
+@@ -1722,6 +1740,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+ }
+ 
+ void MVKCommandEncoderState::bindGraphicsPipeline(MVKGraphicsPipeline* pipeline) {
++	if (!pipeline || !pipeline->wasConfigurationSuccessful()) { return; }
+ 	_mtlGraphics.changePipeline(_vkGraphics._pipeline, pipeline);
+ 	_vkGraphics._pipeline = pipeline;
+ 	MVKPipelineLayout* layout = pipeline->getLayout();
+@@ -1735,6 +1754,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+ }
+ 
+ void MVKCommandEncoderState::bindComputePipeline(MVKComputePipeline* pipeline) {
++	if (!pipeline || !pipeline->wasConfigurationSuccessful()) { return; }
+ 	_vkCompute._pipeline = pipeline;
+ 	MVKPipelineLayout* layout = pipeline->getLayout();
+ 	if (_vkCompute._layout != layout) {
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 index 534a414..001c089 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
@@ -68,7 +229,7 @@ index 534a414..001c089 100644
  
  	void propagateDebugName() override  {}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 9772757..6543c8f 100644
+index 9772757..cc98bed 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -38,6 +38,8 @@
@@ -80,7 +241,18 @@ index 9772757..6543c8f 100644
  
  using namespace std;
  
-@@ -5130,6 +5132,212 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3264,6 +3266,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	// This is captured either as the MoltenVK Git revision, or if that's not available, as the MoltenVK version.
+ 	uint32_t mvkRev = getMoltenVKGitRevision();
+ 	if ( !mvkRev ) { mvkRev = MVK_VERSION; }
++	// Madeira: the cache identifier games saved their pipeline caches under on 2026-10-09
++	// (Detroit rebuilt ~100k pipelines once for it). Changing this value makes every game
++	// throw its saved pipeline cache away and rebuild, so leave it alone.
++	mvkRev ^= 0x4d560001;
+ 	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mvkRev);
+ 	uuidComponentOffset += sizeof(mvkRev);
+ 
+@@ -5130,6 +5136,212 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -293,7 +465,7 @@ index 9772757..6543c8f 100644
  MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
  
  	// If the physical device is lost, bail.
-@@ -5140,6 +5348,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5140,6 +5352,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  
  	initPhysicalDevice(physicalDevice, pCreateInfo);
@@ -306,7 +478,7 @@ index 9772757..6543c8f 100644
  	initPerformanceTracking();
  	enableExtensions(pCreateInfo);
  	enableFeatures(pCreateInfo);
-@@ -5532,6 +5746,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5532,6 +5750,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -347,7 +519,7 @@ index e385e9b..c8e3deb 100644
  
  	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 7eae64c..d5c8809 100644
+index 7eae64c..750892b 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -17,6 +17,7 @@
@@ -384,7 +556,30 @@ index 7eae64c..d5c8809 100644
  	plDesc.stageInputDescriptor.indexBufferIndex = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids[MVKImplicitBuffer::Index];
  
  	plDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-@@ -1872,6 +1884,68 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1658,6 +1670,22 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	auto& mtlFeats = getMetalFeatures();
+ 	if (pFragmentSS) {
+ 		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
++		const auto* pRendInfo = getRenderingCreateInfo(pCreateInfo);
++		shaderConfig.fragmentOutputTypes.assign(pRendInfo->colorAttachmentCount, SPIRType::Unknown);
++		for (uint32_t loc = 0; loc < pRendInfo->colorAttachmentCount; loc++) {
++			if (!mvkIsColorAttachmentUsed(pRendInfo, loc)) { continue; }
++			auto baseType = SPIRType::Float;
++			switch (getPixelFormats()->getFormatType(pRendInfo->pColorAttachmentFormats[loc])) {
++				case kMVKFormatColorUInt8:
++				case kMVKFormatColorUInt16:
++				case kMVKFormatColorUInt32: baseType = SPIRType::UInt; break;
++				case kMVKFormatColorInt8:
++				case kMVKFormatColorInt16:
++				case kMVKFormatColorInt32: baseType = SPIRType::Int; break;
++				default: break;
++			}
++			shaderConfig.fragmentOutputTypes[loc] = baseType;
++		}
+ 		addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
+ 		shaderConfig.options.entryPointName = pFragmentSS->pName;
+@@ -1872,6 +1900,68 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  	return true;
  }
  
@@ -453,7 +648,7 @@ index 7eae64c..d5c8809 100644
  // Adjusts step rates for per-instance vertex buffers based on the number of views to be drawn.
  void MVKGraphicsPipeline::adjustVertexInputForMultiview(MTLVertexDescriptor* inputDesc, const VkPipelineVertexInputStateCreateInfo* pVI, uint32_t viewCount, uint32_t oldViewCount) {
  	uint32_t vbCnt = pVI->vertexBindingDescriptionCount;
-@@ -2392,6 +2466,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -2392,6 +2482,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  }
  
  MVKGraphicsPipeline::~MVKGraphicsPipeline() {
@@ -461,7 +656,17 @@ index 7eae64c..d5c8809 100644
  	@synchronized (getMTLDevice()) {
  		[_mtlTessVertexStageState release];
  		[_mtlTessVertexStageIndex16State release];
-@@ -3092,10 +3167,20 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3027,7 +3118,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
+ 				cfg.shaderOutputs,
+ 				cfg.resourceBindings,
+ 				cfg.discreteDescriptorSets,
+-				cfg.dynamicBufferDescriptors);
++				cfg.dynamicBufferDescriptors,
++				cfg.fragmentOutputTypes);
+ 	}
+ 
+ 	template<class Archive>
+@@ -3092,10 +3184,20 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  #pragma mark -
  #pragma mark MVKRenderPipelineCompiler
  
@@ -482,7 +687,7 @@ index 7eae64c..d5c8809 100644
  		auto mtlDev = getMTLDevice();
  		@synchronized (mtlDev) {
  			[mtlDev newRenderPipelineStateWithDescriptor: mtlRPLDesc
-@@ -3106,6 +3191,7 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3106,6 +3208,7 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  		}
  	});
  
@@ -490,7 +695,7 @@ index 7eae64c..d5c8809 100644
  	return [_mtlRenderPipelineState retain];
  }
  
-@@ -3130,6 +3216,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3130,6 +3233,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  	unique_lock<mutex> lock(_completionLock);
  
  	compile(lock, ^{
@@ -504,7 +709,7 @@ index 7eae64c..d5c8809 100644
  		@synchronized (mtlDev) {
  			[mtlDev newComputePipelineStateWithDescriptor: plDesc
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a4..f137761 100644
+index 3aa44a4..117af3c 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -17,6 +17,7 @@
@@ -515,7 +720,7 @@ index 3aa44a4..f137761 100644
  #include "MVKPipeline.h"
  #include "MVKFoundation.h"
  #include <sys/stat.h>
-@@ -166,6 +167,15 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -166,6 +167,24 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			if ( !dbName ) { dbName = _owner->getDebugName(); }
  			_owner->setMetalObjectLabel(mtlFunc, dbName);
  
@@ -524,14 +729,23 @@ index 3aa44a4..f137761 100644
 +			// set: set it once, atomically (a nonatomic reset released the number another
 +			// thread was reading, a use-after-free in CFNumberGetValue).
 +			if (mtlFunc && !objc_getAssociatedObject(mtlFunc, &kMVKArchiveShaderKey)) {
++				// Only a shader whose fragment outputs were converted to the attachment
++				// type (SPIRV-Cross emits a "<Out>_attachment(thread const ...)" adapter)
++				// gets a new routing key; every other shader keeps the SPIR-V hash, so the
++				// binary archives games already built stay valid.
++				string msl;
++				decompressMSL(msl);
++				size_t routeHash = shaderModule->getKey().codeHash;
++				if (msl.find("_attachment(thread const ") != string::npos)
++					routeHash = mvkHash(msl.data(), msl.size(), routeHash);
 +				objc_setAssociatedObject(mtlFunc, &kMVKArchiveShaderKey,
-+					@(shaderModule->getKey().codeHash), OBJC_ASSOCIATION_RETAIN);
++					@(routeHash), OBJC_ASSOCIATION_RETAIN);
 +			}
 +
  			auto& wgSize = _shaderConversionResultInfo.entryPoint.workgroupSize;
  			return MVKMTLFunction(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
  																					getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
-@@ -415,6 +425,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -415,6 +434,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
  }
  
@@ -541,7 +755,7 @@ index 3aa44a4..f137761 100644
  bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
  							  SPIRVToMSLConversionResult& conversionResult) {
  	const auto& mvkCfg = getMVKConfig();
-@@ -422,7 +435,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -422,7 +444,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
  
  	uint64_t startTime = getPerformanceTimestamp();
@@ -551,7 +765,7 @@ index 3aa44a4..f137761 100644
  	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
  
  	const char* dumpDir = getMVKConfig().shaderDumpDir;
-@@ -554,10 +569,47 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -554,10 +578,128 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  #pragma mark -
  #pragma mark MVKShaderLibraryCompiler
  
@@ -590,20 +804,157 @@ index 3aa44a4..f137761 100644
 +	if (!g_mvkt_sources->insert(h).second) { ++g_mvkt_repeat; }
 +}
 +
++// Madeira: process-wide cache of compiled MSL libraries, least recently used out.
++// A library belongs to its shader module and goes with it, and games that create and
++// destroy pipelines in bulk compile the same source again and again: Detroit: Become
++// Human compiled 203,776 sources (82 ms each) of which 180,121 were exact repeats in
++// the same run. The key is the complete source plus every other compile input
++// (macros, fast-math flags, position invariance), so a hit is the library a fresh
++// compile would return. MVK_MADEIRA_LIBRARY_CACHE sets the entry count (default 6000,
++// 0 = off); a library holds its compiled AIR, tens of KB, so the cap bounds memory.
++#include <list>
++#include <unordered_map>
++namespace {
++struct MVKLibCacheEntry { id<MTLLibrary> lib; std::list<uint64_t>::iterator lru; size_t length; };
++std::mutex g_mvkLibCacheLock;
++std::unordered_map<uint64_t, MVKLibCacheEntry>* g_mvkLibCache;
++std::list<uint64_t>* g_mvkLibLRU;
++std::atomic<uint64_t> g_mvkLibHits, g_mvkLibMisses;
++size_t mvkLibCacheCap() {
++	static size_t cap = [] {
++		const char* v = getenv("MVK_MADEIRA_LIBRARY_CACHE");
++		return (v && *v) ? (size_t)strtoull(v, nullptr, 10) : (size_t)6000;
++	}();
++	return cap;
++}
++uint64_t mvkLibCacheKey(NSString* src, const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& macros,
++						uint32_t fastMath, bool invariant, size_t* length) {
++	const char* c = src.UTF8String;
++	size_t n = c ? strlen(c) : 0;
++	*length = n;
++	uint64_t h = 1469598103934665603ull;
++	for (size_t i = 0; i < n; i++) { h ^= (unsigned char)c[i]; h *= 1099511628211ull; }
++	for (auto& m : macros) {
++		h = h * 1099511628211ull ^ std::hash<std::string>()(m.first.name);
++		h = h * 1099511628211ull ^ (uint64_t)m.second.value.ui64 ^ ((uint64_t)m.second.size << 56);
++	}
++	h = h * 1099511628211ull ^ fastMath;
++	h = h * 1099511628211ull ^ (invariant ? 0x9e3779b97f4a7c15ull : 0);
++	return h;
++}
++id<MTLLibrary> mvkLibCacheGet(uint64_t key, size_t length) {
++	std::lock_guard<std::mutex> g(g_mvkLibCacheLock);
++	if (!g_mvkLibCache) { return nil; }
++	auto it = g_mvkLibCache->find(key);
++	if (it == g_mvkLibCache->end() || it->second.length != length) { return nil; }
++	g_mvkLibLRU->splice(g_mvkLibLRU->begin(), *g_mvkLibLRU, it->second.lru);
++	return [it->second.lib retain];
++}
++void mvkLibCachePut(uint64_t key, size_t length, id<MTLLibrary> lib) {
++	size_t cap = mvkLibCacheCap();
++	if (!lib || !cap) { return; }
++	std::lock_guard<std::mutex> g(g_mvkLibCacheLock);
++	if (!g_mvkLibCache) { g_mvkLibCache = new std::unordered_map<uint64_t, MVKLibCacheEntry>(); g_mvkLibLRU = new std::list<uint64_t>(); }
++	if (g_mvkLibCache->count(key)) { return; }
++	g_mvkLibLRU->push_front(key);
++	(*g_mvkLibCache)[key] = { [lib retain], g_mvkLibLRU->begin(), length };
++	while (g_mvkLibCache->size() > cap) {
++		uint64_t old = g_mvkLibLRU->back();
++		g_mvkLibLRU->pop_back();
++		auto it = g_mvkLibCache->find(old);
++		if (it != g_mvkLibCache->end()) { [it->second.lib release]; g_mvkLibCache->erase(it); }
++	}
++}
++void mvkLibCacheNote(bool hit) {
++	uint64_t n = (hit ? ++g_mvkLibHits : ++g_mvkLibMisses);
++	uint64_t h = g_mvkLibHits.load(), m = g_mvkLibMisses.load();
++	if ((h + m) % 4096 == 0)
++		fprintf(stderr, "[mvk-libcache] hits=%llu misses=%llu (%.0f%%) cap=%zu\n", (unsigned long long)h, (unsigned long long)m,
++				(h + m) ? 100.0 * h / (h + m) : 0.0, mvkLibCacheCap());
++	(void)n;
++}
++}
++
  id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
  													   const SPIRVToMSLConversionResultInfo& shaderConversionResults,
  													   const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& specializationMacroDef) {
++	size_t cacheLength = 0;
++	uint64_t cacheKey = 0;
++	if (mvkLibCacheCap()) {
++		cacheKey = mvkLibCacheKey(mslSourceCode, specializationMacroDef, (uint32_t)shaderConversionResults.entryPoint.fpFastMathFlags,
++								  shaderConversionResults.isPositionInvariant, &cacheLength);
++		if (id<MTLLibrary> cached = mvkLibCacheGet(cacheKey, cacheLength)) {
++			mvkLibCacheNote(true);
++			return cached;	// retained, like a fresh compile
++		}
++	}
  	unique_lock<mutex> lock(_completionLock);
 +	uint64_t mvkTimeStart = mvkTimeNow();
 +	mvkTimeNoteSource(mslSourceCode, specializationMacroDef);
  
  	compile(lock, ^{
  		auto mtlDev = getMTLDevice();
-@@ -589,6 +641,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -589,6 +731,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  		}
  	});
  
 +	mvkTimeAdd(1, mvkTimeStart);
++	if (mvkLibCacheCap()) {
++		mvkLibCacheNote(false);
++		mvkLibCachePut(cacheKey, cacheLength, _mtlLibrary);
++	}
  	return [_mtlLibrary retain];
  }
  
+diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+index b15fe5e..4a06751 100644
+--- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
++++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+@@ -1430,6 +1430,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindPipeline(
+     VkPipeline                                  pipeline) {
+ 	
+ 	MVKTraceVulkanCallStart();
++	if (!MVKCmdBindPipeline::isValidPipeline(pipeline)) {
++		MVKTraceVulkanCallEnd();
++		return;
++	}
+ 	switch (pipelineBindPoint) {
+ 		case VK_PIPELINE_BIND_POINT_GRAPHICS: {
+ 			MVKAddCmd(BindGraphicsPipeline, commandBuffer, pipeline);
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index 406f4f8..a3517ef 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -191,6 +191,7 @@ MVK_PUBLIC_SYMBOL void SPIRVToMSLConversionConfiguration::markAllInterfaceVarsAn
+ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToMSLConversionConfiguration& other) const {
+ 
+     if ( !options.matches(other.options) ) { return false; }
++	if (fragmentOutputTypes != other.fragmentOutputTypes) { return false; }
+ 
+ 	for (const auto& si : shaderInputs) {
+ 		if (si.outIsUsedByShader && !containsMatching(other.shaderInputs, si)) { return false; }
+@@ -311,6 +312,12 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 			pMSLCompiler->add_msl_shader_output(so.shaderVar);
+ 		}
+ 
++		if (shaderConfig.options.entryPointStage == ExecutionModelFragment) {
++			for (uint32_t loc = 0; loc < shaderConfig.fragmentOutputTypes.size(); loc++) {
++				pMSLCompiler->set_fragment_output_type(loc, shaderConfig.fragmentOutputTypes[loc]);
++			}
++		}
++
+ 		// Add resource bindings and hardcoded constexpr samplers
+ 		for (auto& rb : shaderConfig.resourceBindings) {
+ 			auto& rbb = rb.resourceBinding;
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+index bffc072..e0f3f01 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+@@ -153,6 +153,7 @@ namespace mvk {
+ 		std::vector<MSLResourceBinding> resourceBindings;
+ 		std::vector<uint32_t> discreteDescriptorSets;
+ 		std::vector<DescriptorBinding> dynamicBufferDescriptors;
++		std::vector<SPIRV_CROSS_NAMESPACE::SPIRType::BaseType> fragmentOutputTypes;
+ 
+ 		/** Returns whether the pipeline stage being converted supports vertex attributes. */
+ 		bool stageSupportsVertexAttributes() const;

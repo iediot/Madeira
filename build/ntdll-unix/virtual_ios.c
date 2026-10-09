@@ -16205,7 +16205,20 @@ static int ios_swap_is_fexjit( uintptr_t b, size_t size )
 {
     uintptr_t e = b + size, rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
     size_t ps = ios_jit_pool_size_global;
-    if (ios_fex_arena_base_unix && b < ios_fex_arena_end_unix && e > ios_fex_arena_base_unix) return 1;
+    /* ml1314: MADEIRA_SWAP_FEX_ARENA=1 lets the tier back read/write commits in FEX's
+     * arena; the JIT pool stays out and executable views are refused by the callers.
+     * On an iPad the arena is the constrained 16 GB at 0x800000000 where Wine also
+     * places a 64-bit game's memory: Detroit: Become Human committed its data there
+     * (PAGE_READWRITE, from its own threads), so the tier skipped ~8 GB as "fex/jit"
+     * and the game was killed at the 12 GB limit. Opt in: FEX's own hot structures
+     * share the arena. */
+    static int arena_ok = -1;
+    if (arena_ok < 0)
+    {
+        const char *v = getenv( "MADEIRA_SWAP_FEX_ARENA" );
+        arena_ok = v && *v == '1';
+    }
+    if (!arena_ok && ios_fex_arena_base_unix && b < ios_fex_arena_end_unix && e > ios_fex_arena_base_unix) return 1;
     if (ps && rx && b < rx + ps && e > rx) return 1;
     if (ps && rw && b < rw + ps && e > rw) return 1;
     return 0;

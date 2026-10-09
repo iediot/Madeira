@@ -15977,21 +15977,28 @@ index 00dfd96a..3264a844 100644
      };
      NTSTATUS status;
 diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
-index e57e32a7..299c6e35 100644
+index e57e32a7..025a1e18 100644
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
-@@ -1113,6 +1113,26 @@ static VkResult win32u_vkGetMemoryWin32HandlePropertiesKHR( VkDevice client_devi
+@@ -1113,6 +1113,33 @@ static VkResult win32u_vkGetMemoryWin32HandlePropertiesKHR( VkDevice client_devi
      return VK_SUCCESS;
  }
  
 +#ifdef WINE_IOS
-+/* Raw stderr survives Madeira's quiet Wine-channel filter. Log every map so
-+ * an allocation later involved in a fault is not lost to a sampling cap. */
++/* Raw stderr survives Madeira's quiet Wine-channel filter. Every failed map is
++ * logged; successful ones only for the first 64 and then one in 100,000 (ml1313).
++ * Logging each map (with a virtual-memory query) cost Detroit: Become Human about
++ * 6,400 lines and queries a second - 1,026,295 lines in 160 s over 33 memory objects
++ * the game maps again and again. */
 +static void ios_vulkan_note_map( struct device_memory *memory, const VkMemoryMapInfoKHR *info,
 +                                VkResult result, void *data, const char *path )
 +{
++    static LONG maps;
 +    MEMORY_BASIC_INFORMATION mbi = {0};
-+    NTSTATUS status = data ? NtQueryVirtualMemory( GetCurrentProcess(), data, MemoryBasicInformation,
++    NTSTATUS status;
++    LONG n = InterlockedIncrement( &maps );
++    if (result == VK_SUCCESS && n > 64 && n % 100000) return;
++    status = data ? NtQueryVirtualMemory( GetCurrentProcess(), data, MemoryBasicInformation,
 +                                                   &mbi, sizeof(mbi), NULL ) : STATUS_INVALID_PARAMETER;
 +    fprintf( stderr, "[vulkan-map] tid=%04x memory=%#llx host=%#llx offset=%#llx size=%#llx "
 +             "allocation=%#llx path=%s result=%d ptr=%p query=%#x base=%p region=%#lx state=%#lx protect=%#lx\n",
@@ -16007,7 +16014,7 @@ index e57e32a7..299c6e35 100644
  static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMapInfoKHR *map_info, void **data )
  {
      struct vulkan_device *device = vulkan_device_from_handle( client_device );
-@@ -1130,6 +1150,9 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
+@@ -1130,6 +1157,9 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
      {
          *data = (char *)memory->vm_map + info.offset;
          TRACE( "returning %p\n", *data );
@@ -16017,7 +16024,7 @@ index e57e32a7..299c6e35 100644
          return VK_SUCCESS;
      }
  
-@@ -1183,6 +1206,10 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
+@@ -1183,6 +1213,10 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
      }
  #endif
  
@@ -16075,10 +16082,10 @@ index 39c0540a..bab12b1b 100644
      {
          WaitForSingleObject( start_event, INFINITE );
 diff --git a/dlls/winevulkan/vulkan_thunks.c b/dlls/winevulkan/vulkan_thunks.c
-index e7d394fa..47a29901 100644
+index e7d394fa..5c4fa9f8 100644
 --- a/dlls/winevulkan/vulkan_thunks.c
 +++ b/dlls/winevulkan/vulkan_thunks.c
-@@ -25,6 +25,151 @@
+@@ -25,6 +25,183 @@
  
  #include "vulkan_private.h"
  
@@ -16119,6 +16126,38 @@ index e7d394fa..47a29901 100644
 +    if (n <= 200 || !(n % 500))
 +        fprintf( stderr, "[vk-cache] %s #%ld result=%d %llu %llu live=%ld\n", names[kind], (long)n, result, a, b,
 +             (long)ios_vk_caches_live );
++}
++
++/* [vk-fps] (ml1315): frames presented through vkQueuePresentKHR, every 5 s: fps,
++ * average and worst frame interval, and frames over 50 ms (the "dead frames" a
++ * player notices). Madeira's [perf] line only counts DXMT presents, so a Vulkan
++ * game showed 0 fps there. */
++static void ios_vk_fps_note( void )
++{
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static unsigned long long last_ns, window_ns, worst_ns, sum_ns;
++    static unsigned frames, slow;
++    struct timespec ts;
++    unsigned long long now, dt;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    now = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++    pthread_mutex_lock( &lock );
++    if (last_ns)
++    {
++        dt = now - last_ns;
++        frames++; sum_ns += dt;
++        if (dt > worst_ns) worst_ns = dt;
++        if (dt > 50000000ull) slow++;
++    }
++    else window_ns = now;
++    last_ns = now;
++    if (now - window_ns >= 5000000000ull && frames)
++    {
++        fprintf( stderr, "[vk-fps] %.1f fps | frame avg %.1f ms worst %.1f ms | over 50 ms: %u of %u\n",
++                 frames * 1e9 / (double)(now - window_ns), sum_ns / 1e6 / frames, worst_ns / 1e6, slow, frames );
++        frames = slow = 0; sum_ns = worst_ns = 0; window_ns = now;
++    }
++    pthread_mutex_unlock( &lock );
 +}
 +
 +/* [vk-wait]: result counts of the calls a game blocks on (fences, semaphores,
@@ -16230,7 +16269,7 @@ index e7d394fa..47a29901 100644
  WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
  
  typedef struct VkGeometryAABBNV32
-@@ -52232,7 +52377,22 @@ static NTSTATUS thunk64_vkCreateComputePipelines(void *args)
+@@ -52232,7 +52409,22 @@ static NTSTATUS thunk64_vkCreateComputePipelines(void *args)
  
      TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
  
@@ -16254,7 +16293,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -52791,7 +52951,22 @@ static NTSTATUS thunk64_vkCreateGraphicsPipelines(void *args)
+@@ -52791,7 +52983,22 @@ static NTSTATUS thunk64_vkCreateGraphicsPipelines(void *args)
  
      TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
  
@@ -16278,7 +16317,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -53158,6 +53333,13 @@ static NTSTATUS thunk64_vkCreatePipelineCache(void *args)
+@@ -53158,6 +53365,13 @@ static NTSTATUS thunk64_vkCreatePipelineCache(void *args)
      TRACE("%p, %p, %p, %p\n", params->device, params->pCreateInfo, params->pAllocator, params->pPipelineCache);
  
      params->result = vulkan_device_from_handle(params->device)->p_vkCreatePipelineCache(vulkan_device_from_handle(params->device)->host.device, params->pCreateInfo, NULL, params->pPipelineCache);
@@ -16292,7 +16331,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -53649,6 +53831,9 @@ static NTSTATUS thunk64_vkCreateShaderModule(void *args)
+@@ -53649,6 +53863,9 @@ static NTSTATUS thunk64_vkCreateShaderModule(void *args)
      TRACE("%p, %p, %p, %p\n", params->device, params->pCreateInfo, params->pAllocator, params->pShaderModule);
  
      params->result = vulkan_device_from_handle(params->device)->p_vkCreateShaderModule(vulkan_device_from_handle(params->device)->host.device, params->pCreateInfo, NULL, params->pShaderModule);
@@ -16302,7 +16341,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -54817,6 +55002,9 @@ static NTSTATUS thunk64_vkDestroyPipeline(void *args)
+@@ -54817,6 +55034,9 @@ static NTSTATUS thunk64_vkDestroyPipeline(void *args)
      TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->pipeline), params->pAllocator);
  
      vulkan_device_from_handle(params->device)->p_vkDestroyPipeline(vulkan_device_from_handle(params->device)->host.device, params->pipeline, NULL);
@@ -16312,7 +16351,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -54871,6 +55059,10 @@ static NTSTATUS thunk64_vkDestroyPipelineCache(void *args)
+@@ -54871,6 +55091,10 @@ static NTSTATUS thunk64_vkDestroyPipelineCache(void *args)
      TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->pAllocator);
  
      vulkan_device_from_handle(params->device)->p_vkDestroyPipelineCache(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, NULL);
@@ -16323,7 +16362,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -55168,6 +55360,9 @@ static NTSTATUS thunk64_vkDestroyShaderModule(void *args)
+@@ -55168,6 +55392,9 @@ static NTSTATUS thunk64_vkDestroyShaderModule(void *args)
      TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->shaderModule), params->pAllocator);
  
      vulkan_device_from_handle(params->device)->p_vkDestroyShaderModule(vulkan_device_from_handle(params->device)->host.device, params->shaderModule, NULL);
@@ -16333,7 +16372,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -55384,6 +55579,9 @@ static NTSTATUS thunk64_vkDeviceWaitIdle(void *args)
+@@ -55384,6 +55611,9 @@ static NTSTATUS thunk64_vkDeviceWaitIdle(void *args)
      TRACE("%p\n", params->device);
  
      params->result = vulkan_device_from_handle(params->device)->p_vkDeviceWaitIdle(vulkan_device_from_handle(params->device)->host.device);
@@ -16343,7 +16382,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -57742,6 +57940,9 @@ static NTSTATUS thunk64_vkGetFenceStatus(void *args)
+@@ -57742,6 +57972,9 @@ static NTSTATUS thunk64_vkGetFenceStatus(void *args)
      TRACE("%p, 0x%s\n", params->device, wine_dbgstr_longlong(params->fence));
  
      params->result = vulkan_device_from_handle(params->device)->p_vkGetFenceStatus(vulkan_device_from_handle(params->device)->host.device, vulkan_fence_from_handle(params->fence)->host.fence);
@@ -16353,7 +16392,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -60596,7 +60797,42 @@ static NTSTATUS thunk64_vkGetPipelineCacheData(void *args)
+@@ -60596,7 +60829,42 @@ static NTSTATUS thunk64_vkGetPipelineCacheData(void *args)
  
      TRACE("%p, 0x%s, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->pDataSize, params->pData);
  
@@ -16396,7 +16435,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62051,6 +62287,15 @@ static NTSTATUS thunk64_vkMergePipelineCaches(void *args)
+@@ -62051,6 +62319,15 @@ static NTSTATUS thunk64_vkMergePipelineCaches(void *args)
      TRACE("%p, 0x%s, %u, %p\n", params->device, wine_dbgstr_longlong(params->dstCache), params->srcCacheCount, params->pSrcCaches);
  
      params->result = vulkan_device_from_handle(params->device)->p_vkMergePipelineCaches(vulkan_device_from_handle(params->device)->host.device, params->dstCache, params->srcCacheCount, params->pSrcCaches);
@@ -16412,17 +16451,18 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62265,6 +62510,9 @@ static NTSTATUS thunk64_vkQueuePresentKHR(void *args)
+@@ -62265,6 +62542,10 @@ static NTSTATUS thunk64_vkQueuePresentKHR(void *args)
      convert_VkPresentInfoKHR_win64_to_unwrapped_host(ctx, params->pPresentInfo, &pPresentInfo_host);
      params->result = vk_funcs->p_vkQueuePresentKHR(params->queue, &pPresentInfo_host);
      free_conversion_context(ctx);
 +#ifdef WINE_IOS
 +    ios_vk_wait_note( 4, params->result );
++    ios_vk_fps_note();
 +#endif
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62331,6 +62579,9 @@ static NTSTATUS thunk64_vkQueueSubmit(void *args)
+@@ -62331,6 +62612,9 @@ static NTSTATUS thunk64_vkQueueSubmit(void *args)
      pSubmits_host = convert_VkSubmitInfo_array_win64_to_unwrapped_host(ctx, params->pSubmits, params->submitCount);
      params->result = vk_funcs->p_vkQueueSubmit(params->queue, params->submitCount, pSubmits_host, params->fence);
      free_conversion_context(ctx);
@@ -16432,7 +16472,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62372,6 +62623,9 @@ static NTSTATUS thunk64_vkQueueSubmit2(void *args)
+@@ -62372,6 +62656,9 @@ static NTSTATUS thunk64_vkQueueSubmit2(void *args)
      pSubmits_host = convert_VkSubmitInfo2_array_win64_to_unwrapped_host(ctx, params->pSubmits, params->submitCount);
      params->result = vk_funcs->p_vkQueueSubmit2(params->queue, params->submitCount, pSubmits_host, params->fence);
      free_conversion_context(ctx);
@@ -16442,7 +16482,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62413,6 +62667,9 @@ static NTSTATUS thunk64_vkQueueSubmit2KHR(void *args)
+@@ -62413,6 +62700,9 @@ static NTSTATUS thunk64_vkQueueSubmit2KHR(void *args)
      pSubmits_host = convert_VkSubmitInfo2_array_win64_to_unwrapped_host(ctx, params->pSubmits, params->submitCount);
      params->result = vk_funcs->p_vkQueueSubmit2KHR(params->queue, params->submitCount, pSubmits_host, params->fence);
      free_conversion_context(ctx);
@@ -16452,7 +16492,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62448,6 +62705,9 @@ static NTSTATUS thunk64_vkQueueWaitIdle(void *args)
+@@ -62448,6 +62738,9 @@ static NTSTATUS thunk64_vkQueueWaitIdle(void *args)
      TRACE("%p\n", params->queue);
  
      params->result = vulkan_queue_from_handle(params->queue)->device->p_vkQueueWaitIdle(vulkan_queue_from_handle(params->queue)->host.queue);
@@ -16462,7 +16502,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -63710,6 +63970,9 @@ static NTSTATUS thunk64_vkWaitForFences(void *args)
+@@ -63710,6 +64003,9 @@ static NTSTATUS thunk64_vkWaitForFences(void *args)
      pFences_host = convert_VkFence_array_win64_to_host(ctx, params->pFences, params->fenceCount);
      params->result = vulkan_device_from_handle(params->device)->p_vkWaitForFences(vulkan_device_from_handle(params->device)->host.device, params->fenceCount, pFences_host, params->waitAll, params->timeout);
      free_conversion_context(ctx);
@@ -16472,7 +16512,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -63811,6 +64074,9 @@ static NTSTATUS thunk64_vkWaitSemaphores(void *args)
+@@ -63811,6 +64107,9 @@ static NTSTATUS thunk64_vkWaitSemaphores(void *args)
      convert_VkSemaphoreWaitInfo_win64_to_host(ctx, params->pWaitInfo, &pWaitInfo_host);
      params->result = vulkan_device_from_handle(params->device)->p_vkWaitSemaphores(vulkan_device_from_handle(params->device)->host.device, &pWaitInfo_host, params->timeout);
      free_conversion_context(ctx);
@@ -16482,7 +16522,7 @@ index e7d394fa..47a29901 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -63851,6 +64117,9 @@ static NTSTATUS thunk64_vkWaitSemaphoresKHR(void *args)
+@@ -63851,6 +64150,9 @@ static NTSTATUS thunk64_vkWaitSemaphoresKHR(void *args)
      convert_VkSemaphoreWaitInfo_win64_to_host(ctx, params->pWaitInfo, &pWaitInfo_host);
      params->result = vulkan_device_from_handle(params->device)->p_vkWaitSemaphoresKHR(vulkan_device_from_handle(params->device)->host.device, &pWaitInfo_host, params->timeout);
      free_conversion_context(ctx);

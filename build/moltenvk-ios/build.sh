@@ -31,6 +31,29 @@ fi
 
 cd "$SRC"
 [ -d External/build ] || ./fetchDependencies --ios
+# SPIRV-Cross is a separate, ignored dependency repository.
+CROSS_PATCH="$R/patches/spirv-cross-moltenvk-output-types.patch"
+if git -C External/SPIRV-Cross apply --reverse --check "$CROSS_PATCH" 2>/dev/null; then
+    echo "Madeira SPIRV-Cross patch already applied"
+elif git -C External/SPIRV-Cross apply --check "$CROSS_PATCH"; then
+    git -C External/SPIRV-Cross apply "$CROSS_PATCH"
+else
+    echo "SPIRV-Cross patch does not apply cleanly" >&2
+    exit 1
+fi
+
+# MoltenVK links the packaged dependency, not the SPIRV-Cross sources directly.
+# Rebuild it after patching, including when External/build already exists.
+SKIP_PACKAGING=Y xcodebuild build -project ExternalDependencies.xcodeproj \
+    -scheme ExternalDependencies-iOS -destination 'generic/platform=iOS' \
+    -configuration Release -derivedDataPath "$SRC/External/build/DerivedData-deps-ios" \
+    CLANG_MODULE_CACHE_PATH="$SRC/External/build/DerivedData-deps-ios/ModuleCache.noindex" -quiet
+# Package directly: the upstream finish script invokes a separate macOS clean
+# with a default DerivedData path, outside this workspace.
+PROJECT_DIR="$SRC" CONFIGURATION=Release bash Scripts/create_ext_lib_xcframeworks.sh
+ln -sfn Release External/build/Latest
+
+
 # Equivalent to `make ios`, with build intermediates kept in the workspace.
 xcodebuild build -project MoltenVKPackaging.xcodeproj \
     -scheme 'MoltenVK Package (iOS only)' -destination 'generic/platform=iOS' \
@@ -38,6 +61,11 @@ xcodebuild build -project MoltenVKPackaging.xcodeproj \
     CLANG_MODULE_CACHE_PATH="$SRC/External/build/DerivedData-ios/ModuleCache.noindex" -quiet
 
 BIN="$SRC/Package/Release/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework/MoltenVK"
+# The packaging phase can leave the xcframework copy stale while the dynamic
+# framework itself was relinked (seen 2026-10-10: three builds shipped a binary
+# from before their changes). Take whichever is newer.
+BUILT="$SRC/External/build/DerivedData-ios/Build/Products/Release-iphoneos/MoltenVK.framework/MoltenVK"
+if [ -f "$BUILT" ] && [ "$BUILT" -nt "$BIN" ]; then BIN="$BUILT"; fi
 mkdir -p "$OUT" "$LIC"
 cp "$BIN" "$OUT/libMoltenVK.dylib"
 install_name_tool -id @rpath/libMoltenVK.dylib "$OUT/libMoltenVK.dylib"

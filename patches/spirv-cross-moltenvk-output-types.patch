@@ -1,0 +1,125 @@
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index c5a9d433..d7b01eca 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -8410,6 +8410,7 @@ void CompilerMSL::declare_complex_constant_arrays()
+ 
+ void CompilerMSL::emit_resources()
+ {
++	fragment_output_type_name.clear();
+ 	declare_constant_arrays();
+ 
+ 	// Emit the special [[stage_in]] and [[stage_out]] interface blocks which we created.
+@@ -12099,6 +12100,29 @@ void CompilerMSL::emit_spv_amd_shader_trinary_minmax_op(uint32_t result_type, ui
+ 	}
+ }
+ 
++// Keep shader arithmetic and output reads in the original type. Convert only
++// when returning the completed interface, after component/array flattening and padding.
++SPIRType CompilerMSL::fragment_output_type(const SPIRType &type, uint32_t index)
++{
++	auto result = get<SPIRType>(type.member_types[index]);
++	if (!has_member_decoration(type.self, index, DecorationLocation) ||
++	    has_member_decoration(type.self, index, DecorationBuiltIn))
++		return result;
++	auto itr = fragment_output_types.find(get_member_decoration(type.self, index, DecorationLocation));
++	if (itr == end(fragment_output_types) || itr->second == SPIRType::Unknown)
++		return result;
++	auto base = result.basetype;
++	bool matches = itr->second == SPIRType::Float ? (base == SPIRType::Float || base == SPIRType::Half) :
++	               itr->second == SPIRType::UInt ? (base == SPIRType::UInt || base == SPIRType::UShort || base == SPIRType::UByte) :
++	               (base == SPIRType::Int || base == SPIRType::Short || base == SPIRType::SByte);
++	if (!matches)
++	{
++		result.basetype = itr->second;
++		result.width = 32;
++	}
++	return result;
++}
++
+ // Emit a structure declaration for the specified interface variable.
+ void CompilerMSL::emit_interface_block(uint32_t ib_var_id)
+ {
+@@ -12109,6 +12133,44 @@ void CompilerMSL::emit_interface_block(uint32_t ib_var_id)
+ 		//assert(ib_type.basetype == SPIRType::Struct && !ib_type.member_types.empty());
+ 		assert(ib_type.basetype == SPIRType::Struct);
+ 		emit_struct(ib_type);
++		if (ib_var_id != stage_out_var_id || get_entry_point().model != ExecutionModelFragment)
++			return;
++		fragment_output_type_name.clear();
++		bool remapped = false;
++		for (uint32_t i = 0; i < ib_type.member_types.size(); i++)
++			remapped |= fragment_output_type(ib_type, i).basetype != get<SPIRType>(ib_type.member_types[i]).basetype;
++		if (!remapped)
++			return;
++
++		fragment_output_type_name = type_to_glsl(ib_type) + "_attachment";
++		statement("struct ", fragment_output_type_name);
++		begin_scope();
++		for (uint32_t i = 0; i < ib_type.member_types.size(); i++)
++		{
++			auto target = fragment_output_type(ib_type, i);
++			statement(type_to_glsl(target), " ", to_member_name(ib_type, i),
++			          member_attribute_qualifier(ib_type, i), ";");
++		}
++		statement(fragment_output_type_name, "(thread const ", type_to_glsl(ib_type), "& value)");
++		begin_scope();
++		for (uint32_t i = 0; i < ib_type.member_types.size(); i++)
++		{
++			auto target = fragment_output_type(ib_type, i);
++			auto name = to_member_name(ib_type, i);
++			// A desktop GPU stores the raw bits of a mismatched output (a float written
++			// to an R32_UINT target keeps its bit pattern: packed velocities, IDs), so
++			// reinterpret when the sizes match; convert only when they cannot be.
++			auto &source = get<SPIRType>(ib_type.member_types[i]);
++			if (target.basetype != source.basetype && target.vecsize == source.vecsize && target.width == source.width)
++				statement(name, " = as_type<", type_to_glsl(target), ">(value.", name, ");");
++			else if (target.basetype != source.basetype)
++				statement(name, " = ", type_to_glsl(target), "(value.", name, ");");
++			else
++				statement(name, " = value.", name, ";");
++		}
++		end_scope();
++		end_scope_decl();
++		statement("");
+ 	}
+ }
+ 
+@@ -14348,6 +14410,9 @@ string CompilerMSL::func_type_decl(SPIRType &type)
+ 	if (entry_point_returns_stage_output())
+ 		return_type = type_to_glsl(get_stage_out_struct_type()) + type_to_array_glsl(type, 0);
+ 
++	if (entry_point_returns_stage_output() && !fragment_output_type_name.empty())
++		return_type = fragment_output_type_name;
++
+ 	// Prepend a entry type, based on the execution model
+ 	string entry_type;
+ 	auto &execution = get_entry_point();
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index de8608f6..4acef07f 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -775,6 +775,13 @@ public:
+ 	// to use for a particular location. The default is 4 if number of components is not overridden.
+ 	void set_fragment_output_components(uint32_t location, uint32_t components);
+ 
++	// Convert mismatched fragment color outputs at the entry point boundary only.
++	// Unknown (the default) preserves the shader's numeric type.
++	void set_fragment_output_type(uint32_t location, SPIRType::BaseType type)
++	{
++		fragment_output_types[location] = type;
++	}
++
+ 	void set_combined_sampler_suffix(const char *suffix);
+ 	const char *get_combined_sampler_suffix() const;
+ 
+@@ -1238,6 +1245,9 @@ protected:
+ 	std::unordered_set<uint32_t> location_outputs_in_use;
+ 	std::unordered_set<uint32_t> location_outputs_in_use_fallback;
+ 	std::unordered_map<uint32_t, uint32_t> fragment_output_components;
++	std::unordered_map<uint32_t, SPIRType::BaseType> fragment_output_types;
++	std::string fragment_output_type_name;
++	SPIRType fragment_output_type(const SPIRType &type, uint32_t index);
+ 	std::unordered_map<uint32_t, uint32_t> builtin_to_automatic_input_location;
+ 	std::unordered_map<uint32_t, uint32_t> builtin_to_automatic_output_location;
+ 	std::vector<std::string> pragma_lines;
