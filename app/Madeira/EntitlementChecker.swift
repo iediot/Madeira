@@ -164,6 +164,7 @@ enum DeviceDiagnostics {
                 + "outside Madeira (StikDebug's app list attaches and leaves). Enable JIT in Madeira before playing.",
                 level: .error)
         }
+        watchPower()
         let screen = UIScreen.main
         let offset = TimeZone.current.secondsFromGMT()
         let free = (try? URL(fileURLWithPath: NSHomeDirectory())
@@ -174,6 +175,21 @@ enum DeviceDiagnostics {
             + String(format: " utc-offset=%@%02d:%02d", offset < 0 ? "-" : "+", abs(offset) / 3600, abs(offset) / 60 % 60)
             + " free-disk=\(free.map { "\($0 >> 30)GB" } ?? "unknown")"
             + " stikdebug-url=\(StikJITHelper.isAvailable ? 1 : 0)")
+    }
+
+    /// Every change of thermal state or Low Power Mode while the app runs. iOS caps the
+    /// performance cores well before the phone feels hot: Slime Rancher ran 60 fps until
+    /// they dropped from ~3.5 GHz to 1.1 GHz mid-session, and only the launch-time
+    /// state was in the log.
+    private static var powerObservers: [NSObjectProtocol] = []
+    static func watchPower() {
+        guard powerObservers.isEmpty else { return }
+        let center = NotificationCenter.default
+        for name in [ProcessInfo.thermalStateDidChangeNotification, Notification.Name.NSProcessInfoPowerStateDidChange] {
+            powerObservers.append(center.addObserver(forName: name, object: nil, queue: nil) { _ in
+                LogStore.shared.log("[device] power changed: \(power())")
+            })
+        }
     }
 
     /// At each launch: the values that change while the app runs.

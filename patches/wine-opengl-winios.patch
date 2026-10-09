@@ -594,7 +594,7 @@ index e617138e..ea201969 100644
          else if (e->t_tail && !e->t_post)
          {
 diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
-index 4d0fd0e1..d6546778 100644
+index 4d0fd0e1..1380d70b 100644
 --- a/dlls/ntdll/unix/sync.c
 +++ b/dlls/ntdll/unix/sync.c
 @@ -2194,13 +2194,62 @@ static void ios_eco_init(void)
@@ -705,6 +705,31 @@ index 4d0fd0e1..d6546778 100644
          {
              __sync_fetch_and_add( &ios_xp_yield_slept, 1 );
              usleep( (useconds_t)ios_ysleep );
+@@ -5119,9 +5178,23 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
+         susp[j].strikes++;
+         dprintf( 2, "[lock-orphan] SRW %#llx word=%08x waiters=%d no-live-stamp strike=%d/3 rev=ml447\n",
+                  lock, word, nsame, susp[j].strikes );
++        /* ml1316: "no live stamp" only means no recorded owner, not a dead one.
++         * Stamps come from some acquire paths only, so a lock a live thread took
++         * elsewhere (x86-64 code under emulation) looks the same: Slime Rancher had
++         * ten threads waiting on a lock its owner still held, the reap released
++         * it under that owner, and the next thread died outright. Reaping on this
++         * evidence is now opt-in (MADEIRA_SRW_REAP_UNSTAMPED=1); a proven-dead
++         * owner is still reaped through the dead-thread path. */
+         if (susp[j].strikes >= 3)
+         {
+-            ios_srw_reap_exclusive( lock, 0xDEADull );
++            static int reap_unstamped = -1;
++            if (reap_unstamped < 0)
++            {
++                const char *v = getenv( "MADEIRA_SRW_REAP_UNSTAMPED" );
++                reap_unstamped = v && *v == '1';
++            }
++            if (reap_unstamped) ios_srw_reap_exclusive( lock, 0xDEADull );
++            else dprintf( 2, "[lock-orphan] SRW %#llx left held: owner unknown, not proven dead rev=ml1316\n", lock );
+             susp[j].lock = 0;
+             susp[j].strikes = 0;
+         }
 diff --git a/dlls/opengl32/Makefile.in b/dlls/opengl32/Makefile.in
 index 66ce5d28..0128f9cb 100644
 --- a/dlls/opengl32/Makefile.in

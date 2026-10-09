@@ -23,6 +23,7 @@
 #endif
 
 #include "config.h"
+#include "perf_ios.h"
 #include "../madeira_cfg.h"   /* ml1095: one config file */
 #include <malloc/malloc.h>
 
@@ -145,6 +146,7 @@ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
  * never registered → raw-VA DllMain call → unfixable exec-fault loop. */
 #define IOS_JIT_MAX_MAPPINGS 512
 struct ios_jit_mapping {
+    char perf_name[64]; /* Owned export name, survives PE unmapping. */
     void *pe_base;      /* Original PE image base address (unix mapping) */
     void *jit_base;     /* JIT pool RX address */
     size_t size;        /* Size of the mapping */
@@ -205,6 +207,27 @@ static size_t jit_pool_offset = 0;
  * bytes stay intact until actually rehanded out, so execution from a
  * freed-but-unreused range stays valid during the grace window. */
 static pthread_mutex_t ios_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* All range publication and retirement share ios_pool_lock. Copy names too:
+ * the original PE may already be unmapped, even while its pool copy survives. */
+unsigned ios_perf_image_snapshot(struct ios_perf_image *out, unsigned cap)
+{
+    unsigned n = 0;
+    int i;
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_mapping_count && n < cap; ++i)
+    {
+        const struct ios_jit_mapping *m = &ios_jit_mappings[i];
+        if (!m->pe_base || !m->size) continue;
+        out[n].base = (uintptr_t)m->jit_base;
+        out[n].size = m->size;
+        memcpy(out[n].name, m->perf_name, sizeof(out[n].name));
+        ++n;
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+    return n;
+}
+
 
 #define IOS_POOL_LEDGER_MAX 1024
 struct ios_pool_alloc
@@ -3022,6 +3045,8 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
     int i, published_slot = -1;
 
+    pthread_mutex_lock( &ios_pool_lock );
+
     /* Task #33: purge every entry whose PE range OVERLAPS the new image's.
      * A fresh PE image at [pe_base, pe_base+size) proves any overlapping
      * entry is STALE — two live images cannot occupy the same VA in the
@@ -3076,10 +3101,13 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
                 dprintf(2, "[jit-pool] mapping table FULL (%d slots) — image pe_base=%p jit_base=%p "
                         "WILL FAIL TO TRANSLATE (exec-fault loop incoming) — bump IOS_JIT_MAX_MAPPINGS!\n",
                         IOS_JIT_MAX_MAPPINGS, pe_base, jit_base);
+                pthread_mutex_unlock( &ios_pool_lock );
                 return;
             }
             slot = ios_jit_mapping_count;
         }
+        snprintf( ios_jit_mappings[slot].perf_name, sizeof(ios_jit_mappings[slot].perf_name),
+                  "%s", ios_pe_module_name( pe_base, size ) );
         ios_jit_mappings[slot].jit_base = jit_base;
         ios_jit_mappings[slot].size = size;
         ios_jit_mappings[slot].text_offset = 0;
@@ -3103,6 +3131,7 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
         if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
         published_slot = slot;
     }
+    pthread_mutex_unlock( &ios_pool_lock );
 
     /* If xtajit64 has already registered its alias-mapping push callback
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
@@ -14367,9 +14396,16 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
      * last (readers' match key) behind a barrier. */
     {
         int slot = -1, si;
+        pthread_mutex_lock( &ios_pool_lock );
         for (si = 0; si < ios_jit_mapping_count; si++)
             if (!ios_jit_mappings[si].pe_base) { slot = si; break; }
         if (slot < 0) slot = ios_jit_mapping_count;
+        if (slot >= IOS_JIT_MAX_MAPPINGS)
+        {
+            pthread_mutex_unlock( &ios_pool_lock );
+            return -1;
+        }
+        memcpy( ios_jit_mappings[slot].perf_name, m->perf_name, sizeof(m->perf_name) );
         ios_jit_mappings[slot].machine_cached = 0;   /* a reused tombstone keeps no memo */
         ios_jit_mappings[slot].machine_valid = 0;
         ios_jit_mappings[slot].hybrid_cached = 0;
@@ -14389,6 +14425,7 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
         __sync_synchronize();
         ios_jit_mappings[slot].pe_base = m->pe_base;
         if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
+        pthread_mutex_unlock( &ios_pool_lock );
     }
 
     dprintf(2, "[child-ntdll] copied %p+0x%lx -> %p (pool+0x%lx) owner_peb=%p\n",

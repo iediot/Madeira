@@ -199,10 +199,20 @@ index 7d16b94..e164ebb 100644
  	MVKPipelineLayout* layout = pipeline->getLayout();
  	if (_vkCompute._layout != layout) {
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414..001c089 100644
+index 534a414..1c2f4fd 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-@@ -651,9 +651,16 @@ public:
+@@ -35,6 +35,9 @@
+ #import <Metal/Metal.h>
+ #import <QuartzCore/CAMetalLayer.h>
+ 
++// Shared per-device, per-game directory for binary archives and offline MSL.
++NSString* mvkMadeiraGameCacheDirectory(id<MTLDevice> device);
++
+ class MVKInstance;
+ class MVKDevice;
+ class MVKQueue;
+@@ -651,9 +654,16 @@ public:
  };
  
  /** Represents a Vulkan logical GPU device, associated with a physical device. */
@@ -219,7 +229,7 @@ index 534a414..001c089 100644
  
  	/** Returns the Vulkan type of this object. */
  	VkObjectType getVkObjectType() override { return VK_OBJECT_TYPE_DEVICE; }
-@@ -1051,6 +1058,8 @@ public:
+@@ -1051,6 +1061,8 @@ public:
  	}
  
  protected:
@@ -229,7 +239,7 @@ index 534a414..001c089 100644
  
  	void propagateDebugName() override  {}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 9772757..cc98bed 100644
+index 9772757..035fc97 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -38,6 +38,8 @@
@@ -252,7 +262,7 @@ index 9772757..cc98bed 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mvkRev);
  	uuidComponentOffset += sizeof(mvkRev);
  
-@@ -5130,6 +5136,212 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5130,6 +5136,216 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -261,19 +271,23 @@ index 9772757..cc98bed 100644
 +// Metal, not this hash, decides whether the complete pipeline matches.
 +const char kMVKArchiveShaderKey = 0;
 +
++NSString* mvkMadeiraGameCacheDirectory(id<MTLDevice> device) {
++	NSString* root = NSProcessInfo.processInfo.environment[@"MVK_CONFIG_IOS_BINARY_ARCHIVE_DIR"];
++	if (!root.length) { root = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"mvk-binary-archive"]; }
++	NSString* game = NSProcessInfo.processInfo.environment[@"MADEIRA_GAME_KEY"];
++	if (!game.length) { game = NSProcessInfo.processInfo.processName; }
++	NSString* identity = [NSString stringWithFormat:@"v1-%llu-%@-%@", device.registryID, device.name, game];
++	// Stable path component; never interpret a game key as a relative path.
++	uint64_t hash = 14695981039346656037ull;
++	for (const unsigned char* p = (const unsigned char*)identity.UTF8String; *p; ++p) { hash = (hash ^ *p) * 1099511628211ull; }
++	return [root stringByAppendingPathComponent:[NSString stringWithFormat:@"%016llx", (unsigned long long)hash]];
++}
++
 +class MVKBinaryArchiveCache {
 +public:
 +	MVKBinaryArchiveCache(id<MTLDevice> device) : _device(device) {
 +		_queue = dispatch_queue_create("MoltenVK.binary-archive", DISPATCH_QUEUE_SERIAL);
-+		NSString* root = NSProcessInfo.processInfo.environment[@"MVK_CONFIG_IOS_BINARY_ARCHIVE_DIR"];
-+		if (!root.length) { root = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"mvk-binary-archive"]; }
-+		NSString* game = NSProcessInfo.processInfo.environment[@"MADEIRA_GAME_KEY"];
-+		if (!game.length) { game = NSProcessInfo.processInfo.processName; }
-+		NSString* identity = [NSString stringWithFormat:@"v1-%llu-%@-%@", device.registryID, device.name, game];
-+		// Stable path component; never interpret a game key as a relative path.
-+		uint64_t hash = 14695981039346656037ull;
-+		for (const unsigned char* p = (const unsigned char*)identity.UTF8String; *p; ++p) { hash = (hash ^ *p) * 1099511628211ull; }
-+		_directory = [[root stringByAppendingPathComponent:[NSString stringWithFormat:@"%016llx", (unsigned long long)hash]] retain];
++		_directory = [mvkMadeiraGameCacheDirectory(device) retain];
 +		NSError* error = nil;
 +		_enabled = [NSFileManager.defaultManager createDirectoryAtPath:_directory withIntermediateDirectories:YES attributes:nil error:&error];
 +		NSUInteger loaded = 0;
@@ -465,7 +479,7 @@ index 9772757..cc98bed 100644
  MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
  
  	// If the physical device is lost, bail.
-@@ -5140,6 +5352,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5140,6 +5356,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  
  	initPhysicalDevice(physicalDevice, pCreateInfo);
@@ -478,7 +492,7 @@ index 9772757..cc98bed 100644
  	initPerformanceTracking();
  	enableExtensions(pCreateInfo);
  	enableFeatures(pCreateInfo);
-@@ -5532,6 +5750,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5532,6 +5754,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -709,7 +723,7 @@ index 7eae64c..750892b 100644
  		@synchronized (mtlDev) {
  			[mtlDev newComputePipelineStateWithDescriptor: plDesc
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a4..117af3c 100644
+index 3aa44a4..1e2a184 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -17,6 +17,7 @@
@@ -765,7 +779,7 @@ index 3aa44a4..117af3c 100644
  	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
  
  	const char* dumpDir = getMVKConfig().shaderDumpDir;
-@@ -554,10 +578,128 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -554,10 +578,244 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  #pragma mark -
  #pragma mark MVKShaderLibraryCompiler
  
@@ -810,8 +824,8 @@ index 3aa44a4..117af3c 100644
 +// Human compiled 203,776 sources (82 ms each) of which 180,121 were exact repeats in
 +// the same run. The key is the complete source plus every other compile input
 +// (macros, fast-math flags, position invariance), so a hit is the library a fresh
-+// compile would return. MVK_MADEIRA_LIBRARY_CACHE sets the entry count (default 6000,
-+// 0 = off); a library holds its compiled AIR, tens of KB, so the cap bounds memory.
++// compile would return. MVK_MADEIRA_LIBRARY_CACHE sets the entry count (default 256,
++// 0 = off). A library is far from small: 3,300 of them took Detroit past the iPad's 12 GB limit in 3 minutes, so the cap stays low; precompiled libraries cover the rest.
 +#include <list>
 +#include <unordered_map>
 +namespace {
@@ -823,7 +837,7 @@ index 3aa44a4..117af3c 100644
 +size_t mvkLibCacheCap() {
 +	static size_t cap = [] {
 +		const char* v = getenv("MVK_MADEIRA_LIBRARY_CACHE");
-+		return (v && *v) ? (size_t)strtoull(v, nullptr, 10) : (size_t)6000;
++		return (v && *v) ? (size_t)strtoull(v, nullptr, 10) : (size_t)256;
 +	}();
 +	return cap;
 +}
@@ -873,20 +887,136 @@ index 3aa44a4..117af3c 100644
 +				(h + m) ? 100.0 * h / (h + m) : 0.0, mvkLibCacheCap());
 +	(void)n;
 +}
++// Disk I/O is serialized, including quota accounting and duplicate suppression.
++// Bound queued source memory too: a slow/full disk must not grow the process heap.
++std::atomic<uint64_t> g_mvkPrecompLoaded{0}, g_mvkPrecompCompiled{0}, g_mvkPrecompCollected{0};
++std::atomic<uint64_t> g_mvkPrecompEvents{0}, g_mvkPrecompPending{0};
++void mvkPrecompNote(bool loaded) {
++	if (loaded) { ++g_mvkPrecompLoaded; } else { ++g_mvkPrecompCompiled; }
++	if ((++g_mvkPrecompEvents % 2048) == 0) {
++		fprintf(stderr, "[mvk-precomp] loaded=%llu compiled=%llu collected=%llu\n",
++			(unsigned long long)g_mvkPrecompLoaded.load(), (unsigned long long)g_mvkPrecompCompiled.load(),
++			(unsigned long long)g_mvkPrecompCollected.load());
++	}
++}
++NSString* mvkPrecompKeyString(uint64_t key) {
++	return [NSString stringWithFormat:@"%016llx", (unsigned long long)key];
++}
++NSString* mvkPrecompDirectory(id<MTLDevice> device) {
++	return [mvkMadeiraGameCacheDirectory(device) stringByAppendingPathComponent:@"msl"];
++}
++uint64_t mvkPrecompCollectCap() {
++	static uint64_t cap = [] {
++		const char* v = getenv("MVK_MADEIRA_MSL_COLLECT_MB");
++		uint64_t mb = v ? strtoull(v, nullptr, 10) : 2048;
++		return std::min(mb, UINT64_MAX / (1024 * 1024)) * (1024 * 1024);
++	}();
++	return cap;
++}
++id<MTLLibrary> mvkPrecompLoad(id<MTLDevice> device, uint64_t key, const std::string& entry) {
++	const char* enabled = getenv("MVK_MADEIRA_PRECOMPILED");
++	if (enabled && !strcmp(enabled, "0")) { return nil; }
++	NSString* path = [[mvkPrecompDirectory(device) stringByAppendingPathComponent:@"lib"]
++		stringByAppendingPathComponent:[mvkPrecompKeyString(key) stringByAppendingString:@".metallib"]];
++	if (![NSFileManager.defaultManager fileExistsAtPath:path]) { return nil; }
++	// Say why the first few files are refused: a silent nil hid that 11,557 libraries
++	// built for iOS 27 could not load on iPadOS 26 (only loaded=0 showed).
++	NSError* err = nil;
++	id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
++	static std::atomic<int> refusals{0};
++	if (!lib && refusals.fetch_add(1) < 4)
++		fprintf(stderr, "[mvk-precomp] refused %s: %s\n", path.UTF8String, err ? err.localizedDescription.UTF8String : "no error");
++	if (lib && ![lib.functionNames containsObject:@(entry.c_str())]) {
++		if (refusals.fetch_add(1) < 4) fprintf(stderr, "[mvk-precomp] refused %s: no function %s\n", path.UTF8String, entry.c_str());
++		[lib release];
++		return nil;
++	}
++	if (lib) { mvkPrecompNote(true); }
++	return lib;
++}
++NSDictionary* mvkPrecompOptions(MTLCompileOptions* options, uint64_t key) {
++	NSMutableDictionary* macros = [NSMutableDictionary dictionary];
++	for (NSString* name in options.preprocessorMacros) {
++		// Preserve NSNumber's textual expansion, without a JSON float round trip.
++		macros[name] = [options.preprocessorMacros[name] description];
++	}
++	NSMutableDictionary* result = [NSMutableDictionary dictionaryWithDictionary:@{
++		@"schemaVersion": @1, @"key": mvkPrecompKeyString(key),
++		@"languageVersion": @(options.languageVersion), @"fastMathEnabled": @(options.fastMathEnabled),
++		@"preserveInvariance": @(options.preserveInvariance), @"preprocessorMacros": macros }];
++#if MVK_XCODE_16
++	if ([options respondsToSelector:@selector(mathMode)]) {
++		result[@"mathMode"] = @(options.mathMode);
++		result[@"mathFloatingPointFunctions"] = @(options.mathFloatingPointFunctions);
++	}
++#endif
++	if ([options respondsToSelector:@selector(optimizationLevel)]) {
++		result[@"optimizationLevel"] = @(options.optimizationLevel);
++	}
++	return result;
++}
++void mvkPrecompCollect(NSString* directory, uint64_t key, NSString* source, NSDictionary* options) {
++	if (!mvkPrecompCollectCap()) { return; }
++	uint64_t bytes = [source lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
++	const uint64_t pendingCap = 32 * 1024 * 1024;
++	if (bytes > pendingCap) { return; }
++	uint64_t previous = g_mvkPrecompPending.fetch_add(bytes);
++	if (previous > pendingCap - bytes) { g_mvkPrecompPending.fetch_sub(bytes); return; }
++	static dispatch_queue_t queue = dispatch_queue_create("MoltenVK.msl-collect", DISPATCH_QUEUE_SERIAL);
++	// dispatch_async copies the block and retains its Objective-C captures under MRC.
++	dispatch_async(queue, ^{
++		@autoreleasepool {
++			static NSMutableDictionary* totals = [NSMutableDictionary new];
++			NSFileManager* fm = NSFileManager.defaultManager;
++			NSString* srcDir = [directory stringByAppendingPathComponent:@"src"];
++			NSString* stem = [srcDir stringByAppendingPathComponent:mvkPrecompKeyString(key)];
++			NSString* metalPath = [stem stringByAppendingString:@".metal"];
++			NSString* jsonPath = [stem stringByAppendingString:@".json"];
++			if (![fm fileExistsAtPath:metalPath] || ![fm fileExistsAtPath:jsonPath]) {
++				if (!totals[srcDir]) {
++					uint64_t used = 0;
++					for (NSString* file in [fm contentsOfDirectoryAtPath:srcDir error:nil]) {
++						if ([file hasSuffix:@".metal"]) { used += [[fm attributesOfItemAtPath:[srcDir stringByAppendingPathComponent:file] error:nil] fileSize]; }
++					}
++					totals[srcDir] = @(used);
++				}
++				uint64_t used = [totals[srcDir] unsignedLongLongValue];
++				uint64_t oldBytes = [[fm attributesOfItemAtPath:metalPath error:nil] fileSize];
++				uint64_t added = bytes > oldBytes ? bytes - oldBytes : 0;
++				if (used <= mvkPrecompCollectCap() && added <= mvkPrecompCollectCap() - used &&
++					[fm createDirectoryAtPath:srcDir withIntermediateDirectories:YES attributes:nil error:nil]) {
++					[fm createDirectoryAtPath:[directory stringByAppendingPathComponent:@"lib"] withIntermediateDirectories:YES attributes:nil error:nil];
++					NSData* json = [NSJSONSerialization dataWithJSONObject:options options:NSJSONWritingSortedKeys error:nil];
++					// NSDataWritingAtomic writes a temporary file then renames it. Publish source last.
++					if (json && [json writeToFile:jsonPath options:NSDataWritingAtomic error:nil] &&
++						[[source dataUsingEncoding:NSUTF8StringEncoding] writeToFile:metalPath options:NSDataWritingAtomic error:nil]) {
++						totals[srcDir] = @(used + added);
++						++g_mvkPrecompCollected;
++					}
++				}
++			}
++		}
++		g_mvkPrecompPending.fetch_sub(bytes);
++	});
++}
++
 +}
 +
  id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
  													   const SPIRVToMSLConversionResultInfo& shaderConversionResults,
  													   const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& specializationMacroDef) {
 +	size_t cacheLength = 0;
-+	uint64_t cacheKey = 0;
-+	if (mvkLibCacheCap()) {
-+		cacheKey = mvkLibCacheKey(mslSourceCode, specializationMacroDef, (uint32_t)shaderConversionResults.entryPoint.fpFastMathFlags,
++	uint64_t cacheKey = mvkLibCacheKey(mslSourceCode, specializationMacroDef, (uint32_t)shaderConversionResults.entryPoint.fpFastMathFlags,
 +								  shaderConversionResults.isPositionInvariant, &cacheLength);
++	if (mvkLibCacheCap()) {
 +		if (id<MTLLibrary> cached = mvkLibCacheGet(cacheKey, cacheLength)) {
 +			mvkLibCacheNote(true);
 +			return cached;	// retained, like a fresh compile
 +		}
++	}
++	if (id<MTLLibrary> disk = mvkPrecompLoad(getMTLDevice(), cacheKey, shaderConversionResults.entryPoint.mtlFunctionName)) {
++		mvkLibCachePut(cacheKey, cacheLength, disk);
++		return disk;
 +	}
  	unique_lock<mutex> lock(_completionLock);
 +	uint64_t mvkTimeStart = mvkTimeNow();
@@ -894,7 +1024,24 @@ index 3aa44a4..117af3c 100644
  
  	compile(lock, ^{
  		auto mtlDev = getMTLDevice();
-@@ -589,6 +731,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -578,10 +836,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 																						 count: macro_count];
+ 				}
+ 				logCompilation(mtlCompileOptions);
++				NSDictionary* collectedOptions = mvkPrecompCollectCap() ? mvkPrecompOptions(mtlCompileOptions, cacheKey) : nil;
++				NSString* collectDirectory = collectedOptions ? mvkPrecompDirectory(mtlDev) : nil;
+ 
+ 				[mtlDev newLibraryWithSource: mslSourceCode
+ 									options: mtlCompileOptions
+ 						completionHandler: ^(id<MTLLibrary> mtlLib, NSError* error) {
++							if (mtlLib) {
++								mvkPrecompNote(false);
++								if (collectedOptions) { mvkPrecompCollect(collectDirectory, cacheKey, mslSourceCode, collectedOptions); }
++							}
+ 							bool isLate = compileComplete(mtlLib, error);
+ 							if (isLate) { destroy(); }
+ 						}];
+@@ -589,6 +853,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  		}
  	});
  
