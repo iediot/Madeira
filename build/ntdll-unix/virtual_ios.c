@@ -16471,12 +16471,47 @@ static void ios_swap_note( int why, size_t size )
     ios_swap_why_bytes[why] += size;
     ios_swap_tick( 0 );
 }
+/* ml1300: the tier waits for real memory pressure. Backing every 8 MB commit from
+ * the start made games that never come near the limit pay the file on each fresh
+ * allocation: Borderlands: The Pre-Sequel frees and recommits 8 MB blocks ~43 times
+ * a second, ran at ~5 fps with the tier on and 16-20 with it off, peaking at 3 GB.
+ * The tier arms once the footprint reaches MADEIRA_SWAP_ARM_MB (default 3584; 0 =
+ * from the start, the old behaviour) and then stays armed for the session, so it
+ * never flips around the threshold. Ranges backed before stay backed. */
+static size_t ios_swap_arm_mb = (size_t)-1;   /* unset until ios_swap_armed() first runs */
+static int ios_swap_is_armed;
+static int ios_swap_armed( void )
+{
+    static struct timespec last;
+    struct timespec now;
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (ios_swap_is_armed) return 1;
+    if (ios_swap_arm_mb == (size_t)-1)
+    {
+        const char *v = getenv( "MADEIRA_SWAP_ARM_MB" );
+        ios_swap_arm_mb = (v && *v) ? (size_t)strtoul( v, NULL, 10 ) : 3584;
+        dprintf( 2, "[swap] ml1300 arms at footprint %zu MB%s\n", ios_swap_arm_mb,
+                 ios_swap_arm_mb ? "" : " (from the start)" );
+    }
+    if (!ios_swap_arm_mb) return ios_swap_is_armed = 1;
+    /* one task_info per 100 ms at most: commits this large are not a hot path, but a
+     * burst of them should not each pay a Mach call */
+    clock_gettime( CLOCK_MONOTONIC, &now );
+    if (last.tv_sec && (now.tv_sec - last.tv_sec) * 1000000000LL + (now.tv_nsec - last.tv_nsec) < 100000000LL) return 0;
+    last = now;
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) != KERN_SUCCESS) return 0;
+    if (((size_t)(vmi.phys_footprint >> 20)) < ios_swap_arm_mb) return 0;
+    dprintf( 2, "[swap] ml1300 armed: footprint %llu MB reached %zu MB\n",
+             (unsigned long long)(vmi.phys_footprint >> 20), ios_swap_arm_mb );
+    return ios_swap_is_armed = 1;
+}
 /* A fresh commit (MEM_COMMIT, with or without MEM_RESERVE) of [base, base+size).
  * classic runs the original rule unchanged. */
 static void ios_swap_commit( void *base, size_t size, unsigned int vprot, struct file_view *view )
 {
     int why;
-    if (ios_swap_fd < 0) return;
+    if (ios_swap_fd < 0 || size < ios_swap_min || !ios_swap_armed()) return;
     if (!ios_swap_v2) { if (ios_swap_eligible( base, size, vprot, view )) ios_swap_back( base, size, vprot ); return; }
     if ((ios_swap_wide || ios_swap_broad) && ios_swap_n && ios_swap_overlaps( base, size )) { ios_swap_note( IOS_SW_PRESENT, size ); return; }
     why = ios_swap_why( base, size, vprot, view );
@@ -16490,6 +16525,7 @@ static void ios_swap_reserve( void *base, size_t size, unsigned int vprot, struc
 {
     if (ios_swap_fd < 0 || !ios_swap_wide) return;
     if ((vprot & VPROT_COMMITTED) || size > ios_swap_resv_max) return;
+    if (size < ios_swap_min || !ios_swap_armed()) return;   /* ml1300 */
     if (ios_swap_why( base, size, vprot, view ) != IOS_SW_BACKED) return;
     if (ios_swap_map( base, size, get_unix_prot( vprot ) ) != IOS_SW_BACKED) return;
     /* ml1257: decommit inside it punches in place, like broad's reservations, so a
@@ -16511,6 +16547,7 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     uintptr_t b;
     int why;
     if (ios_swap_fd < 0 || !ios_swap_broad) return 0;
+    if (view->size < ios_swap_min || !ios_swap_armed()) return 0;   /* ml1300 */
     b = (uintptr_t)view->base;
     if (vprot & (VPROT_EXEC | VPROT_WRITECOPY | VPROT_GUARD | VPROT_WRITEWATCH | VPROT_PLACEHOLDER))
     { ios_swap_skip_bytes[IOS_SWK_PROT] += view->size; return 0; }
