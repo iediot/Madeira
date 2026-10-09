@@ -329,6 +329,11 @@ final class SteamOwnedLibrary: ObservableObject {
         let now = SteamSignIn.isSignedIn
         guard now != signedIn || (now && Self.accountKey(SteamSignIn.accountName) != cachedAccount) else { return }
         signedIn = now
+        // The cloud sync record belongs to the account that was signed in: kept,
+        // the next sync would compare the new account's saves with the old one's
+        // hashes (and record them under the new account). baseline() reloads it
+        // from disk, where it is tagged with its account.
+        cloudBaseline = nil; cloud = [:]; cloudAudited = false
         if !now {
             for id in Array(downloads.keys) { pause(id) }
             session.logoff()

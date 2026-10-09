@@ -107,10 +107,13 @@ void madeira_d3d12_note_unimplemented(const char *iface, const char *method) {
     /* Rate limiting is per call site rather than global: one chatty method must
      * not hide the first occurrence of every other one. */
     static const char *seen[64];
-    static unsigned seen_n;
-    for (unsigned i = 0; i < seen_n; i++)
+    static LONG seen_n;
+    LONG n = seen_n, slot;
+    for (LONG i = 0; i < n && i < 64; i++)
         if (seen[i] == method) return;
-    if (seen_n < 64) seen[seen_n++] = method;
+    /* Claimed atomically: two threads appending at once wrote seen[64]. A rare
+     * duplicate log line is the only cost of the unlocked scan. */
+    if (n < 64 && (slot = InterlockedIncrement(&seen_n) - 1) < 64) seen[slot] = method;
     d3d12_log("[madeira-d3d12] unimplemented: %s::%s\n", iface, method);
 }
 
@@ -952,9 +955,23 @@ struct mad_fence {
     UINT64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
-    struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
-    unsigned nwaiters;
+    /* ml1109: t_reg = registration time. `waiters` is waiters_inline until more
+     * events are registered at once than it holds; then it grows (a fixed 16 made
+     * SetEventOnCompletion fail for good once 16 waits for values never reached,
+     * abandoned ones included, had piled up). */
+    struct mad_fence_waiter { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters_inline[MAD_FENCE_WAITERS], *waiters;
+    unsigned nwaiters, cwaiters;
 };
+
+static int mad_fence_grow(struct mad_fence *f) {
+    unsigned cap = f->cwaiters * 2;
+    struct mad_fence_waiter *n;
+    if (cap > (1u << 16) || !(n = malloc(cap * sizeof *n))) return 0;
+    memcpy(n, f->waiters, f->nwaiters * sizeof *n);
+    if (f->waiters != f->waiters_inline) free(f->waiters);
+    f->waiters = n; f->cwaiters = cap;
+    return 1;
+}
 
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
     f->value = v;
@@ -978,7 +995,13 @@ static ULONG STDMETHODCALLTYPE fence_AddRef(ID3D12Fence *This) { return mad_addr
 static ULONG STDMETHODCALLTYPE fence_Release(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
     LONG r = InterlockedDecrement(&f->refs);
-    if (r == 0) { mad_pd_purge(This);   /* ml1143 */ DeleteCriticalSection(&f->lock); d3d12_log("[madeira-d3d12] destroyed %s\n", f->name); free(f); }
+    if (r == 0) {
+        mad_pd_purge(This);   /* ml1143 */
+        DeleteCriticalSection(&f->lock);
+        if (f->waiters != f->waiters_inline) free(f->waiters);
+        d3d12_log("[madeira-d3d12] destroyed %s\n", f->name);
+        free(f);
+    }
     return (ULONG)r;
 }
 /* ml1142: WHO SPINS ON GetCompletedValue. ph-empire07: 4.4 M calls/s from the
@@ -1040,7 +1063,7 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
          * reached our value yet. */
         while (f->value < value)
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
-    } else if (f->nwaiters < MAD_FENCE_WAITERS) {
+    } else if (f->nwaiters < f->cwaiters || mad_fence_grow(f)) {
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); f->waiters[f->nwaiters].t_reg = t.QuadPart; }   /* ml1109 */
         InterlockedIncrement(&g_perf_waits);
         f->waiters[f->nwaiters].value = value;
@@ -6001,6 +6024,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
     struct mad_fence *f = calloc(1, sizeof *f);
     if (!f) return E_OUTOFMEMORY;
     f->vtbl = &g_fence_vtbl; f->refs = 1; f->iid = &IID_ID3D12Fence; f->name = "Fence";
+    f->waiters = f->waiters_inline; f->cwaiters = MAD_FENCE_WAITERS;
     f->value = initial;
     InitializeCriticalSection(&f->lock);
     InitializeConditionVariable(&f->cv);

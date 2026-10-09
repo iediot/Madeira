@@ -594,7 +594,7 @@ index e617138e..ea201969 100644
          else if (e->t_tail && !e->t_post)
          {
 diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
-index 4d0fd0e1..f4f1697c 100644
+index 4d0fd0e1..d6546778 100644
 --- a/dlls/ntdll/unix/sync.c
 +++ b/dlls/ntdll/unix/sync.c
 @@ -2194,13 +2194,62 @@ static void ios_eco_init(void)
@@ -661,6 +661,50 @@ index 4d0fd0e1..f4f1697c 100644
  }
  #define IOS_ECO_POLL() do { if (__builtin_expect( ios_eco_seen != ios_eco_gen, 0 )) ios_eco_apply_self(); } while (0)
  
+@@ -3574,26 +3623,36 @@ NTSTATUS WINAPI NtYieldExecution(void)
+      * thread and heats the package into throttling. After a burst of back-to-back
+      * yields the thread is put to sleep for 100 us instead: the same forward
+      * progress with a bounded latency cost. Streaks reset after a 2 ms gap. */
+-    {
+-        static __thread unsigned long long ios_last_yield_ns;
++    /* ml1311: the streak must also have lasted yield-spin-us (default 1000) of wall
++     * time. 256 back-to-back yields take well under a millisecond, so the count
++     * alone put threads to sleep for 100 us in the middle of short hand-offs: an
++     * Unreal Engine 3 game thread waiting microseconds for its render thread slept
++     * 3,000-5,000 times a second in CPU-bound scenes. A spinner idle for a whole
++     * millisecond is still put to sleep, which is what the heat guard is for. */
++    {
++        static __thread unsigned long long ios_last_yield_ns, ios_streak_start_ns;
+         static __thread unsigned ios_yield_streak;
+         struct timespec ts;
+         unsigned long long now;
+         clock_gettime( CLOCK_MONOTONIC, &ts );
+         now = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+-        static long long ios_ysleep = -1, ios_ystreak = 256;   /* ml1124: madeira.cfg yield-sleep-us (default 100, 0 = never sleep), yield-streak (256) */
++        static long long ios_ysleep = -1, ios_ystreak = 256, ios_yspin_ns = 1000000;   /* ml1124: madeira.cfg yield-sleep-us (default 100, 0 = never sleep), yield-streak (256); ml1311 yield-spin-us (1000) */
+         if (ios_ysleep < 0)
+         {
++            long long spin_us;
+             ios_ystreak = madeira_cfg_int( "yield-streak", 256 );
++            spin_us = madeira_cfg_int( "yield-spin-us", 1000 );
++            ios_yspin_ns = spin_us > 0 ? spin_us * 1000 : 0;
+             ios_ysleep = madeira_cfg_int( "yield-sleep-us", 100 );
+             if (ios_ysleep < 0) ios_ysleep = 0;
+-            fprintf( stderr, "[sync-census] ml1124 adaptive yield: sleep %lld us after %lld back-to-back yields%s\n",
+-                     ios_ysleep, ios_ystreak, ios_ysleep ? "" : " (DISABLED)" );
++            fprintf( stderr, "[sync-census] ml1124 adaptive yield: sleep %lld us after %lld back-to-back yields spanning %lld us%s\n",
++                     ios_ysleep, ios_ystreak, ios_yspin_ns / 1000, ios_ysleep ? "" : " (DISABLED)" );
+         }
+-        if (now - ios_last_yield_ns < 2000000ull) ios_yield_streak++; else ios_yield_streak = 0;
++        if (now - ios_last_yield_ns < 2000000ull) ios_yield_streak++;
++        else { ios_yield_streak = 0; ios_streak_start_ns = now; }
+         ios_last_yield_ns = now;
+         __sync_fetch_and_add( &ios_xp_yield, 1 );   /* ml1131 */
+-        if (ios_ysleep && ios_yield_streak > ios_ystreak)
++        if (ios_ysleep && ios_yield_streak > ios_ystreak && now - ios_streak_start_ns >= (unsigned long long)ios_yspin_ns)
+         {
+             __sync_fetch_and_add( &ios_xp_yield_slept, 1 );
+             usleep( (useconds_t)ios_ysleep );
 diff --git a/dlls/opengl32/Makefile.in b/dlls/opengl32/Makefile.in
 index 66ce5d28..0128f9cb 100644
 --- a/dlls/opengl32/Makefile.in
@@ -16031,10 +16075,10 @@ index 39c0540a..bab12b1b 100644
      {
          WaitForSingleObject( start_event, INFINITE );
 diff --git a/dlls/winevulkan/vulkan_thunks.c b/dlls/winevulkan/vulkan_thunks.c
-index e7d394fa..d94ca46d 100644
+index e7d394fa..47a29901 100644
 --- a/dlls/winevulkan/vulkan_thunks.c
 +++ b/dlls/winevulkan/vulkan_thunks.c
-@@ -25,6 +25,79 @@
+@@ -25,6 +25,151 @@
  
  #include "vulkan_private.h"
  
@@ -16063,6 +16107,20 @@ index e7d394fa..d94ca46d 100644
 +}
 +
 +
++/* [vk-cache]: every pipeline-cache create / data query / merge a game makes, so a
++ * load screen that ends with "save the cache" (Detroit: Become Human's 98%) shows
++ * what it asked for and what came back. The first 200 of each, then every 500th. */
++static LONG ios_vk_caches_live;   /* defined with the other [vk-pipe] counters below */
++static LONG ios_vkc_n[3];
++static void ios_vk_cache_note( int kind, VkResult result, unsigned long long a, unsigned long long b )
++{
++    static const char *names[3] = { "create initial", "get-data size/ptr", "merge srcs" };
++    LONG n = InterlockedIncrement( &ios_vkc_n[kind] );
++    if (n <= 200 || !(n % 500))
++        fprintf( stderr, "[vk-cache] %s #%ld result=%d %llu %llu live=%ld\n", names[kind], (long)n, result, a, b,
++             (long)ios_vk_caches_live );
++}
++
 +/* [vk-wait]: result counts of the calls a game blocks on (fences, semaphores,
 + * submits, presents, idle waits), one line every 4096 calls: a fence that never
 + * signals or a lost device shows as a growing TIMEOUT/NOT_READY/error count. */
@@ -16086,10 +16144,68 @@ index e7d394fa..d94ca46d 100644
 +/* object lifetimes behind [vk-pipe]: is the game freeing what it builds? */
 +static LONG ios_vk_pipes_destroyed, ios_vk_modules_live, ios_vk_caches_live;
 +
++/* Pipeline-cache shadow (ml1310). ios_pipeline_cache() hands MoltenVK no cache, so
++ * the game's cache never fills: vkGetPipelineCacheData answers with the bare header
++ * (36 bytes) forever. Detroit: Become Human polls that size at the end of its shader
++ * step (its "98%") and never moves on - 8,500+ identical queries in one log. The
++ * data is opaque to the game, which stores the bytes and checks their size, so each
++ * game cache keeps a count of the pipelines created through it and the query returns
++ * MoltenVK's own header followed by 8 bytes per pipeline. MoltenVK still never sees
++ * the cache, so its memory stays bounded; initial data a game hands back on a later
++ * launch only seeds the count. Off with MADEIRA_VK_PIPELINE_CACHE=1 (the real cache
++ * is then passed through) or MADEIRA_VK_CACHE_SHADOW=0. */
++#define IOS_VKC_SLOTS 256
++static struct { VkPipelineCache cache; ULONGLONG pipes; } ios_vkc_shadow[IOS_VKC_SLOTS];
++static pthread_mutex_t ios_vkc_lock = PTHREAD_MUTEX_INITIALIZER;
++static int ios_vkc_shadow_on( void )
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *pass = getenv( "MADEIRA_VK_PIPELINE_CACHE" ), *sh = getenv( "MADEIRA_VK_CACHE_SHADOW" );
++        on = !(pass && *pass == '1') && !(sh && *sh == '0');
++    }
++    return on;
++}
++/* Add n pipelines to cache's count (creating its slot when create is set). */
++static void ios_vkc_add( VkPipelineCache cache, ULONGLONG n, int create )
++{
++    unsigned i, free_slot = IOS_VKC_SLOTS;
++    if (!cache || !ios_vkc_shadow_on()) return;
++    pthread_mutex_lock( &ios_vkc_lock );
++    for (i = 0; i < IOS_VKC_SLOTS; i++)
++    {
++        if (ios_vkc_shadow[i].cache == cache) { ios_vkc_shadow[i].pipes += n; break; }
++        if (!ios_vkc_shadow[i].cache && free_slot == IOS_VKC_SLOTS) free_slot = i;
++    }
++    if (i == IOS_VKC_SLOTS && create && free_slot < IOS_VKC_SLOTS)
++    {
++        ios_vkc_shadow[free_slot].cache = cache;
++        ios_vkc_shadow[free_slot].pipes = n;
++    }
++    pthread_mutex_unlock( &ios_vkc_lock );
++}
++static ULONGLONG ios_vkc_get( VkPipelineCache cache, int remove )
++{
++    unsigned i;
++    ULONGLONG n = 0;
++    pthread_mutex_lock( &ios_vkc_lock );
++    for (i = 0; i < IOS_VKC_SLOTS; i++)
++        if (ios_vkc_shadow[i].cache == cache)
++        {
++            n = ios_vkc_shadow[i].pipes;
++            if (remove) ios_vkc_shadow[i].cache = 0;
++            break;
++        }
++    pthread_mutex_unlock( &ios_vkc_lock );
++    return n;
++}
++
 +static void ios_pipe_time( const char *kind, uint32_t count, VkPipelineCache cache,
 +                           VkResult result, struct timespec *t0 )
 +{
 +    static LONG calls, pipes, slow;
++    if (result == VK_SUCCESS || result == VK_PIPELINE_COMPILE_REQUIRED) ios_vkc_add( cache, count, 0 );
 +    static LONGLONG total_us, max_us;
 +    struct timespec t1;
 +    LONGLONG us;
@@ -16114,7 +16230,7 @@ index e7d394fa..d94ca46d 100644
  WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
  
  typedef struct VkGeometryAABBNV32
-@@ -52232,7 +52305,22 @@ static NTSTATUS thunk64_vkCreateComputePipelines(void *args)
+@@ -52232,7 +52377,22 @@ static NTSTATUS thunk64_vkCreateComputePipelines(void *args)
  
      TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
  
@@ -16138,7 +16254,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -52791,7 +52879,22 @@ static NTSTATUS thunk64_vkCreateGraphicsPipelines(void *args)
+@@ -52791,7 +52951,22 @@ static NTSTATUS thunk64_vkCreateGraphicsPipelines(void *args)
  
      TRACE("%p, 0x%s, %u, %p, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->createInfoCount, params->pCreateInfos, params->pAllocator, params->pPipelines);
  
@@ -16162,17 +16278,21 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -53158,6 +53261,9 @@ static NTSTATUS thunk64_vkCreatePipelineCache(void *args)
+@@ -53158,6 +53333,13 @@ static NTSTATUS thunk64_vkCreatePipelineCache(void *args)
      TRACE("%p, %p, %p, %p\n", params->device, params->pCreateInfo, params->pAllocator, params->pPipelineCache);
  
      params->result = vulkan_device_from_handle(params->device)->p_vkCreatePipelineCache(vulkan_device_from_handle(params->device)->host.device, params->pCreateInfo, NULL, params->pPipelineCache);
 +#ifdef WINE_IOS
 +    if (!params->result) InterlockedIncrement( &ios_vk_caches_live );
++    if (!params->result && params->pCreateInfo)
++        ios_vkc_add( *params->pPipelineCache,
++                     params->pCreateInfo->initialDataSize > 36 ? (params->pCreateInfo->initialDataSize - 36) / 8 : 0, 1 );
++    ios_vk_cache_note( 0, params->result, params->pCreateInfo ? (unsigned long long)params->pCreateInfo->initialDataSize : 0, 0 );
 +#endif
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -53649,6 +53755,9 @@ static NTSTATUS thunk64_vkCreateShaderModule(void *args)
+@@ -53649,6 +53831,9 @@ static NTSTATUS thunk64_vkCreateShaderModule(void *args)
      TRACE("%p, %p, %p, %p\n", params->device, params->pCreateInfo, params->pAllocator, params->pShaderModule);
  
      params->result = vulkan_device_from_handle(params->device)->p_vkCreateShaderModule(vulkan_device_from_handle(params->device)->host.device, params->pCreateInfo, NULL, params->pShaderModule);
@@ -16182,7 +16302,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -54817,6 +54926,9 @@ static NTSTATUS thunk64_vkDestroyPipeline(void *args)
+@@ -54817,6 +55002,9 @@ static NTSTATUS thunk64_vkDestroyPipeline(void *args)
      TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->pipeline), params->pAllocator);
  
      vulkan_device_from_handle(params->device)->p_vkDestroyPipeline(vulkan_device_from_handle(params->device)->host.device, params->pipeline, NULL);
@@ -16192,17 +16312,18 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -54871,6 +54983,9 @@ static NTSTATUS thunk64_vkDestroyPipelineCache(void *args)
+@@ -54871,6 +55059,10 @@ static NTSTATUS thunk64_vkDestroyPipelineCache(void *args)
      TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->pAllocator);
  
      vulkan_device_from_handle(params->device)->p_vkDestroyPipelineCache(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, NULL);
 +#ifdef WINE_IOS
 +    if (params->pipelineCache) InterlockedDecrement( &ios_vk_caches_live );
++    if (params->pipelineCache) ios_vkc_get( params->pipelineCache, 1 );
 +#endif
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -55168,6 +55283,9 @@ static NTSTATUS thunk64_vkDestroyShaderModule(void *args)
+@@ -55168,6 +55360,9 @@ static NTSTATUS thunk64_vkDestroyShaderModule(void *args)
      TRACE("%p, 0x%s, %p\n", params->device, wine_dbgstr_longlong(params->shaderModule), params->pAllocator);
  
      vulkan_device_from_handle(params->device)->p_vkDestroyShaderModule(vulkan_device_from_handle(params->device)->host.device, params->shaderModule, NULL);
@@ -16212,7 +16333,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -55384,6 +55502,9 @@ static NTSTATUS thunk64_vkDeviceWaitIdle(void *args)
+@@ -55384,6 +55579,9 @@ static NTSTATUS thunk64_vkDeviceWaitIdle(void *args)
      TRACE("%p\n", params->device);
  
      params->result = vulkan_device_from_handle(params->device)->p_vkDeviceWaitIdle(vulkan_device_from_handle(params->device)->host.device);
@@ -16222,7 +16343,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -57742,6 +57863,9 @@ static NTSTATUS thunk64_vkGetFenceStatus(void *args)
+@@ -57742,6 +57940,9 @@ static NTSTATUS thunk64_vkGetFenceStatus(void *args)
      TRACE("%p, 0x%s\n", params->device, wine_dbgstr_longlong(params->fence));
  
      params->result = vulkan_device_from_handle(params->device)->p_vkGetFenceStatus(vulkan_device_from_handle(params->device)->host.device, vulkan_fence_from_handle(params->fence)->host.fence);
@@ -16232,7 +16353,66 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62265,6 +62389,9 @@ static NTSTATUS thunk64_vkQueuePresentKHR(void *args)
+@@ -60596,7 +60797,42 @@ static NTSTATUS thunk64_vkGetPipelineCacheData(void *args)
+ 
+     TRACE("%p, 0x%s, %p, %p\n", params->device, wine_dbgstr_longlong(params->pipelineCache), params->pDataSize, params->pData);
+ 
++#ifdef WINE_IOS
++    if (ios_vkc_shadow_on() && params->pDataSize)
++    {
++        /* MoltenVK's header (it never sees pipelines, so its data is only that),
++         * then 8 bytes per pipeline: the pipeline ordinal, so the bytes are stable
++         * for a given count. */
++        unsigned char header[256];
++        size_t hsize = sizeof(header), want, have = *params->pDataSize, k;
++        ULONGLONG pipes = ios_vkc_get( params->pipelineCache, 0 );
++        VkResult r = vulkan_device_from_handle(params->device)->p_vkGetPipelineCacheData(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, &hsize, header);
++        if (r == VK_SUCCESS && hsize <= sizeof(header))
++        {
++            want = hsize + (size_t)pipes * 8;
++            if (!params->pData) { *params->pDataSize = want; params->result = VK_SUCCESS; }
++            else
++            {
++                size_t n = have < want ? have : want;
++                unsigned char *out = params->pData;
++                memcpy( out, header, n < hsize ? n : hsize );
++                for (k = hsize; k < n; k++)
++                {
++                    ULONGLONG ord = (k - hsize) / 8;
++                    out[k] = (unsigned char)(ord >> (8 * ((k - hsize) % 8)));
++                }
++                *params->pDataSize = n;
++                params->result = n < want ? VK_INCOMPLETE : VK_SUCCESS;
++            }
++            ios_vk_cache_note( 1, params->result, *params->pDataSize, params->pData != NULL );
++            return STATUS_SUCCESS;
++        }
++    }
++#endif
+     params->result = vulkan_device_from_handle(params->device)->p_vkGetPipelineCacheData(vulkan_device_from_handle(params->device)->host.device, params->pipelineCache, params->pDataSize, params->pData);
++#ifdef WINE_IOS
++    ios_vk_cache_note( 1, params->result, params->pDataSize ? (unsigned long long)*params->pDataSize : 0, params->pData != NULL );
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -62051,6 +62287,15 @@ static NTSTATUS thunk64_vkMergePipelineCaches(void *args)
+     TRACE("%p, 0x%s, %u, %p\n", params->device, wine_dbgstr_longlong(params->dstCache), params->srcCacheCount, params->pSrcCaches);
+ 
+     params->result = vulkan_device_from_handle(params->device)->p_vkMergePipelineCaches(vulkan_device_from_handle(params->device)->host.device, params->dstCache, params->srcCacheCount, params->pSrcCaches);
++#ifdef WINE_IOS
++    if (!params->result && ios_vkc_shadow_on())
++    {
++        uint32_t k;
++        for (k = 0; k < params->srcCacheCount; k++)
++            ios_vkc_add( params->dstCache, ios_vkc_get( params->pSrcCaches[k], 0 ), 1 );
++    }
++    ios_vk_cache_note( 2, params->result, params->srcCacheCount, 0 );
++#endif
+     return STATUS_SUCCESS;
+ }
+ #endif /* _WIN64 */
+@@ -62265,6 +62510,9 @@ static NTSTATUS thunk64_vkQueuePresentKHR(void *args)
      convert_VkPresentInfoKHR_win64_to_unwrapped_host(ctx, params->pPresentInfo, &pPresentInfo_host);
      params->result = vk_funcs->p_vkQueuePresentKHR(params->queue, &pPresentInfo_host);
      free_conversion_context(ctx);
@@ -16242,7 +16422,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62331,6 +62458,9 @@ static NTSTATUS thunk64_vkQueueSubmit(void *args)
+@@ -62331,6 +62579,9 @@ static NTSTATUS thunk64_vkQueueSubmit(void *args)
      pSubmits_host = convert_VkSubmitInfo_array_win64_to_unwrapped_host(ctx, params->pSubmits, params->submitCount);
      params->result = vk_funcs->p_vkQueueSubmit(params->queue, params->submitCount, pSubmits_host, params->fence);
      free_conversion_context(ctx);
@@ -16252,7 +16432,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62372,6 +62502,9 @@ static NTSTATUS thunk64_vkQueueSubmit2(void *args)
+@@ -62372,6 +62623,9 @@ static NTSTATUS thunk64_vkQueueSubmit2(void *args)
      pSubmits_host = convert_VkSubmitInfo2_array_win64_to_unwrapped_host(ctx, params->pSubmits, params->submitCount);
      params->result = vk_funcs->p_vkQueueSubmit2(params->queue, params->submitCount, pSubmits_host, params->fence);
      free_conversion_context(ctx);
@@ -16262,7 +16442,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62413,6 +62546,9 @@ static NTSTATUS thunk64_vkQueueSubmit2KHR(void *args)
+@@ -62413,6 +62667,9 @@ static NTSTATUS thunk64_vkQueueSubmit2KHR(void *args)
      pSubmits_host = convert_VkSubmitInfo2_array_win64_to_unwrapped_host(ctx, params->pSubmits, params->submitCount);
      params->result = vk_funcs->p_vkQueueSubmit2KHR(params->queue, params->submitCount, pSubmits_host, params->fence);
      free_conversion_context(ctx);
@@ -16272,7 +16452,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -62448,6 +62584,9 @@ static NTSTATUS thunk64_vkQueueWaitIdle(void *args)
+@@ -62448,6 +62705,9 @@ static NTSTATUS thunk64_vkQueueWaitIdle(void *args)
      TRACE("%p\n", params->queue);
  
      params->result = vulkan_queue_from_handle(params->queue)->device->p_vkQueueWaitIdle(vulkan_queue_from_handle(params->queue)->host.queue);
@@ -16282,7 +16462,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -63710,6 +63849,9 @@ static NTSTATUS thunk64_vkWaitForFences(void *args)
+@@ -63710,6 +63970,9 @@ static NTSTATUS thunk64_vkWaitForFences(void *args)
      pFences_host = convert_VkFence_array_win64_to_host(ctx, params->pFences, params->fenceCount);
      params->result = vulkan_device_from_handle(params->device)->p_vkWaitForFences(vulkan_device_from_handle(params->device)->host.device, params->fenceCount, pFences_host, params->waitAll, params->timeout);
      free_conversion_context(ctx);
@@ -16292,7 +16472,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -63811,6 +63953,9 @@ static NTSTATUS thunk64_vkWaitSemaphores(void *args)
+@@ -63811,6 +64074,9 @@ static NTSTATUS thunk64_vkWaitSemaphores(void *args)
      convert_VkSemaphoreWaitInfo_win64_to_host(ctx, params->pWaitInfo, &pWaitInfo_host);
      params->result = vulkan_device_from_handle(params->device)->p_vkWaitSemaphores(vulkan_device_from_handle(params->device)->host.device, &pWaitInfo_host, params->timeout);
      free_conversion_context(ctx);
@@ -16302,7 +16482,7 @@ index e7d394fa..d94ca46d 100644
      return STATUS_SUCCESS;
  }
  #endif /* _WIN64 */
-@@ -63851,6 +63996,9 @@ static NTSTATUS thunk64_vkWaitSemaphoresKHR(void *args)
+@@ -63851,6 +64117,9 @@ static NTSTATUS thunk64_vkWaitSemaphoresKHR(void *args)
      convert_VkSemaphoreWaitInfo_win64_to_host(ctx, params->pWaitInfo, &pWaitInfo_host);
      params->result = vulkan_device_from_handle(params->device)->p_vkWaitSemaphoresKHR(vulkan_device_from_handle(params->device)->host.device, &pWaitInfo_host, params->timeout);
      free_conversion_context(ctx);

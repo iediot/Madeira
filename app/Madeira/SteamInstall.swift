@@ -61,10 +61,20 @@ enum SteamInstallFiles {
         let fm = FileManager.default
         let common = steamApps.appendingPathComponent("common", isDirectory: true).resolvingSymlinksInPath().standardizedFileURL
         let folder = common.appendingPathComponent(safeFolderName(folderName)).resolvingSymlinksInPath().standardizedFileURL
+        let recordURL = steamApps.appendingPathComponent("appmanifest_\(appID).acf")
+        // Games can share one install folder (Half-Life, Opposing Force and
+        // Counter-Strike all use "Half-Life"). When another installed game's record
+        // names this folder, removing it would delete that game, saves kept in its
+        // folder included: keep the folder and the other records, and remove only
+        // this app's record and journal. Some of its files may then stay behind.
+        if otherInstall(sharing: folderName, except: appID, steamApps: steamApps) {
+            try? fm.removeItem(at: recordURL)
+            try? fm.removeItem(at: steamApps.appendingPathComponent("downloading/\(appID)", isDirectory: true))
+            return
+        }
         if folder.path.hasPrefix(common.path + "/"), folder.deletingLastPathComponent().path == common.path {
             try? fm.removeItem(at: folder)
         }
-        let recordURL = steamApps.appendingPathComponent("appmanifest_\(appID).acf")
         if let state = record(appID: appID, steamApps: steamApps) {
             for (_, owner) in (state["SharedDepots"]?.fields ?? [:]).sorted(by: { $0.key < $1.key }).prefix(64) {
                 guard let ownerID = owner.string.flatMap({ Int($0) }), ownerID > 0, ownerID != appID,
@@ -118,6 +128,26 @@ enum SteamInstallFiles {
         guard !cleaned.isEmpty, cleaned != ".", cleaned != "..", !cleaned.contains(":"),
               !cleaned.unicodeScalars.contains(where: { $0.value < 0x20 }) else { return "app" }
         return cleaned
+    }
+
+    /// Whether another installed app's record names `folderName` as its install
+    /// folder. The record of an app that owns depots `appID` shares (written by
+    /// AppManifestWriter.mergeOwnerManifest when `appID` was installed) counts as
+    /// `appID`'s own while every depot in it is one of those shared depots; one
+    /// with depots of its own is that app's real install.
+    private static func otherInstall(sharing folderName: String, except appID: Int, steamApps: URL) -> Bool {
+        let shared = Set((record(appID: appID, steamApps: steamApps)?["SharedDepots"]?.fields ?? [:]).keys)
+        let wanted = safeFolderName(folderName)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: steamApps.path) else { return false }
+        for name in names.prefix(4000) where name.hasPrefix("appmanifest_") && name.hasSuffix(".acf") {
+            guard let id = Int(name.dropFirst("appmanifest_".count).dropLast(".acf".count)), id > 0, id != appID,
+                  let state = record(appID: id, steamApps: steamApps),
+                  let dir = state["installdir"]?.string,
+                  safeFolderName(dir).caseInsensitiveCompare(wanted) == .orderedSame else { continue }
+            let depots = Set((state["InstalledDepots"]?.fields ?? [:]).keys)
+            if depots.isEmpty || !depots.isSubset(of: shared) { return true }
+        }
+        return false
     }
 
     /// The `AppState` block of `appmanifest_<appid>.acf` when the file is

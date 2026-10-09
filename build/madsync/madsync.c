@@ -405,6 +405,20 @@ static int do_wait( struct ntsync_wait_args *args, int all )
     int ret = 0;
 
     if (args->count > NTSYNC_MAX_WAIT_COUNT) { errno = EINVAL; return -1; }
+    /* Wait-all on one object twice is refused, as the ntsync driver does: both
+     * checks would pass and the object be taken twice (a count-1 semaphore wrapped
+     * to 0xffffffff, a mutex left with a recursion count one release cannot undo). */
+    if (all)
+    {
+        unsigned a, b;
+        for (a = 1; a < args->count; a++)
+        {
+            struct ms_obj *oa = obj_of( fds[a] );
+            if (!oa) continue;   /* the locked path reports EBADF */
+            for (b = 0; b < a; b++)
+                if (obj_of( fds[b] ) == oa) { errno = EINVAL; return -1; }
+        }
+    }
     /* ml1063: LOCK-FREE POLL. The dominant call is WaitForSingleObject(h, 0) in a
      * spin loop (19-290M per run) and almost always finds nothing. Reading the
      * object state without the lock is safe here: the caller's cached descriptor
