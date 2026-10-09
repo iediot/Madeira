@@ -60,7 +60,7 @@ index 0635a0d..4f0e86a 100644
 \ No newline at end of file
 +}; // namespace dxmt
 diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
-index 1e2a92f..90c59e2 100644
+index 1e2a92f..935a721 100644
 --- a/src/d3d11/d3d11_context_impl.cpp
 +++ b/src/d3d11/d3d11_context_impl.cpp
 @@ -27,6 +27,7 @@ since it is for internal use only
@@ -87,7 +87,28 @@ index 1e2a92f..90c59e2 100644
  /* ml746: COPY-PATH clamp accounting. CopySubresourceRegion never translated mip
   * indices, so every copy touching a clamped texture landed on the wrong level --
   * invisible in the menu (0 copies) and severe in gameplay (1,860). Classified by
-@@ -3147,7 +3157,8 @@ public:
+@@ -635,6 +645,20 @@ inline void BCStreamReport() {
+                                         "?","?","?","?","?","?","BC4s","BC5s"};
+   uint32_t total = 0;
+   for (int i = 0; i < 16; i++) total += g_bc_stream_ok[i].load(std::memory_order_relaxed);
++  // Print only when something moved since the last line: unchanged it repeated
++  // ~44 times a second in The Talos Principle (41,464 identical zero lines), each
++  // a log write on the game's own thread.
++  {
++    static uint64_t last_sig = ~0ull;
++    const uint64_t sig = (uint64_t)total * 1000003ull ^ g_bc_stream_fail.load() * 7919ull ^
++                         g_bc_clamp_xlated.load() * 104729ull ^ g_bc_clamp_dropped.load() * 31ull ^
++                         g_cp_xlated.load() * 131ull ^ g_cp_dropped.load() * 137ull ^ g_cp_lost.load() * 139ull ^
++                         g_cp_refilled.load() * 149ull ^ g_cp_bc_stg_unsupported.load() * 151ull ^
++                         g_cp_bc_stg_decoded.load() * 157ull ^ g_cp_bc_stg_fail.load() * 163ull;
++    if (sig == last_sig)
++      return;
++    last_sig = sig;
++  }
+   ERR("[bc-stream] ml744 decoded total=", total,
+       " BC1=", g_bc_stream_ok[1].load(), " BC2=", g_bc_stream_ok[2].load(),
+       " BC3=", g_bc_stream_ok[3].load(), " BC4u=", g_bc_stream_ok[4].load(),
+@@ -3147,7 +3171,8 @@ public:
  
    template <typename T> moveonly_list<T> AllocateCommandData(size_t n = 1);
  
@@ -97,7 +118,7 @@ index 1e2a92f..90c59e2 100644
    void UseCopyDestination(Rc<StagingResource> &);
    void UseCopySource(Rc<StagingResource> &);
  
-@@ -3779,6 +3790,13 @@ public:
+@@ -3779,6 +3804,13 @@ public:
       * so they take bias 0, which is what we want. Drop only when a requested
       * logical level sits below its own texture's bias -- it does not exist. */
      {
@@ -111,7 +132,7 @@ index 1e2a92f..90c59e2 100644
        uint32_t src_bias = 0, dst_bias = 0;
        if (auto t = GetTexture(cmd.pSrc)) src_bias = t->mipBias();
        if (auto t = GetTexture(cmd.pDst)) dst_bias = t->mipBias();
-@@ -4302,6 +4320,13 @@ public:
+@@ -4302,6 +4334,13 @@ public:
         *
         * Without this every streamed update would land on the wrong mip, which is
         * worse than not clamping at all. */
@@ -125,7 +146,7 @@ index 1e2a92f..90c59e2 100644
        const uint32_t mip_bias = dst->mipBias();
        if (mip_bias) {
          if (cmd.Dst.MipLevel < mip_bias) {
-@@ -4413,9 +4438,23 @@ public:
+@@ -4413,9 +4452,23 @@ public:
          cmd.EffectiveRows = cmd.DstSize.height;
          g_bc_stream_ok[bc_kind & 15].fetch_add(1, std::memory_order_relaxed);
        }
@@ -152,7 +173,7 @@ index 1e2a92f..90c59e2 100644
          for (unsigned depthSlice = 0; depthSlice < cmd.DstSize.depth; depthSlice++) {
            auto dst_offset = offset + depthSlice * bytes_per_depth_slice;
            const char *src = ((const char *)pSrcData) + depthSlice * SrcDepthPitch;
-@@ -4496,6 +4535,13 @@ public:
+@@ -4496,6 +4549,13 @@ public:
         *
         * Without this every streamed update would land on the wrong mip, which is
         * worse than not clamping at all. */
@@ -166,7 +187,7 @@ index 1e2a92f..90c59e2 100644
        const uint32_t mip_bias = dst->mipBias();
        if (mip_bias) {
          if (cmd.Dst.MipLevel < mip_bias) {
-@@ -5769,8 +5815,9 @@ public:
+@@ -5769,8 +5829,9 @@ public:
    }
  
    std::tuple<WMT::Buffer, uint64_t>
@@ -2455,18 +2476,19 @@ index b8e7348..8b30fee 100644
 \ No newline at end of file
 +} // namespace dxmt
 diff --git a/src/dxmt/dxmt_dynamic.cpp b/src/dxmt/dxmt_dynamic.cpp
-index dafa85f..cc4dd13 100644
+index dafa85f..1ae0ce2 100644
 --- a/src/dxmt/dxmt_dynamic.cpp
 +++ b/src/dxmt/dxmt_dynamic.cpp
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  #include "dxmt_dynamic.hpp"
++#include <algorithm>
  #include "dxmt_texture.hpp"
  #include "dxmt_mem_census.hpp"
 +#include "log/log.hpp"
  
  namespace dxmt {
  DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) :
-@@ -96,7 +97,14 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
+@@ -96,7 +98,28 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
       *
       * A blanket depth cap would be a use-after-free: an entry whose
       * will_free_at still exceeds coherent_seq_id can be in GPU use right now. */
@@ -2474,7 +2496,21 @@ index dafa85f..cc4dd13 100644
 +    // Large app-visible generations consume guest address space. Keep at most
 +    // eight idle names including the current and the allocation being returned;
 +    // fenced generations remain pinned until completion, never forcibly reused.
-+    const unsigned DYN_KEEP_ELIGIBLE = buffer->hasExternalBacking() ? 6 : 64;
++    // Otherwise the reserve is a byte budget, not a fixed count (ml1312). A small
++    // buffer the game rewrites with DISCARD per draw needs as many generations as
++    // writes in flight: The Talos Principle peaked at 685 queued, What Remains of
++    // Edith Finch at 1,970. With a flat 64 the surplus was released the moment the
++    // GPU caught up and minted again next frame: 16.8 million Metal buffers created
++    // and destroyed in 15 minutes, ~18,000 IOGPUResourceCreate calls a second. 8 MB
++    // per instance keeps those small names (floor 64, ceiling 4096) and leaves a
++    // large buffer near the old reserve.
++    unsigned DYN_KEEP_ELIGIBLE = 64;
++    if (buffer->hasExternalBacking())
++      DYN_KEEP_ELIGIBLE = 6;
++    else if (!fifo.empty() && fifo.front().allocation.ptr()) {
++      const uint64_t entry_bytes = std::max<uint64_t>(fifo.front().allocation->census_bytes_, 256);
++      DYN_KEEP_ELIGIBLE = (unsigned)std::clamp<uint64_t>((8ull << 20) / entry_bytes, 64, 4096);
++    }
 +    if (buffer->hasExternalBacking() && fifo.size() + 2 > 8 && !alias_warned_) {
 +      alias_warned_ = true;
 +      Logger::warn("d3d9: aliased buffer exceeded eight generations; retaining GPU-busy storage");
