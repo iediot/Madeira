@@ -207,6 +207,250 @@ index 3f8a7549..3361f1e3 100644
      {
          WARN( "Could not allocate %#Ix bytes, status %#lx\n", *region_size, status );
          return NULL;
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index b316ccac..5d533c1f 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -159,8 +159,17 @@ typedef struct _wine_modref
+     struct file_id        id;
+     ULONG                 CheckSum;
+     BOOL                  system;
++    LIST_ENTRY            failed_import_entry;
++    NTSTATUS              import_status;
++    BYTE                 *resolved_imports;
+ } WINE_MODREF;
+ 
++/* Import failures retain one image per file, outside the public module lists.
++ * Dependencies can already point into it (including cycles), so freeing its
++ * image or executable copy here is unsafe. Retry that image instead of leaking
++ * another mapping, TLS slot and JIT copy on every LoadLibrary attempt. */
++static LIST_ENTRY failed_import_modules = { &failed_import_modules, &failed_import_modules };
++
+ static UINT tls_module_count = 32;     /* number of modules with TLS directory */
+ static IMAGE_TLS_DIRECTORY *tls_dirs;  /* array of TLS directories */
+ 
+@@ -1828,7 +1837,7 @@ static NTSTATUS fixup_imports_ilonly( WINE_MODREF *wm, LPCWSTR load_path, void *
+     if (!(wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)) return STATUS_SUCCESS;  /* already done */
+     wm->ldr.Flags &= ~LDR_DONT_RESOLVE_REFS;
+ 
+-    assert( !wm->ldr.DdagNode->Dependencies.Tail );
++    /* A retained import failure may already have an mscoree dependency. */
+     if (!(status = load_dll( load_path, L"mscoree.dll", 0, &imp, FALSE ))
+           && !add_module_dependency_after( wm->ldr.DdagNode, imp->ldr.DdagNode, NULL ))
+         status = STATUS_NO_MEMORY;
+@@ -1883,7 +1892,11 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
+ 
+     if (!nb_imports) return STATUS_SUCCESS;  /* no imports */
+ 
+-    if (!create_module_activation_context( &wm->ldr ))
++    if (!wm->resolved_imports &&
++        !(wm->resolved_imports = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, nb_imports )))
++        return STATUS_NO_MEMORY;
++
++    if (wm->ldr.ActivationContext || !create_module_activation_context( &wm->ldr ))
+         RtlActivateActivationContext( 0, wm->ldr.ActivationContext, &cookie );
+ 
+     /* load the imported modules. They are automatically
+@@ -1892,11 +1905,19 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
+     status = STATUS_SUCCESS;
+     for (i = 0; i < nb_imports; i++)
+     {
++        /* Do not bind a successful descriptor twice. With OriginalFirstThunk
++         * absent its FirstThunk already contains function pointers, not names.
++         * This also avoids duplicate dependency references and stub allocations. */
++        if (wm->resolved_imports[i]) continue;
+         dep_after = wm->ldr.DdagNode->Dependencies.Tail;
+         if (!import_dll( wm, &imports[i], load_path, &imp ))
+             status = STATUS_DLL_NOT_FOUND;
+-        else if (imp && imp->ldr.DdagNode != node_ntdll && imp->ldr.DdagNode != node_kernel32)
+-            add_module_dependency_after( wm->ldr.DdagNode, imp->ldr.DdagNode, dep_after );
++        else
++        {
++            wm->resolved_imports[i] = 1;
++            if (imp && imp->ldr.DdagNode != node_ntdll && imp->ldr.DdagNode != node_kernel32)
++                add_module_dependency_after( wm->ldr.DdagNode, imp->ldr.DdagNode, dep_after );
++        }
+     }
+     if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
+     return status;
+@@ -2187,6 +2208,8 @@ static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved )
+     mod = CONTAINING_RECORD( node->Modules.Flink, LDR_DATA_TABLE_ENTRY, NodeModuleLink );
+     wm = CONTAINING_RECORD( mod, WINE_MODREF, ldr );
+ 
++    if (wm->import_status) return wm->import_status;
++
+     /* Skip initialization entirely if requested */
+     if (wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)
+         return status;
+@@ -2850,6 +2873,82 @@ done:
+ }
+ 
+ 
++/* Called under loader_section; keep failed images out of every public lookup.
++ * Retain the dependency graph, TLS and activation context for a safe retry. */
++static void retain_failed_import_module( WINE_MODREF *wm, NTSTATUS status )
++{
++    RemoveEntryList( &wm->ldr.InLoadOrderLinks );
++    RemoveEntryList( &wm->ldr.InMemoryOrderLinks );
++    RemoveEntryList( &wm->ldr.HashLinks );
++    RtlRbRemoveNode( &base_address_index_tree, &wm->ldr.BaseAddressIndexNode );
++    if (cached_modref == wm) cached_modref = NULL;
++    wm->import_status = status;
++    wm->ldr.Flags |= LDR_DONT_RESOLVE_REFS;
++    InsertTailList( &failed_import_modules, &wm->failed_import_entry );
++}
++
++static WINE_MODREF *find_failed_import_module( const UNICODE_STRING *nt_name,
++                                              const struct file_id *id )
++{
++    static const struct file_id no_id;
++    UNICODE_STRING name = *nt_name;
++    LIST_ENTRY *entry;
++    WINE_MODREF *wm;
++
++    name.Buffer += 4;
++    name.Length -= 4 * sizeof(WCHAR);
++    for (entry = failed_import_modules.Flink; entry != &failed_import_modules; entry = entry->Flink)
++    {
++        wm = CONTAINING_RECORD( entry, WINE_MODREF, failed_import_entry );
++        if (id && memcmp( id, &no_id, sizeof(*id) ))
++        {
++            if (!memcmp( &wm->id, id, sizeof(*id) )) return wm;
++        }
++        else if (RtlEqualUnicodeString( &name, &wm->ldr.FullDllName, TRUE )) return wm;
++    }
++    return NULL;
++}
++
++static NTSTATUS retry_failed_import_module( WINE_MODREF *wm, LPCWSTR load_path )
++{
++    NTSTATUS status;
++    static unsigned int reports;
++
++    RemoveEntryList( &wm->failed_import_entry );
++    InsertTailList( &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList, &wm->ldr.InLoadOrderLinks );
++    InsertTailList( &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList, &wm->ldr.InMemoryOrderLinks );
++    InsertTailList( &hash_table[hash_basename( &wm->ldr.BaseDllName )], &wm->ldr.HashLinks );
++    rtl_rb_tree_put( &base_address_index_tree, wm->ldr.DllBase,
++                     &wm->ldr.BaseAddressIndexNode, base_address_compare );
++    /* Publish temporarily during resolution so circular imports find this
++     * same image. No initialization is allowed until resolution succeeds. */
++    wm->import_status = STATUS_SUCCESS;
++    if (wm->ldr.Flags & LDR_COR_ILONLY)
++        status = fixup_imports_ilonly( wm, load_path, &wm->ldr.EntryPoint );
++    else
++        status = fixup_imports( wm, load_path );
++    if (status) retain_failed_import_module( wm, status );
++    if (reports++ < 16)
++        ERR( "[import-retry] reused %s base=%p status=%lx (no new image or TLS slot)\n",
++             debugstr_w(wm->ldr.FullDllName.Buffer), wm->ldr.DllBase, status );
++    return status;
++}
++
++static void complete_loaded_module( WINE_MODREF *wm )
++{
++    BOOL is_builtin = !!(wm->ldr.Flags & LDR_WINE_INTERNAL);
++    HMODULE module = wm->ldr.DllBase;
++
++    if (is_builtin)
++    {
++        if (TRACE_ON(relay)) RELAY_SetupDLL( module );
++    }
++    else if ((wm->ldr.Flags & LDR_IMAGE_IS_DLL) && TRACE_ON(snoop)) SNOOP_SetupDLL( module );
++    TRACE_(loaddll)( "Loaded %s at %p: %s\n", debugstr_w(wm->ldr.FullDllName.Buffer), module,
++                     is_builtin ? "builtin" : "native" );
++    wm->ldr.LoadCount = 1;
++}
++
+ /*************************************************************************
+  *		build_module
+  *
+@@ -2899,19 +2998,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+             status = fixup_imports( wm, load_path );
+         if (status != STATUS_SUCCESS)
+         {
+-            /* the module has only be inserted in the load & memory order lists */
+-            RemoveEntryList(&wm->ldr.InLoadOrderLinks);
+-            RemoveEntryList(&wm->ldr.InMemoryOrderLinks);
+-            RemoveEntryList(&wm->ldr.HashLinks);
+-            RtlRbRemoveNode( &base_address_index_tree, &wm->ldr.BaseAddressIndexNode );
+-
+-            /* FIXME: there are several more dangling references
+-             * left. Including dlls loaded by this dll before the
+-             * failed one. Unrolling is rather difficult with the
+-             * current structure and we can leave them lying
+-             * around with no problems, so we don't care.
+-             * As these might reference our wm, we don't free it.
+-             */
++            retain_failed_import_module( wm, status );
+             *module = NULL;
+             return status;
+         }
+@@ -2919,19 +3006,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+ 
+     TRACE( "loaded %s %p %p\n", debugstr_us(nt_name), wm, *module );
+ 
+-    if (is_builtin)
+-    {
+-        if (TRACE_ON(relay)) RELAY_SetupDLL( *module );
+-    }
+-    else
+-    {
+-        if ((wm->ldr.Flags & LDR_IMAGE_IS_DLL) && TRACE_ON(snoop)) SNOOP_SetupDLL( *module );
+-    }
+-
+-    TRACE_(loaddll)( "Loaded %s at %p: %s\n", debugstr_w(wm->ldr.FullDllName.Buffer), *module,
+-                     is_builtin ? "builtin" : "native" );
+-
+-    wm->ldr.LoadCount = 1;
++    complete_loaded_module( wm );
+     *pwm = wm;
+     *module = NULL;
+     return STATUS_SUCCESS;
+@@ -3410,9 +3485,25 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
+                                  DWORD flags, BOOL system, BOOL redirected, WINE_MODREF** pwm )
+ {
+     void *module = NULL;
++    WINE_MODREF *failed;
+     SIZE_T len = 0;
+-    NTSTATUS status = NtMapViewOfSection( mapping, NtCurrentProcess(), &module, 0, 0, NULL, &len,
+-                                          ViewShare, 0, PAGE_EXECUTE_READ );
++    NTSTATUS status;
++
++    /* Search still opens the current file and obtains its identity. Replacing
++     * it therefore does not adopt a failed image from the old file. */
++    if (!(flags & LDR_DONT_RESOLVE_REFS) && (failed = find_failed_import_module( nt_name, id )))
++    {
++        if ((status = retry_failed_import_module( failed, load_path )))
++        {
++            *pwm = NULL;
++            return status;
++        }
++        complete_loaded_module( failed );
++        *pwm = failed;
++        goto loaded;
++    }
++    status = NtMapViewOfSection( mapping, NtCurrentProcess(), &module, 0, 0, NULL, &len,
++                                ViewShare, 0, PAGE_EXECUTE_READ );
+ 
+     if (!NT_SUCCESS(status)) return status;
+ 
+@@ -3431,6 +3522,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
+ #endif
+     if (NT_SUCCESS(status)) status = build_module( load_path, nt_name, &module, image_info, id,
+                                                    flags, system, redirected, pwm );
++loaded:
+ #ifdef __arm64ec__
+     /* iOS-Madeira ml709: tell the emulator this image's code is executable, here rather
+      * than relying on NtMapViewOfSection's notification -- that one never fires in a
+@@ -5130,6 +5222,7 @@ static void free_modref( WINE_MODREF *wm )
+     NtUnmapViewOfSection( NtCurrentProcess(), wm->ldr.DllBase );
+     if (cached_modref == wm) cached_modref = NULL;
+     RtlFreeUnicodeString( &wm->ldr.FullDllName );
++    RtlFreeHeap( GetProcessHeap(), 0, wm->resolved_imports );
+     RtlFreeHeap( GetProcessHeap(), 0, wm );
+ }
+ 
 diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
 index b2f445e0..71219b57 100644
 --- a/dlls/ntdll/unix/file.c
@@ -500,10 +744,63 @@ index b2f445e0..71219b57 100644
      send_completion = cvalue != 0;
  
 diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
-index e617138e..ea201969 100644
+index e617138e..f78afce4 100644
 --- a/dlls/ntdll/unix/socket.c
 +++ b/dlls/ntdll/unix/socket.c
-@@ -905,6 +905,7 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
+@@ -488,6 +488,11 @@ static int convert_control_headers(struct msghdr *hdr, WSABUF *control)
+ #endif /* IP_PKTINFO */
+ 
+ #if defined(IP_TOS)
++#if defined(IP_RECVTOS) && IP_RECVTOS != IP_TOS
++                    /* Darwin/BSD return the receive option as the message type,
++                     * while Linux returns IP_TOS. Winsock expects IP_TOS. */
++                    case IP_RECVTOS:
++#endif
+                     case IP_TOS:
+                     {
+                         INT tos = *(unsigned char *)CMSG_DATA(cmsg_unix);
+@@ -598,25 +603,32 @@ static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_3
+     {
+         struct cmsghdr_32 *cmsg32 = (struct cmsghdr_32 *)ptr32;
+         const WSACMSGHDR *cmsg64 = (const WSACMSGHDR *)ptr64;
++        size_t remaining = control64->buf + control64->len - ptr64;
++        size_t payload, message_size;
+ 
+-        if (ptr32 + sizeof(*cmsg32) + cmsg_align_32( cmsg64->cmsg_len ) > buf32 + max_len)
+-        {
+-            control32->len = 0;
+-            return 0;
+-        }
++        if (remaining < sizeof(*cmsg64) || cmsg64->cmsg_len < sizeof(*cmsg64) ||
++            cmsg64->cmsg_len > remaining || WSA_CMSG_ALIGN( cmsg64->cmsg_len ) > remaining)
++            goto error;
++        payload = cmsg64->cmsg_len - sizeof(*cmsg64);
++        message_size = sizeof(*cmsg32) + payload;
++        if (cmsg_align_32( message_size ) > max_len - (size_t)(ptr32 - buf32)) goto error;
+ 
+-        cmsg32->cmsg_len = cmsg64->cmsg_len - sizeof(*cmsg64) + sizeof(*cmsg32);
++        cmsg32->cmsg_len = message_size;
+         cmsg32->cmsg_level = cmsg64->cmsg_level;
+         cmsg32->cmsg_type = cmsg64->cmsg_type;
+-        memcpy( cmsg32 + 1, cmsg64 + 1, cmsg64->cmsg_len );
++        memcpy( cmsg32 + 1, cmsg64 + 1, payload );
+ 
+         ptr64 += WSA_CMSG_ALIGN( cmsg64->cmsg_len );
+         ptr32 += cmsg_align_32( cmsg32->cmsg_len );
+     }
+ 
+     control32->len = ptr32 - buf32;
+-    FIXME("-> %d\n", control32->len);
++    TRACE("-> %d\n", control32->len);
+     return 1;
++
++error:
++    control32->len = 0;
++    return 0;
+ }
+ 
+ struct ip_hdr
+@@ -905,6 +917,7 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
   * Caveat kept from ml590: TLS 1.3 puts EncryptedExtensions/Certificate/
   * CertificateVerify/Finished/NewSessionTicket ALL under record type 0x17, so the tail
   * read is "post-handshake", not provably application data. */
@@ -511,7 +808,7 @@ index e617138e..ea201969 100644
  #define IOS_TL_SLOTS 128
  struct ios_tl_ent
  {
-@@ -916,7 +917,41 @@ struct ios_tl_ent
+@@ -916,7 +929,41 @@ struct ios_tl_ent
      unsigned long      b_send, b_recv;
      int                post_len;
      unsigned char      post5[5];
@@ -553,7 +850,7 @@ index e617138e..ea201969 100644
  static struct ios_tl_ent ios_tl_tab[IOS_TL_SLOTS];
  static unsigned int ios_tl_gen;
  
-@@ -945,12 +980,13 @@ static void ios_tl_flush( struct ios_tl_ent *e, const char *fate )
+@@ -945,12 +992,13 @@ static void ios_tl_flush( struct ios_tl_ent *e, const char *fate )
  
      dprintf( 2, "[sock-tl] fd=%d gen=%u port=%u open->CH=%.1f CH->flight=%.1f "
                  "flight->fin=%.1f fin->tail=%.1f tail->post=%.1f total=%.1fms "
@@ -569,7 +866,7 @@ index e617138e..ea201969 100644
      e->fd = -1;
  }
  
-@@ -1026,6 +1062,10 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
+@@ -1026,6 +1074,10 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
          e = &ios_tl_tab[freeslot];
          memset( e, 0, sizeof(*e) );
          e->fd = fd; e->port = port; e->gen = ++ios_tl_gen; e->t0 = now;
@@ -580,7 +877,7 @@ index e617138e..ea201969 100644
      }
  
      e->t_last = now;
-@@ -1035,7 +1075,11 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
+@@ -1035,7 +1087,11 @@ static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, i
  
      if (is_send)
      {

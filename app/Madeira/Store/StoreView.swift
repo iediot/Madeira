@@ -548,6 +548,9 @@ private struct StoreTrailer: View {
         NavigationStack {
             VideoPlayer(player: player).navigationTitle(movie.name).navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+                // The app sets the playback category only when a game starts; until then iOS's
+                // default category follows the silent switch, so a trailer played mute.
+                .onAppear { try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback); try? AVAudioSession.sharedInstance().setActive(true) }
                 .onDisappear { player.pause() }
         }
     }

@@ -16196,20 +16196,25 @@ static int ios_swap_churn_find( size_t size, int add )
 }
 static int ios_swap_churn_is( unsigned i )
 {
+    /* ml1317: classic coverage needs nearly every block of a size to die young.
+     * Stick It To The Stickman loads textures through 16 MB blocks of which about
+     * half are freed quickly and half live on; "half" made the size churny, the
+     * survivors stayed anonymous and the game was killed at 5.6 GB. Borderlands:
+     * The Pre-Sequel's 8 MB blocks all die young and still qualify. */
+    if (!ios_swap_broad)
+        return ios_swap_churn[i].hits >= 32 && ios_swap_churn[i].hits * 10 >= ios_swap_churn[i].backs * 9;
     return ios_swap_churn[i].hits >= IOS_SWAP_CHURN_MIN_YOUNG &&
            ios_swap_churn[i].hits * 2 >= ios_swap_churn[i].backs;
 }
 static int ios_swap_churny( size_t size )
 {
     int i;
-    if (!ios_swap_broad) return 0;
     i = ios_swap_churn_find( size, 0 );
     return i >= 0 && ios_swap_churn_is( (unsigned)i );
 }
 static void ios_swap_churn_backed( size_t size )
 {
     int i;
-    if (!ios_swap_broad) return;
     if ((i = ios_swap_churn_find( size, 1 )) >= 0) ios_swap_churn[i].backs++;
 }
 static void ios_swap_churn_note( size_t size, uint64_t lived_ns )
@@ -16227,6 +16232,16 @@ static void ios_swap_churn_note( size_t size, uint64_t lived_ns )
                  (unsigned long long)(lived_ns / 1000000), ios_swap_nchurny );
     }
 }
+static size_t ios_swap_churn_ceiling_mb( void )
+{
+    static size_t v = (size_t)-1;
+    if (v == (size_t)-1)
+    {
+        const char *e = getenv( "MADEIRA_SWAP_CHURN_MB" );
+        v = (e && *e) ? (size_t)strtoul( e, NULL, 10 ) : 3072;
+    }
+    return v;
+}
 static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot, struct file_view *view )
 {
     uintptr_t b = (uintptr_t)base;
@@ -16235,6 +16250,14 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
     if (!view || !is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM))) return 0;
     if (b < 0x7000000000ULL || b >= 0x7c00000000ULL) return 0;   /* the guest band only */
     if (size < ios_swap_min) return 0;   /* 8 MB unless madeira.cfg swap-min-mb (ml1257) */
+    /* ml1317/ml1318: a churning size is skipped only while memory is comfortable.
+     * Borderlands: The Pre-Sequel churns 8 MB blocks at 2-3 GB, where backing them
+     * only costs speed. Stick It To The Stickman also churns its 16 MB texture blocks
+     * (90% die young) but keeps climbing toward the 6 GB limit, where the survivors
+     * must be backed: skipping the size outright got it killed at 5.3-5.6 GB.
+     * MADEIRA_SWAP_CHURN_MB sets the ceiling (default 3072). */
+    if (ios_swap_churny( size ) && ios_swap_footprint_mb() < (unsigned long long)ios_swap_churn_ceiling_mb())
+    { ios_swap_churn_skips++; return 0; }
     return 1;
 }
 /* blocks/wide/broad: why a range is (not) eligible; the census counts by this. */
@@ -16271,7 +16294,8 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
     if (ios_swap_broad) { if (b + size > 0x7c00000000ULL) return IOS_SW_BAND; }   /* ml1257: FEX's band and above */
     else if (!ios_swap_wide && (b < 0x7000000000ULL || b >= 0x7c00000000ULL)) return IOS_SW_BAND;
     if (size < ios_swap_min) return IOS_SW_SMALL;
-    if (ios_swap_churny( size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }   /* ml1258 */
+    if (ios_swap_churny( size ) && ios_swap_footprint_mb() < (unsigned long long)ios_swap_churn_ceiling_mb())
+    { ios_swap_churn_skips++; return IOS_SW_CHURN; }   /* ml1258, ml1318 */
     return IOS_SW_BACKED;
 }
 static const char *ios_swap_map_tag = "";   /* ml1257: the "backed" log line names whole reservations */
@@ -16299,7 +16323,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     }
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
     ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size;
-    ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
+    ios_swap_ext[ios_swap_n].born = ios_swap_now_ns(); ios_swap_n++;   /* ml1317: classic too */
     ios_swap_churn_backed( size );   /* ml1226 */
     ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
     ios_swap_backs++;
@@ -16400,7 +16424,7 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
             /* trim the extent: up to two remaining pieces */
             if (oa == a && ob == b)
             {
-                if (!copy_back && ios_swap_broad && ios_swap_ext[i].born != noted_born)   /* ml1258: freed whole; how long did it live? */
+                if (!copy_back && ios_swap_ext[i].born != noted_born)   /* ml1258: freed whole; how long did it live? */
                 {
                     uint64_t lived = ios_swap_now_ns() - ios_swap_ext[i].born;
                     noted_born = ios_swap_ext[i].born;
@@ -16569,7 +16593,14 @@ static int ios_swap_armed( void )
     if (ios_swap_arm_mb == (size_t)-1)
     {
         const char *v = getenv( "MADEIRA_SWAP_ARM_MB" );
-        ios_swap_arm_mb = (v && *v) ? (size_t)strtoul( v, NULL, 10 ) : 3584;
+        /* ml1317: 0 (from the start) again. Arming at 3584 MB was too late for a game
+         * that loads fast: Stick It To The Stickman went from 2.1 GB to past the 6 GB
+         * limit in seconds after the tier armed at 3.9 GB, and was killed twice. The
+         * cost the gate avoided -- Borderlands: The Pre-Sequel freeing and recommitting
+         * 8 MB blocks ~43 times a second -- is now caught by the churn detector, which
+         * classic coverage uses too: a size whose backed blocks keep dying young stops
+         * being backed. */
+        ios_swap_arm_mb = (v && *v) ? (size_t)strtoul( v, NULL, 10 ) : 0;
         dprintf( 2, "[swap] ml1300 arms at footprint %zu MB%s\n", ios_swap_arm_mb,
                  ios_swap_arm_mb ? "" : " (from the start)" );
     }

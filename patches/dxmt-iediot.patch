@@ -60,7 +60,7 @@ index 0635a0d..4f0e86a 100644
 \ No newline at end of file
 +}; // namespace dxmt
 diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
-index 1e2a92f..935a721 100644
+index 1e2a92f..1125df4 100644
 --- a/src/d3d11/d3d11_context_impl.cpp
 +++ b/src/d3d11/d3d11_context_impl.cpp
 @@ -27,6 +27,7 @@ since it is for internal use only
@@ -187,7 +187,57 @@ index 1e2a92f..935a721 100644
        const uint32_t mip_bias = dst->mipBias();
        if (mip_bias) {
          if (cmd.Dst.MipLevel < mip_bias) {
-@@ -5769,8 +5829,9 @@ public:
+@@ -4539,7 +4599,40 @@ public:
+   - flush/present
+   Return value indicates if a commit happens
+   */
+-  bool
++  /* DXMT_D11_PASS_STATS=1: which call sites end render passes. Edith Finch ran 83-97
++   * Metal render passes a frame (GPU 20-42 ms); each break stores the targets and the
++   * next pass loads them again, which is what tile GPUs pay for. Every 4096 ends the
++   * top callers are logged as offsets in this DLL (map them with llvm-addr2line on the
++   * unstripped build). */
++  __attribute__((noinline)) void
++  NotePassEnd(void *caller) {
++    static const bool on = [] { const auto v = env::getEnvVar("DXMT_D11_PASS_STATS"); return !v.empty() && v != "0"; }();
++    if (!on)
++      return;
++    static uintptr_t base = [] {
++      HMODULE module = nullptr;
++      GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                         (LPCSTR)&env::getEnvVar, &module);
++      return (uintptr_t)module;
++    }();
++    static std::mutex lock;
++    static std::unordered_map<uintptr_t, uint64_t> counts;
++    static uint64_t total;
++    std::lock_guard<std::mutex> g(lock);
++    counts[(uintptr_t)caller - base]++;
++    if (++total % 4096)
++      return;
++    std::vector<std::pair<uint64_t, uintptr_t>> top;
++    for (auto &[rva, n] : counts)
++      top.emplace_back(n, rva);
++    std::sort(top.rbegin(), top.rend());
++    std::string line = str::format("[pass-end] ", total, " render passes ended; top callers (rva:count):");
++    for (size_t i = 0; i < top.size() && i < 8; i++)
++      line += str::format(" 0x", std::hex, top[i].second, std::dec, ":", top[i].first);
++    WARN(line);
++  }
++
++  __attribute__((noinline)) bool
+   InvalidateCurrentPass(bool defer_commit = false) {
+     switch (cmdbuf_state) {
+     case CommandBufferState::Idle:
+@@ -4548,6 +4641,7 @@ public:
+     case CommandBufferState::RenderPipelineReady:
+     case CommandBufferState::TessellationRenderPipelineReady:
+     case CommandBufferState::GeometryRenderPipelineReady: {
++      NotePassEnd(__builtin_return_address(0));
+       // EmitCommand([](CommandChunk::context &ctx) {
+       //   ctx.render_encoder->endEncoding();
+       //   ctx.render_encoder = nullptr;
+@@ -5769,8 +5863,9 @@ public:
    }
  
    std::tuple<WMT::Buffer, uint64_t>
@@ -259,7 +309,7 @@ index aeb3673..188572a 100644
    double madeira_inside_sum_ms_ = 0, madeira_inside_max_ms_ = 0;
    UINT madeira_gap_sync_min_ = ~0u, madeira_gap_sync_max_ = 0;
 diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
-index dfc927b..8867ff7 100644
+index dfc927b..b1b90b2 100644
 --- a/src/d3d11/d3d11_texture_device.cpp
 +++ b/src/d3d11/d3d11_texture_device.cpp
 @@ -9,6 +9,9 @@
@@ -388,7 +438,24 @@ index dfc927b..8867ff7 100644
  /* ---- ml2000: memory-pressure-aware automatic clamp (d3d11.mipClampAuto) ----
   *
   * A D3D11 scene load created ~500 SRV-only BC textures (mostly 2048/4096
-@@ -492,16 +604,10 @@ static std::atomic<int64_t> g_auto_headroom_mb{mip_clamp::kHeadroomUnknown};
+@@ -463,8 +575,14 @@ GetMipClampAutoConfig() {
+     else if (!opt.empty() || !env_v.empty())
+       c.enabled = true;
+     else
+-      c.enabled = kMadeira32BitModule;
+-    c.threshold_mb = (uint32_t)std::max(0, Config::getInstance().getOption<int>("d3d11.mipClampAutoMB", 1536));
++      c.enabled = true;   /* ml2120: 64-bit too (was 32-bit only, see below) */
++    /* ml2120: Stick It to the Stickman (64-bit) loads 3.8 GB of large BC and
++     * RGBA8 art, nearly all of it eligible, and was killed at the iPhone's 6 GB
++     * limit with nothing clamped because the auto clamp only ran in the i386
++     * module. A 64-bit process also has more besides textures (FEX, Wine, the
++     * game's own heap), so it starts clamping a little earlier. */
++    c.threshold_mb = (uint32_t)std::max(0, Config::getInstance().getOption<int>("d3d11.mipClampAutoMB",
++                                                                            kMadeira32BitModule ? 1536 : 2048));
+     if (c.enabled)
+       ERR("[mip-clamp] ml2000 auto on threshold=", c.threshold_mb,
+           " MB (d3d11.mipClampAuto=0 or MADEIRA_MIP_CLAMP_AUTO=0 disables; d3d11.mipClampAutoMB sets the threshold)");
+@@ -492,16 +610,10 @@ static std::atomic<int64_t> g_auto_headroom_mb{mip_clamp::kHeadroomUnknown};
  static std::atomic<int64_t> g_auto_footprint_mb{0};
  static std::atomic<bool> g_auto_pressure_logged{false};
  
@@ -409,7 +476,7 @@ index dfc927b..8867ff7 100644
    const uint64_t n = g_auto_candidates.fetch_add(1, std::memory_order_relaxed) + 1;
    int64_t headroom = g_auto_headroom_mb.load(std::memory_order_relaxed);
    if (mip_clamp::ShouldRequery(n, headroom, cfg.threshold_mb)) {
-@@ -522,8 +628,21 @@ MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
+@@ -522,8 +634,21 @@ MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
          g_auto_footprint_mb.load(std::memory_order_relaxed), " MB -> ", pressure ? "clamping" : "not clamping",
          " large BC textures (threshold ", cfg.threshold_mb, " MB) clamped=",
          g_auto_clamped.load(std::memory_order_relaxed));
@@ -432,7 +499,7 @@ index dfc927b..8867ff7 100644
  
    const uint64_t clamped = g_auto_clamped.fetch_add(1, std::memory_order_relaxed) + 1;
    if (mip_clamp::ShouldLogClamp(clamped))
-@@ -557,6 +676,9 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+@@ -557,6 +682,9 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     * descriptor; only `info` and the upload loop see reduced numbers. */
    uint32_t mip_bias = 0;
    typename tag::DESC1 physDesc = finalDesc;
@@ -442,7 +509,7 @@ index dfc927b..8867ff7 100644
    if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
      static int cached_clamp = -1;
      if (cached_clamp < 0)
-@@ -568,7 +690,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+@@ -568,7 +696,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
       * LOGICAL mip indices, which UpdateTexture now translates through the bias,
       * dropping levels that no longer exist physically. */
      const bool eligible =
@@ -451,7 +518,7 @@ index dfc927b..8867ff7 100644
          (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
          finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
          finalDesc.MipLevels >= 2 && finalDesc.SampleDesc.Count <= 1 &&
-@@ -604,6 +726,80 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+@@ -604,6 +732,80 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
        info.height             = physDesc.Height;
        info.mipmap_level_count = physDesc.MipLevels;
      }
@@ -532,7 +599,7 @@ index dfc927b..8867ff7 100644
    }
    bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
                              !(physDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
-@@ -611,6 +807,25 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+@@ -611,6 +813,25 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
    /* ml745: the immediate context resolves streamed uploads through the dxmt
     * Texture, not the D3D wrapper, so the bias must be visible there too. */
    texture->setMipBias(mip_bias);
