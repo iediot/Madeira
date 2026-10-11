@@ -104,7 +104,7 @@ index 5119f85..d47cb97 100644
  	virtual bool isTessellationPipeline() { return false; };
  
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
-index 9092954..86f58bf 100644
+index 9092954..ad85381 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
 @@ -17,6 +17,7 @@
@@ -115,7 +115,42 @@ index 9092954..86f58bf 100644
  #include "MVKCommandBuffer.h"
  #include "MVKCommandPool.h"
  #include "MVKImage.h"
-@@ -237,7 +238,19 @@
+@@ -104,6 +105,10 @@
+ 	for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
+ 		_barriers.emplace_back(pImageMemoryBarriers[i], srcStageMask, dstStageMask);
+ 	}
++	// Madeira: stage masks alone define a valid execution dependency.
++	if (_barriers.empty()) {
++		_barriers.emplace_back(srcStageMask, dstStageMask);
++	}
+ 
+ 	return VK_SUCCESS;
+ }
+@@ -112,6 +117,8 @@
+ void MVKCmdPipelineBarrier<N>::encode(MVKCommandEncoder* cmdEncoder) {
+ 	
+ 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
++	bool madeiraArgBufferBarriers = cmdEncoder->isUsingMetalArgumentBuffers() && cmdEncoder->getDevice()->hasResidencySet();
++	bool madeiraComputeEncoderStaysOpen = cmdEncoder->encodeFullMemoryBarrier();
+ 
+ #if MVK_MACOS
+ 	// Calls below invoke MTLBlitCommandEncoder so must apply this first.
+@@ -157,8 +164,12 @@
+ 	}
+ #endif
+ 
+-	if (!cmdEncoder->_mtlRenderEncoder && cmdEncoder->isUsingMetalArgumentBuffers() && cmdEncoder->getDevice()->hasResidencySet()) {
+-		cmdEncoder->endCurrentMetalEncoding();
++	if (!cmdEncoder->_mtlRenderEncoder && madeiraArgBufferBarriers) {
++		// Madeira: mode 2 keeps compute work in one encoder; its memory barrier above
++		// supplies the intra-encoder dependency for argument-buffer resources.
++		if (!madeiraComputeEncoderStaysOpen) {
++			cmdEncoder->endCurrentMetalEncoding();
++		}
+ 
+ 		for (auto& b : _barriers) {
+ 			uint64_t sourceStageMask = mvkBarrierStagesFromPipelineStageFlags(b.srcStageMask), destStageMask = mvkBarrierStagesFromPipelineStageFlags(b.dstStageMask);
+@@ -237,7 +248,19 @@
  #pragma mark -
  #pragma mark MVKCmdBindPipeline
  
@@ -135,7 +170,7 @@ index 9092954..86f58bf 100644
  	_pipeline = (MVKPipeline*)pipeline;
  
  	cmdBuff->recordBindPipeline(this);
-@@ -254,7 +267,7 @@
+@@ -254,7 +277,7 @@
  }
  
  bool MVKCmdBindGraphicsPipeline::isTessellationPipeline() {
@@ -145,15 +180,15 @@ index 9092954..86f58bf 100644
  
  
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.h b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.h
-index 9aebb24..2437c4f 100644
+index 9aebb24..b53186e 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.h
-@@ -51,13 +51,14 @@ public:
+@@ -51,13 +51,15 @@ public:
      VkResult setContent(MVKCommandBuffer* cmdBuff,
                          const VkCopyImageInfo2* pImageInfo);
  
 -	void encode(MVKCommandEncoder* cmdEncoder) override { encode(cmdEncoder, kMVKCommandUseCopyImage); }
-+	void encode(MVKCommandEncoder* cmdEncoder) override { encode(cmdEncoder, kMVKCommandUseCopyImage); madeiraDumpDst(cmdEncoder); }
++	void encode(MVKCommandEncoder* cmdEncoder) override;
  
  	void encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse commandUse);
  
@@ -161,17 +196,123 @@ index 9aebb24..2437c4f 100644
  	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
      VkResult validate(MVKCommandBuffer* cmdBuff, const VkImageCopy2* region);
 +	void madeiraDumpDst(MVKCommandEncoder* cmdEncoder);
++	void madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder);
  
  	MVKSmallVector<VkImageCopy2, N> _vkImageCopies;
  	MVKImage* _srcImage;
+@@ -102,7 +104,7 @@ public:
+     VkResult setContent(MVKCommandBuffer* cmdBuff,
+                         const VkBlitImageInfo2* pBlitImageInfo);
+ 
+-	void encode(MVKCommandEncoder* cmdEncoder) override { encode(cmdEncoder, kMVKCommandUseBlitImage); }
++	void encode(MVKCommandEncoder* cmdEncoder) override;
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse commandUse);
+ 
+@@ -112,6 +114,7 @@ protected:
+ 	bool canCopy(const VkImageBlit2& region);
+ 	void populateVertices(MVKVertexPosTex* vertices, const VkImageBlit2& region);
+     VkResult validate(MVKCommandBuffer* cmdBuff, const VkImageBlit2* region, bool isDestUnwritableLinear);
++	void madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder);
+ 
+ 	MVKSmallVector<VkImageBlit2, N> _vkImageBlits;
+ 	MVKImage* _srcImage;
+@@ -158,6 +161,7 @@ public:
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+     VkResult validate(MVKCommandBuffer* cmdBuff, const VkImageResolve2* region);
++	void madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder);
+ 
+ 	MVKSmallVector<VkImageResolve2, N> _vkImageResolves;
+     MVKImage* _srcImage;
+@@ -230,9 +234,13 @@ public:
+ 
+     void encode(MVKCommandEncoder* cmdEncoder) override;
+ 
++	/** Encodes the copy without the Madeira frame dump (MVKCmdCopyImage uses this one internally). */
++	void encodeRegions(MVKCommandEncoder* cmdEncoder);
++
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+ 	bool isArrayTexture();
++	void madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder);
+     VkResult validate(MVKCommandBuffer* cmdBuff);
+ 
+ 	MVKSmallVector<VkBufferImageCopy2, N> _bufferImageCopyRegions;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
-index ab318c5..dfd6d33 100644
+index ab318c5..5048ff8 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
-@@ -319,6 +319,17 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -309,16 +309,81 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+         // Create and execute a temporary buffer image command.
+         // To be threadsafe...do NOT acquire and return the command from the pool.
+         cpyCmd.setContent(cmdEncoder->_cmdBuffer, tempBuff, (VkImage)_srcImage, _srcLayout, copyCnt, vkSrcCopies, false);
+-        cpyCmd.encode(cmdEncoder);
++        cpyCmd.encodeRegions(cmdEncoder);
+ 
+         // Copy from buffer to destination image
+         // Create and execute a temporary buffer image command.
+         // To be threadsafe...do NOT acquire and return the command from the pool.
+         cpyCmd.setContent(cmdEncoder->_cmdBuffer, tempBuff, (VkImage)_dstImage, _dstLayout, copyCnt, vkDstCopies, true);
+-        cpyCmd.encode(cmdEncoder);
++        cpyCmd.encodeRegions(cmdEncoder);
      }
  }
  
++// Madeira frame dump: transfer regions as JSON (index entries of kind "transfer"), at most
++// kMVKMadeiraDumpMaxRegions of them; regionCount gives the total.
++static constexpr size_t kMVKMadeiraDumpMaxRegions = 32;
++static void mvkMadeiraRegionSub(std::string& j, const char* key, const VkImageSubresourceLayers& sub) {
++	char buf[160];
++	snprintf(buf, sizeof(buf), "\"%s\":{\"aspect\":%u,\"mip\":%u,\"layer\":%u,\"layers\":%u}",
++			 key, sub.aspectMask, sub.mipLevel, sub.baseArrayLayer, sub.layerCount);
++	j += buf;
++}
++static void mvkMadeiraRegionOffset(std::string& j, const char* key, const VkOffset3D& o) {
++	char buf[96];
++	snprintf(buf, sizeof(buf), "\"%s\":[%d,%d,%d]", key, o.x, o.y, o.z);
++	j += buf;
++}
++static void mvkMadeiraRegionExtent(std::string& j, const char* key, const VkExtent3D& e) {
++	char buf[96];
++	snprintf(buf, sizeof(buf), "\"%s\":[%u,%u,%u]", key, e.width, e.height, e.depth);
++	j += buf;
++}
++template <typename R>
++static std::string mvkMadeiraImageRegions(const R* regions, size_t count) {
++	std::string j = "[";
++	for (size_t i = 0; i < count && i < kMVKMadeiraDumpMaxRegions; i++) {
++		const R& r = regions[i];
++		if (i) { j += ","; }
++		j += "{";
++		mvkMadeiraRegionSub(j, "srcSubresource", r.srcSubresource);    j += ",";
++		mvkMadeiraRegionOffset(j, "srcOffset", r.srcOffset);           j += ",";
++		mvkMadeiraRegionSub(j, "dstSubresource", r.dstSubresource);    j += ",";
++		mvkMadeiraRegionOffset(j, "dstOffset", r.dstOffset);           j += ",";
++		mvkMadeiraRegionExtent(j, "extent", r.extent);
++		j += "}";
++	}
++	return j + "]";
++}
++
++template <size_t N>
++void MVKCmdCopyImage<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	if (cmdEncoder->_madeiraDump) { madeiraDumpTransfer(cmdEncoder); }	// Madeira
++	encode(cmdEncoder, kMVKCommandUseCopyImage);
++	madeiraDumpDst(cmdEncoder);
++}
++
++// Madeira: frame dump entry for vkCmdCopyImage, listed even when its destination cannot be dumped.
++template <size_t N>
++void MVKCmdCopyImage<N>::madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder) {
++	if (_vkImageCopies.empty()) { return; }
++	auto& r0 = _vkImageCopies[0];
++	cmdEncoder->madeiraDumpTransfer(kMVKCommandUseCopyImage, "vkCmdCopyImage",
++									_srcImage->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(r0.srcSubresource.aspectMask)), nil, 0,
++									_dstImage->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(r0.dstSubresource.aspectMask)), nil, 0,
++									mvkMadeiraImageRegions(_vkImageCopies.data(), _vkImageCopies.size()), _vkImageCopies.size());
++}
++
 +// Madeira: frame dump of a vkCmdCopyImage destination (first region).
 +template <size_t N>
 +void MVKCmdCopyImage<N>::madeiraDumpDst(MVKCommandEncoder* cmdEncoder) {
@@ -186,7 +327,7 @@ index ab318c5..dfd6d33 100644
  template class MVKCmdCopyImage<1>;
  template class MVKCmdCopyImage<4>;
  
-@@ -725,6 +736,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -725,11 +790,43 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  
  				[mtlRendEnc popDebugGroup];
                  [mtlRendEnc endEncoding];
@@ -194,7 +335,64 @@ index ab318c5..dfd6d33 100644
              }
          }
      }
-@@ -956,6 +968,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ }
+ 
++template <size_t N>
++void MVKCmdBlitImage<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	if (cmdEncoder->_madeiraDump) { madeiraDumpTransfer(cmdEncoder); }	// Madeira
++	encode(cmdEncoder, kMVKCommandUseBlitImage);
++}
++
++// Madeira: frame dump entry for vkCmdBlitImage.
++template <size_t N>
++void MVKCmdBlitImage<N>::madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder) {
++	if (_vkImageBlits.empty()) { return; }
++	std::string j = "[";
++	for (size_t i = 0; i < _vkImageBlits.size() && i < kMVKMadeiraDumpMaxRegions; i++) {
++		const VkImageBlit2& r = _vkImageBlits[i];
++		if (i) { j += ","; }
++		j += "{";
++		mvkMadeiraRegionSub(j, "srcSubresource", r.srcSubresource);  j += ",";
++		mvkMadeiraRegionOffset(j, "srcOffset0", r.srcOffsets[0]);    j += ",";
++		mvkMadeiraRegionOffset(j, "srcOffset1", r.srcOffsets[1]);    j += ",";
++		mvkMadeiraRegionSub(j, "dstSubresource", r.dstSubresource);  j += ",";
++		mvkMadeiraRegionOffset(j, "dstOffset0", r.dstOffsets[0]);    j += ",";
++		mvkMadeiraRegionOffset(j, "dstOffset1", r.dstOffsets[1]);
++		j += _filter == VK_FILTER_NEAREST ? ",\"filter\":\"nearest\"}" : ",\"filter\":\"linear\"}";
++	}
++	j += "]";
++	auto& r0 = _vkImageBlits[0];
++	cmdEncoder->madeiraDumpTransfer(kMVKCommandUseBlitImage, "vkCmdBlitImage",
++									_srcImage->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(r0.srcSubresource.aspectMask)), nil, 0,
++									_dstImage->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(r0.dstSubresource.aspectMask)), nil, 0,
++									j, _vkImageBlits.size());
++}
++
+ template class MVKCmdBlitImage<1>;
+ template class MVKCmdBlitImage<4>;
+ 
+@@ -804,8 +901,20 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+     return VK_SUCCESS;
+ }
+ 
++// Madeira: frame dump entry for vkCmdResolveImage.
++template <size_t N>
++void MVKCmdResolveImage<N>::madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder) {
++	if (_vkImageResolves.empty()) { return; }
++	auto& r0 = _vkImageResolves[0];
++	cmdEncoder->madeiraDumpTransfer(kMVKCommandUseResolveImage, "vkCmdResolveImage",
++									_srcImage->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(r0.srcSubresource.aspectMask)), nil, 0,
++									_dstImage->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(r0.dstSubresource.aspectMask)), nil, 0,
++									mvkMadeiraImageRegions(_vkImageResolves.data(), _vkImageResolves.size()), _vkImageResolves.size());
++}
++
+ template <size_t N>
+ void MVKCmdResolveImage<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	if (cmdEncoder->_madeiraDump) { madeiraDumpTransfer(cmdEncoder); }	// Madeira
+ 
+ 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
+ 	size_t vkIRCnt = _vkImageResolves.size();
+@@ -956,6 +1065,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  		cmdEncoder->barrierUpdate(kMVKBarrierStageCopy, mtlRendEnc, MTLRenderStageFragment);
  
  		[mtlRendEnc endEncoding];
@@ -202,7 +400,58 @@ index ab318c5..dfd6d33 100644
  	}
  }
  
-@@ -1653,6 +1666,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -1131,6 +1241,50 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+     
+ template <size_t N>
+ void MVKCmdBufferImageCopy<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	if (cmdEncoder->_madeiraDump) { madeiraDumpTransfer(cmdEncoder); }	// Madeira
++	encodeRegions(cmdEncoder);
++	// Madeira: frame dump of a vkCmdCopyBufferToImage destination (first region).
++	if (cmdEncoder->_madeiraDump && _toImage && !_bufferImageCopyRegions.empty()) {
++		auto& r0 = _bufferImageCopyRegions[0];
++		bool is3D = _image->getMTLTextureType() == MTLTextureType3D;
++		cmdEncoder->madeiraDumpTransferTexture(_image->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(r0.imageSubresource.aspectMask)),
++											   r0.imageSubresource.mipLevel, is3D ? r0.imageOffset.z : r0.imageSubresource.baseArrayLayer,
++											   mvkMTLBlitCommandEncoderLabel(kMVKCommandUseCopyBufferToImage));
++	}
++}
++
++// Madeira: frame dump entry for vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer, with the
++// buffer's layout (rowLength / imageHeight in texels, 0 = tightly packed) per region.
++template <size_t N>
++void MVKCmdBufferImageCopy<N>::madeiraDumpTransfer(MVKCommandEncoder* cmdEncoder) {
++	if (_bufferImageCopyRegions.empty()) { return; }
++	std::string j = "[";
++	for (size_t i = 0; i < _bufferImageCopyRegions.size() && i < kMVKMadeiraDumpMaxRegions; i++) {
++		const VkBufferImageCopy2& r = _bufferImageCopyRegions[i];
++		char buf[160];
++		snprintf(buf, sizeof(buf), "%s{\"bufferOffset\":%llu,\"bufferRowLength\":%u,\"bufferImageHeight\":%u,",
++				 i ? "," : "", (unsigned long long)r.bufferOffset, r.bufferRowLength, r.bufferImageHeight);
++		j += buf;
++		mvkMadeiraRegionSub(j, "imageSubresource", r.imageSubresource);  j += ",";
++		mvkMadeiraRegionOffset(j, "imageOffset", r.imageOffset);         j += ",";
++		mvkMadeiraRegionExtent(j, "imageExtent", r.imageExtent);
++		j += "}";
++	}
++	j += "]";
++	id<MTLTexture> tex = _image->getMTLTexture(MVKImage::getPlaneFromVkImageAspectFlags(_bufferImageCopyRegions[0].imageSubresource.aspectMask));
++	id<MTLBuffer> buff = _buffer->getMTLBuffer();
++	NSUInteger offset = _buffer->getMTLBufferOffset();
++	if (_toImage) {
++		cmdEncoder->madeiraDumpTransfer(kMVKCommandUseCopyBufferToImage, "vkCmdCopyBufferToImage", nil, buff, offset, tex, nil, 0,
++										j, _bufferImageCopyRegions.size());
++	} else {
++		cmdEncoder->madeiraDumpTransfer(kMVKCommandUseCopyImageToBuffer, "vkCmdCopyImageToBuffer", tex, nil, 0, nil, buff, offset,
++										j, _bufferImageCopyRegions.size());
++	}
++}
++
++template <size_t N>
++void MVKCmdBufferImageCopy<N>::encodeRegions(MVKCommandEncoder* cmdEncoder) {
+     id<MTLBuffer> mtlBuffer = _buffer->getMTLBuffer();
+     if ( !mtlBuffer ) { return; }
+ 
+@@ -1653,6 +1807,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  				cmdEncoder->barrierUpdate(kMVKBarrierStageCopy, mtlRendEnc, MTLRenderStageFragment);
  
                  [mtlRendEnc endEncoding];
@@ -210,7 +459,7 @@ index ab318c5..dfd6d33 100644
              } else {
                  for (uint32_t layer = layerStart; layer < layerEnd; layer++) {
                      if (is3D) {
-@@ -1672,6 +1686,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -1672,6 +1827,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  					cmdEncoder->barrierUpdate(kMVKBarrierStageCopy, mtlRendEnc, MTLRenderStageFragment);
  
  					[mtlRendEnc endEncoding];
@@ -218,7 +467,7 @@ index ab318c5..dfd6d33 100644
                  }
              }
          }
-@@ -1792,8 +1807,6 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -1792,8 +1948,6 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
                            size: _dataSize];
  
      // Return the MTLBuffer allocation to the pool once the command buffer is done with it
@@ -229,15 +478,16 @@ index ab318c5..dfd6d33 100644
  }
  
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
-index 76ca788..0443372 100644
+index 76ca788..fbbe74e 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
-@@ -27,10 +27,14 @@
+@@ -27,10 +27,15 @@
  #include "MVKQueryPool.h"
  #include "MVKSmallVector.h"
  #include <unordered_map>
 +#include <vector>
 +#include <memory>
++#include <string>
  
  class MVKCommandPool;
  class MVKQueueCommandBufferSubmission;
@@ -247,7 +497,7 @@ index 76ca788..0443372 100644
  class MVKCommandEncodingPool;
  class MVKRenderPass;
  class MVKFramebuffer;
-@@ -441,6 +445,9 @@ public:
+@@ -441,6 +446,9 @@ public:
  	/** Copy the bytes to a temporary MTLBuffer that will be returned to a pool after the command buffer is finished. */
  	const MVKMTLBufferAllocation* copyToTempMTLBufferAllocation(const void* bytes, NSUInteger length, bool isDedicated = false);
  
@@ -257,7 +507,17 @@ index 76ca788..0443372 100644
      /** Returns the command encoding pool. */
      MVKCommandEncodingPool* getCommandEncodingPool();
  
-@@ -479,6 +486,23 @@ public:
+@@ -455,6 +463,9 @@ public:
+ 	/** Insert a new execution barrier */
+ 	void setBarrier(uint64_t sourceStageMask, uint64_t destStageMask);
+ 
++	/** Madeira: encode a mode-2 memory barrier, returning true when compute encoding stays open. */
++	bool encodeFullMemoryBarrier();
++
+ 	/** Encode waits for a specific stage in given encoder. */
+ 	void barrierWait(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages beforeStages);
+ 	void barrierWait(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder);
+@@ -479,6 +490,29 @@ public:
      /** Reset a range of queries. */
      void resetQueries(MVKQueryPool* pQueryPool, uint32_t firstQuery, uint32_t queryCount);
  
@@ -278,10 +538,16 @@ index 76ca788..0443372 100644
 +	/** Madeira: ends the current encoder and dumps a texture written by a transfer command. */
 +	void madeiraDumpTransferTexture(id<MTLTexture> mtlTex, uint32_t level, uint32_t slice, NSString* label);
 +
++	/** Madeira: lists a transfer command (source, destination, regions as a JSON array) in the frame dump. */
++	void madeiraDumpTransfer(MVKCommandUse cmdUse, const char* vkCmd,
++							 id<MTLTexture> srcTex, id<MTLBuffer> srcBuff, NSUInteger srcBuffOffset,
++							 id<MTLTexture> dstTex, id<MTLBuffer> dstBuff, NSUInteger dstBuffOffset,
++							 const std::string& regions, size_t regionCount);
++
  #pragma mark Dynamic encoding state accessed directly
  
  	/** Context for tracking information across multiple encodings. */
-@@ -530,6 +554,8 @@ protected:
+@@ -530,6 +564,8 @@ protected:
  	template<typename T> void retainIfImmediatelyEncoding(T& mtlEnc);
  	template<typename T> void endMetalEncoding(T& mtlEnc);
  	id<MTLFence> getBarrierStageFence(MVKBarrierStage stage);
@@ -290,7 +556,7 @@ index 76ca788..0443372 100644
  
  	typedef struct GPUCounterQuery {
  		MVKGPUCounterQueryPool* queryPool = nullptr;
-@@ -539,6 +565,8 @@ protected:
+@@ -539,6 +575,8 @@ protected:
  	VkRect2D _renderArea;
  	MVKCommand* _lastMultiviewPassCmd;
      MVKActivatedQueries* _pActivatedQueries;
@@ -299,7 +565,15 @@ index 76ca788..0443372 100644
  	MVKSmallVector<GPUCounterQuery, 16> _timestampStageCounterQueries;
  	MVKSmallVector<VkClearValue, kMVKDefaultAttachmentCount> _clearValues;
  	MVKSmallVector<MVKImageView*, kMVKDefaultAttachmentCount> _attachments;
-@@ -559,6 +587,9 @@ protected:
+@@ -551,6 +589,7 @@ protected:
+ 	uint32_t _multiviewPassIndex;
+     uint32_t _flushCount;
+ 	MVKCommandUse _mtlComputeEncoderUse;
++	uint32_t _mtlComputeEncoderStages;
+ 	MVKCommandUse _mtlBlitEncoderUse;
+ 	bool _isRenderingEntireAttachment;
+ };
+@@ -559,6 +598,9 @@ protected:
  #pragma mark -
  #pragma mark Support functions
  
@@ -310,7 +584,7 @@ index 76ca788..0443372 100644
  NSString* mvkMTLRenderCommandEncoderLabel(MVKCommandUse cmdUse);
  
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
-index 8c24deb..c83af3e 100644
+index 8c24deb..00c3b74 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 @@ -25,7 +25,14 @@
@@ -328,7 +602,7 @@ index 8c24deb..c83af3e 100644
  
  using namespace std;
  
-@@ -72,6 +79,581 @@
+@@ -72,6 +79,1066 @@
  }
  
  
@@ -348,6 +622,16 @@ index 8c24deb..c83af3e 100644
 +// MVK_MADEIRA_FRAME_DUMP_MB (default 1536) caps the bytes dumped, _MAX_DIM (default 4096)
 +// the texture size, _INFLIGHT_MB (default 768) the bytes waiting in shared buffers for their
 +// command buffer to complete; anything past a cap is listed in the index as skipped.
++//
++// What a pass reads matters as much as what it writes (a pass that writes garbage may only be
++// passing on garbage it sampled), so each draw (up to kMVKMadeiraDumpMaxDraws per pass) and
++// each dispatch also lists the textures and samplers bound to its stages, with the descriptor
++// set/binding they came from, and the sampled ones are dumped too ("input" entries, once per
++// pass) for dispatches and for render passes of at most _INPUT_DRAWS (default 4) draws.
++// Inputs are copied after the pass, the first point the encoder allows: only an input the
++// pass also writes ("alsoWritten") can differ from what the draws saw. Transfer commands get
++// "transfer" entries (source, destination, regions), and every pipeline used gets its MSL and
++// binding map written once to shaders/.
 +
 +struct MVKMadeiraDumpFormat {
 +	const char* name;
@@ -416,6 +700,8 @@ index 8c24deb..c83af3e 100644
 +	uint64_t inflight = 0;
 +	uint64_t written = 0;
 +	uint32_t skipped = 0;
++	uint32_t inputDraws = 4;
++	std::unordered_map<const void*, std::string> pipelineShaders;	// pipeline -> its "shaders" JSON fields
 +	FILE* jsonl = nullptr;
 +	std::vector<std::pair<uint32_t, std::string>> entries;
 +
@@ -451,11 +737,39 @@ index 8c24deb..c83af3e 100644
 +	uint32_t slice;
 +	uint32_t depthPlane;
 +	std::string slot;
++	int64_t seq = -1;			// preassigned (inputs, so the consumer's entry can name them), else the next one
++	const char* kind = nullptr;	// overrides the pass's kind (inputs)
++	std::string extra;			// more JSON fields for this target's entry
 +};
++
++/** A texture bound to a stage of a draw or dispatch. */
++struct MVKMadeiraDumpInput {
++	id<MTLTexture> texture;	// retained when known valid, else nil
++	bool dumpable;			// sampled, not a storage image the pass's own dump covers
++	std::string slot;		// stage and Metal index, e.g. fragment3
++	std::string json;		// left open, so the seq of its input entry can be added
++};
++
++/** The bindings of one draw of a render pass. */
++struct MVKMadeiraDumpDraw {
++	uint32_t index;
++	const void* pipeline;
++	std::vector<MVKMadeiraDumpInput> inputs;
++	std::vector<std::string> samplers;
++};
++
++static constexpr uint32_t kMVKMadeiraDumpMaxDraws = 64;
++
++static void mvkMadeiraDumpRelease(std::vector<MVKMadeiraDumpInput>& inputs) {
++	for (auto& in : inputs) { [in.texture release]; }
++	inputs.clear();
++}
 +
 +/** The Metal render pass being recorded: its attachments and what drew into it. */
 +struct MVKMadeiraDumpPass {
 +	std::vector<MVKMadeiraDumpTarget> targets;
++	std::vector<MVKMadeiraDumpTarget> inputs;	// sampled textures of the first draws, first use each
++	std::vector<MVKMadeiraDumpDraw> drawList;
 +	std::string label;
 +	std::string use;
 +	uint32_t width = 0;
@@ -464,7 +778,11 @@ index 8c24deb..c83af3e 100644
 +	std::vector<const void*> pipelinePtrs;
 +	std::vector<std::string> pipelines;
 +	std::vector<std::string> viewports;
-+	~MVKMadeiraDumpPass() { for (auto& t : targets) { [t.texture release]; } }
++	~MVKMadeiraDumpPass() {
++		for (auto& t : targets) { [t.texture release]; }
++		for (auto& t : inputs) { [t.texture release]; }
++		for (auto& d : drawList) { mvkMadeiraDumpRelease(d.inputs); }
++	}
 +};
 +
 +static std::atomic<bool> _mvkMadeiraDumpArmed{false};
@@ -547,6 +865,8 @@ index 8c24deb..c83af3e 100644
 +	frame->budget = mvkMadeiraDumpEnv("MVK_MADEIRA_FRAME_DUMP_MB", 1536) << 20;
 +	frame->inflightCap = mvkMadeiraDumpEnv("MVK_MADEIRA_FRAME_DUMP_INFLIGHT_MB", 768) << 20;
 +	frame->maxDim = (uint32_t)mvkMadeiraDumpEnv("MVK_MADEIRA_FRAME_DUMP_MAX_DIM", 4096);
++	frame->inputDraws = (uint32_t)mvkMadeiraDumpEnv("MVK_MADEIRA_FRAME_DUMP_INPUT_DRAWS", 4);
++	mkdir((frame->dir + "/shaders").c_str(), 0755);
 +	frame->jsonl = fopen((frame->dir + "/index.jsonl").c_str(), "w");
 +	fprintf(stderr, "[mvk-dump] start dir=%s budget=%lluMB inflight=%lluMB max-dim=%u\n", frame->dir.c_str(),
 +			(unsigned long long)(frame->budget >> 20), (unsigned long long)(frame->inflightCap >> 20), frame->maxDim);
@@ -561,7 +881,7 @@ index 8c24deb..c83af3e 100644
 +	for (auto& t : targets) {
 +		if (t.texture == tex && t.level == level && t.slice == slice && t.depthPlane == depthPlane) { return; }
 +	}
-+	targets.push_back({ [tex retain], (uint32_t)level, (uint32_t)slice, (uint32_t)depthPlane, slot });
++	targets.push_back({ [tex retain], (uint32_t)level, (uint32_t)slice, (uint32_t)depthPlane, slot, -1, nullptr, {} });
 +}
 +
 +static void mvkMadeiraDumpCollectAttachments(MTLRenderPassDescriptor* mtlRPDesc, std::vector<MVKMadeiraDumpTarget>& targets) {
@@ -591,7 +911,8 @@ index 8c24deb..c83af3e 100644
 + */
 +static void mvkMadeiraDumpEncode(const std::shared_ptr<MVKMadeiraFrameDump>& frame, id<MTLCommandBuffer> mtlCmdBuff,
 +								 const char* kind, const std::string& passFields,
-+								 std::vector<MVKMadeiraDumpTarget>& targets) {
++								 std::vector<MVKMadeiraDumpTarget>& targets,
++								 int64_t passNo = -1, const std::string& firstFields = std::string()) {
 +	struct Pending {
 +		id<MTLBuffer> buffer;
 +		std::string path;
@@ -604,17 +925,19 @@ index 8c24deb..c83af3e 100644
 +	uint32_t pass;
 +	{
 +		std::lock_guard<std::mutex> guard(frame->lock);
-+		pass = frame->nextPass++;
++		pass = passNo >= 0 ? (uint32_t)passNo : frame->nextPass++;
 +		if (targets.empty()) {
 +			uint32_t seq = frame->nextSeq++;
 +			char head[96];
 +			snprintf(head, sizeof(head), "{\"seq\":%u,\"pass\":%u,\"kind\":\"%s\",", seq, pass, kind);
-+			frame->add(seq, head + passFields + ",\"slot\":null,\"skipped\":\"no-outputs\"}");
++			frame->add(seq, head + passFields + firstFields + ",\"slot\":null,\"skipped\":\"no-outputs\"}");
 +			frame->skipped++;
 +		}
 +	}
++	bool first = true;
 +	for (auto& t : targets) {
 +		id<MTLTexture> tex = t.texture;
++		const char* tkind = t.kind ? t.kind : kind;
 +		MVKMadeiraDumpFormat fmt = { nullptr, 0, MTLBlitOptionNone };
 +		bool known = mvkMadeiraDumpFormat(tex.pixelFormat, fmt);
 +		uint32_t width = std::max<uint32_t>(1, (uint32_t)tex.width >> t.level);
@@ -634,7 +957,7 @@ index 8c24deb..c83af3e 100644
 +		uint32_t seq;
 +		{
 +			std::lock_guard<std::mutex> guard(frame->lock);
-+			seq = frame->nextSeq++;
++			seq = t.seq >= 0 ? (uint32_t)t.seq : frame->nextSeq++;
 +			if ( !skip && frame->reserved + size > frame->budget) { skip = "budget"; }
 +			if ( !skip && frame->inflight + size > frame->inflightCap) { skip = "inflight"; }
 +			if ( !skip ) { frame->reserved += size; frame->inflight += size; }
@@ -651,22 +974,29 @@ index 8c24deb..c83af3e 100644
 +		}
 +
 +		char file[160];
-+		snprintf(file, sizeof(file), "%04u_%s_%s.raw", seq, kind, t.slot.c_str());
++		snprintf(file, sizeof(file), "%04u_%s_%s.raw", seq, tkind, t.slot.c_str());
 +		std::string json;
 +		char buf[256];
-+		snprintf(buf, sizeof(buf), "{\"seq\":%u,\"pass\":%u,\"kind\":\"%s\",", seq, pass, kind);
++		snprintf(buf, sizeof(buf), "{\"seq\":%u,\"pass\":%u,\"kind\":\"%s\",", seq, pass, tkind);
 +		json += buf;
 +		json += passFields;
++		if (first) { json += firstFields; first = false; }
 +		json += ",\"slot\":";
 +		mvkMadeiraJSON(json, t.slot.c_str());
 +		json += ",\"texture\":{\"label\":";
 +		mvkMadeiraJSON(json, tex.label);
 +		json += ",\"ptr\":";
 +		mvkMadeiraJSONPtr(json, tex);
-+		snprintf(buf, sizeof(buf), ",\"type\":%lu,\"usage\":%lu,\"samples\":%lu,\"mips\":%lu,\"size\":[%lu,%lu,%lu,%lu]}",
++		snprintf(buf, sizeof(buf), ",\"type\":%lu,\"usage\":%lu,\"samples\":%lu,\"mips\":%lu,\"size\":[%lu,%lu,%lu,%lu]",
 +				 (unsigned long)texType, (unsigned long)tex.usage, (unsigned long)tex.sampleCount, (unsigned long)tex.mipmapLevelCount,
 +				 (unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.depth, (unsigned long)tex.arrayLength);
 +		json += buf;
++		if (id<MTLTexture> parent = tex.parentTexture) {	// attachments and inputs are often views
++			json += ",\"parentTexture\":";
++			mvkMadeiraJSONPtr(json, parent);
++		}
++		json += "}";
++		json += t.extra;
 +		snprintf(buf, sizeof(buf), ",\"width\":%u,\"height\":%u,\"level\":%u,\"slice\":%u,\"depthPlane\":%u,\"format\":%lu,\"formatName\":",
 +				 width, height, t.level, t.slice, t.depthPlane, (unsigned long)tex.pixelFormat);
 +		json += buf;
@@ -678,9 +1008,9 @@ index 8c24deb..c83af3e 100644
 +			json += ",\"file\":null,\"skipped\":\"";
 +			json += skip;
 +			json += "\"}";
-+			if ( !known ) {
++			if ( !known && !t.kind ) {	// inputs are often compressed: not worth a line each
 +				fprintf(stderr, "[mvk-dump] skip #%u %s %s: pixel format %lu unsupported\n",
-+						seq, kind, t.slot.c_str(), (unsigned long)tex.pixelFormat);
++						seq, tkind, t.slot.c_str(), (unsigned long)tex.pixelFormat);
 +			}
 +			std::lock_guard<std::mutex> guard(frame->lock);
 +			frame->skipped++;
@@ -735,19 +1065,6 @@ index 8c24deb..c83af3e 100644
 +	}];
 +}
 +
-+static std::string mvkMadeiraDumpPipelineJSON(const void* vkPipeline, id mtlPipeline, NSString* mtlLabel, NSString* vkName) {
-+	std::string json = "{\"ptr\":";
-+	mvkMadeiraJSONPtr(json, vkPipeline);
-+	json += ",\"mtl\":";
-+	mvkMadeiraJSONPtr(json, mtlPipeline);
-+	json += ",\"label\":";
-+	mvkMadeiraJSON(json, mtlLabel);
-+	json += ",\"name\":";
-+	mvkMadeiraJSON(json, vkName);
-+	json += "}";
-+	return json;
-+}
-+
 +static void mvkMadeiraDumpJoin(std::string& json, const char* key, const std::vector<std::string>& items) {
 +	json += ",\"";
 +	json += key;
@@ -755,6 +1072,341 @@ index 8c24deb..c83af3e 100644
 +	for (size_t i = 0; i < items.size(); i++) {
 +		if (i) { json += ","; }
 +		json += items[i];
++	}
++	json += "]";
++}
++
++static const char* mvkMadeiraDumpDescriptorType(VkDescriptorType type) {
++	switch (type) {
++		case VK_DESCRIPTOR_TYPE_SAMPLER:                return "sampler";
++		case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return "combined-image-sampler";
++		case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:          return "sampled-image";
++		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:          return "storage-image";
++		case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:       return "input-attachment";
++		case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:   return "uniform-texel-buffer";
++		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:   return "storage-texel-buffer";
++		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:         return "uniform-buffer";
++		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:         return "storage-buffer";
++		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return "uniform-buffer-dynamic";
++		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return "storage-buffer-dynamic";
++		case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:   return "inline-uniform-block";
++		default:                                        return "other";
++	}
++}
++
++/** Describes a texture as Metal sees it. The texture must be valid. */
++static void mvkMadeiraDumpTextureJSON(std::string& json, id<MTLTexture> tex, MVKPixelFormats* pixFmts) {
++	json += "{\"ptr\":";
++	mvkMadeiraJSONPtr(json, tex);
++	json += ",\"label\":";
++	mvkMadeiraJSON(json, tex.label);
++	MVKMadeiraDumpFormat fmt = { nullptr, 0, MTLBlitOptionNone };
++	bool known = mvkMadeiraDumpFormat(tex.pixelFormat, fmt);
++	char buf[256];
++	snprintf(buf, sizeof(buf), ",\"type\":%lu,\"format\":%lu,\"formatName\":", (unsigned long)tex.textureType, (unsigned long)tex.pixelFormat);
++	json += buf;
++	mvkMadeiraJSON(json, known ? fmt.name : (pixFmts ? pixFmts->getName(tex.pixelFormat) : nullptr));
++	snprintf(buf, sizeof(buf), ",\"size\":[%lu,%lu,%lu,%lu],\"mips\":%lu,\"samples\":%lu,\"usage\":%lu,\"storageMode\":%lu",
++			 (unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.depth, (unsigned long)tex.arrayLength,
++			 (unsigned long)tex.mipmapLevelCount, (unsigned long)tex.sampleCount, (unsigned long)tex.usage, (unsigned long)tex.storageMode);
++	json += buf;
++	// A sampled view names the texture an earlier pass wrote (texture.ptr / parentTexture of its entries).
++	if (id<MTLTexture> parent = tex.parentTexture) {
++		json += ",\"parentTexture\":";
++		mvkMadeiraJSONPtr(json, parent);
++		snprintf(buf, sizeof(buf), ",\"parentFormat\":%lu,\"parentFormatName\":", (unsigned long)parent.pixelFormat);
++		json += buf;
++		mvkMadeiraJSON(json, pixFmts ? pixFmts->getName(parent.pixelFormat) : nullptr);
++		snprintf(buf, sizeof(buf), ",\"parentSize\":[%lu,%lu,%lu,%lu],\"parentMips\":%lu,\"levels\":[%lu,%lu],\"slices\":[%lu,%lu]",
++				 (unsigned long)parent.width, (unsigned long)parent.height, (unsigned long)parent.depth, (unsigned long)parent.arrayLength,
++				 (unsigned long)parent.mipmapLevelCount, (unsigned long)tex.parentRelativeLevel, (unsigned long)tex.mipmapLevelCount,
++				 (unsigned long)tex.parentRelativeSlice, (unsigned long)tex.arrayLength);
++		json += buf;
++	}
++	if (id<MTLBuffer> buff = tex.buffer) {
++		json += ",\"buffer\":";
++		mvkMadeiraJSONPtr(json, buff);
++		snprintf(buf, sizeof(buf), ",\"bufferOffset\":%lu,\"bufferBytesPerRow\":%lu", (unsigned long)tex.bufferOffset, (unsigned long)tex.bufferBytesPerRow);
++		json += buf;
++	}
++	json += "}";
++}
++
++static id<MTLTexture> mvkMadeiraDumpRoot(id<MTLTexture> tex) {
++	while (id<MTLTexture> parent = tex.parentTexture) { tex = parent; }
++	return tex;
++}
++
++/** One stage of a pipeline: its name in the dump and what MoltenVK kept of its conversion. */
++struct MVKMadeiraDumpStage {
++	const char* name;
++	const MVKPipelineStageResourceInfo* res;
++};
++
++/**
++ * Writes the MSL and binding map of each stage of a pipeline to shaders/ once per dump, and
++ * returns the fields naming them. The MSL comes from the live MVKShaderLibrary; one whose
++ * shader module the game already destroyed is listed as unavailable.
++ */
++static std::string mvkMadeiraDumpShaders(const std::shared_ptr<MVKMadeiraFrameDump>& frame, MVKPipeline* pipeline,
++										 const MVKMadeiraDumpStage* stages, size_t stageCount) {
++	{
++		std::lock_guard<std::mutex> guard(frame->lock);
++		auto it = frame->pipelineShaders.find(pipeline);
++		if (it != frame->pipelineShaders.end()) { return it->second; }
++	}
++	char ptr[32];
++	snprintf(ptr, sizeof(ptr), "%p", pipeline);
++	MVKPipelineLayout* layout = pipeline->getLayout();
++	auto* files = new std::vector<std::pair<std::string, std::string>>();
++	std::string fields = ",\"shaders\":{";
++	std::string map = "{\"ptr\":\"";
++	map += ptr;
++	map += "\",\"name\":";
++	mvkMadeiraJSON(map, pipeline->getDebugName());
++	map += ",\"stages\":{";
++	bool firstStage = true;
++	for (size_t s = 0; s < stageCount; s++) {
++		const MVKPipelineStageResourceInfo* res = stages[s].res;
++		if ( !res || (!res->madeiraMSL && res->madeiraBindings.empty()) ) { continue; }
++		std::string file = std::string("shaders/") + ptr + "_" + stages[s].name + ".metal";
++		std::string msl;
++		bool haveMSL = mvkMadeiraShaderMSL(res->madeiraMSL, msl);
++
++		// The binding map, as JSON and as a comment heading the MSL. An argument-buffer set
++		// gives [[id(n)]] inside its spvDescriptorSetBuffer<set>, a direct one [[texture(n)]] etc.
++		std::string header = std::string("// Madeira frame dump: pipeline ") + ptr + ", " + stages[s].name + " stage\n"
++			"// set.binding -> Metal index ([[id]] for argument-buffer sets)\n";
++		std::string bindings = "[";
++		for (size_t b = 0; b < res->madeiraBindings.size(); b++) {
++			const MVKMadeiraBindingMap& m = res->madeiraBindings[b];
++			const MVKDescriptorSetLayout* setLayout = (layout && m.set < layout->getDescriptorSetCount()) ? layout->getDescriptorSetLayout(m.set) : nullptr;
++			const MVKDescriptorBinding* binding = nullptr;
++			if (setLayout) {
++				uint32_t idx = setLayout->getBindingIndex(m.binding);
++				if (idx < setLayout->bindings().size()) { binding = &setLayout->bindings()[idx]; }
++			}
++			bool argBuf = setLayout && setLayout->argBufMode() != MVKArgumentBufferMode::Off;
++			const char* type = binding ? mvkMadeiraDumpDescriptorType(binding->descriptorType) : "unknown";
++			char buf[320];
++			snprintf(buf, sizeof(buf), "%s{\"set\":%u,\"binding\":%u,\"count\":%u,\"type\":\"%s\",\"argBuffer\":%s,\"buffer\":%u,\"texture\":%u,\"sampler\":%u,\"constexprSampler\":%s}",
++					 b ? "," : "", m.set, m.binding, m.count, type, argBuf ? "true" : "false", m.buffer, m.texture, m.sampler,
++					 m.constexprSampler ? "true" : "false");
++			bindings += buf;
++			snprintf(buf, sizeof(buf), "//   set %u binding %u (%s x%u)%s -> buffer %u, texture %u, sampler %u%s\n",
++					 m.set, m.binding, type, m.count, argBuf ? " argument buffer" : "", m.buffer, m.texture, m.sampler,
++					 m.constexprSampler ? " (constexpr sampler)" : "");
++			header += buf;
++		}
++		bindings += "]";
++
++		fields += firstStage ? "\"" : ",\"";
++		fields += stages[s].name;
++		fields += "\":";
++		if (haveMSL) { mvkMadeiraJSON(fields, file.c_str()); } else { fields += "null"; }
++		map += firstStage ? "\"" : ",\"";
++		map += stages[s].name;
++		map += "\":{\"file\":";
++		if (haveMSL) { mvkMadeiraJSON(map, file.c_str()); } else { map += "null"; }
++		map += haveMSL ? ",\"msl\":\"ok\"" : ",\"msl\":\"unavailable\"";
++		map += ",\"bindings\":";
++		map += bindings;
++		map += "}";
++		firstStage = false;
++		if (haveMSL) { files->emplace_back(frame->dir + "/" + file, header + "\n" + msl); }
++	}
++	map += "}}\n";
++	fields += "},\"bindingMap\":\"shaders/";
++	fields += ptr;
++	fields += ".json\"";
++	files->emplace_back(frame->dir + "/shaders/" + ptr + ".json", std::move(map));
++	dispatch_async(mvkMadeiraDumpQueue(), ^{
++		for (auto& f : *files) {
++			if (FILE* out = fopen(f.first.c_str(), "w")) {
++				fwrite(f.second.data(), 1, f.second.size(), out);
++				fclose(out);
++			}
++		}
++		delete files;
++	});
++	std::lock_guard<std::mutex> guard(frame->lock);
++	frame->pipelineShaders.emplace(pipeline, fields);
++	return fields;
++}
++
++static std::string mvkMadeiraDumpPipelineJSON(const std::shared_ptr<MVKMadeiraFrameDump>& frame, MVKPipeline* pipeline,
++											  const MVKMadeiraDumpStage* stages, size_t stageCount, id mtlPipeline, NSString* mtlLabel) {
++	std::string json = "{\"ptr\":";
++	mvkMadeiraJSONPtr(json, pipeline);
++	json += ",\"mtl\":";
++	mvkMadeiraJSONPtr(json, mtlPipeline);
++	json += ",\"label\":";
++	mvkMadeiraJSON(json, mtlLabel);
++	json += ",\"name\":";
++	mvkMadeiraJSON(json, pipeline->getDebugName());
++	json += mvkMadeiraDumpShaders(frame, pipeline, stages, stageCount);
++	json += "}";
++	return json;
++}
++
++static std::string mvkMadeiraDumpGraphicsPipelineJSON(const std::shared_ptr<MVKMadeiraFrameDump>& frame, MVKGraphicsPipeline* pipeline) {
++	id<MTLRenderPipelineState> mtlPS = pipeline->getMainPipelineState();
++	MVKMadeiraDumpStage stages[] = {
++		{ "vertex",   &pipeline->getStageResources(kMVKShaderStageVertex) },
++		{ "tessctl",  &pipeline->getStageResources(kMVKShaderStageTessCtl) },
++		{ "tesseval", &pipeline->getStageResources(kMVKShaderStageTessEval) },
++		{ "fragment", &pipeline->getStageResources(kMVKShaderStageFragment) },
++	};
++	return mvkMadeiraDumpPipelineJSON(frame, pipeline, stages, 4, mtlPS, mtlPS.label);
++}
++
++/**
++ * Lists the textures and samplers one stage of a draw or dispatch can read, as bound at
++ * encode time: for direct bindings from the Metal encoder state, for argument-buffer sets
++ * from the descriptor set's CPU copy (its first id per descriptor is the MTLTexture). Only
++ * the bindings the shader uses, by the pipeline's conversion map; arrays show 16 elements.
++ */
++static void mvkMadeiraDumpCollectInputs(std::vector<MVKMadeiraDumpInput>& inputs, std::vector<std::string>& samplers,
++										const char* stageName, const MVKPipelineStageResourceInfo& res,
++										const MVKVulkanCommonEncoderState& vk, const MVKStageResourceBits& exists,
++										const MVKStageResourceBindings& bindings, MVKLiveResourceSet& live, MVKPixelFormats* pixFmts) {
++	if ( !vk._layout ) { return; }
++	for (const MVKMadeiraBindingMap& m : res.madeiraBindings) {
++		if (m.set >= vk._layout->getDescriptorSetCount() || m.set >= kMVKMaxDescriptorSetCount) { continue; }
++		const MVKDescriptorSetLayout* setLayout = vk._layout->getDescriptorSetLayout(m.set);
++		if ( !setLayout ) { continue; }
++		uint32_t bIdx = setLayout->getBindingIndex(m.binding);
++		if (bIdx >= setLayout->bindings().size()) { continue; }
++		const MVKDescriptorBinding& binding = setLayout->bindings()[bIdx];
++		uint32_t texCount = binding.perDescriptorResourceCount.texture;
++		bool hasSampler = binding.perDescriptorResourceCount.sampler || binding.hasImmutableSamplers() || m.constexprSampler;
++		if ( !texCount && !hasSampler ) { continue; }
++
++		MVKDescriptorSet* set = vk._descriptorSets[m.set];
++		bool argBuf = setLayout->argBufMode() != MVKArgumentBufferMode::Off;
++		uint32_t count = (binding.isVariable() && set) ? set->variableDescriptorCount : binding.descriptorCount;
++		size_t stride = descriptorCPUSize(binding.cpuLayout);
++		const char* cpu = (set && set->cpuBuffer && stride >= sizeof(id)) ? set->cpuBuffer + binding.cpuOffset : nullptr;
++		// An argument-buffer descriptor the shader never reads can still name a destroyed texture
++		// (Detroit crashed the dump that way), so without live tracking those are listed by pointer
++		// only. MVK_MADEIRA_FRAME_DUMP_INPUTS=1 turns the tracking on.
++		bool trusted = live.enabled;
++		bool storage = binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
++					   binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
++		const char* type = mvkMadeiraDumpDescriptorType(binding.descriptorType);
++
++		for (uint32_t i = 0; i < count && i < 16; i++) {
++			char head[320];
++			if (texCount) {
++				uint32_t index = m.texture + i;
++				snprintf(head, sizeof(head), "{\"stage\":\"%s\",\"index\":%u,\"set\":%u,\"binding\":%u,\"element\":%u,\"count\":%u,\"type\":\"%s\",\"argBuffer\":%s,\"texture\":",
++						 stageName, index, m.set, m.binding, i, count, type, argBuf ? "true" : "false");
++				MVKMadeiraDumpInput in = { nil, false, std::string(stageName) + std::to_string(index), head };
++				id<MTLTexture> tex = nil;
++				if ( !argBuf ) {
++					if (index < kMVKMaxTextureCount && exists.textures.get(index)) { tex = bindings.textures[index]; }
++				} else if (cpu) {
++					tex = *reinterpret_cast<const id*>(cpu + i * stride);
++				}
++				if ( !tex ) {
++					in.json += "null";
++				} else if (argBuf && live.enabled) {
++					auto isLive = live.isLive(tex);	// holds the live list's lock while the texture is read
++					if (isLive) {
++						mvkMadeiraDumpTextureJSON(in.json, tex, pixFmts);
++						in.texture = [tex retain];
++						in.dumpable = !storage;
++					} else {
++						in.json += "{\"ptr\":";
++						mvkMadeiraJSONPtr(in.json, tex);
++						in.json += ",\"dead\":true}";
++					}
++				} else if (argBuf && !trusted) {
++					in.json += "{\"ptr\":";
++					mvkMadeiraJSONPtr(in.json, tex);
++					in.json += ",\"unverified\":true}";
++				} else {
++					mvkMadeiraDumpTextureJSON(in.json, tex, pixFmts);
++					in.texture = [tex retain];
++					in.dumpable = !storage;
++				}
++				inputs.push_back(std::move(in));
++			}
++			if (hasSampler) {
++				uint32_t index = m.sampler + i;
++				snprintf(head, sizeof(head), "{\"stage\":\"%s\",\"index\":%u,\"set\":%u,\"binding\":%u,\"element\":%u,\"argBuffer\":%s",
++						 stageName, index, m.set, m.binding, i, argBuf ? "true" : "false");
++				std::string json = head;
++				if (m.constexprSampler) {
++					json += ",\"constexpr\":true}";
++				} else {
++					id<MTLSamplerState> samp = nil;
++					if (binding.hasImmutableSamplers()) {
++						auto imm = setLayout->immutableSamplers();
++						if (binding.immSamplerIndex + i < imm.size()) { samp = imm[binding.immSamplerIndex + i]->getMTLSamplerState(); }
++						json += ",\"immutable\":true";
++					} else if ( !argBuf ) {
++						if (index < kMVKMaxSamplerCount && exists.samplers.get(index)) { samp = bindings.samplers[index]; }
++					} else if (cpu) {
++						samp = *reinterpret_cast<const id*>(cpu + i * stride + texCount * sizeof(id));
++					}
++					json += ",\"ptr\":";
++					mvkMadeiraJSONPtr(json, samp);
++					json += "}";
++				}
++				samplers.push_back(std::move(json));
++			}
++		}
++	}
++}
++
++/** Adds the sampled inputs not yet listed as retained input targets of a pass. */
++static void mvkMadeiraDumpAddInputTargets(std::vector<MVKMadeiraDumpTarget>& targets, const std::vector<MVKMadeiraDumpInput>& inputs,
++										  const std::string& extra) {
++	for (const MVKMadeiraDumpInput& in : inputs) {
++		if ( !in.dumpable || !in.texture ) { continue; }
++		bool listed = false;
++		for (auto& t : targets) { if (t.texture == in.texture) { listed = true; break; } }
++		if (listed) { continue; }
++		targets.push_back({ [in.texture retain], 0, 0, 0, in.slot, -1, "input", extra });
++	}
++}
++
++/**
++ * Takes the pass number and the seqs of the input targets ahead of encoding, so the entry
++ * of their consumer can name them, and marks the inputs the pass itself also writes.
++ */
++static uint32_t mvkMadeiraDumpReserve(MVKMadeiraFrameDump& frame, std::vector<MVKMadeiraDumpTarget>& inputs,
++									  const std::vector<MVKMadeiraDumpTarget>& outputs) {
++	for (auto& in : inputs) {
++		id<MTLTexture> root = mvkMadeiraDumpRoot(in.texture);
++		bool written = false;
++		for (auto& out : outputs) { if (mvkMadeiraDumpRoot(out.texture) == root) { written = true; break; } }
++		in.extra += written ? ",\"alsoWritten\":true" : ",\"alsoWritten\":false";
++	}
++	std::lock_guard<std::mutex> guard(frame.lock);
++	for (auto& in : inputs) { in.seq = frame.nextSeq++; }
++	return frame.nextPass++;
++}
++
++/** The inputs array of a draw or dispatch, each with the seq of its input entry if it was dumped. */
++static void mvkMadeiraDumpInputsJSON(std::string& json, const std::vector<MVKMadeiraDumpInput>& inputs,
++									 const std::vector<MVKMadeiraDumpTarget>& dumped) {
++	json += "[";
++	for (size_t i = 0; i < inputs.size(); i++) {
++		if (i) { json += ","; }
++		json += inputs[i].json;
++		if (inputs[i].texture) {
++			for (auto& t : dumped) {
++				if (t.texture == inputs[i].texture && t.seq >= 0) {
++					char buf[48];
++					snprintf(buf, sizeof(buf), ",\"inputSeq\":%lld", (long long)t.seq);
++					json += buf;
++					break;
++				}
++			}
++		}
++		json += "}";
 +	}
 +	json += "]";
 +}
@@ -773,13 +1425,12 @@ index 8c24deb..c83af3e 100644
 +
 +void MVKCommandEncoder::madeiraDumpNoteDraw() {
 +	MVKMadeiraDumpPass* pass = _madeiraDumpPass;
-+	pass->draws++;
++	uint32_t drawIdx = pass->draws++;
 +	MVKGraphicsPipeline* pipeline = getGraphicsPipeline();
 +	if (pipeline && pass->pipelinePtrs.size() < 32 &&
 +		std::find(pass->pipelinePtrs.begin(), pass->pipelinePtrs.end(), pipeline) == pass->pipelinePtrs.end()) {
-+		id<MTLRenderPipelineState> mtlPS = pipeline->getMainPipelineState();
 +		pass->pipelinePtrs.push_back(pipeline);
-+		pass->pipelines.push_back(mvkMadeiraDumpPipelineJSON(pipeline, mtlPS, mtlPS.label, pipeline->getDebugName()));
++		pass->pipelines.push_back(mvkMadeiraDumpGraphicsPipelineJSON(_madeiraDump, pipeline));
 +	}
 +	MVKMetalGraphicsCommandEncoderState& mtlGfx = getMtlGraphics();
 +	for (uint32_t i = 0; i < mtlGfx._numViewports && i < kMVKMaxViewportScissorCount && pass->viewports.size() < 16; i++) {
@@ -790,6 +1441,22 @@ index 8c24deb..c83af3e 100644
 +			pass->viewports.push_back(buf);
 +		}
 +	}
++	if ( !pipeline || drawIdx >= kMVKMadeiraDumpMaxDraws ) { return; }
++
++	// The render encoder's vertex stage runs the tessellation evaluation shader of a tessellated pipeline.
++	MVKMadeiraDumpDraw draw = { drawIdx, pipeline, {}, {} };
++	MVKShaderStage vtxStage = pipeline->isTessellationPipeline() ? kMVKShaderStageTessEval : kMVKShaderStageVertex;
++	MVKLiveResourceSet& live = getDevice()->getLiveResources();
++	mvkMadeiraDumpCollectInputs(draw.inputs, draw.samplers, "vertex", pipeline->getStageResources(vtxStage), getVkGraphics(),
++								mtlGfx._exists.vertex(), mtlGfx._bindings.vertex(), live, getPixelFormats());
++	mvkMadeiraDumpCollectInputs(draw.inputs, draw.samplers, "fragment", pipeline->getStageResources(kMVKShaderStageFragment), getVkGraphics(),
++								mtlGfx._exists.fragment(), mtlGfx._bindings.fragment(), live, getPixelFormats());
++	if (drawIdx < _madeiraDump->inputDraws) {
++		char extra[96];
++		snprintf(extra, sizeof(extra), ",\"consumerDraw\":%u,\"when\":\"after-pass\"", drawIdx);
++		mvkMadeiraDumpAddInputTargets(pass->inputs, draw.inputs, extra);
++	}
++	pass->drawList.push_back(std::move(draw));
 +}
 +
 +void MVKCommandEncoder::madeiraDumpEndPass() {
@@ -805,7 +1472,30 @@ index 8c24deb..c83af3e 100644
 +		fields += buf;
 +		mvkMadeiraDumpJoin(fields, "pipelines", pass->pipelines);
 +		mvkMadeiraDumpJoin(fields, "viewports", pass->viewports);
-+		mvkMadeiraDumpEncode(_madeiraDump, _mtlCmdBuffer, "render", fields, pass->targets);
++
++		// Inputs only for small passes: a pass of many draws samples many textures.
++		std::vector<MVKMadeiraDumpTarget> targets;
++		if (pass->draws <= _madeiraDump->inputDraws) { targets.swap(pass->inputs); }
++		uint32_t passNo = mvkMadeiraDumpReserve(*_madeiraDump, targets, pass->targets);
++
++		// The per-draw bindings go on the pass's first entry only; every entry repeats the fields above.
++		std::string first = ",\"drawList\":[";
++		for (size_t d = 0; d < pass->drawList.size(); d++) {
++			const MVKMadeiraDumpDraw& draw = pass->drawList[d];
++			snprintf(buf, sizeof(buf), "%s{\"draw\":%u,\"pipeline\":", d ? "," : "", draw.index);
++			first += buf;
++			mvkMadeiraJSONPtr(first, draw.pipeline);
++			first += ",\"inputs\":";
++			mvkMadeiraDumpInputsJSON(first, draw.inputs, targets);
++			mvkMadeiraDumpJoin(first, "samplers", draw.samplers);
++			first += "}";
++		}
++		snprintf(buf, sizeof(buf), "],\"drawsDropped\":%u", pass->draws > kMVKMadeiraDumpMaxDraws ? pass->draws - kMVKMadeiraDumpMaxDraws : 0);
++		first += buf;
++
++		targets.insert(targets.end(), pass->targets.begin(), pass->targets.end());
++		pass->targets.clear();	// owned by targets now
++		mvkMadeiraDumpEncode(_madeiraDump, _mtlCmdBuffer, "render", fields, targets, passNo, first);
 +	}
 +	delete pass;
 +}
@@ -838,8 +1528,58 @@ index 8c24deb..c83af3e 100644
 +	mvkMadeiraDumpEncode(_madeiraDump, _mtlCmdBuffer, "blit", fields, targets);
 +}
 +
++// A transfer command's source, destination and regions, as a metadata entry ("status":"meta",
++// no file), so copies show even when their destination is not dumpable. Images and buffers of
++// a recorded transfer are valid by the Vulkan rules, so describing them is safe.
++void MVKCommandEncoder::madeiraDumpTransfer(MVKCommandUse cmdUse, const char* vkCmd,
++											id<MTLTexture> srcTex, id<MTLBuffer> srcBuff, NSUInteger srcBuffOffset,
++											id<MTLTexture> dstTex, id<MTLBuffer> dstBuff, NSUInteger dstBuffOffset,
++											const std::string& regions, size_t regionCount) {
++	if ( !_madeiraDump ) { return; }
++	uint32_t seq, pass;
++	{
++		std::lock_guard<std::mutex> guard(_madeiraDump->lock);
++		seq = _madeiraDump->nextSeq++;
++		pass = _madeiraDump->nextPass++;
++	}
++	auto describe = [this](std::string& json, id<MTLTexture> tex, id<MTLBuffer> buff, NSUInteger offset) {
++		if (tex) {
++			json += "{\"texture\":";
++			mvkMadeiraDumpTextureJSON(json, tex, getPixelFormats());
++			json += "}";
++		} else if (buff) {
++			json += "{\"buffer\":";
++			mvkMadeiraJSONPtr(json, buff);
++			char buf[96];
++			snprintf(buf, sizeof(buf), ",\"offset\":%lu,\"length\":%lu,\"label\":", (unsigned long)offset, (unsigned long)buff.length);
++			json += buf;
++			mvkMadeiraJSON(json, buff.label);
++			json += "}";
++		} else {
++			json += "null";
++		}
++	};
++	char buf[160];
++	snprintf(buf, sizeof(buf), "{\"seq\":%u,\"pass\":%u,\"kind\":\"transfer\",\"encoder\":", seq, pass);
++	std::string json = buf;
++	mvkMadeiraJSON(json, mvkMTLBlitCommandEncoderLabel(cmdUse));
++	json += ",\"use\":";
++	mvkMadeiraJSON(json, vkCmd);
++	json += ",\"slot\":null,\"src\":";
++	describe(json, srcTex, srcBuff, srcBuffOffset);
++	json += ",\"dst\":";
++	describe(json, dstTex, dstBuff, dstBuffOffset);
++	snprintf(buf, sizeof(buf), ",\"regionCount\":%zu,\"regions\":", regionCount);
++	json += buf;
++	json += regions;
++	json += ",\"status\":\"meta\"}";
++	std::lock_guard<std::mutex> guard(_madeiraDump->lock);
++	_madeiraDump->add(seq, std::move(json));
++}
++
 +// The storage images of every descriptor set the bound compute pipeline reads, as the
 +// binding code walks them: the first id of a storage-image descriptor is its MTLTexture.
++// Also everything the dispatch can read (inputs), and the sampled textures' contents.
 +void MVKCommandEncoder::madeiraDumpDispatch(MTLSize threadgroups, MTLSize threadsPerThreadgroup, bool indirect) {
 +	if ( !_madeiraDump || !_mtlCmdBuffer ) { return; }
 +	MVKComputePipeline* pipeline = getComputePipeline();
@@ -850,6 +1590,7 @@ index 8c24deb..c83af3e 100644
 +		bool used[kMVKMaxDescriptorSetCount] = {};
 +		for (size_t idx : resources.resources.descriptorSetData) { if (idx < kMVKMaxDescriptorSetCount) { used[idx] = true; } }
 +		for (const MVKDescriptorBindOperation& op : resources.bindScript.ops) { used[op.set] = true; }
++		for (const MVKMadeiraBindingMap& m : resources.madeiraBindings) { if (m.set < kMVKMaxDescriptorSetCount) { used[m.set] = true; } }
 +		MVKLiveResourceSet& live = getDevice()->getLiveResources();
 +		size_t setCount = std::min<size_t>(vkCompute._layout->getDescriptorSetCount(), kMVKMaxDescriptorSetCount);
 +		for (size_t setIdx = 0; setIdx < setCount; setIdx++) {
@@ -886,7 +1627,8 @@ index 8c24deb..c83af3e 100644
 +	std::vector<std::string> pipelines;
 +	if (pipeline) {
 +		id<MTLComputePipelineState> mtlPS = getMtlCompute()._pipeline;
-+		pipelines.push_back(mvkMadeiraDumpPipelineJSON(pipeline, mtlPS, mtlPS.label, pipeline->getDebugName()));
++		MVKMadeiraDumpStage stage = { "compute", &pipeline->getStageResources() };
++		pipelines.push_back(mvkMadeiraDumpPipelineJSON(_madeiraDump, pipeline, &stage, 1, mtlPS, mtlPS.label));
 +	}
 +	mvkMadeiraDumpJoin(fields, "pipelines", pipelines);
 +	char buf[160];
@@ -901,16 +1643,33 @@ index 8c24deb..c83af3e 100644
 +			 (unsigned long)threadsPerThreadgroup.width, (unsigned long)threadsPerThreadgroup.height, (unsigned long)threadsPerThreadgroup.depth);
 +	fields += buf;
 +
++	// What the dispatch can read; the sampled textures are dumped after it, with its outputs.
++	std::vector<MVKMadeiraDumpInput> inputs;
++	std::vector<std::string> samplers;
++	std::vector<MVKMadeiraDumpTarget> all;
++	if (pipeline) {
++		MVKMetalComputeCommandEncoderState& mtlCompute = getMtlCompute();
++		mvkMadeiraDumpCollectInputs(inputs, samplers, "compute", pipeline->getStageResources(), vkCompute,
++									mtlCompute._exists, mtlCompute._bindings, getDevice()->getLiveResources(), getPixelFormats());
++		mvkMadeiraDumpAddInputTargets(all, inputs, ",\"consumer\":\"dispatch\",\"when\":\"after-dispatch\"");
++	}
++	uint32_t passNo = mvkMadeiraDumpReserve(*_madeiraDump, all, targets);
++	std::string first = ",\"inputs\":";
++	mvkMadeiraDumpInputsJSON(first, inputs, all);
++	mvkMadeiraDumpJoin(first, "samplers", samplers);
++	mvkMadeiraDumpRelease(inputs);
++	all.insert(all.end(), targets.begin(), targets.end());
++
 +	// End the compute encoder only when there is something to copy; MoltenVK rebinds on the next one.
-+	if ( !targets.empty() ) { endCurrentMetalEncoding(); }
-+	mvkMadeiraDumpEncode(_madeiraDump, _mtlCmdBuffer, "compute", fields, targets);
++	if ( !all.empty() ) { endCurrentMetalEncoding(); }
++	mvkMadeiraDumpEncode(_madeiraDump, _mtlCmdBuffer, "compute", fields, all, passNo, first);
 +}
 +
 +
  #pragma mark -
  #pragma mark MVKCurrentSubpassInfo
  
-@@ -361,6 +943,7 @@
+@@ -361,6 +1428,7 @@
  	// a prefilled Metal command buffer that the app did not intend to submit, potentially
  	// causing unexpected side effects. But unfortunately there is nothing else we can do.
  	if (_prefilledMTLCmdBuffer && _prefilledMTLCmdBuffer.status == MTLCommandBufferStatusNotEnqueued) {
@@ -918,7 +1677,7 @@ index 8c24deb..c83af3e 100644
  		[_prefilledMTLCmdBuffer commit];
  	}
  
-@@ -431,6 +1014,8 @@
+@@ -431,6 +1499,8 @@
      _canUseLayeredRendering = false;
  
      _mtlCmdBuffer = mtlCmdBuff;        // not retained
@@ -927,7 +1686,7 @@ index 8c24deb..c83af3e 100644
  
  	_cmdBuffer->setMetalObjectLabel(_mtlCmdBuffer, _cmdBuffer->_debugName);
  }
-@@ -465,6 +1050,8 @@
+@@ -465,6 +1535,8 @@
  void MVKCommandEncoder::endEncoding() {
  	endCurrentMetalEncoding();
  	finishQueries();
@@ -936,7 +1695,100 @@ index 8c24deb..c83af3e 100644
  }
  
  void MVKCommandEncoder::encodeSecondary(MVKCommandBuffer* secondaryCmdBuffer) {
-@@ -839,6 +1426,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -561,13 +1633,13 @@
+ }
+ 
+ // Sets the current render subpass to the subpass with the specified index.
+-// End current Metal renderpass before updating subpass index.
++// Madeira: end every active encoder before capturing dependency fence slots.
+ void MVKCommandEncoder::setSubpass(MVKCommand* subpassCmd,
+ 								   VkSubpassContents subpassContents,
+ 								   uint32_t subpassIndex,
+ 								   MVKCommandUse cmdUse) {
+ 	encodeStoreActions();
+-	endMetalRenderEncoding();
++	endCurrentMetalEncoding();
+ 
+ 	MVKRenderPass* renderPass = _pEncodingContext->getRenderPass();
+ 	if (renderPass) { renderPass->encodeSubpassDependencyBarriers(this, subpassIndex); }
+@@ -651,7 +1723,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages beforeStages) {
+ 	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
+ 	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
+-		auto fenceIndex = _pEncodingContext->fenceSlots.wait[stage][i];
++		// Madeira: full mode makes every encoder boundary an ALL_COMMANDS dependency.
++		auto& slots = _pEncodingContext->fenceSlots;
++		auto fenceIndex = mvkMadeiraFullBarriersMode() ? slots.update[i] : slots.wait[stage][i];
+ 		auto fence = _device->getFence((MVKBarrierStage)i, fenceIndex);
+ 		[mtlEncoder waitForFence:fence beforeStages:beforeStages];
+ 	}
+@@ -660,7 +1734,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder) {
+ 	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
+ 	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
+-		auto fenceIndex = _pEncodingContext->fenceSlots.wait[stage][i];
++		// Madeira: full mode waits for the newest update from every logical stage.
++		auto& slots = _pEncodingContext->fenceSlots;
++		auto fenceIndex = mvkMadeiraFullBarriersMode() ? slots.update[i] : slots.wait[stage][i];
+ 		auto fence = _device->getFence((MVKBarrierStage)i, fenceIndex);
+ 		[mtlEncoder waitForFence:fence];
+ 	}
+@@ -669,7 +1745,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder) {
+ 	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
+ 	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
+-		auto fenceIndex = _pEncodingContext->fenceSlots.wait[stage][i];
++		// Madeira: full mode waits for the newest update from every logical stage.
++		auto& slots = _pEncodingContext->fenceSlots;
++		auto fenceIndex = mvkMadeiraFullBarriersMode() ? slots.update[i] : slots.wait[stage][i];
+ 		auto fence = _device->getFence((MVKBarrierStage)i, fenceIndex);
+ 		[mtlEncoder waitForFence:fence];
+ 	}
+@@ -721,6 +1799,28 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	}
+ }
+ 
++bool MVKCommandEncoder::encodeFullMemoryBarrier() {
++	if (mvkMadeiraFullBarriersMode() < 2 || !isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) {
++		return false;
++	}
++
++	MTLBarrierScope scope = MTLBarrierScopeBuffers | MTLBarrierScopeTextures;
++	if (_mtlComputeEncoder) {
++		// Madeira: cover argument-buffer resources without splitting the compute encoder.
++		[_mtlComputeEncoder memoryBarrierWithScope:scope];
++		return true;
++	}
++#if MVK_MACOS
++	if (_mtlRenderEncoder && getMetalFeatures().memoryBarriers) {
++		// Madeira: Apple GPUs reject render barriers; use this only where Metal supports it.
++		[_mtlRenderEncoder memoryBarrierWithScope:scope
++								 afterStages:MTLRenderStageVertex | MTLRenderStageFragment
++								beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
++	}
++#endif
++	return false;
++}
++
+ 
+ void MVKCommandEncoder::encodeBarrierWaits(MVKCommandUse use) {
+ 	if (_mtlRenderEncoder) {
+@@ -749,9 +1849,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	}
+ 
+ 	if (_mtlComputeEncoder) {
+-		MVKBarrierStage stage = commandUseToBarrierStage(_mtlComputeEncoderUse);
+-		if (stage != kMVKBarrierStageNone) {
+-			barrierUpdate(stage, _mtlComputeEncoder);
++		// Madeira: one compute encoder can contain compute and internal copy work.
++		for (int stage = 0; stage < kMVKBarrierStageCount; ++stage) {
++			if (mvkIsAnyFlagEnabled(_mtlComputeEncoderStages, 1 << stage)) {
++				barrierUpdate((MVKBarrierStage)stage, _mtlComputeEncoder);
++			}
+ 		}
+ 	}
+ 
+@@ -839,6 +1941,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	retainIfImmediatelyEncoding(_mtlRenderEncoder);
  	_cmdBuffer->setMetalObjectLabel(_mtlRenderEncoder, getMTLRenderCommandEncoderName(cmdUse));
  	getState().beginGraphicsEncoding(getSampleCount());
@@ -944,7 +1796,7 @@ index 8c24deb..c83af3e 100644
  
  	encodeBarrierWaits(cmdUse);
  
-@@ -965,6 +1553,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -965,6 +2068,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	if (stage == kMVKGraphicsStageRasterization) {
  		prepareDraw();
  		_occlusionQueryState.encode(_mtlRenderEncoder, this);
@@ -952,7 +1804,7 @@ index 8c24deb..c83af3e 100644
  	} else {
  		getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
  		prepareRenderDispatch(stage);
-@@ -1052,6 +1641,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1052,6 +2156,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  
  	getSubpass()->resolveUnresolvableAttachments(this, _attachments.contents());
  	endCurrentMetalEncoding();
@@ -960,7 +1812,26 @@ index 8c24deb..c83af3e 100644
  
      _occlusionQueryState.endMetalRenderPass(this);
  }
-@@ -1185,10 +1775,32 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1063,6 +2168,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	if (_mtlComputeEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlComputeEncoder updateFence: getStageCountersMTLFence()]; }
+ 	endMetalEncoding(_mtlComputeEncoder);
+ 	_mtlComputeEncoderUse = kMVKCommandUseNone;
++	_mtlComputeEncoderStages = 0;
+ 
+ 	if (_mtlBlitEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlBlitEncoder updateFence: getStageCountersMTLFence()]; }
+ 	endMetalEncoding(_mtlBlitEncoder);
+@@ -1109,6 +2215,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+ 	if (_mtlComputeEncoderUse != cmdUse) {
+ 		needWaits = true;
+ 		_mtlComputeEncoderUse = cmdUse;
++		MVKBarrierStage stage = commandUseToBarrierStage(cmdUse);
++		if (stage != kMVKBarrierStageNone) {
++			mvkEnableFlags(_mtlComputeEncoderStages, 1 << stage);
++		}
+ 		_cmdBuffer->setMetalObjectLabel(_mtlComputeEncoder, mvkMTLComputeCommandEncoderLabel(cmdUse));
+ 	}
+ 	if (needWaits) {
+@@ -1185,10 +2295,32 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  // Return the MTLBuffer allocation to the pool once the command buffer is done with it
  const MVKMTLBufferAllocation* MVKCommandEncoder::getTempMTLBuffer(NSUInteger length, bool isPrivate, bool isDedicated) {
      MVKMTLBufferAllocation* mtlBuffAlloc = getCommandEncodingPool()->acquireMTLBufferAllocation(length, isPrivate, isDedicated);
@@ -994,7 +1865,15 @@ index 8c24deb..c83af3e 100644
  MVKCommandEncodingPool* MVKCommandEncoder::getCommandEncodingPool() {
  	return _cmdBuffer->getCommandPool()->getCommandEncodingPool();
  }
-@@ -1358,6 +1970,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1350,6 +2482,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+ 	_mtlRenderEncoder = nil;
+ 	_mtlComputeEncoder = nil;
+ 	_mtlComputeEncoderUse = kMVKCommandUseNone;
++	_mtlComputeEncoderStages = 0;
+ 	_mtlBlitEncoder = nil;
+ 	_mtlBlitEncoderUse = kMVKCommandUseNone;
+ 	_pEncodingContext = nullptr;
+@@ -1358,6 +2491,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  }
  
  MVKCommandEncoder::~MVKCommandEncoder() {
@@ -1075,11 +1954,32 @@ index 7d16b94..e164ebb 100644
  	_vkCompute._pipeline = pipeline;
  	MVKPipelineLayout* layout = pipeline->getLayout();
  	if (_vkCompute._layout != layout) {
+diff --git a/MoltenVK/MoltenVK/Commands/MVKMTLResourceBindings.h b/MoltenVK/MoltenVK/Commands/MVKMTLResourceBindings.h
+index b659de8..11d8e00 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKMTLResourceBindings.h
++++ b/MoltenVK/MoltenVK/Commands/MVKMTLResourceBindings.h
+@@ -82,6 +82,16 @@ typedef struct MVKPipelineBarrier {
+ 	bool isBufferBarrier() { return type == Buffer; }
+ 	bool isImageBarrier() { return type == Image; }
+ 
++	// Madeira: preserve a legacy execution-only pipeline barrier with no resource barriers.
++	MVKPipelineBarrier(VkPipelineStageFlags srcStageMask,
++					   VkPipelineStageFlags dstStageMask) :
++		type(Memory),
++		srcStageMask(srcStageMask),
++		srcAccessMask(0),
++		dstStageMask(dstStageMask),
++		dstAccessMask(0)
++		{}
++
+ 	MVKPipelineBarrier(const VkMemoryBarrier2& vkBarrier) :
+ 		type(Memory),
+ 		srcStageMask(vkBarrier.srcStageMask),
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414..49a5559 100644
+index 534a414..2abee0b 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-@@ -31,10 +31,26 @@
+@@ -31,10 +31,29 @@
  #include <string>
  #include <mutex>
  #include <os/lock.h>
@@ -1103,10 +2003,13 @@ index 534a414..49a5559 100644
 +} MVKMadeiraCPUOptions;
 +const MVKMadeiraCPUOptions& mvkMadeiraCPUOptions();
 +
++/** Madeira: conservative argument-buffer barrier mode (MVK_MADEIRA_FULL_BARRIERS, 0-2). */
++uint32_t mvkMadeiraFullBarriersMode();
++
  class MVKInstance;
  class MVKDevice;
  class MVKQueue;
-@@ -651,9 +667,16 @@ public:
+@@ -651,9 +670,16 @@ public:
  };
  
  /** Represents a Vulkan logical GPU device, associated with a physical device. */
@@ -1123,7 +2026,7 @@ index 534a414..49a5559 100644
  
  	/** Returns the Vulkan type of this object. */
  	VkObjectType getVkObjectType() override { return VK_OBJECT_TYPE_DEVICE; }
-@@ -983,7 +1006,14 @@ public:
+@@ -983,7 +1009,14 @@ public:
  	void makeResident(id<MTLAllocation> allocation) {
  		@synchronized(_residencySet) {
  			[_residencySet addAllocation: allocation];
@@ -1139,7 +2042,7 @@ index 534a414..49a5559 100644
  		}
  	}
  #endif
-@@ -994,11 +1024,36 @@ public:
+@@ -994,11 +1027,36 @@ public:
  	void removeResidency(id<MTLAllocation> allocation) {
  		@synchronized(_residencySet) {
  			[_residencySet removeAllocation:allocation];
@@ -1176,7 +2079,7 @@ index 534a414..49a5559 100644
  	void addResidencySet(id<MTLCommandQueue> queue) {
  #if MVK_XCODE_16
  		if (_residencySet) [queue addResidencySet:_residencySet];
-@@ -1051,6 +1106,8 @@ public:
+@@ -1051,6 +1109,8 @@ public:
  	}
  
  protected:
@@ -1185,7 +2088,7 @@ index 534a414..49a5559 100644
  	friend class MVKDeviceTrackingMixin;
  
  	void propagateDebugName() override  {}
-@@ -1113,6 +1170,8 @@ protected:
+@@ -1113,6 +1173,8 @@ protected:
  	id<MTLBuffer> _dummyBlitMTLBuffer = nil;
  #if MVK_XCODE_16
  	id<MTLResidencySet> _residencySet = nil;
@@ -1195,7 +2098,7 @@ index 534a414..49a5559 100644
  	uint32_t _visibilityBufferCount = 0;
  	int _capturePipeFileDesc = -1;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 9772757..280ed72 100644
+index 9772757..3bb640b 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -38,6 +38,8 @@
@@ -1207,7 +2110,22 @@ index 9772757..280ed72 100644
  
  using namespace std;
  
-@@ -3264,6 +3266,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -2578,6 +2580,14 @@
+ 
+ 		_metalFeatures.astcHDRTextures = !MVK_TVOS || mvkOSVersionIsAtLeast(16.0);
+ 		_metalFeatures.residencySets = mvkOSVersionIsAtLeast(15.0, 18.0, 2.0);
++		// Madeira: with residency sets, resources reached only through argument buffers are not
++		// hazard-tracked by Metal and MoltenVK orders encoders with its own barrier fences.
++		// MVK_MADEIRA_NO_RESIDENCY_SET=1 falls back to useResource, so Metal tracks them itself
++		// (testing Detroit's depth-of-field race, which vanishes whenever a frame dump runs).
++		if (const char* v = getenv("MVK_MADEIRA_NO_RESIDENCY_SET"); v && atoi(v) != 0) {
++			_metalFeatures.residencySets = false;
++			fprintf(stderr, "[mvk-residency] residency sets off (MVK_MADEIRA_NO_RESIDENCY_SET)\n");
++		}
+ 		_metalFeatures.simdPermute = true;
+ 	}
+ 
+@@ -3264,6 +3274,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// This is captured either as the MoltenVK Git revision, or if that's not available, as the MoltenVK version.
  	uint32_t mvkRev = getMoltenVKGitRevision();
  	if ( !mvkRev ) { mvkRev = MVK_VERSION; }
@@ -1218,7 +2136,7 @@ index 9772757..280ed72 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mvkRev);
  	uuidComponentOffset += sizeof(mvkRev);
  
-@@ -4797,6 +4803,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4797,6 +4811,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -1226,7 +2144,7 @@ index 9772757..280ed72 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -5130,6 +5137,262 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5130,6 +5145,271 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -1247,6 +2165,15 @@ index 9772757..280ed72 100644
 +		return o;
 +	}();
 +	return options;
++}
++
++uint32_t mvkMadeiraFullBarriersMode() {
++	static const uint32_t mode = [] {
++		// Madeira: values above 2 select the strongest documented mode.
++		const char* value = getenv("MVK_MADEIRA_FULL_BARRIERS");
++		return value ? std::min<uint32_t>((uint32_t)strtoul(value, nullptr, 10), 2) : 0;
++	}();
++	return mode;
 +}
 +
 +NSString* mvkMadeiraGameCacheDirectory(id<MTLDevice> device) {
@@ -1489,7 +2416,7 @@ index 9772757..280ed72 100644
  MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
  
  	// If the physical device is lost, bail.
-@@ -5140,6 +5403,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5140,6 +5420,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  
  	initPhysicalDevice(physicalDevice, pCreateInfo);
@@ -1502,15 +2429,29 @@ index 9772757..280ed72 100644
  	initPerformanceTracking();
  	enableExtensions(pCreateInfo);
  	enableFeatures(pCreateInfo);
-@@ -5448,6 +5717,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5223,7 +5509,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ void MVKDevice::initConfiguration() {
+ 	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
+ 	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
+-	_liveResources.enabled = needsLiveTrackingForCopy || needsLiveTrackingForEncode;
++	// Madeira: the frame dump reads argument-buffer descriptors, which can still name destroyed
++	// textures; it only touches the ones this list confirms are alive.
++	const char* dumpInputs = getenv("MVK_MADEIRA_FRAME_DUMP_INPUTS");
++	bool needsLiveTrackingForDump = dumpInputs && atoi(dumpInputs) != 0;
++	_liveResources.enabled = needsLiveTrackingForCopy || needsLiveTrackingForEncode || needsLiveTrackingForDump;
+ }
+ 
+ void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
+@@ -5448,6 +5738,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Create the command queues
  void MVKDevice::initQueues(const VkDeviceCreateInfo* pCreateInfo) {
 +	mvkMadeiraCPUOptions();		// Madeira: read and log the [mvk-cpu] switches at device creation
++	fprintf(stderr, "[mvk-barrier] full barriers mode=%u\n", mvkMadeiraFullBarriersMode());
  #if MVK_XCODE_16
  	if (_physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.residencySets) {
  		MTLResidencySetDescriptor *setDescriptor;
-@@ -5532,6 +5802,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5532,6 +5824,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -1539,10 +2480,39 @@ index ef8ca60..3993b76 100644
  		}
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
-index e385e9b..c8e3deb 100644
+index e385e9b..29301ed 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
-@@ -315,6 +315,9 @@ public:
+@@ -229,11 +229,28 @@ typedef std::pair<uint32_t, uint32_t> MVKZeroDivisorVertexBinding;
+ typedef MVKSmallVector<MVKGraphicsStage, 4> MVKPiplineStages;
+ 
+ 
++/** Madeira frame dump: where one descriptor binding a stage uses lands in Metal (from the shader conversion). */
++struct MVKMadeiraBindingMap {
++	uint32_t set;
++	uint32_t binding;
++	uint32_t count;
++	uint32_t buffer;	/**< Metal buffer index, or argument buffer [[id]] when the set is an argument buffer. */
++	uint32_t texture;	/**< Likewise for textures. */
++	uint32_t sampler;	/**< Likewise for samplers. */
++	uint32_t basetype;	/**< SPIRType::BaseType */
++	bool constexprSampler;
++};
++
+ struct MVKPipelineStageResourceInfo {
+ 	MVKPipelineBindScript bindScript;
+ 	MVKImplicitBufferBindings implicitBuffers;
+ 	bool usesPhysicalStorageBufferAddresses;
+ 	MVKStageResourceBits resources;
++	// Madeira frame dump: the pipeline's MSL and binding map are only reachable at pipeline
++	// creation, so a dump of a later frame needs them kept: the id of the MVKShaderLibrary
++	// (mvkMadeiraShaderMSL) and the stage's used bindings, a few dozen bytes per stage.
++	uint64_t madeiraMSL = 0;
++	std::vector<MVKMadeiraBindingMap> madeiraBindings;
+ };
+ 
+ /** Represents an Vulkan graphics pipeline. */
+@@ -315,6 +332,9 @@ public:
  	/** Returns a list of the vertex buffers used by this pipeline by Vulkan buffer ID */
  	const MVKStaticBitSet<kMVKMaxBufferCount>& getVkVertexBuffers() const { return _vkVertexBuffers; }
  	/** Returns a list of the vertex buffers used by this pipeline by Metal buffer ID */
@@ -1552,7 +2522,7 @@ index e385e9b..c8e3deb 100644
  	const MVKStaticBitSet<kMVKMaxBufferCount>& getMtlVertexBuffers() const { return _mtlVertexBuffers; }
  	const VkViewport* getViewports() const { return _viewports; }
  	const VkRect2D* getScissors() const { return _scissors; }
-@@ -362,6 +365,8 @@ protected:
+@@ -362,6 +382,8 @@ protected:
      bool isRenderingPoints();
      bool isRasterizationDisabled(const VkGraphicsPipelineCreateInfo* pCreateInfo);
      bool isDepthClipNegativeOneToOne(const VkGraphicsPipelineCreateInfo* pCreateInfo);
@@ -1561,7 +2531,7 @@ index e385e9b..c8e3deb 100644
  	bool verifyImplicitBuffers(MVKShaderStage stage);
  	uint32_t getTranslatedVertexBinding(uint32_t binding, uint32_t translationOffset, uint32_t maxBinding);
  	uint32_t getImplicitBufferIndex(MVKShaderStage stage, uint32_t bufferIndexOffset);
-@@ -392,6 +397,8 @@ protected:
+@@ -392,6 +414,8 @@ protected:
  	id<MTLComputePipelineState> _mtlTessVertexStageIndex16State = nil;
  	id<MTLComputePipelineState> _mtlTessVertexStageIndex32State = nil;
  	id<MTLComputePipelineState> _mtlTessControlStageState = nil;
@@ -1571,7 +2541,7 @@ index e385e9b..c8e3deb 100644
  
  	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 7eae64c..c5b8308 100644
+index 7eae64c..9084fec 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -17,6 +17,7 @@
@@ -1582,7 +2552,26 @@ index 7eae64c..c5b8308 100644
  #include "MVKCommandBuffer.h"
  #include "MVKInlineObjectConstructor.h"
  #include "MVKImage.h"
-@@ -1190,7 +1191,9 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -428,7 +429,17 @@ static bool isWriteable(VkDescriptorType type) {
+ #pragma mark MVKGraphicsPipeline
+ 
+ /** Populate a MVKStageResourceBits based on the resources used by the given shader info. */
+-static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLConversionConfiguration& src, SPIRVToMSLConversionResultInfo& results, spv::ExecutionModel stage) {
++static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLConversionConfiguration& src, SPIRVToMSLConversionResultInfo& results, spv::ExecutionModel stage, uint64_t madeiraMSL) {
++	// Madeira frame dump: keep what a dump needs to name this stage's shader and bindings.
++	dst.madeiraMSL = madeiraMSL;
++	dst.madeiraBindings.clear();
++	for (const auto& b : src.resourceBindings) {
++		const auto& rb = b.resourceBinding;
++		if ( !b.outIsUsedByShader || rb.stage != stage || rb.desc_set == kPushConstDescSet ) { continue; }
++		dst.madeiraBindings.push_back({ rb.desc_set, rb.binding, rb.count, rb.msl_buffer, rb.msl_texture, rb.msl_sampler,
++										(uint32_t)rb.basetype, b.requiresConstExprSampler });
++	}
++	dst.madeiraBindings.shrink_to_fit();
+ 	dst.usesPhysicalStorageBufferAddresses = results.usesPhysicalStorageBufferAddressesCapability;
+ 	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Swizzle,       results.needsSwizzleBuffer);
+ 	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Output,        results.needsOutputBuffer);
+@@ -1190,7 +1201,9 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  
  	// Vertex input
  	// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
@@ -1592,7 +2581,7 @@ index 7eae64c..c5b8308 100644
  
  	// Fragment shader - only add if rasterization is enabled
  	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pFragmentSS, pFragmentFB)) { return nil; }
-@@ -1236,6 +1239,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1236,6 +1249,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  	// Vertex input
  	plDesc.stageInputDescriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
  	if (!addVertexInputToPipeline(plDesc.stageInputDescriptor, pCreateInfo->pVertexInputState, shaderConfig)) { return nil; }
@@ -1608,7 +2597,43 @@ index 7eae64c..c5b8308 100644
  	plDesc.stageInputDescriptor.indexBufferIndex = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids[MVKImplicitBuffer::Index];
  
  	plDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-@@ -1658,6 +1670,22 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1515,7 +1537,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 
+ 	auto& funcRslts = func.shaderConversionResults;
+ 	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+-	populateResourceUsage(_stageResources[kMVKShaderStageVertex], shaderConfig, funcRslts, spv::ExecutionModelVertex);
++	populateResourceUsage(_stageResources[kMVKShaderStageVertex], shaderConfig, funcRslts, spv::ExecutionModelVertex, func.madeiraMSL);
+ 	_stageResources[kMVKShaderStageVertex].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
+ 	_layout->populateBindOperations(_stageResources[kMVKShaderStageVertex].bindScript, shaderConfig, spv::ExecutionModelVertex);
+ 
+@@ -1562,7 +1584,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		pVtxFunctions[i] = func;
+ 
+ 		auto& funcRslts = func.shaderConversionResults;
+-		populateResourceUsage(_stageResources[kMVKShaderStageVertex], shaderConfig, funcRslts, spv::ExecutionModelVertex);
++		populateResourceUsage(_stageResources[kMVKShaderStageVertex], shaderConfig, funcRslts, spv::ExecutionModelVertex, func.madeiraMSL);
+ 	}
+ 
+ 	_layout->populateBindOperations(_stageResources[kMVKShaderStageVertex].bindScript, shaderConfig, spv::ExecutionModelVertex);
+@@ -1604,7 +1626,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		MVKImplicitBuffer::IndirectParams,
+ 		MVKImplicitBuffer::TessLevel,
+ 	});
+-	populateResourceUsage(_stageResources[kMVKShaderStageTessCtl], shaderConfig, funcRslts, spv::ExecutionModelTessellationControl);
++	populateResourceUsage(_stageResources[kMVKShaderStageTessCtl], shaderConfig, funcRslts, spv::ExecutionModelTessellationControl, func.madeiraMSL);
+ 	_layout->populateBindOperations(_stageResources[kMVKShaderStageTessCtl].bindScript, shaderConfig, spv::ExecutionModelTessellationControl);
+ 
+ 	return verifyImplicitBuffers(kMVKShaderStageTessCtl);
+@@ -1637,7 +1659,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 
+ 	auto& funcRslts = func.shaderConversionResults;
+ 	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
+-	populateResourceUsage(_stageResources[kMVKShaderStageTessEval], shaderConfig, funcRslts, spv::ExecutionModelTessellationEvaluation);
++	populateResourceUsage(_stageResources[kMVKShaderStageTessEval], shaderConfig, funcRslts, spv::ExecutionModelTessellationEvaluation, func.madeiraMSL);
+ 	_stageResources[kMVKShaderStageTessEval].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
+ 	_layout->populateBindOperations(_stageResources[kMVKShaderStageTessEval].bindScript, shaderConfig, spv::ExecutionModelTessellationEvaluation);
+ 
+@@ -1658,6 +1680,22 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  	auto& mtlFeats = getMetalFeatures();
  	if (pFragmentSS) {
  		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
@@ -1631,7 +2656,16 @@ index 7eae64c..c5b8308 100644
  		addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
  		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
  		shaderConfig.options.entryPointName = pFragmentSS->pName;
-@@ -1872,6 +1900,68 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1698,7 +1736,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		if ( !mtlFunc ) { return false; }
+ 
+ 		auto& funcRslts = func.shaderConversionResults;
+-		populateResourceUsage(_stageResources[kMVKShaderStageFragment], shaderConfig, funcRslts, spv::ExecutionModelFragment);
++		populateResourceUsage(_stageResources[kMVKShaderStageFragment], shaderConfig, funcRslts, spv::ExecutionModelFragment, func.madeiraMSL);
+ 		_layout->populateBindOperations(_stageResources[kMVKShaderStageFragment].bindScript, shaderConfig, spv::ExecutionModelFragment);
+ 	}
+ 	return verifyImplicitBuffers(kMVKShaderStageFragment);
+@@ -1872,6 +1910,68 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  	return true;
  }
  
@@ -1700,7 +2734,7 @@ index 7eae64c..c5b8308 100644
  // Adjusts step rates for per-instance vertex buffers based on the number of views to be drawn.
  void MVKGraphicsPipeline::adjustVertexInputForMultiview(MTLVertexDescriptor* inputDesc, const VkPipelineVertexInputStateCreateInfo* pVI, uint32_t viewCount, uint32_t oldViewCount) {
  	uint32_t vbCnt = pVI->vertexBindingDescriptionCount;
-@@ -1949,6 +2039,15 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1949,6 +2049,15 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  
  	// Color attachments - must ignore bad pColorBlendState pointer if rasterization is disabled or subpass has no color attachments
      if (_isRasterizingColor && pCreateInfo->pColorBlendState) {
@@ -1716,7 +2750,7 @@ index 7eae64c..c5b8308 100644
          for (uint32_t caIdx = 0; caIdx < pCreateInfo->pColorBlendState->attachmentCount; caIdx++) {
              const VkPipelineColorBlendAttachmentState* pCA = &pCreateInfo->pColorBlendState->pAttachments[caIdx];
  
-@@ -1991,8 +2090,18 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1991,8 +2100,18 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  					plDesc.logicOperationMVK = mvkMTLLogicOperationFromVkLogicOp(pCreateInfo->pColorBlendState->logicOp);
  				}
  #endif
@@ -1737,7 +2771,7 @@ index 7eae64c..c5b8308 100644
              }
          }
      }
-@@ -2392,6 +2501,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -2392,6 +2511,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  }
  
  MVKGraphicsPipeline::~MVKGraphicsPipeline() {
@@ -1745,7 +2779,16 @@ index 7eae64c..c5b8308 100644
  	@synchronized (getMTLDevice()) {
  		[_mtlTessVertexStageState release];
  		[_mtlTessVertexStageIndex16State release];
-@@ -3027,7 +3137,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
+@@ -2545,7 +2665,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		}
+ 	}
+ 	auto& funcRslts = func.shaderConversionResults;
+-	populateResourceUsage(_stageResources, shaderConfig, funcRslts, spv::ExecutionModelGLCompute);
++	populateResourceUsage(_stageResources, shaderConfig, funcRslts, spv::ExecutionModelGLCompute, func.madeiraMSL);
+ 	_layout->populateBindOperations(_stageResources.bindScript, shaderConfig, spv::ExecutionModelGLCompute);
+ 
+ 	return func;
+@@ -3027,7 +3147,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
  				cfg.shaderOutputs,
  				cfg.resourceBindings,
  				cfg.discreteDescriptorSets,
@@ -1755,7 +2798,7 @@ index 7eae64c..c5b8308 100644
  	}
  
  	template<class Archive>
-@@ -3092,10 +3203,20 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3092,10 +3213,20 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  #pragma mark -
  #pragma mark MVKRenderPipelineCompiler
  
@@ -1776,7 +2819,7 @@ index 7eae64c..c5b8308 100644
  		auto mtlDev = getMTLDevice();
  		@synchronized (mtlDev) {
  			[mtlDev newRenderPipelineStateWithDescriptor: mtlRPLDesc
-@@ -3106,6 +3227,7 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3106,6 +3237,7 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  		}
  	});
  
@@ -1784,7 +2827,7 @@ index 7eae64c..c5b8308 100644
  	return [_mtlRenderPipelineState retain];
  }
  
-@@ -3130,6 +3252,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3130,6 +3262,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  	unique_lock<mutex> lock(_completionLock);
  
  	compile(lock, ^{
@@ -2081,11 +3124,51 @@ index dec4b45..719cec3 100644
  	return rslt;
  }
  
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+index c5b7499..2ccf37b 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+@@ -39,6 +39,7 @@ class MVKShaderModule;
+ typedef struct MVKMTLFunction {
+   mvk::SPIRVToMSLConversionResultInfo shaderConversionResults;
+ 	MTLSize threadGroupSize;
++	uint64_t madeiraMSL = 0;	/**< Madeira frame dump: the library's id for mvkMadeiraShaderMSL, 0 without MSL. */
+ 	id<MTLFunction> getMTLFunction() { return _mtlFunction; }
+ 
+ 	MVKMTLFunction(id<MTLFunction> mtlFunc, const mvk::SPIRVToMSLConversionResultInfo scRslts, MTLSize tgSize);
+@@ -149,10 +150,13 @@ protected:
+ 	void compressMSL(const std::string& msl);
+ 	void decompressMSL(std::string& msl);
+ 	MVKCompressor<std::string>& getCompressedMSL() { return _compressedMSL; }
++	void madeiraRegister();
++	friend bool mvkMadeiraShaderMSL(uint64_t madeiraMSL, std::string& msl);
+ 
+ 	MVKVulkanAPIDeviceObject* _owner;
+ 	id<MTLLibrary> _mtlLibrary;
+ 	MVKCompressor<std::string> _compressedMSL;
++	uint64_t _madeiraMSL = 0;	// Madeira frame dump: this library's id in the MSL registry
+ 	mvk::SPIRVToMSLConversionResultInfo _shaderConversionResultInfo;
+ 
+ 	/** When true, representing a library created with source, but never specialized */
+@@ -162,6 +166,13 @@ protected:
+ };
+ 
+ 
++/**
++ * Madeira frame dump: writes the MSL of the live shader library with this id into msl.
++ * Returns false when the library is gone (its shader module was destroyed) or has no MSL.
++ */
++bool mvkMadeiraShaderMSL(uint64_t madeiraMSL, std::string& msl);
++
++
+ #pragma mark -
+ #pragma mark MVKShaderLibraryCache
+ 
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a4..1e2a184 100644
+index 3aa44a4..cc2a5b3 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-@@ -17,6 +17,7 @@
+@@ -17,9 +17,13 @@
   */
  
  #include "MVKShaderModule.h"
@@ -2093,7 +3176,29 @@ index 3aa44a4..1e2a184 100644
  #include "MVKPipeline.h"
  #include "MVKFoundation.h"
  #include <sys/stat.h>
-@@ -166,6 +167,24 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
++#include <atomic>
++#include <mutex>
++#include <unordered_map>
+ 
+ using namespace std;
+ using namespace mvk;
+@@ -34,6 +38,7 @@
+ 	_mtlFunction = [other._mtlFunction retain];		// retained
+ 	shaderConversionResults = other.shaderConversionResults;
+ 	threadGroupSize = other.threadGroupSize;
++	madeiraMSL = other.madeiraMSL;
+ }
+ 
+ MVKMTLFunction& MVKMTLFunction::operator=(const MVKMTLFunction& other) {
+@@ -44,6 +49,7 @@
+ 
+ 	shaderConversionResults = other.shaderConversionResults;
+ 	threadGroupSize = other.threadGroupSize;
++	madeiraMSL = other.madeiraMSL;
+ 	return *this;
+ }
+ 
+@@ -166,10 +172,30 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			if ( !dbName ) { dbName = _owner->getDebugName(); }
  			_owner->setMetalObjectLabel(mtlFunc, dbName);
  
@@ -2116,9 +3221,87 @@ index 3aa44a4..1e2a184 100644
 +			}
 +
  			auto& wgSize = _shaderConversionResultInfo.entryPoint.workgroupSize;
- 			return MVKMTLFunction(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
- 																					getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
-@@ -415,6 +434,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+-			return MVKMTLFunction(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
+-																					getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
+-																					getWorkgroupDimensionSize(wgSize.depth, pSpecializationInfo)));
++			MVKMTLFunction func(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
++																				  getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
++																				  getWorkgroupDimensionSize(wgSize.depth, pSpecializationInfo)));
++			func.madeiraMSL = _madeiraMSL;	// Madeira frame dump
++			return func;
+ 		}
+ 	}
+ }
+@@ -185,6 +211,33 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	wgSize.depth.size = z;
+ }
+ 
++// Madeira frame dump: live libraries by id, so a dump can save the MSL of the pipelines a
++// frame uses. Pipelines keep only the id: a game destroys its shader modules (and with them
++// these libraries) once its pipelines exist, and holding the MSL alive for them would cost
++// memory all the time. A destroyed library is reported as such. One map entry per library.
++static std::mutex& mvkMadeiraMSLLock() { static std::mutex* lock = new std::mutex(); return *lock; }
++static std::unordered_map<uint64_t, MVKShaderLibrary*>& mvkMadeiraMSLLibs() {
++	static auto* libs = new std::unordered_map<uint64_t, MVKShaderLibrary*>();
++	return *libs;
++}
++
++void MVKShaderLibrary::madeiraRegister() {
++	static std::atomic<uint64_t> nextID{1};
++	std::lock_guard<std::mutex> guard(mvkMadeiraMSLLock());
++	if (_madeiraMSL) { mvkMadeiraMSLLibs().erase(_madeiraMSL); }
++	_madeiraMSL = nextID++;
++	mvkMadeiraMSLLibs()[_madeiraMSL] = this;
++}
++
++bool mvkMadeiraShaderMSL(uint64_t madeiraMSL, std::string& msl) {
++	if ( !madeiraMSL ) { return false; }
++	std::lock_guard<std::mutex> guard(mvkMadeiraMSLLock());	// the destructor waits here, so the library stays alive
++	auto it = mvkMadeiraMSLLibs().find(madeiraMSL);
++	if (it == mvkMadeiraMSLLibs().end() || !it->second->_compressedMSL._uncompressedSize) { return false; }
++	it->second->decompressMSL(msl);
++	return true;
++}
++
+ // Sets the cached MSL source code, after first compressing it.
+ void MVKShaderLibrary::compressMSL(const string& msl) {
+ 	uint64_t startTime = getPerformanceTimestamp();
+@@ -207,6 +260,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 
+ 	_shaderConversionResultInfo = conversionResult.resultInfo;
+ 	compressMSL(conversionResult.msl);
++	madeiraRegister();
+ 	compileLibrary(conversionResult.msl);
+ }
+ 
+@@ -220,6 +274,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 
+ 	_shaderConversionResultInfo = resultInfo;
+ 	_compressedMSL = compressedMSL;
++	madeiraRegister();
+ 	string msl;
+ 	decompressMSL(msl);
+ 	compileLibrary(msl, specializationMacroDef);
+@@ -276,6 +331,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	_mtlLibrary = [other._mtlLibrary retain];
+ 	_shaderConversionResultInfo = other._shaderConversionResultInfo;
+ 	_compressedMSL = other._compressedMSL;
++	madeiraRegister();
+ }
+ 
+ MVKShaderLibrary& MVKShaderLibrary::operator=(const MVKShaderLibrary& other) {
+@@ -306,6 +362,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ }
+ 
+ MVKShaderLibrary::~MVKShaderLibrary() {
++	if (_madeiraMSL) {
++		std::lock_guard<std::mutex> guard(mvkMadeiraMSLLock());
++		mvkMadeiraMSLLibs().erase(_madeiraMSL);
++	}
+ 	[_mtlLibrary release];
+ 
+ 	for (auto& item: _specializationVariants) {
+@@ -415,6 +475,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
  }
  
@@ -2128,7 +3311,7 @@ index 3aa44a4..1e2a184 100644
  bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
  							  SPIRVToMSLConversionResult& conversionResult) {
  	const auto& mvkCfg = getMVKConfig();
-@@ -422,7 +444,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -422,7 +485,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
  
  	uint64_t startTime = getPerformanceTimestamp();
@@ -2138,7 +3321,7 @@ index 3aa44a4..1e2a184 100644
  	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
  
  	const char* dumpDir = getMVKConfig().shaderDumpDir;
-@@ -554,10 +578,244 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -554,10 +619,244 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  #pragma mark -
  #pragma mark MVKShaderLibraryCompiler
  
@@ -2383,7 +3566,7 @@ index 3aa44a4..1e2a184 100644
  
  	compile(lock, ^{
  		auto mtlDev = getMTLDevice();
-@@ -578,10 +836,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -578,10 +877,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  																						 count: macro_count];
  				}
  				logCompilation(mtlCompileOptions);
@@ -2400,7 +3583,7 @@ index 3aa44a4..1e2a184 100644
  							bool isLate = compileComplete(mtlLib, error);
  							if (isLate) { destroy(); }
  						}];
-@@ -589,6 +853,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -589,6 +894,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  		}
  	});
  

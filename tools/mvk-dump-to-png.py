@@ -3,8 +3,11 @@
 
 The dump is what MoltenVK writes to Documents/mvk-dump-<n>/ when Documents/mvk-dump-now
 appears on the device (see mvkMadeiraFrameDumpTick in MVKCommandBuffer.mm): one raw file
-per render-pass attachment, compute storage image or copy destination, and index.json
-(index.jsonl while the frame is still being written) describing each one.
+per render-pass attachment, compute storage image, copy destination or sampled input
+("input" entries), and index.json (index.jsonl while the frame is still being written)
+describing each one. Render entries carry drawList (per draw: the textures and samplers bound
+to its stages), compute entries inputs/samplers, "transfer" entries a copy's source,
+destination and regions, and shaders/ holds each pipeline's MSL and binding map.
 
     tools/mvk-dump-to-png.py DUMP_DIR [--float reinhard|clamp|normalize] [--gamma 2.2] [-j N]
 
@@ -327,6 +330,119 @@ def pipeline_text(p):
     return p.get('name') or p.get('label') or p.get('ptr')
 
 
+def pipeline_html(p):
+    """Pipeline name with links to its MSL per stage and its binding map."""
+    links = ['<a href="%s">%s</a>' % (html.escape(f), html.escape(stage))
+             for stage, f in (p.get('shaders') or {}).items() if f]
+    missing = [stage for stage, f in (p.get('shaders') or {}).items() if not f]
+    if p.get('bindingMap'):
+        links.append('<a href="%s">bindings</a>' % html.escape(p['bindingMap']))
+    text = html.escape(str(pipeline_text(p)))
+    if p.get('name') or p.get('label'):
+        text += ' <span class="m">%s</span>' % html.escape(str(p.get('ptr')))
+    if missing:
+        links.append('<span class="m">no MSL: %s</span>' % html.escape(', '.join(missing)))
+    return text + (' [%s]' % ' '.join(links) if links else '')
+
+
+def tex_text(t):
+    if not t:
+        return 'none'
+    if t.get('dead'):
+        return '%s (destroyed)' % t.get('ptr')
+    if t.get('unverified'):
+        return '%s (partially bound, not checked)' % t.get('ptr')
+    size = t.get('size') or [0, 0, 0, 0]
+    text = '%s %dx%d' % (t.get('ptr'), size[0], size[1])
+    if size[2] > 1:
+        text += 'x%d' % size[2]
+    if size[3] > 1:
+        text += '[%d]' % size[3]
+    text += ' %s mips %s' % (t.get('formatName') or t.get('format'), t.get('mips'))
+    if t.get('parentTexture'):
+        text += ' · view of %s (%s) levels %s slices %s' % (
+            t['parentTexture'], t.get('parentFormatName') or t.get('parentFormat'),
+            t.get('levels'), t.get('slices'))
+    if t.get('buffer'):
+        text += ' · buffer %s+%s' % (t['buffer'], t.get('bufferOffset'))
+    if t.get('label'):
+        text = '%s · %s' % (t['label'], text)
+    return text
+
+
+class Writers:
+    """Which earlier entry wrote a texture (by pointer, or the parent of a view)."""
+
+    def __init__(self, entries):
+        self.by_ptr = {}
+        for e in entries:
+            if e.get('kind') == 'input':
+                continue
+            if e.get('kind') == 'transfer':
+                t = (e.get('dst') or {}).get('texture')
+                what = e.get('use') or 'transfer'
+            else:
+                t = e.get('texture')
+                what = '%s %s' % (e.get('kind'), e.get('slot'))
+            if not t:
+                continue
+            for ptr in (t.get('ptr'), t.get('parentTexture')):
+                if ptr:
+                    self.by_ptr.setdefault(ptr, []).append((e.get('pass', -1), e['seq'], what))
+
+    def last_before(self, t, pass_no):
+        best = None
+        for ptr in (t.get('ptr'), t.get('parentTexture')):
+            for w in self.by_ptr.get(ptr, []):
+                if w[0] < pass_no and (best is None or w[0] > best[0] or (w[0] == best[0] and w[1] > best[1])):
+                    best = w
+        return best
+
+
+def inputs_html(inputs, samplers, pass_no, results, writers):
+    rows = []
+    for i in inputs or []:
+        t = i.get('texture')
+        thumb = ''
+        res = results.get(i.get('inputSeq'), {}) if i.get('inputSeq') is not None else {}
+        if res.get('outputs'):
+            o = res['outputs'][0]
+            thumb = '<a href="%s"><img loading="lazy" src="%s"></a>' % (html.escape(o['png']), html.escape(o['thumb']))
+        where = '%s%s · set %s binding %s[%s] · %s%s' % (
+            i.get('stage'), i.get('index'), i.get('set'), i.get('binding'), i.get('element'), i.get('type'),
+            ' (argument buffer)' if i.get('argBuffer') else '')
+        extra = ''
+        if i.get('inputSeq') is not None:
+            extra += ' · dumped #%04d' % i['inputSeq']
+        if t and not t.get('dead') and not t.get('unverified'):
+            w = writers.last_before(t, pass_no)
+            extra += (' · last written by #%04d (pass %s, %s)' % (w[1], w[0], w[2])) if w else ' · not written earlier in this dump'
+        rows.append('<div class="in">%s<div><b>%s</b><div class="m">%s%s</div></div></div>'
+                    % (thumb, html.escape(where), html.escape(tex_text(t)), html.escape(extra)))
+    if samplers:
+        rows.append('<div class="m">samplers: %s</div>' % html.escape(', '.join(
+            '%s%s=%s' % (s.get('stage'), s.get('index'), 'constexpr' if s.get('constexpr') else s.get('ptr'))
+            for s in samplers)))
+    return ''.join(rows)
+
+
+def regions_text(e):
+    parts = []
+    for r in (e.get('regions') or [])[:4]:
+        parts.append(json.dumps(r, separators=(',', ':')))
+    more = (e.get('regionCount') or 0) - len(parts)
+    return ' '.join(parts) + (' (+%d more)' % more if more > 0 else '')
+
+
+def endpoint_text(x):
+    if not x:
+        return 'none'
+    if x.get('texture'):
+        return 'texture ' + tex_text(x['texture'])
+    return 'buffer %s+%s (%s bytes)%s' % (x.get('buffer'), x.get('offset'), x.get('length'),
+                                          (' ' + x['label']) if x.get('label') else '')
+
+
 CSS = """
 :root { color-scheme: light dark; --bg:#f5f5f4; --card:#fff; --fg:#1c1917; --muted:#78716c; --line:#e7e5e4; --bad:#b91c1c; }
 @media (prefers-color-scheme: dark) { :root { --bg:#1c1917; --card:#292524; --fg:#f5f5f4; --muted:#a8a29e; --line:#44403c; --bad:#f87171; } }
@@ -344,6 +460,11 @@ h1 { font-size:18px; margin:0 0 4px; }
 .card .t { font-weight:600; }
 .card .m { color:var(--muted); word-break:break-all; }
 .card .bad { color:var(--bad); }
+.draws { margin:4px 0 8px; }
+.draw { margin:2px 0 6px; }
+.in { display:flex; gap:8px; align-items:flex-start; margin:2px 0 2px 12px; }
+.in img { max-width:96px; max-height:72px; image-rendering:pixelated; background:repeating-conic-gradient(#8884 0 25%, transparent 0 50%) 0 0/16px 16px; }
+.in .m, .draw .m, .ph .m { word-break:break-all; }
 .hide-skipped .skipped { display:none; }
 label { user-select:none; }
 """
@@ -355,7 +476,8 @@ def write_html(root, entries, source, results):
         if not passes or passes[-1][0] != e.get('pass'):
             passes.append((e.get('pass'), []))
         passes[-1][1].append(e)
-    skipped = sum(1 for e in entries if e.get('status') != 'ok')
+    skipped = sum(1 for e in entries if e.get('status') not in ('ok', 'meta'))
+    writers = Writers(entries)
     total = sum(e['bytesPerRow'] * e['height'] for e in entries if e.get('status') == 'ok')
     out = ['<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
            '<title>%s</title><style>%s</style>' % (html.escape(os.path.basename(os.path.abspath(root))), CSS),
@@ -364,13 +486,34 @@ def write_html(root, entries, source, results):
            '<label><input type="checkbox" onchange="document.body.classList.toggle(\'hide-skipped\', this.checked)"> hide skipped</label></div>'
            % (len(passes), len(entries), skipped, total / 1048576.0, html.escape(source))]
     for pno, group in passes:
-        e0 = group[0]
-        pipes = ', '.join(html.escape(str(pipeline_text(p))) for p in e0.get('pipelines', []))
-        cls = 'pass skipped' if all(e.get('status') != 'ok' for e in group) else 'pass'
-        out.append('<div class="%s"><div class="ph"><b>pass %s</b><span class="k">%s</span>%s <span class="m">%s · %s</span>%s</div><div class="cards">'
+        # Input entries come first in a pass; the pass's own kind is that of its other entries.
+        e0 = next((e for e in group if e.get('kind') != 'input'), group[0])
+        pipes = ', '.join(pipeline_html(p) for p in e0.get('pipelines', []))
+        cls = 'pass skipped' if all(e.get('status') not in ('ok', 'meta') for e in group) else 'pass'
+        out.append('<div class="%s"><div class="ph"><b>pass %s</b><span class="k">%s</span>%s <span class="m">%s · %s</span>%s</div>'
                    % (cls, pno, html.escape(e0['kind']), html.escape(str(e0.get('encoder') or '')),
                       html.escape(str(e0.get('use') or '')), html.escape(pass_summary(e0)),
                       ('<div class="m">pipelines: %s</div>' % pipes) if pipes else ''))
+        if e0.get('kind') == 'transfer':
+            out.append('<div class="m">src: %s<br>dst: %s<br>%d regions: %s</div>' % (
+                html.escape(endpoint_text(e0.get('src'))), html.escape(endpoint_text(e0.get('dst'))),
+                e0.get('regionCount') or 0, html.escape(regions_text(e0))))
+        # Bindings ride on the pass's first entry (drawList for render passes, inputs for dispatches).
+        info = next((e for e in group if 'drawList' in e or 'inputs' in e), None)
+        if info is not None:
+            pass_no = info.get('pass', -1)
+            out.append('<details class="draws"%s><summary>bindings</summary>' % (' open' if len(info.get('drawList') or [1]) <= 4 else ''))
+            if 'drawList' in info:
+                for d in info['drawList']:
+                    out.append('<div class="draw">draw %s <span class="m">pipeline %s</span>%s</div>' % (
+                        d.get('draw'), html.escape(str(d.get('pipeline'))),
+                        inputs_html(d.get('inputs'), d.get('samplers'), pass_no, results, writers)))
+                if info.get('drawsDropped'):
+                    out.append('<div class="m">%d more draws not listed</div>' % info['drawsDropped'])
+            else:
+                out.append(inputs_html(info.get('inputs'), info.get('samplers'), pass_no, results, writers))
+            out.append('</details>')
+        out.append('<div class="cards">')
         for e in group:
             if e.get('slot') is None:
                 continue
@@ -379,7 +522,8 @@ def write_html(root, entries, source, results):
             meta = '%s · %dx%d %s (%s) · mip %s slice %s' % (
                 html.escape(str(tex.get('label') or tex.get('ptr'))), e['width'], e['height'],
                 html.escape(str(e.get('formatName') or '?')), e.get('format'), e.get('level'), e.get('slice'))
-            card = ['<div class="card%s"><div class="t">#%04d %s</div>' % ('' if e.get('status') == 'ok' else ' skipped', e['seq'], html.escape(e['slot']))]
+            title = e['slot'] if e.get('kind') != 'input' else 'input ' + e['slot']
+            card = ['<div class="card%s"><div class="t">#%04d %s</div>' % ('' if e.get('status') == 'ok' else ' skipped', e['seq'], html.escape(title))]
             for o in res.get('outputs', []):
                 card.append('<a href="%s"><img loading="lazy" src="%s"></a>' % (html.escape(o['png']), html.escape(o['thumb'])))
                 if o['note']:
@@ -388,6 +532,10 @@ def write_html(root, entries, source, results):
                 card.append('<div class="bad">%s</div>' % html.escape(str(e.get('skipped') or e.get('status') or 'not written')))
             if res.get('error'):
                 card.append('<div class="bad">%s</div>' % html.escape(res['error']))
+            if e.get('kind') == 'input':
+                meta += ' · copied %s%s' % (e.get('when', ''), ', also written by this pass' if e.get('alsoWritten') else '')
+            if tex.get('parentTexture'):
+                meta += ' · view of %s' % html.escape(tex['parentTexture'])
             card.append('<div class="m">%s</div></div>' % meta)
             out.append(''.join(card))
         out.append('</div></div>')
