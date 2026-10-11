@@ -98,6 +98,8 @@ struct EpicGameCard: View {
                     Text(game.title).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
                         .multilineTextAlignment(.leading)
                     tags(oneRow: true).frame(height: LibraryLayout.pillRow, alignment: .leading)
+                    // The download's state as the status line, as on Steam's cards.
+                    Text(state ?? " ").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
                 .padding(4)
             }
@@ -122,23 +124,24 @@ struct EpicGameCard: View {
     }
 
     /// The same pills as a Steam card: once installed the store and the format pills of
-    /// any library game (bits, graphics API, size), otherwise the store and the state.
+    /// any library game (bits, graphics API, size), otherwise the store and "Not
+    /// installed". A download's state is the status line, never a pill.
     @ViewBuilder private func tags(oneRow: Bool = false) -> some View {
         if !installer.isDownloading(game.appName), let entry = installer.entry(game.appName) {
             LibraryBadges(entry: entry, store: "Epic", oneRow: oneRow).foregroundStyle(.secondary)
         } else {
             HStack(spacing: 4) {
-                LibrarySourceTag(text: state)
+                if state == nil, installer.installed[game.appName] == nil { LibrarySourceTag(text: "Not installed") }
                 LibrarySourceTag(text: "Epic")
             }
         }
     }
 
-    /// Steam's wording for the same states (SteamGamesRules.Status.badge).
-    private var state: String {
-        guard let download = installer.installs[game.appName]?.download else { return "Not installed" }
+    /// A download's state in Steam's wording (SteamGamesRules.Status.badge); nil without one.
+    private var state: String? {
+        guard let download = installer.installs[game.appName]?.download else { return nil }
         switch download.state {
-        case .queued: return "Waiting"
+        case .queued: return "Queued"
         case .active: return "Downloading \(Int(download.progress.fraction * 100))%"
         case .paused: return "Paused"
         case .failed: return "Download failed"
@@ -241,6 +244,7 @@ struct EpicGameSheet: View {
                                 .clipped()
                         )
                 }
+                Section { EpicStoreGameMedia(game: game) }
                 if let download = installer.installs[game.appName]?.download {
                     Section("Download") {
                         SteamDownloadStatus(download: download)

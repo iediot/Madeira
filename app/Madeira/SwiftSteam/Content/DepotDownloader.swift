@@ -24,6 +24,22 @@ struct SteamDownloadProgress: Equatable, Sendable {
     var fraction: Double { totalBytes > 0 ? min(1, Double(doneBytes) / Double(totalBytes)) : 0 }
 }
 
+/// Downloads report progress for every chunk. Publishing each report re-rendered
+/// every library card many times a second (a slow UI, and the library jumping up
+/// while scrolling during an install), so a game's progress is passed on at most
+/// four times a second, and always when its phase changes or it completes.
+struct DownloadProgressThrottle {
+    private var last: [AnyHashable: (date: Date, phase: SteamDownloadProgress.Phase)] = [:]
+
+    mutating func allows(_ key: AnyHashable, _ progress: SteamDownloadProgress, interval: TimeInterval = 0.25) -> Bool {
+        let now = Date()
+        if let previous = last[key], previous.phase == progress.phase, progress.doneBytes < progress.totalBytes,
+           now.timeIntervalSince(previous.date) < interval { return false }
+        last[key] = (now, progress.phase)
+        return true
+    }
+}
+
 /// Orchestrates downloading an owned application's Windows depots from the
 /// Steam content network into a Steam library folder.
 ///
@@ -49,7 +65,9 @@ final class DepotDownloader {
     private let session: SteamCMSession
     private var depotKeys: [UInt32: Data] = [:]
     private var cdnAuthTokens: [String: String] = [:]  // "depot|host" -> "?auth=…" fragment
-    private let maxConcurrentChunks = 8
+    /// Chunks in flight at once. 16 rather than 8: a ~1 MB chunk is mostly round-trip
+    /// latency to the content server, so more in flight is what lifts throughput.
+    private let maxConcurrentChunks = 16
     private let attemptsPerChunk = 5
     private let hostPoolSize = 6
 
@@ -59,7 +77,7 @@ final class DepotDownloader {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 300
-        config.httpMaximumConnectionsPerHost = 8
+        config.httpMaximumConnectionsPerHost = 16
         return URLSession(configuration: config)
     }()
 

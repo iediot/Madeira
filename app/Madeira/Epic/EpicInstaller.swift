@@ -41,6 +41,7 @@ struct EpicInstalledGame: Codable {
         var pending: [String: Pending] = [:]
     }
     @Published private(set) var installs: [String: Install] = [:]
+    private var progressThrottle = DownloadProgressThrottle()
     @Published private(set) var installed: [String: EpicInstalledGame] = [:]
     @Published private(set) var ready = false
     @Published var error: String?
@@ -169,6 +170,7 @@ struct EpicInstalledGame: Codable {
                 let record = try await worker.run(job, catalog: catalog, token: token) { progress in
                     await MainActor.run {
                         guard self.active?.id == id, self.installs[id]?.state == .active else { return }
+                        guard self.progressThrottle.allows(id, progress) else { return }
                         self.installs[id]?.progress = progress
                         self.background.progress(progress)
                     }
@@ -314,6 +316,31 @@ private actor EpicInstallWorker {
         LogStore.shared.log("[epic-install] start files=\(manifest.files.count) reused=\(reused) chunks=\(remaining.count) download-bytes=\(total) write-bytes=\(required)")
         await progress(status)
         var cache: [String: Data] = [:], lru: [String] = []
+        // Chunks are fetched ahead in the order the files use them, up to 16 at a time and
+        // across file boundaries. Waiting for at most four of one file's chunks at a time
+        // left a game made of small files downloading about one chunk per round trip.
+        var order: [String] = [], ordered = Set<String>()
+        for file in files { for part in file.parts where ordered.insert(part.guid).inserted { order.append(part.guid) } }
+        let featureLevel = manifest.meta.featureLevel
+        var inflight: [String: Task<(Data, Int), Error>] = [:], next = 0
+        func request(_ guid: String) throws {
+            let chunk = chunks[guid]!
+            let url = base.appendingPathComponent(try chunk.path(featureLevel: featureLevel))
+            // Detached so chunks also decompress in parallel, off this actor.
+            inflight[guid] = Task.detached {
+                let bytes = try await fetch(url, chunk)
+                try Task.checkCancellation()
+                return (try EpicChunk.parse(bytes, expected: chunk), bytes.count)
+            }
+        }
+        func fillWindow() throws {
+            while inflight.count < 16, next < order.count {
+                let guid = order[next]; next += 1
+                if cache[guid] == nil, inflight[guid] == nil, remaining[guid, default: 0] > 0 { try request(guid) }
+            }
+        }
+        defer { for task in inflight.values { task.cancel() } }
+        try fillWindow()
         for file in files {
             try Task.checkCancellation()
             let target = try safeURL(file.filename, under: root)
@@ -327,32 +354,18 @@ private actor EpicInstallWorker {
                 for (index, part) in file.parts.enumerated() {
                     try Task.checkCancellation()
                     if cache[part.guid] == nil {
-                        var wanted: [EpicManifest.Chunk] = [], seen = Set<String>()
-                        for next in file.parts[index..<min(file.parts.count, index + 4)] where cache[next.guid] == nil && seen.insert(next.guid).inserted {
-                            wanted.append(chunks[next.guid]!)
-                        }
-                        let downloaded = try await withThrowingTaskGroup(of: (String, Data, Int).self) { group in
-                            for chunk in wanted {
-                                let url = base.appendingPathComponent(try chunk.path(featureLevel: manifest.meta.featureLevel))
-                                group.addTask {
-                                    let bytes = try await fetch(url, chunk)
-                                    try Task.checkCancellation()
-                                    return (chunk.guid, try EpicChunk.parse(bytes, expected: chunk), bytes.count)
-                                }
-                            }
-                            var result: [(String, Data, Int)] = []
-                            for try await item in group { result.append(item) }
-                            return result
-                        }
-                        // Bound retained data before adding at most four freshly downloaded chunks.
-                        while cache.values.reduce(0, { $0 + $1.count }) > 8 * 1024 * 1024, let oldest = lru.first {
+                        // Not in flight only when an earlier copy was evicted before its last use.
+                        if inflight[part.guid] == nil { try request(part.guid) }
+                        let task = inflight.removeValue(forKey: part.guid)!
+                        let (data, bytes) = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+                        // Chunks kept for a later file stay within 32 MB; chunks fetched ahead are bounded by the window.
+                        while cache.values.reduce(0, { $0 + $1.count }) > 32 * 1024 * 1024, let oldest = lru.first {
                             cache.removeValue(forKey: oldest); lru.removeFirst()
                         }
-                        for (guid, data, bytes) in downloaded {
-                            cache[guid] = data; lru.removeAll { $0 == guid }; lru.append(guid)
-                            received += UInt64(bytes)
-                            if fetched.insert(guid).inserted { status.doneBytes += UInt64(bytes) }
-                        }
+                        cache[part.guid] = data; lru.removeAll { $0 == part.guid }; lru.append(part.guid)
+                        received += UInt64(bytes)
+                        if fetched.insert(part.guid).inserted { status.doneBytes += UInt64(bytes) }
+                        try fillWindow()
                     }
                     guard let data = cache[part.guid] else { throw EpicContentError.invalid("Missing Epic chunk.") }
                     let bytes = data.subdata(in: part.offset..<part.offset + part.size)
@@ -360,7 +373,7 @@ private actor EpicInstallWorker {
                     remaining[part.guid, default: 0] -= 1
                     lru.removeAll { $0 == part.guid }
                     if remaining[part.guid] == 0 { cache.removeValue(forKey: part.guid) } else { lru.append(part.guid) }
-                    while cache.values.reduce(0, { $0 + $1.count }) > 8 * 1024 * 1024, let oldest = lru.first {
+                    while cache.values.reduce(0, { $0 + $1.count }) > 32 * 1024 * 1024, let oldest = lru.first {
                         cache.removeValue(forKey: oldest); lru.removeFirst()
                     }
                     status.bytesPerSecond = Double(received) / max(0.1, Date().timeIntervalSince(start))

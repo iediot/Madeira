@@ -306,7 +306,7 @@ struct LibraryEntry: Codable, Identifiable {
     var steamMetadataInstall: String?
     /// Fastsync's per-game switches, used only while Settings › Sync engine is
     /// Fastsync: "Fast synchronization" (nil = on; off gives this game Wine's
-    /// standard sync) and "Fast semaphore waits" (nil = off). Optional, so older
+    /// standard sync) and "Fast semaphore waits" (nil = on for Unity games, else off). Optional, so older
     /// library files decode; the fork's files carry the same keys.
     var fastSync: Bool?
     var semaphoreFastPath: Bool?
@@ -477,6 +477,18 @@ struct LibraryEntry: Codable, Identifiable {
 
     var windowsPath: String { "C:\\" + relativePath.replacingOccurrences(of: "/", with: "\\") }
 
+    /// A Unity game: UnityPlayer.dll sits next to its program. Unity's job system
+    /// hands work between threads through semaphores, which is what Fastsync's
+    /// semaphore fast path speeds up (Slime Rancher), so those games get it unless
+    /// they or madeira.cfg choose otherwise.
+    var isUnityGame: Bool {
+        guard let exe = Self.hostURL(ofWindowsPath: windowsPath) else { return false }
+        return FileManager.default.fileExists(atPath: exe.deletingLastPathComponent()
+            .appendingPathComponent("UnityPlayer.dll").path)
+    }
+    /// "Fast semaphore waits" as it applies: this game's choice, else on for Unity games.
+    var semaphoreFastPathEffective: Bool { semaphoreFastPath ?? isUnityGame }
+
     /// The vsync mode to apply: a saved 30 or 40 FPS limit runs as 60 when it is
     /// not offered (DXMT without that cap would present uncapped).
     var effectiveFPSMode: Int32 { ProMotionIntent.supportedMode(fpsMode) }
@@ -579,8 +591,10 @@ struct LibraryEntry: Codable, Identifiable {
         if SyncEngine.current == .fastsync {
             let mode = MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "auto"
             setenv("MADEIRA_FASTSYNC", fastSync == false ? "0" : mode, 1)
-            // Only a game's own choice; otherwise madeira.cfg's env.MADEIRA_FASTSYNC_SEM applies.
+            // A game's own choice wins; then madeira.cfg's env.MADEIRA_FASTSYNC_SEM; with
+            // neither, Unity games get the semaphore fast path (isUnityGame).
             if let sem = semaphoreFastPath { setenv("MADEIRA_FASTSYNC_SEM", sem ? "1" : "0", 1) }
+            else if MadeiraConfig.get("env.MADEIRA_FASTSYNC_SEM") == nil, isUnityGame { setenv("MADEIRA_FASTSYNC_SEM", "1", 1) }
             else { unsetenv("MADEIRA_FASTSYNC_SEM") }
         }
         madeira_set_vsync_locked(effectiveFPSMode)
@@ -3075,6 +3089,9 @@ struct LibraryDetail: View {
                 if let appID = entry.steamAppID {
                     Section { StoreGameMedia(appID: appID) }
                 }
+                if let epic = entry.epicAppName, let game = EpicLibrary.shared.games.first(where: { $0.appName == epic }) {
+                    Section { EpicStoreGameMedia(game: game) }
+                }
                 Section("Display") {   // first after Play: the setting changed most often, then On screen
                     // The Windows screen the game renders for (and the Desktop's size).
                     // ml1172: this device's choices (ResolutionChoices), grouped.
@@ -3213,7 +3230,7 @@ struct LibraryDetail: View {
                     Group {
                         Toggle("Fast synchronization", isOn: Binding(get: { entry.fastSync ?? true }, set: { entry.fastSync = $0 }))
                         Toggle("Fast semaphore waits (experimental)",
-                               isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
+                               isOn: Binding(get: { entry.semaphoreFastPathEffective }, set: { entry.semaphoreFastPath = $0 }))
                     }
                     .disabled(syncEngine != .fastsync)
                 } header: { Text("Compatibility & performance") }

@@ -40,10 +40,19 @@ enum SteamGamesRules {
             case .partlyInstalled: return "Not fully installed"
             case .installed: return nil
             case .updateAvailable: return "Update"
-            case .queued: return "Waiting"
+            case .queued: return "Queued"
             case .downloading(let percent): return "Downloading \(percent)%"
             case .paused: return "Paused"
             case .failed: return "Download failed"
+            }
+        }
+
+        /// A download's state. It is the card's status line, never one of its pills:
+        /// pills describe the game, not what it is doing now.
+        var isTransfer: Bool {
+            switch self {
+            case .queued, .downloading, .paused, .failed: return true
+            default: return false
             }
         }
 
@@ -844,7 +853,8 @@ struct SteamGameCell: View {
                     // Fixed lines (LibraryEntryCard): the pills and playtime arrive later.
                     Text(item.name).font(.footnote.weight(.semibold)).lineLimit(2, reservesSpace: true)
                     pills(status, entry, oneRow: true).frame(height: LibraryLayout.pillRow, alignment: .leading)
-                    Text(steam.playtime[item.id]?.played ?? " ").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    Text(status.isTransfer ? status.badge ?? " " : steam.playtime[item.id]?.played ?? " ")
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }.padding(4)
             }
         }
@@ -865,7 +875,7 @@ struct SteamGameCell: View {
             LibraryBadges(entry: entry, note: status.badge, store: "Steam", oneRow: oneRow).foregroundStyle(.secondary)
         } else {
             HStack(spacing: 4) {
-                if let text = status.badge { badge(text) }
+                if let text = status.badge, !status.isTransfer { badge(text) }
                 badge("Steam")
             }
         }
@@ -963,6 +973,7 @@ struct SteamGameSheet: View {
                                 Text(item.name).font(.title2.bold())
                                 if let summary = steam.playtime[appID]?.summary {
                                     Text(summary).font(.subheadline).foregroundStyle(.secondary)
+                             
                                 }
                                 primaryAction(item)
                             }

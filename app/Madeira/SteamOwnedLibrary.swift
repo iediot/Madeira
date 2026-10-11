@@ -216,6 +216,7 @@ final class SteamOwnedLibrary: ObservableObject {
         var progress = SteamDownloadProgress()
     }
     @Published private(set) var downloads: [Int: Download] = [:]
+    private var progressThrottle = DownloadProgressThrottle()
     private var queue: [Int] = []
     private var active: (id: Int, task: Task<Void, Never>)?
     /// A game session runs: downloads wait, and the Steam connection stays closed.
@@ -1234,7 +1235,8 @@ final class SteamOwnedLibrary: ObservableObject {
                 || DepotDownloader.hasPartialDownload(appID: UInt32(appID), steamApps: Self.steamApps) {
                 let folder = try await downloader.install(info, steamApps: Self.steamApps,
                                                           ownedDepots: { [weak self] in try? await self?.fetcher.ownedDepotIDs() }) { [weak self] progress in
-                    self?.downloads[appID]?.progress = progress
+                    guard let self, self.progressThrottle.allows(appID, progress) else { return }
+                    self.downloads[appID]?.progress = progress
                     SteamDownloadBackground.shared.progress(progress)
                 }
                 // Only now: a paused or failed Repair is still a Repair when it resumes.
@@ -1405,7 +1407,8 @@ final class SteamOwnedLibrary: ObservableObject {
                 download: { item in
                     try await downloader.downloadWorkshopItem(item, app: info, steamApps: steamApps) { progress in
                         Task { @MainActor [weak self] in
-                            self?.downloads[appID]?.progress = progress
+                            guard let self, self.progressThrottle.allows(appID, progress) else { return }
+                            self.downloads[appID]?.progress = progress
                             SteamDownloadBackground.shared.progress(progress)
                         }
                     }

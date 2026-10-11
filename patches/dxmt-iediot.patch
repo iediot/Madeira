@@ -1469,7 +1469,7 @@ index f086337..5814ff4 100644
  // device-teardown high-water reports.
  inline bool
 diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
-index 2515624..701a88b 100644
+index 2515624..3584e25 100644
 --- a/src/d3d9/d3d9_device.cpp
 +++ b/src/d3d9/d3d9_device.cpp
 @@ -834,6 +834,9 @@ MTLD3D9Device::releaseBufferBacking(
@@ -1675,7 +1675,39 @@ index 2515624..701a88b 100644
  void
  MTLD3D9Device::noteReadback(unsigned kind, const D3DSURFACE_DESC &desc) {
    static const bool enabled = [] { const auto v = env::getEnvVar("DXMT_D9_READBACK_STATS"); return !v.empty() && v != "0"; }();
-@@ -3515,24 +3697,38 @@ MTLD3D9Device::CreateCubeTexture(
+@@ -2568,6 +2750,31 @@ HRESULT STDMETHODCALLTYPE
+ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
+   D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_Reset);
+   D9DeviceLock lock = LockDevice();
++  // ml2330: [d3d9-reset] reports what Reset actually returned. The
++  // [d3d9-modes] line is written before the losable-resource gate and reads
++  // hr 0x0 even when the gate then fails the call: Borderlands: The Pre-
++  // Sequel on the native frontend logged 46 such "successful" Resets in a row
++  // after a resolution change and never presented again. The losable count
++  // before the call is what tells a held DEFAULT resource apart from a failed
++  // swapchain rebuild. First 16, then every 64th, so a retry loop stays legible.
++  const uint32_t losable = losableResourceCount();
++  const HRESULT hr = resetDevice(pPresentationParameters);
++  static std::atomic<uint32_t> s_resets{0};
++  const uint32_t n = s_resets.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n <= 16 || n % 64 == 0) {
++    const D3DPRESENT_PARAMETERS *p = pPresentationParameters;
++    Logger::info(str::format(
++        "[d3d9-reset] ml2330 #", n, m_isEx ? " Ex" : "", " ", p ? p->BackBufferWidth : 0u, "x",
++        p ? p->BackBufferHeight : 0u, " windowed=", p ? (int)p->Windowed : -1, " losable-before=", losable,
++        " after=", losableResourceCount(), " -> hr 0x", std::hex, (uint32_t)hr, std::dec,
++        hr == D3DERR_INVALIDCALL && losable ? " (app still holds DEFAULT-pool resources)" : ""
++    ));
++  }
++  return hr;
++}
++
++HRESULT
++MTLD3D9Device::resetDevice(D3DPRESENT_PARAMETERS *pPresentationParameters) {
+   // Wine's main thread has no outer NSAutoreleasePool. Reset tears
+   // down and recreates the backbuffer + auto-DS, each of which routes
+   // through Metal APIs that return autoreleased handles (newBuffer,
+@@ -3515,24 +3722,38 @@ MTLD3D9Device::CreateCubeTexture(
    *ppCubeTexture = tex;
    return D3D_OK;
  }
@@ -1727,7 +1759,7 @@ index 2515624..701a88b 100644
    if (!mirror)
      return false;
    std::memset(mirror, 0, length);
-@@ -3610,15 +3806,15 @@ MTLD3D9Device::CreateVertexBuffer(
+@@ -3610,15 +3831,15 @@ MTLD3D9Device::CreateVertexBuffer(
      return D3DERR_INVALIDCALL;
    }
  
@@ -1748,7 +1780,7 @@ index 2515624..701a88b 100644
    if (Pool == D3DPOOL_DEFAULT)
      vb->markLosable();
    vb->AddRef();
-@@ -3688,11 +3884,12 @@ MTLD3D9Device::CreateIndexBuffer(
+@@ -3688,11 +3909,12 @@ MTLD3D9Device::CreateIndexBuffer(
  
    // Storage: see CreateVertexBuffer.
    void *host_ptr = nullptr;
@@ -1763,7 +1795,7 @@ index 2515624..701a88b 100644
    if (Pool == D3DPOOL_DEFAULT)
      ib->markLosable();
    ib->AddRef();
-@@ -3990,6 +4187,11 @@ MTLD3D9Device::UpdateSurface(
+@@ -3990,6 +4212,11 @@ MTLD3D9Device::UpdateSurface(
  ) {
    D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_UpdateSurface);
    D9DeviceLock lock = LockDevice();
@@ -1775,7 +1807,7 @@ index 2515624..701a88b 100644
    settleUploadPressure(); // ml1490, as in UpdateTexture
    if (!pSourceSurface || !pDestinationSurface)
      return D3DERR_INVALIDCALL;
-@@ -4168,6 +4370,9 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
+@@ -4168,6 +4395,9 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
      return D3DERR_INVALIDCALL;
    if (pSourceTexture == pDestinationTexture)
      return D3DERR_INVALIDCALL;
@@ -1785,7 +1817,7 @@ index 2515624..701a88b 100644
    // Identify both textures without calling through their app-visible vtables (see
    // SetTexture); read each type from its own internal common-texture vtable.
    MTLD3D9CommonTexture *src_common = commonTextureFromBound(pSourceTexture);
-@@ -4210,6 +4415,11 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
+@@ -4210,6 +4440,11 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
      // untouched: levels_to_copy caps at the source's remaining count, so the
      // wider-dst case native accepts needs no gate. Native and PRIMARY wined3d both
      // accept it; only DXVK rejects.
@@ -1797,7 +1829,7 @@ index 2515624..701a88b 100644
      const UINT src_levels = src->levelCount();
      const UINT dst_levels = dst->levelCount();
      // Mip-tail correspondence: when src has a larger base than dst, dst maps
-@@ -5212,6 +5422,11 @@ MTLD3D9Device::stretchRectImpl(
+@@ -5212,6 +5447,11 @@ MTLD3D9Device::stretchRectImpl(
      D3DTEXTUREFILTERTYPE Filter, bool from_readback
  ) {
    D9DeviceLock lock = LockDevice();
@@ -1809,7 +1841,7 @@ index 2515624..701a88b 100644
    // No autorelease pool needed here post-chunk-migration. The body
    // only does validation, rect parsing, and QueueBlitOp (a vector
    // push_back); every Metal-touching call moved into the chunk
-@@ -6003,6 +6218,15 @@ MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRend
+@@ -6003,6 +6243,15 @@ MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRend
    // ref and AddRefPrivate's the new one. surface=nullptr is the
    // unbind path (idx>0).
    m_renderTargets[RenderTargetIndex] = surface;
@@ -1825,7 +1857,7 @@ index 2515624..701a88b 100644
    // Flag an AUTOGENMIPMAP render target for mip regen on bind, matching
    // DXVK (SetRenderTargetInternal: IsAutomaticMip -> SetNeedsMipGen).
    // dxmt already flags on Clear/StretchRect/ColorFill but not the
-@@ -6188,6 +6412,11 @@ HRESULT STDMETHODCALLTYPE
+@@ -6188,6 +6437,11 @@ HRESULT STDMETHODCALLTYPE
  MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) {
    D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_Clear);
    D9DeviceLock lock = LockDevice();
@@ -1837,7 +1869,7 @@ index 2515624..701a88b 100644
    // DXVK: Count==0 with a non-null rect array is a documented
    // no-op, not an error.
    if (Count == 0 && pRects != nullptr)
-@@ -6206,8 +6435,11 @@ MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR C
+@@ -6206,8 +6460,11 @@ MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR C
    // dropped whole ("mismatching sizes"), returning OK.
    if (ds && (Flags & D3DCLEAR_TARGET) && (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))) {
      MTLD3D9Surface *rt0 = m_renderTargets[0].ptr();
@@ -1850,7 +1882,7 @@ index 2515624..701a88b 100644
    }
    // Drop stencil if the bound DS format has no stencil aspect; D3D9
    // silently masks; Metal would reject the encoder. DXVK does
-@@ -6397,6 +6629,20 @@ MTLD3D9Device::SetViewport(const D3DVIEWPORT9 *pViewport) {
+@@ -6397,6 +6654,20 @@ MTLD3D9Device::SetViewport(const D3DVIEWPORT9 *pViewport) {
    if (!pViewport)
      return D3DERR_INVALIDCALL;
    D3DVIEWPORT9 vp = *pViewport;
@@ -1871,7 +1903,7 @@ index 2515624..701a88b 100644
    // DXVK normalises inverted Z (d3d9_device.cpp); Metal's
    // viewport rejects MaxZ <= MinZ at draw time.
    if (!(vp.MinZ < vp.MaxZ))
-@@ -6916,6 +7162,11 @@ MTLD3D9Device::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) {
+@@ -6916,6 +7187,11 @@ MTLD3D9Device::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) {
    // overlay may have wrapped, or an app deliberately corrupted): an unrecognised
    // non-null pointer is treated as "no texture", matching wined3d.
    MTLD3D9CommonTexture *common = commonTextureFromBound(pTexture);
@@ -1883,7 +1915,7 @@ index 2515624..701a88b 100644
    if (common) {
      // Cross-device check matches Set(RT|DepthStencilSurface). Same
      // reasoning: deviceRaw() avoids an AddRef/Release cycle that
-@@ -7514,6 +7765,13 @@ MTLD3D9Device::BuildDrawCapture() {
+@@ -7514,6 +7790,13 @@ MTLD3D9Device::BuildDrawCapture() {
  
  void
  MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
@@ -1897,7 +1929,7 @@ index 2515624..701a88b 100644
    // Regenerate any bound AUTOGENMIPMAP texture's dirty mip chain before this
    // draw is pushed, so the mip-gen op precedes the draws that sample it in the
    // op stream (DXVK PrepareDraw shape). The hot path pays a single relaxed load
-@@ -7808,6 +8066,18 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
+@@ -7808,6 +8091,18 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
    // in a heavy draw scene, clustered such that effectively every draw
    // rebuilt the snapshot under COW). wined3d CS shape.
  
@@ -1916,7 +1948,7 @@ index 2515624..701a88b 100644
    // Push to the arrival-order op stream FIRST so the index field
    // points at the slot we're about to occupy in m_pendingDraws.
    m_pendingOps.push_back({PendingOpRef::Draw, static_cast<uint32_t>(m_pendingDraws.size())});
-@@ -8816,8 +9086,11 @@ MTLD3D9Device::PackDrawConstants(
+@@ -8816,8 +9111,11 @@ MTLD3D9Device::PackDrawConstants(
  
    constexpr size_t kSubAlign = 256;
    auto align_up = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
@@ -1930,7 +1962,7 @@ index 2515624..701a88b 100644
    // ~20 PS registers against the 256/224 maxes; full-extent uploads are
    // mostly memcpying zeros. DXVK's maxChangedConstF is the literal
    // reference. A relative-addressing shader instead uploads the whole
-@@ -8833,8 +9106,12 @@ MTLD3D9Device::PackDrawConstants(
+@@ -8833,8 +9131,12 @@ MTLD3D9Device::PackDrawConstants(
    // 256 and the hot path is unchanged.
    const uint32_t vs_file_size =
        pod.vs_const_F_overflow ? (D3D9_MAX_VS_CONST_F + pod.vs_const_F_overflow_count) : D3D9_MAX_VS_CONST_F;
@@ -1945,7 +1977,7 @@ index 2515624..701a88b 100644
    // A generated vertex shader reads the fixed-function uniforms block
    // through this slot; size it for the full layout contract (matrix,
    // fog, point-scale and lighting blocks) rather than the register
-@@ -10605,16 +10882,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
+@@ -10605,16 +10907,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
    // snapshot, so a shader<->fixed-function transition inside one cluster
    // would otherwise reuse the other kind's upload verbatim. A
    // relative-addressing shader also keys here: its upload differs from a
@@ -1967,7 +1999,7 @@ index 2515624..701a88b 100644
  
    // Reuse prior draw's uploads if pod_snapshot pointer equals (implies byte-equality)
    // and the def-stamping shaders match. VS/PS constants, clip planes
-@@ -10757,6 +11035,7 @@ MTLD3D9Device::FlushDrawBatch() {
+@@ -10757,6 +11060,7 @@ MTLD3D9Device::FlushDrawBatch() {
            // reset was missing.
            res = D9ResolvedDraw{};
            if (!this->ResolveBatchedDrawForChunk(bd, res, chunk_seq, chunk_coherent_id, const_cache, resolve_cache)) {
@@ -1975,7 +2007,7 @@ index 2515624..701a88b 100644
              continue;
            }
          }
-@@ -10791,6 +11070,7 @@ MTLD3D9Device::FlushDrawBatch() {
+@@ -10791,6 +11095,7 @@ MTLD3D9Device::FlushDrawBatch() {
            }
            res.resolved_pso = res.resolved_pso_task->state().handle;
            if (res.resolved_pso == 0) {
@@ -1983,7 +2015,7 @@ index 2515624..701a88b 100644
              continue; // link failed: skip
            }
          }
-@@ -12272,6 +12552,10 @@ MTLD3D9Device::SetPixelShaderConstantF(UINT StartRegister, const float *pConstan
+@@ -12272,6 +12577,10 @@ MTLD3D9Device::SetPixelShaderConstantF(UINT StartRegister, const float *pConstan
      return D3D_OK;
    if (!pConstantData)
      return D3DERR_INVALIDCALL;
@@ -1995,7 +2027,7 @@ index 2515624..701a88b 100644
      std::memcpy(
          &m_recordingBlock->m_snapPsConstantsF[StartRegister][0], pConstantData,
 diff --git a/src/d3d9/d3d9_device.hpp b/src/d3d9/d3d9_device.hpp
-index f77f25a..96d8c18 100644
+index f77f25a..78cf3fc 100644
 --- a/src/d3d9/d3d9_device.hpp
 +++ b/src/d3d9/d3d9_device.hpp
 @@ -101,7 +101,8 @@ inline constexpr unsigned D3D9_MAX_PS_CONST_B = 16;
@@ -2047,6 +2079,16 @@ index f77f25a..96d8c18 100644
    // Seed the D3D9-spec render-state defaults. Called once from the
    // ctor; mirrors DXVK's D3D9DeviceEx::ResetState in shape (the
    // wined3d defaults match value-for-value but are stored under
+@@ -635,6 +654,9 @@ private:
+   // Reset replaces those by hand with the new backbuffer + auto-DS.
+   // Called by Reset; the ctor runs the equivalent code inline.
+   void resetStateToDefaults(bool enableAutoDepthStencil);
++  // The body of Reset, under the device lock; Reset wraps it to log the
++  // result (ml2330). Not STDMETHODCALLTYPE, so the census does not count it.
++  HRESULT resetDevice(D3DPRESENT_PARAMETERS *pPresentationParameters);
+   // Allocates an implicit depth-stencil surface matching `params` and
+   // assigns it to m_depthStencilSurface. Used by the ctor for the
+   // first auto-DS creation and by Reset to rebuild after a resolution
 diff --git a/src/d3d9/d3d9_guest_alloc.hpp b/src/d3d9/d3d9_guest_alloc.hpp
 index a488271..a622028 100644
 --- a/src/d3d9/d3d9_guest_alloc.hpp
@@ -2118,6 +2160,121 @@ index dd85748..918cea2 100644
    const uint32_t bb_w = m_params.BackBufferWidth;
    const uint32_t bb_h = m_params.BackBufferHeight;
    bool canvas_seed = false;
+diff --git a/src/d3d9shim/d3d9shim_custom.c b/src/d3d9shim/d3d9shim_custom.c
+index abab447..f7b8a81 100644
+--- a/src/d3d9shim/d3d9shim_custom.c
++++ b/src/d3d9shim/d3d9shim_custom.c
+@@ -208,6 +208,35 @@ custom_reset(IDirect3DDevice9Ex *iface, D3DPRESENT_PARAMETERS *parameters,
+         return hr;
+     }
+ 
++    /* ml2331: the native losable gate counts PUBLIC references, and every
++     * native handle the shim holds is one.  The identity caches (back
++     * buffers, render targets, depth stencil) were dropped only AFTER a
++     * successful Reset, so once an application had asked for its back buffer
++     * or depth stencil and released it, the cached wrapper still held the
++     * implicit surface publicly and every non-Ex Reset failed INVALIDCALL
++     * from then on -- the native frontend stopped drawing after an in-game
++     * resolution change (Borderlands: The Pre-Sequel, 46 Resets, no Present).
++     * Those caches re-resolve on demand and keep identity for a wrapper the
++     * application still holds, so dropping them here is invisible.
++     *
++     * Bindings do not re-resolve, so a non-Ex device unbinds only what the
++     * application no longer references: it lost the right to observe those
++     * through Get* when it released them, and a Reset that succeeds unbinds
++     * them anyway.  Ex devices have no gate and keep their state. */
++    d3d9shim_device_invalidate_children(dev);
++    if (!(D3D9SHIM_IMPL(&dev->hdr)->flags & D3D9SHIM_F_IS_EX)) {
++        unsigned int i;
++
++        for (i = 0; i < D3D9SHIM_MAX_TEXTURE_SLOTS; i++)
++            if (dev->textures[i] && !d3d9shim_obj_app_held(dev->textures[i]))
++                IDirect3DDevice9Ex_SetTexture(iface, i < 16 ? i : D3DVERTEXTEXTURESAMPLER0 + (i - 16), NULL);
++        for (i = 0; i < D3D9_MAX_VERTEX_STREAMS; i++)
++            if (dev->stream_buffers[i] && !d3d9shim_obj_app_held(dev->stream_buffers[i]))
++                IDirect3DDevice9Ex_SetStreamSource(iface, i, NULL, 0, 0);
++        if (dev->index_buffer && !d3d9shim_obj_app_held(dev->index_buffer))
++            IDirect3DDevice9Ex_SetIndices(iface, NULL);
++    }
++
+     device_window = parameters->hDeviceWindow;
+     if (!device_window && extra)
+         device_window = extra->focus_window;
+@@ -247,6 +276,8 @@ custom_reset(IDirect3DDevice9Ex *iface, D3DPRESENT_PARAMETERS *parameters,
+          * buffers, so every cached child identity is stale: drop them and let
+          * the next GetBackBuffer / GetSwapChain resolve fresh handles. */
+         d3d9shim_device_invalidate_children(dev);
++        if (!(D3D9SHIM_IMPL(&dev->hdr)->flags & D3D9SHIM_F_IS_EX))
++            d3d9shim_device_reset_bindings(dev);
+         d3d9shim_window_on_device_reset(dev, parameters);
+     }
+     d3d9shim_unlock(dev);
+diff --git a/src/d3d9shim/d3d9shim_object.c b/src/d3d9shim/d3d9shim_object.c
+index 12f093d..94164e8 100644
+--- a/src/d3d9shim/d3d9shim_object.c
++++ b/src/d3d9shim/d3d9shim_object.c
+@@ -1414,6 +1414,47 @@ d3d9shim_device_invalidate_children(struct d3d9shim_device *dev)
+     table_unlock();
+ }
+ 
++/* ml2331: a non-Ex Reset returns every binding to its default
++ * (d3d9_device.cpp resetStateToDefaults), so the shadow has to follow it.
++ * Left in place, the shadow kept answering GetTexture / GetStreamSource /
++ * GetIndices with pre-Reset objects, and its private references kept their
++ * wrappers -- and so their native handles, which are PUBLIC references on
++ * the native side -- alive.  A DEFAULT-pool resource the application had
++ * already released then still counted in the native losable gate and failed
++ * the next Reset.  Render targets and the depth stencil are re-resolved
++ * through d3d9shim_device_invalidate_children. */
++void
++d3d9shim_device_reset_bindings(struct d3d9shim_device *dev)
++{
++    unsigned int i;
++
++    if (!dev)
++        return;
++    table_lock();
++    for (i = 0; i < D3D9SHIM_MAX_TEXTURE_SLOTS; i++)
++        drop_child(&dev->textures[i]);
++    for (i = 0; i < D3D9_MAX_VERTEX_STREAMS; i++) {
++        drop_child(&dev->stream_buffers[i]);
++        dev->stream_offsets[i] = 0;
++        dev->stream_strides[i] = 0;
++    }
++    drop_child(&dev->index_buffer);
++    drop_child(&dev->vertex_declaration);
++    drop_child(&dev->vertex_shader);
++    drop_child(&dev->pixel_shader);
++    dev->in_scene = 0;
++    table_unlock();
++}
++
++/* ml2331: whether the application itself still references a bound object,
++ * as opposed to only the shadow.  Textures and buffers are never
++ * sub-resources, so their own public count is the application's. */
++int
++d3d9shim_obj_app_held(const struct d3d9shim_object *obj)
++{
++    return obj && obj->refcount > 0;
++}
++
+ struct d3d9shim_device_extra *
+ d3d9shim_extra(struct d3d9shim_device *dev)
+ {
+diff --git a/src/d3d9shim/d3d9shim_object.h b/src/d3d9shim/d3d9shim_object.h
+index 263983b..bc019a1 100644
+--- a/src/d3d9shim/d3d9shim_object.h
++++ b/src/d3d9shim/d3d9shim_object.h
+@@ -165,6 +165,9 @@ void  d3d9shim_obj_release_private(struct d3d9shim_object *obj);
+ void  d3d9shim_obj_note_call(unsigned int op, const void *block);
+ /* Reset invalidates every cached implicit child identity. */
+ void  d3d9shim_device_invalidate_children(struct d3d9shim_device *dev);
++/* A successful non-Ex Reset unbinds everything; the shadow follows (ml2331). */
++void  d3d9shim_device_reset_bindings(struct d3d9shim_device *dev);
++int   d3d9shim_obj_app_held(const struct d3d9shim_object *obj);
+ struct d3d9shim_device_extra *d3d9shim_extra(struct d3d9shim_device *dev);
+ const void *d3d9shim_kind_vtbl(unsigned int kind);
+ 
 diff --git a/src/dxmt/dxmt_bcn_downscale.hpp b/src/dxmt/dxmt_bcn_downscale.hpp
 new file mode 100644
 index 0000000..718dc30

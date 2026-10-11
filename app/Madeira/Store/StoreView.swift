@@ -343,6 +343,23 @@ struct StoreGameMedia: View {
     }
 }
 
+/// An Epic library game's store media, as StoreGameMedia for Steam: Epic's store
+/// search for its title, matched by namespace or catalog item (EpicStoreGame.matches),
+/// so an owned game's page shows the same screenshots as its store page.
+struct EpicStoreGameMedia: View {
+    let game: EpicGame
+    @State private var media: StoreGame?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let media, !(media.screenshots.isEmpty && media.movies.isEmpty) { StoreMediaContent(game: media) }
+        }
+        .task(id: game.appName) {
+            let found = (try? await EpicStore.shared.search(game.title)) ?? []
+            media = found.first { $0.matches(namespace: game.namespace, catalogItemID: game.catalogItemId, title: game.title) }?.presentation
+        }
+    }
+}
+
 /// One media strip as on Steam: the trailers first, then the screenshots, as cards the
 /// same height; a trailer plays in a player sheet, a screenshot opens full screen.
 struct StoreMediaContent: View {

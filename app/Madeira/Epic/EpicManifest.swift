@@ -277,13 +277,25 @@ struct EpicManifest {
     }
 
     /// URLSession spools responses to disk so a bad CDN response cannot fill RAM.
+    /// Epic's CDN for manifests and chunks: no URL cache, and up to 16 connections to a
+    /// host (URLSession.shared allows only a few, which capped a download's parallel chunks).
+    static let http: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 300
+        config.httpMaximumConnectionsPerHost = 16
+        return URLSession(configuration: config)
+    }()
+
+    /// In memory rather than through a temporary file: a chunk is at most about 1 MB,
+    /// and writing then reading it back cost every chunk a round trip to storage.
     static func download(_ request: URLRequest, limit: Int) async throws -> Data {
-        let (file, response) = try await URLSession.shared.download(for: request)
-        defer { try? FileManager.default.removeItem(at: file) }
+        let (data, response) = try await http.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { throw EpicContentError.httpStatus(status) }
-        let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        guard size <= limit else { throw EpicContentError.invalid("Epic download exceeds the size limit.") }
-        return try Data(contentsOf: file)
+        guard data.count <= limit else { throw EpicContentError.invalid("Epic download exceeds the size limit.") }
+        return data
     }
 }
