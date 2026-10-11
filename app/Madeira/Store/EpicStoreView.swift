@@ -19,6 +19,8 @@ struct StoreView: View {
     private func go(_ store: StoreDestination?) {
         search = ""
         withAnimation(UIAccessibility.isReduceMotionEnabled ? .easeOut(duration: 0.2) : Self.move) { destination = store }
+        // Into a store (or back to the picker): focus starts on its first game (or store).
+        ControllerNavigation.shared.sectionChanged(after: 0.45)   // after the slide, so the old page is gone
     }
     var body: some View {
         ZStack {
@@ -29,6 +31,7 @@ struct StoreView: View {
                         Button { go(nil) } label: {
                             Image(systemName: "chevron.left").font(.headline).frame(width: 40, height: 40).libraryRowGlass(Circle())
                         }.buttonStyle(.plain).accessibilityLabel("Choose a store")
+                            .controllerFocusable(cornerRadius: 20, activate: { go(nil) })
                         Text(destination.rawValue).font(.title2.bold())
                         Spacer(minLength: 0)
                         if wide {
@@ -64,6 +67,7 @@ struct StoreView: View {
                                 }
                                 Button { go(store) } label: { StorePickerCard(store: store) }
                                     .libraryCardButtonStyle(grid: true)
+                                    .controllerFocusable(cornerRadius: 18, primary: true, activate: { go(store) })
                             }
                         }
                     }.padding(.horizontal, margin).padding(.vertical, 20)
@@ -72,6 +76,9 @@ struct StoreView: View {
                 .transition(.opacity)
             }
         }.background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+            .onReceive(LibraryController.shared.commands) { command in
+                if command == "back", destination != nil { go(nil) }
+            }
     }
 }
 
@@ -130,6 +137,7 @@ struct EpicStorePage: View {
                             Button { withAnimation(.snappy) { self.expanded = nil } } label: {
                                 Image(systemName: "chevron.left").font(.headline).frame(width: 40, height: 40).libraryRowGlass(Circle())
                             }.buttonStyle(.plain).accessibilityLabel("Back to Epic Games")
+                                .controllerFocusable(cornerRadius: 20, activate: { withAnimation(.snappy) { self.expanded = nil } })
                             Text(expanded.displayTitle).font(.title2.bold())
                         }.padding(.horizontal, LibraryLayout.margin(geo.size.width))
                         grid(expanded.games, width: geo.size.width)
@@ -164,13 +172,17 @@ struct EpicStorePage: View {
                 searchError = "The Epic Games search could not load. Try again."; searching = false
             }
         }
-        .sheet(item: $selection) { EpicStoreGameSheet(game: $0, open: open) }
+        .sheet(item: $selection) { EpicStoreGameSheet(game: $0, open: open).controllerDismiss() }
+        .onReceive(LibraryController.shared.commands) { command in
+            if command == "back", expanded != nil { withAnimation(.snappy) { expanded = nil } }
+        }
     }
     private func errorView(_ message: String) -> some View {
         VStack(spacing: 12) {
             Text(message).foregroundStyle(.secondary)
             Button("Try again") { if query.isEmpty { Task { await load() } } else { retry += 1 } }
                 .buttonStyle(.plain).padding(12).libraryRowGlass(Capsule())
+                .controllerFocusable(cornerRadius: 20, activate: { if query.isEmpty { Task { await load() } } else { retry += 1 } })
         }.frame(maxWidth: .infinity).padding()
     }
     private func grid(_ games: [EpicStoreGame], width: CGFloat) -> some View {
@@ -191,6 +203,7 @@ struct EpicStorePage: View {
                     .frame(height: LibraryLayout.pillRow, alignment: .leading)
             }.padding(4).foregroundStyle(.primary)
         }.libraryCardButtonStyle(grid: true)
+            .controllerFocusable(cornerRadius: 12, primary: true, activate: { selection = game })
     }
     private func load() async {
         loading = shelves.isEmpty; failure = nil
@@ -258,6 +271,11 @@ struct EpicStoreGameSheet: View {
                                 Text(owned != nil ? "In your library" : game.presentation.isFree ? "Get on Epic" : "Buy on Epic")
                                     .fontWeight(.semibold).frame(maxWidth: .infinity, minHeight: 48).libraryRowGlass(Capsule())
                             }.buttonStyle(.plain).disabled(owned == nil && game.url == nil)
+                                .controllerFocusable(cornerRadius: 24, activate: {
+                                    if let owned { ownedSelection = owned } else { buying = true }
+                                }, context: {
+                                    if let owned { ownedSelection = owned } else { buying = true }
+                                })
                         }
                         if let promotion = game.promotionLabel { Text(promotion).font(.subheadline).foregroundStyle(.secondary) }
                         StoreMediaContent(game: game.presentation)

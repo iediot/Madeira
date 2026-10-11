@@ -61,6 +61,7 @@ struct SteamStorePage: View {
                             Button { withAnimation(.snappy) { self.expanded = nil } } label: {
                                 Image(systemName: "chevron.left").font(.headline).frame(width: 40, height: 40).libraryRowGlass(Circle())
                             }.buttonStyle(.plain).accessibilityLabel("Back to the store")
+                                .controllerFocusable(cornerRadius: 20, activate: { withAnimation(.snappy) { self.expanded = nil } })
                             Text(expanded.title).font(.title2.bold())
                         }.padding(.horizontal, LibraryLayout.margin(geo.size.width))
                         grid(expanded.items, width: geo.size.width)
@@ -115,13 +116,17 @@ struct SteamStorePage: View {
                 searchError = "The store search could not load. Try again."; searching = false
             }
         }
-        .sheet(item: $selection) { game in StoreGameSheet(game: game, open: open) }
+        .sheet(item: $selection) { game in StoreGameSheet(game: game, open: open).controllerDismiss() }
+        .onReceive(LibraryController.shared.commands) { command in
+            if command == "back", expanded != nil { withAnimation(.snappy) { expanded = nil } }
+        }
     }
     private func failure(_ message: String) -> some View {
         VStack(spacing: 12) {
             Text(message).foregroundStyle(.secondary)
             Button("Try again") { if query.isEmpty { Task { await load() } } else { retry += 1 } }
                 .buttonStyle(.plain).padding(12).libraryRowGlass(Capsule())
+                .controllerFocusable(cornerRadius: 20, activate: { if query.isEmpty { Task { await load() } } else { retry += 1 } })
         }.frame(maxWidth: .infinity).padding()
     }
     @ViewBuilder private func shelf(_ title: String, key: String, width: CGFloat, limit: Int? = nil) -> some View {
@@ -153,6 +158,7 @@ struct SteamStorePage: View {
                     .frame(height: LibraryLayout.pillRow, alignment: .leading)
             }.padding(4).foregroundStyle(.primary)
         }.libraryCardButtonStyle(grid: true)
+            .controllerFocusable(cornerRadius: 12, primary: true, activate: { selection = game })
     }
     /// Every shelf is filtered before it is shown, so no unrated game flashes up first.
     /// The featuredcategories lists hold about ten games each, too few once filtered, so
@@ -304,6 +310,7 @@ struct StoreGameSheet: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 48).libraryRowGlass(Capsule())
             }.buttonStyle(.plain).disabled(busy || (!owned && details == nil))
+                .controllerFocusable(cornerRadius: 24, activate: act, context: act)
         }
     }
 

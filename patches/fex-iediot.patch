@@ -2337,14 +2337,21 @@ index 58ea2d0..67f228c 100644
  
    if (!HomeDir) {
 diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
-index 61d7a23..57acf04 100644
+index 61d7a23..0e0f60d 100644
 --- a/Source/Windows/ARM64EC/IosJitAlias.cpp
 +++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
-@@ -32,7 +32,15 @@ struct IosAliasEntry {
+@@ -30,9 +30,21 @@ struct IosAliasEntry {
+   uint64_t PeBase;
+   uint64_t JitBase;
    uint64_t Size;
-   uint64_t _Padding;  // Keeps the struct 32-byte to make array stride a power of 2.
+-  uint64_t _Padding;  // Keeps the struct 32-byte to make array stride a power of 2.
++  uint64_t Generation;  // Odd while an entry is changing; also keeps a 32-byte stride.
  };
 -constexpr int kMaxEntries = 256;
++struct alignas(16) IosAliasCacheEntry {
++  uint64_t Tag;    // address page in bits 16..63, even generation in bits 0..15
++  uint64_t Delta;  // added to the address on a hit
++};
 +/* iOS-Madeira ml1201: 256 -> 2048. FEX is ONE module shared by every x64
 + * pseudo-process, and nothing retires an entry when its process exits (only an
 + * overlapping re-registration does), so steam.exe + steamwebhelper (libcef and
@@ -2357,9 +2364,123 @@ index 61d7a23..57acf04 100644
  
  // extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
  // can reach the table via adrp/:lo12: — it translates the branch target
-@@ -375,6 +383,10 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+@@ -41,19 +53,101 @@ constexpr int kMaxEntries = 256;
+ extern "C" {
+ IosAliasEntry IosAliasEntries[kMaxEntries];
+ volatile int IosAliasCount = 0;
+-/* ml1116: the entry that satisfied the last translation, checked first by
+- * Module.S before the walk. A pointer (one atomic 8-byte store) rather than a
+- * copy of the fields, so a reader can never see a torn entry; a retired entry
+- * has Size 0 and simply misses. The walk itself now runs NEWEST-FIRST: the
+- * images the game calls (its own EC ntdll/kernel32/kernelbase, the D3D12
+- * runtime) are registered late, so oldest-first cost ~150 iterations per
+- * x64->EC call at up to a million calls a second. */
+-IosAliasEntry* volatile IosAliasLast = nullptr;
++/* iOS-Madeira ml1132: registration populates these direct caches; transition
++ * readers only load them. A repeated tag read is the seqlock, so remaps cannot
++ * expose a new tag with an old delta. Collisions fall back to the exact table. */
++IosAliasCacheEntry IosAliasPeCache[16384];
++IosAliasCacheEntry IosAliasJitCache[16384];
++extern uint64_t IosXpFex[];
+ }
  
-   int count = g_EntryCount;
+ namespace {
+ IosAliasEntry* const g_Entries = IosAliasEntries;
+ volatile int& g_EntryCount = IosAliasCount;
++constexpr uint64_t kCacheMask = 16384 - 1;
++std::atomic_flag g_UpdateLock = ATOMIC_FLAG_INIT;
++
++struct UpdateLock {
++  UpdateLock() {
++    while (g_UpdateLock.test_and_set(std::memory_order_acquire)) {}
++  }
++  ~UpdateLock() { g_UpdateLock.clear(std::memory_order_release); }
++};
++
++void CachePublishEntry(IosAliasCacheEntry& Entry, uint64_t Page, uint64_t Delta) {
++  const uint64_t Old = __atomic_load_n(&Entry.Tag, __ATOMIC_RELAXED);
++  uint64_t Generation = (Old + 2) & 0xfffe;
++  if (!Generation) {
++    Generation = 2;
++  }
++  __atomic_store_n(&Entry.Tag, Old | 1, __ATOMIC_RELEASE);
++  __atomic_store_n(&Entry.Delta, Delta, __ATOMIC_RELAXED);
++  __atomic_store_n(&Entry.Tag, (Page << 16) | Generation, __ATOMIC_RELEASE);
++}
++
++void CachePublish(IosAliasCacheEntry* Cache, uint64_t Page, uint64_t Delta) {
++  CachePublishEntry(Cache[Page & kCacheMask], Page, Delta);
++}
++
++void CacheRemove(IosAliasCacheEntry* Cache, uint64_t Base, uint64_t Size, uint64_t Delta) {
++  if (!Size) return;
++  /* Only whole 64KB pages are cached. A partial edge page needs the exact
++   * range check in the fallback table or a nearby non-image address could hit. */
++  const uint64_t First = (Base + 0xffff) >> 16;
++  const uint64_t Last = (Base + Size) >> 16;
++  for (uint64_t Page = First; Page < Last; ++Page) {
++    auto& Entry = Cache[Page & kCacheMask];
++    const uint64_t Tag = __atomic_load_n(&Entry.Tag, __ATOMIC_ACQUIRE);
++    if (!(Tag & 1) && (Tag >> 16) == Page && __atomic_load_n(&Entry.Delta, __ATOMIC_RELAXED) == Delta) {
++      CachePublishEntry(Entry, 0, 0);
++    }
++  }
++}
++
++void CacheAdd(IosAliasCacheEntry* Cache, uint64_t Base, uint64_t Size, uint64_t Delta) {
++  if (!Size) return;
++  const uint64_t First = (Base + 0xffff) >> 16;
++  const uint64_t Last = (Base + Size) >> 16;
++  for (uint64_t Page = First; Page < Last; ++Page) {
++    CachePublish(Cache, Page, Delta);
++  }
++}
++
++void EntryPublish(IosAliasEntry& Entry, uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
++  const uint64_t Old = __atomic_load_n(&Entry.Generation, __ATOMIC_RELAXED);
++  __atomic_store_n(&Entry.Generation, Old | 1, __ATOMIC_RELEASE);
++  Entry.PeBase = PeBase;
++  Entry.JitBase = JitBase;
++  Entry.Size = Size;
++  __atomic_store_n(&Entry.Generation, (Old + 2) & ~1ull, __ATOMIC_RELEASE);
++}
++
++bool EntryRead(const IosAliasEntry& Entry, uint64_t& PeBase, uint64_t& JitBase, uint64_t& Size) {
++  const uint64_t Before = __atomic_load_n(&Entry.Generation, __ATOMIC_ACQUIRE);
++  if (Before & 1) return false;
++  PeBase = Entry.PeBase;
++  JitBase = Entry.JitBase;
++  Size = Entry.Size;
++  return Before == __atomic_load_n(&Entry.Generation, __ATOMIC_ACQUIRE);
++}
++
++bool CacheRead(IosAliasCacheEntry* Cache, uint64_t Addr, uint64_t& Result) {
++  const uint64_t Page = Addr >> 16;
++  auto& Entry = Cache[Page & kCacheMask];
++  const uint64_t Before = __atomic_load_n(&Entry.Tag, __ATOMIC_ACQUIRE);
++  if ((Before & 1) || (Before >> 16) != Page) return false;
++  const uint64_t Delta = __atomic_load_n(&Entry.Delta, __ATOMIC_RELAXED);
++  if (Before != __atomic_load_n(&Entry.Tag, __ATOMIC_ACQUIRE)) return false;
++  Result = Addr + Delta;
++  return true;
++}
++
++void UpdateAliasStats(int Count) {
++  uint64_t Live = 0;
++  for (int i = 0; i < Count; ++i) Live += g_Entries[i].Size != 0;
++  IosXpFex[4496] = Live;
++  IosXpFex[4497] = Count;
++}
+ }  // namespace
+ 
+ extern "C" {
+@@ -373,8 +467,13 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+     return;
+   }
+ 
+-  int count = g_EntryCount;
++  UpdateLock Lock;
++  int count = __atomic_load_n(&g_EntryCount, __ATOMIC_ACQUIRE);
  
 +  /* No logging here: this is also called from native Madeira code (ios_push_subfloor_window,
 +   * the alias catch-up loop) on threads without a Windows TEB, where FEX's log output reaches
@@ -2368,11 +2489,308 @@ index 61d7a23..57acf04 100644
    // Identical re-registration: nothing to do.
    for (int i = 0; i < count; i++) {
      if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {
+@@ -391,18 +490,19 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+       continue;
+     }
+     if (pb < PeBase + Size && PeBase < pb + sz) {
+-      g_Entries[i].Size = 0;
+-      __sync_synchronize();
++      CacheRemove(IosAliasPeCache, pb, sz, g_Entries[i].JitBase - pb);
++      CacheRemove(IosAliasJitCache, g_Entries[i].JitBase, sz, pb - g_Entries[i].JitBase);
++      EntryPublish(g_Entries[i], pb, g_Entries[i].JitBase, 0);
+     }
+   }
+ 
+   // Prefer a retired slot so long-running processes don't exhaust the table.
+   for (int i = 0; i < count; i++) {
+     if (!g_Entries[i].Size) {
+-      g_Entries[i].PeBase = PeBase;
+-      g_Entries[i].JitBase = JitBase;
+-      __sync_synchronize();
+-      g_Entries[i].Size = Size; // published last: readers see a complete entry
++      EntryPublish(g_Entries[i], PeBase, JitBase, Size);
++      CacheAdd(IosAliasPeCache, PeBase, Size, JitBase - PeBase);
++      CacheAdd(IosAliasJitCache, JitBase, Size, PeBase - JitBase);
++      UpdateAliasStats(count);
+       return;
+     }
+   }
+@@ -417,32 +517,36 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+     }
+     return;
+   }
+-  g_Entries[count].PeBase = PeBase;
+-  g_Entries[count].JitBase = JitBase;
+-  g_Entries[count].Size = Size;
+-  __sync_synchronize();
+-  g_EntryCount = count + 1;
++  EntryPublish(g_Entries[count], PeBase, JitBase, Size);
++  CacheAdd(IosAliasPeCache, PeBase, Size, JitBase - PeBase);
++  CacheAdd(IosAliasJitCache, JitBase, Size, PeBase - JitBase);
++  __atomic_store_n(&g_EntryCount, count + 1, __ATOMIC_RELEASE);
++  UpdateAliasStats(count + 1);
+ }
+ 
+ uint64_t IosJitTranslate(uint64_t Addr) {
+-  int count = g_EntryCount;
+-  for (int i = 0; i < count; i++) {
+-    uint64_t pb = g_Entries[i].PeBase;
+-    uint64_t sz = g_Entries[i].Size;
++  uint64_t Result;
++  if (CacheRead(IosAliasPeCache, Addr, Result)) return Result;
++  const int count = __atomic_load_n(&g_EntryCount, __ATOMIC_ACQUIRE);
++  for (int i = count - 1; i >= 0; --i) {
++    uint64_t pb, jb, sz;
++    if (!EntryRead(g_Entries[i], pb, jb, sz)) continue;
+     if (Addr >= pb && Addr < pb + sz) {
+-      return g_Entries[i].JitBase + (Addr - pb);
++      return jb + (Addr - pb);
+     }
+   }
+   return Addr;
+ }
+ 
+ uint64_t IosJitReverseTranslate(uint64_t Addr) {
+-  int count = g_EntryCount;
+-  for (int i = 0; i < count; i++) {
+-    uint64_t jb = g_Entries[i].JitBase;
+-    uint64_t sz = g_Entries[i].Size;
++  uint64_t Result;
++  if (CacheRead(IosAliasJitCache, Addr, Result)) return Result;
++  const int count = __atomic_load_n(&g_EntryCount, __ATOMIC_ACQUIRE);
++  for (int i = count - 1; i >= 0; --i) {
++    uint64_t pb, jb, sz;
++    if (!EntryRead(g_Entries[i], pb, jb, sz)) continue;
+     if (Addr >= jb && Addr < jb + sz) {
+-      return g_Entries[i].PeBase + (Addr - jb);
++      return pb + (Addr - jb);
+     }
+   }
+   return Addr;
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 8153212..4100358 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -19,16 +19,22 @@
+ // The JIT emitters read the same offset at runtime via IosTebTsdOffset.
+ #ifdef FEX_IOS_HOST
+ .arch_extension lse   // ml1131: stadd/ldadd for the transition probe counters
+-// ml1131: add 1 to the sp-sharded counter at IosXpFex + \off. Clobbers \a, \b.
++// ml1132: diagnostics default off; one flag load+branch avoids every shared atomic.
++// Add 1 to the sp-sharded counter at IosXpFex + \off. Clobbers \a, \b.
+ .macro IOS_XP_COUNT off, a, b
++  adrp \a, IosXpEnabled
++  ldr \b, [\a, #:lo12:IosXpEnabled]
++  cbz \b, 99f
+   adrp \a, IosXpFex
+   add \a, \a, #:lo12:IosXpFex
+   mov \b, sp
+   ubfx \b, \b, #16, #4
+   add \a, \a, \b, lsl #6
+-  add \a, \a, #\off
++  mov \b, #\off
++  add \a, \a, \b
+   mov \b, #1
+   stadd \b, [\a]
++99:
+ .endm
+ .macro IOS_LOAD_TEB reg
+   mrs \reg, TPIDRRO_EL0
+@@ -125,37 +131,57 @@ ExitToX64:
+   // x4/x9 are spilled to free loop registers; restored on every exit path.
+   // (Native EC callers keep sp 16-aligned at call boundaries per AAPCS.)
+   stp x4, x9, [sp, #-16]!
+-  // ml1116: last-hit entry first, then the table newest-first.
+-  adrp x16, IosAliasLast
+-  ldr x16, [x16, #:lo12:IosAliasLast]
+-  cbz x16, ios_ffs_xlate_walk
+-  ldr x4, [x16, #8]      // Entry.JitBase
+-  sub x4, x17, x4
+-  ldr x23, [x16, #16]    // Entry.Size
+-  cmp x4, x23
+-  b.lo ios_ffs_xlate_hit
++  // ml1132: reverse direct cache; readers never write a shared cache line.
++  adrp x16, IosAliasJitCache
++  add x16, x16, #:lo12:IosAliasJitCache
++  lsr x23, x17, #16
++  and x23, x23, #0x3fff
++  add x16, x16, x23, lsl #4
++  ldar x9, [x16]
++  tbnz x9, #0, ios_ffs_xlate_walk
++  ldr x4, [x16, #8]
++  ldar x23, [x16]
++  cmp x9, x23
++  b.ne ios_ffs_xlate_walk
++  lsr x23, x23, #16
++  cmp x23, x17, lsr #16
++  b.ne ios_ffs_xlate_walk
++  add x17, x17, x4
++  b ios_ffs_xlate_done
+ ios_ffs_xlate_walk:
++  IOS_XP_COUNT 37120, x16, x9 // ml1132: JIT->PE cache miss/table walk
++  str x17, [sp, #-16]!
+   adrp x9, IosAliasCount
+-  ldr w9, [x9, #:lo12:IosAliasCount]
++  add x9, x9, #:lo12:IosAliasCount
++  ldar w9, [x9]
+   adrp x16, IosAliasEntries
+   add x16, x16, #:lo12:IosAliasEntries
+   add x16, x16, x9, lsl #5   // one past the last entry
+ ios_ffs_xlate_loop:
+-  cbz w9, ios_ffs_xlate_done
++  cbz w9, ios_ffs_xlate_miss
+   sub x16, x16, #32
+   sub w9, w9, #1
++  add x16, x16, #24
++  ldar x17, [x16]        // Entry.Generation
++  sub x16, x16, #24
++  tbnz x17, #0, ios_ffs_xlate_loop
+   ldr x4, [x16, #8]      // Entry.JitBase
+-  sub x4, x17, x4
++  ldr x23, [sp]           // original target
++  sub x4, x23, x4
+   ldr x23, [x16, #16]    // Entry.Size
+   cmp x4, x23
+-  b.lo ios_ffs_xlate_hit_walk
+-  b ios_ffs_xlate_loop
+-ios_ffs_xlate_hit_walk:
+-  adrp x23, IosAliasLast
+-  str x16, [x23, #:lo12:IosAliasLast]
+-ios_ffs_xlate_hit:
++  b.hs ios_ffs_xlate_loop
++  add x16, x16, #24
++  ldar x23, [x16]
++  sub x16, x16, #24
++  cmp x17, x23
++  b.ne ios_ffs_xlate_loop
+   ldr x23, [x16]         // Entry.PeBase
+   add x17, x23, x4       // target in PE space
++  add sp, sp, #16
++  b ios_ffs_xlate_done
++ios_ffs_xlate_miss:
++  ldr x17, [sp], #16
+ ios_ffs_xlate_done:
+   IOS_LOAD_TEB x16
+   ldr x16, [x16, #0x60]  // TEB->PEB
+@@ -282,9 +308,12 @@ ExitFunctionEC:
+ #endif
+ 1:
+ #ifdef FEX_IOS_HOST
+-  // ml1131: count this x64->EC call (x9 = target as the caller addressed it) and
++  // ml1131/1132: when MADEIRA_FEX_XP=1, count this x64->EC call and
+   // append every 64th target of a shard to the ring. x4 (x64 R10, volatile at a
+   // call boundary), x16, x17 and x23 are clobbered on every path below anyway.
++  adrp x16, IosXpEnabled
++  ldr x16, [x16, #:lo12:IosXpEnabled]
++  cbz x16, 2f
+   adrp x16, IosXpFex
+   add x16, x16, #:lo12:IosXpFex
+   mov x23, sp
+@@ -324,37 +353,56 @@ ExitFunctionSuspendResumePoint:
+   // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
+   // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
+   // regardless.
+-  // ml1116: last-hit entry first, then the table newest-first.
+-  adrp x16, IosAliasLast
+-  ldr x16, [x16, #:lo12:IosAliasLast]
+-  cbz x16, ios_ec_xlate_walk
+-  ldr x23, [x16]        // Entry.PeBase
+-  sub x23, x9, x23
+-  ldr x4, [x16, #16]    // Entry.Size
+-  cmp x23, x4
+-  b.lo ios_ec_xlate_hit
++  // ml1132: read-only direct cache. The tag contains page key + generation;
++  // reading it twice makes concurrent registration safe without hot-path writes.
++  adrp x16, IosAliasPeCache
++  add x16, x16, #:lo12:IosAliasPeCache
++  lsr x17, x9, #16
++  and x17, x17, #0x3fff
++  add x16, x16, x17, lsl #4
++  ldar x17, [x16]
++  tbnz x17, #0, ios_ec_xlate_walk
++  ldr x23, [x16, #8]
++  ldar x4, [x16]
++  cmp x17, x4
++  b.ne ios_ec_xlate_walk
++  lsr x4, x4, #16
++  cmp x4, x9, lsr #16
++  b.ne ios_ec_xlate_walk
++  add x9, x9, x23
++  b ios_ec_xlate_done
+ ios_ec_xlate_walk:
++  IOS_XP_COUNT 36096, x16, x17 // ml1132: PE->JIT cache miss/table walk
++  // No stack use here: sp is the x64 stack and may be only 8-byte aligned
++  // (an x64 call just pushed its return address), and an ARM64 store through
++  // a misaligned sp faults. x9 (target) is kept intact until a hit; the walk
++  // runs on x16 (entry), x17 (temp), x23 (generation) and x4 (offset).
+   adrp x17, IosAliasCount
+-  ldr w17, [x17, #:lo12:IosAliasCount]
++  add x17, x17, #:lo12:IosAliasCount
++  ldar w17, [x17]
+   adrp x16, IosAliasEntries
+   add x16, x16, #:lo12:IosAliasEntries
+   add x16, x16, x17, lsl #5   // one past the last entry
+ ios_ec_xlate_loop:
+-  cbz w17, ios_ec_xlate_done
++  adrp x17, IosAliasEntries
++  add x17, x17, #:lo12:IosAliasEntries
++  cmp x16, x17
++  b.ls ios_ec_xlate_done      // walked past the first entry: no mapping
+   sub x16, x16, #32
+-  sub w17, w17, #1
+-  ldr x23, [x16]        // Entry.PeBase
+-  sub x23, x9, x23      // offset into image (unsigned-wraps huge if below base)
+-  ldr x4, [x16, #16]    // Entry.Size
+-  cmp x23, x4
+-  b.lo ios_ec_xlate_hit_walk
+-  b ios_ec_xlate_loop
+-ios_ec_xlate_hit_walk:
+-  adrp x4, IosAliasLast
+-  str x16, [x4, #:lo12:IosAliasLast]
+-ios_ec_xlate_hit:
+-  ldr x4, [x16, #8]     // Entry.JitBase
+-  add x9, x4, x23
++  add x17, x16, #24
++  ldar x23, [x17]       // Entry.Generation
++  tbnz x23, #0, ios_ec_xlate_loop
++  ldr x4, [x16]         // Entry.PeBase
++  sub x4, x9, x4        // offset into image (unsigned-wraps huge if below base)
++  ldr x17, [x16, #16]   // Entry.Size
++  cmp x4, x17
++  b.hs ios_ec_xlate_loop
++  add x17, x16, #24
++  ldar x17, [x17]       // generation unchanged while we read the entry
++  cmp x17, x23
++  b.ne ios_ec_xlate_loop
++  ldr x17, [x16, #8]    // Entry.JitBase
++  add x9, x17, x4
+ ios_ec_xlate_done:
+ #endif
+   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index fbaf76f..9fa0c1d 100644
+index fbaf76f..aa0abfb 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
-@@ -756,6 +756,26 @@ public:
+@@ -102,9 +102,16 @@ uint64_t IosFfsBypassLog[4] {};
+  *   2112  EC->x64 calls through ExitToX64 (not the FFS bypass), 16 shards
+  *   3136  ring index (every 64th x64->EC call of a shard appends its target)
+  *   3200  ring[4096] of target addresses (as the x64 caller called them)
++ *   35968 live alias entries; 35976 allocated/high-water entry slots
++ *   36096 PE->JIT cache misses/table walks, 16 shards
++ *   37120 JIT->PE cache misses/table walks, 16 shards
+  * Keep in sync with Module.S and build/ntdll-unix/server_ios.c (ios_xp_fex_*). */
+-extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4496];
+-__attribute__((aligned(64))) uint64_t IosXpFex[4496] {};
++extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4768];
++__attribute__((aligned(64))) uint64_t IosXpFex[4768] {};
++/* iOS-Madeira ml1132: one read+branch at each probe when diagnostics are off.
++ * Keep this separate from IosXpFex so the profiler's exported layout stays stable. */
++extern "C" uint64_t IosXpEnabled;
++uint64_t IosXpEnabled {};
+ #endif // FEX_IOS_HOST
+ 
+ namespace Exception {
+@@ -756,6 +763,26 @@ public:
      InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
    }
  
@@ -2399,7 +2817,32 @@ index fbaf76f..9fa0c1d 100644
    void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
      OvercommitTracker->MarkRange(Start, Length);
    }
-@@ -1110,7 +1130,17 @@ NTSTATUS ProcessInit() {
+@@ -892,6 +919,12 @@ NTSTATUS ProcessInit() {
+   InitSyscalls();
+ 
+   FEX::Windows::InitCRTProcess();
++#ifdef FEX_IOS_HOST
++  {
++    const char* Xp = getenv("MADEIRA_FEX_XP");
++    IosXpEnabled = Xp && Xp[0] == '1' && Xp[1] == 0;
++  }
++#endif
+   const auto ExecutableName = FEX::Windows::BaseName(FEX::Windows::GetExecutableFilePath());
+   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
+   FEXCore::Config::ReloadMetaLayer();
+@@ -949,8 +982,10 @@ NTSTATUS ProcessInit() {
+  * __DATE__/__TIME__ below is compiler-generated and therefore the
+  * authoritative identity; if the two disagree, the tag is wrong, not the
+  * build. */
+-#define MADEIRA_REV "ml908"
++#define MADEIRA_REV "ml1132"
+   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
++  LogMan::Msg::EFmt("[xp-api] MADEIRA_FEX_XP={} ({})", IosXpEnabled ? 1 : 0,
++                    IosXpEnabled ? "transition probes enabled" : "transition probes disabled");
+ #ifdef FEX_IOS_HOST
+   /* ml751: flush the VA band selector's beacons.
+    *
+@@ -1110,7 +1145,17 @@ NTSTATUS ProcessInit() {
    return STATUS_SUCCESS;
  }
  

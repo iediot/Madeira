@@ -17,8 +17,44 @@ index 2a7eff4..a110d03 100644
 +	if (cmdEncoder->_madeiraDump) { cmdEncoder->madeiraDumpDispatch(MTLSizeMake(0, 0, 0), cmdEncoder->getComputePipeline()->getThreadgroupSize(), true); }	// Madeira
  }
  
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+index ad371c3..0c1fe4e 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+@@ -98,6 +98,7 @@ public:
+ 						uint32_t firstInstance);
+ 
+     void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraIsDraw() const override { return true; }
+ 	void encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder);
+ 
+ protected:
+@@ -124,6 +125,7 @@ public:
+ 						uint32_t firstInstance);
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraIsDraw() const override { return true; }
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+@@ -150,6 +152,7 @@ public:
+ 						uint32_t stride);
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraIsDraw() const override { return true; }
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+@@ -183,6 +186,7 @@ public:
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
+ 	void encode(MVKCommandEncoder* cmdEncoder, const MVKIndexMTLBufferBinding& ibbOrig);
++	bool madeiraIsDraw() const override { return true; }
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
-index 664276b..9efdf4b 100644
+index 664276b..950cd8a 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
 @@ -131,6 +131,8 @@
@@ -30,7 +66,7 @@ index 664276b..9efdf4b 100644
  
  	// Create an indexed indirect buffer and populate it from the draw arguments.
  	uint32_t indirectIdxBuffStride = sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
-@@ -170,6 +172,8 @@
+@@ -170,8 +172,13 @@
  }
  
  void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
@@ -38,8 +74,13 @@ index 664276b..9efdf4b 100644
 +	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
  
  	if (_vertexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
++	// Madeira: decide before changing encoders or binding any partial graphics state.
++	if (cmdEncoder->getGraphicsPipeline()->shouldSkipDraw(_vertexCount, _instanceCount,
++															 cmdEncoder->madeiraIsOnlyDrawInSubpass(this))) { return; }
  
-@@ -376,6 +380,8 @@
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -376,6 +383,8 @@
  
  // Populates and encodes a MVKCmdDrawIndexedIndirect command, after populating an indexed indirect buffer.
  void MVKCmdDrawIndexed::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
@@ -48,7 +89,7 @@ index 664276b..9efdf4b 100644
  
  	// Create an indexed indirect buffer and populate it from the draw arguments.
  	uint32_t indirectIdxBuffStride = sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
-@@ -443,6 +449,8 @@
+@@ -443,8 +452,13 @@
  }
  
  void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
@@ -56,8 +97,13 @@ index 664276b..9efdf4b 100644
 +	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
  
  	if (_indexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
++	// Madeira: decide before index conversion or any render-state mutation.
++	if (cmdEncoder->getGraphicsPipeline()->shouldSkipDraw(_indexCount, _instanceCount,
++															 cmdEncoder->madeiraIsOnlyDrawInSubpass(this))) { return; }
  
-@@ -674,6 +682,8 @@
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -674,6 +688,8 @@
  
  // Populates and encodes a MVKCmdDrawIndexedIndirect command, after populating indexed indirect buffers.
  void MVKCmdDrawIndirect::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
@@ -66,21 +112,25 @@ index 664276b..9efdf4b 100644
  
  	// Create an indexed indirect buffer to be populated from the non-indexed indirect buffer.
  	uint32_t indirectIdxBuffStride = sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
-@@ -720,6 +730,8 @@
+@@ -720,6 +736,10 @@
  }
  
  void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
 +	if (!cmdEncoder->getGraphicsPipeline() ||
 +	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
++	// Madeira: a skipped indirect draw must not run its conversion compute work.
++	if (cmdEncoder->getGraphicsPipeline()->shouldSkipDraw(0, 0, false, _drawCount)) { return; }
  
  	cmdEncoder->restartMetalRenderPassIfNeeded();
  
-@@ -1025,11 +1037,15 @@
+@@ -1025,11 +1045,17 @@
  }
  
  void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder) {
 +	if (!cmdEncoder->getGraphicsPipeline() ||
 +	    !cmdEncoder->getGraphicsPipeline()->wasConfigurationSuccessful()) { return; }
++	// Madeira: skip before restarting the pass or converting the index buffer.
++	if (cmdEncoder->getGraphicsPipeline()->shouldSkipDraw(0, 0, false, _drawCount)) { return; }
  	cmdEncoder->restartMetalRenderPassIfNeeded();
  	encode(cmdEncoder, cmdEncoder->getVkGraphics()._indexBuffer);
  }
@@ -179,6 +229,50 @@ index 9092954..ad85381 100644
  }
  
  
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdRendering.h b/MoltenVK/MoltenVK/Commands/MVKCmdRendering.h
+index 55132e2..b0aa33b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdRendering.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdRendering.h
+@@ -71,6 +71,7 @@ public:
+ 						MVKArrayRef<MVKImageView*> attachments);
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraStartsSubpass() const override { return true; }
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+@@ -110,6 +111,7 @@ public:
+ 						const VkSubpassEndInfo* pSubpassEndInfo);
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraStartsSubpass() const override { return true; }
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+@@ -129,6 +131,7 @@ public:
+ 						const VkSubpassEndInfo* pSubpassEndInfo);
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraEndsSubpass() const override { return true; }
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+@@ -151,6 +154,7 @@ public:
+ 						const VkRenderingInfo* pRenderingInfo);
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraStartsSubpass() const override { return true; }
+ 
+ 
+ protected:
+@@ -218,6 +222,7 @@ public:
+ 	VkResult setContent(MVKCommandBuffer* cmdBuff);
+ 
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
++	bool madeiraEndsSubpass() const override { return true; }
+ 
+ protected:
+ 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.h b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.h
 index 9aebb24..b53186e 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.h
@@ -477,8 +571,27 @@ index ab318c5..5048ff8 100644
 +    cmdEncoder->returnToPoolOnCompletion(srcMTLBufferAlloc);	// Madeira: batched per MTLCommandBuffer
  }
  
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommand.h b/MoltenVK/MoltenVK/Commands/MVKCommand.h
+index ca02901..e788ab5 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommand.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommand.h
+@@ -67,8 +67,14 @@ public:
+ 	/** Encodes this command on the specified command encoder. */
+ 	virtual void encode(MVKCommandEncoder* cmdEncoder) = 0;
+ 
++	/** Madeira: lightweight render-pass draw classification for bounded async waits. */
++	virtual bool madeiraIsDraw() const { return false; }
++	virtual bool madeiraStartsSubpass() const { return false; }
++	virtual bool madeiraEndsSubpass() const { return false; }
++
+ protected:
+ 	friend MVKCommandBuffer;
++	friend MVKCommandEncoder;
+ 
+ 	// Returns the command type pool used by this command, from the command pool.
+ 	// This function is overridden in each concrete subclass declaration, but the implementation of
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
-index 76ca788..fbbe74e 100644
+index 76ca788..e55c01d 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
 @@ -27,10 +27,15 @@
@@ -497,7 +610,17 @@ index 76ca788..fbbe74e 100644
  class MVKCommandEncodingPool;
  class MVKRenderPass;
  class MVKFramebuffer;
-@@ -441,6 +446,9 @@ public:
+@@ -411,6 +416,9 @@ public:
+ 	/** Returns the compute pipeline. */
+ 	MVKComputePipeline* getComputePipeline() { return getVkCompute()._pipeline; }
+ 
++	/** Madeira: returns whether this is the sole draw in the active render subpass. */
++	bool madeiraIsOnlyDrawInSubpass(MVKCommand* drawCmd);
++
+     /**
+ 	 * Copy bytes into the Metal encoder at a Metal vertex buffer index, and optionally indicate
+ 	 * that this binding might override a desriptor binding. If so, the descriptor binding will
+@@ -441,6 +449,9 @@ public:
  	/** Copy the bytes to a temporary MTLBuffer that will be returned to a pool after the command buffer is finished. */
  	const MVKMTLBufferAllocation* copyToTempMTLBufferAllocation(const void* bytes, NSUInteger length, bool isDedicated = false);
  
@@ -507,7 +630,7 @@ index 76ca788..fbbe74e 100644
      /** Returns the command encoding pool. */
      MVKCommandEncodingPool* getCommandEncodingPool();
  
-@@ -455,6 +463,9 @@ public:
+@@ -455,6 +466,9 @@ public:
  	/** Insert a new execution barrier */
  	void setBarrier(uint64_t sourceStageMask, uint64_t destStageMask);
  
@@ -517,7 +640,7 @@ index 76ca788..fbbe74e 100644
  	/** Encode waits for a specific stage in given encoder. */
  	void barrierWait(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages beforeStages);
  	void barrierWait(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder);
-@@ -479,6 +490,29 @@ public:
+@@ -479,6 +493,29 @@ public:
      /** Reset a range of queries. */
      void resetQueries(MVKQueryPool* pQueryPool, uint32_t firstQuery, uint32_t queryCount);
  
@@ -547,7 +670,7 @@ index 76ca788..fbbe74e 100644
  #pragma mark Dynamic encoding state accessed directly
  
  	/** Context for tracking information across multiple encodings. */
-@@ -530,6 +564,8 @@ protected:
+@@ -530,6 +567,8 @@ protected:
  	template<typename T> void retainIfImmediatelyEncoding(T& mtlEnc);
  	template<typename T> void endMetalEncoding(T& mtlEnc);
  	id<MTLFence> getBarrierStageFence(MVKBarrierStage stage);
@@ -556,7 +679,7 @@ index 76ca788..fbbe74e 100644
  
  	typedef struct GPUCounterQuery {
  		MVKGPUCounterQueryPool* queryPool = nullptr;
-@@ -539,6 +575,8 @@ protected:
+@@ -539,6 +578,8 @@ protected:
  	VkRect2D _renderArea;
  	MVKCommand* _lastMultiviewPassCmd;
      MVKActivatedQueries* _pActivatedQueries;
@@ -565,7 +688,12 @@ index 76ca788..fbbe74e 100644
  	MVKSmallVector<GPUCounterQuery, 16> _timestampStageCounterQueries;
  	MVKSmallVector<VkClearValue, kMVKDefaultAttachmentCount> _clearValues;
  	MVKSmallVector<MVKImageView*, kMVKDefaultAttachmentCount> _attachments;
-@@ -551,6 +589,7 @@ protected:
+@@ -547,10 +588,12 @@ protected:
+ 	id<MTLFence> _stageCountersMTLFence;
+ 	MVKPrefillMetalCommandBuffersStyle _prefillStyle;
+ 	VkSubpassContents _subpassContents;
++	uint32_t _madeiraDrawsInSubpass = 0;
+ 	uint32_t _renderSubpassIndex;
  	uint32_t _multiviewPassIndex;
      uint32_t _flushCount;
  	MVKCommandUse _mtlComputeEncoderUse;
@@ -573,7 +701,7 @@ index 76ca788..fbbe74e 100644
  	MVKCommandUse _mtlBlitEncoderUse;
  	bool _isRenderingEntireAttachment;
  };
-@@ -559,6 +598,9 @@ protected:
+@@ -559,6 +602,9 @@ protected:
  #pragma mark -
  #pragma mark Support functions
  
@@ -584,7 +712,7 @@ index 76ca788..fbbe74e 100644
  NSString* mvkMTLRenderCommandEncoderLabel(MVKCommandUse cmdUse);
  
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
-index 8c24deb..00c3b74 100644
+index 8c24deb..0ba0f2c 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
 @@ -25,7 +25,14 @@
@@ -1677,8 +1805,11 @@ index 8c24deb..00c3b74 100644
  		[_prefilledMTLCmdBuffer commit];
  	}
  
-@@ -431,6 +1499,8 @@
+@@ -429,8 +1497,11 @@
+     _renderSubpassIndex = 0;
+     _multiviewPassIndex = 0;
      _canUseLayeredRendering = false;
++	_madeiraDrawsInSubpass = 0;
  
      _mtlCmdBuffer = mtlCmdBuff;        // not retained
 +	_madeiraTempAllocs = nullptr;		// Madeira: a new MTLCommandBuffer gets its own batch
@@ -1686,7 +1817,29 @@ index 8c24deb..00c3b74 100644
  
  	_cmdBuffer->setMetalObjectLabel(_mtlCmdBuffer, _cmdBuffer->_debugName);
  }
-@@ -465,6 +1535,8 @@
+@@ -450,6 +1521,9 @@
+     while(command) {
+         uint32_t prevMVPassIdx = _multiviewPassIndex;
+         command->encode(this);
++		if (command->madeiraStartsSubpass()) { _madeiraDrawsInSubpass = 0; }
++		if (command->madeiraIsDraw()) { ++_madeiraDrawsInSubpass; }
++		if (command->madeiraEndsSubpass()) { _madeiraDrawsInSubpass = 0; }
+ 
+         if(_multiviewPassIndex > prevMVPassIdx) {
+             // This means we're in a multiview render pass, and we moved on to the
+@@ -462,9 +1536,20 @@
+     }
+ }
+ 
++bool MVKCommandEncoder::madeiraIsOnlyDrawInSubpass(MVKCommand* drawCmd) {
++	if (_madeiraDrawsInSubpass) { return false; }
++	for (MVKCommand* command = drawCmd->_next; command; command = command->_next) {
++		if (command->madeiraStartsSubpass() || command->madeiraEndsSubpass()) { break; }
++		if (command->madeiraIsDraw()) { return false; }
++	}
++	return true;
++}
++
  void MVKCommandEncoder::endEncoding() {
  	endCurrentMetalEncoding();
  	finishQueries();
@@ -1695,7 +1848,7 @@ index 8c24deb..00c3b74 100644
  }
  
  void MVKCommandEncoder::encodeSecondary(MVKCommandBuffer* secondaryCmdBuffer) {
-@@ -561,13 +1633,13 @@
+@@ -561,13 +1646,13 @@
  }
  
  // Sets the current render subpass to the subpass with the specified index.
@@ -1711,7 +1864,7 @@ index 8c24deb..00c3b74 100644
  
  	MVKRenderPass* renderPass = _pEncodingContext->getRenderPass();
  	if (renderPass) { renderPass->encodeSubpassDependencyBarriers(this, subpassIndex); }
-@@ -651,7 +1723,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -651,7 +1736,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages beforeStages) {
  	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
  	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
@@ -1722,7 +1875,7 @@ index 8c24deb..00c3b74 100644
  		auto fence = _device->getFence((MVKBarrierStage)i, fenceIndex);
  		[mtlEncoder waitForFence:fence beforeStages:beforeStages];
  	}
-@@ -660,7 +1734,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -660,7 +1747,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder) {
  	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
  	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
@@ -1733,7 +1886,7 @@ index 8c24deb..00c3b74 100644
  		auto fence = _device->getFence((MVKBarrierStage)i, fenceIndex);
  		[mtlEncoder waitForFence:fence];
  	}
-@@ -669,7 +1745,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -669,7 +1758,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder) {
  	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
  	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
@@ -1744,7 +1897,7 @@ index 8c24deb..00c3b74 100644
  		auto fence = _device->getFence((MVKBarrierStage)i, fenceIndex);
  		[mtlEncoder waitForFence:fence];
  	}
-@@ -721,6 +1799,28 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -721,6 +1812,28 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	}
  }
  
@@ -1773,7 +1926,7 @@ index 8c24deb..00c3b74 100644
  
  void MVKCommandEncoder::encodeBarrierWaits(MVKCommandUse use) {
  	if (_mtlRenderEncoder) {
-@@ -749,9 +1849,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -749,9 +1862,11 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	}
  
  	if (_mtlComputeEncoder) {
@@ -1788,7 +1941,7 @@ index 8c24deb..00c3b74 100644
  		}
  	}
  
-@@ -839,6 +1941,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -839,6 +1954,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	retainIfImmediatelyEncoding(_mtlRenderEncoder);
  	_cmdBuffer->setMetalObjectLabel(_mtlRenderEncoder, getMTLRenderCommandEncoderName(cmdUse));
  	getState().beginGraphicsEncoding(getSampleCount());
@@ -1796,7 +1949,7 @@ index 8c24deb..00c3b74 100644
  
  	encodeBarrierWaits(cmdUse);
  
-@@ -965,6 +2068,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -965,6 +2081,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	if (stage == kMVKGraphicsStageRasterization) {
  		prepareDraw();
  		_occlusionQueryState.encode(_mtlRenderEncoder, this);
@@ -1804,7 +1957,7 @@ index 8c24deb..00c3b74 100644
  	} else {
  		getMTLComputeEncoder(kMVKCommandUseTessellationVertexTessCtl);
  		prepareRenderDispatch(stage);
-@@ -1052,6 +2156,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1052,6 +2169,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  
  	getSubpass()->resolveUnresolvableAttachments(this, _attachments.contents());
  	endCurrentMetalEncoding();
@@ -1812,7 +1965,7 @@ index 8c24deb..00c3b74 100644
  
      _occlusionQueryState.endMetalRenderPass(this);
  }
-@@ -1063,6 +2168,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+@@ -1063,6 +2181,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
  	if (_mtlComputeEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlComputeEncoder updateFence: getStageCountersMTLFence()]; }
  	endMetalEncoding(_mtlComputeEncoder);
  	_mtlComputeEncoderUse = kMVKCommandUseNone;
@@ -1820,7 +1973,7 @@ index 8c24deb..00c3b74 100644
  
  	if (_mtlBlitEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlBlitEncoder updateFence: getStageCountersMTLFence()]; }
  	endMetalEncoding(_mtlBlitEncoder);
-@@ -1109,6 +2215,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1109,6 +2228,10 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	if (_mtlComputeEncoderUse != cmdUse) {
  		needWaits = true;
  		_mtlComputeEncoderUse = cmdUse;
@@ -1831,7 +1984,7 @@ index 8c24deb..00c3b74 100644
  		_cmdBuffer->setMetalObjectLabel(_mtlComputeEncoder, mvkMTLComputeCommandEncoderLabel(cmdUse));
  	}
  	if (needWaits) {
-@@ -1185,10 +2295,32 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1185,10 +2308,32 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  // Return the MTLBuffer allocation to the pool once the command buffer is done with it
  const MVKMTLBufferAllocation* MVKCommandEncoder::getTempMTLBuffer(NSUInteger length, bool isPrivate, bool isDedicated) {
      MVKMTLBufferAllocation* mtlBuffAlloc = getCommandEncodingPool()->acquireMTLBufferAllocation(length, isPrivate, isDedicated);
@@ -1865,7 +2018,7 @@ index 8c24deb..00c3b74 100644
  MVKCommandEncodingPool* MVKCommandEncoder::getCommandEncodingPool() {
  	return _cmdBuffer->getCommandPool()->getCommandEncodingPool();
  }
-@@ -1350,6 +2482,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1350,6 +2495,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  	_mtlRenderEncoder = nil;
  	_mtlComputeEncoder = nil;
  	_mtlComputeEncoderUse = kMVKCommandUseNone;
@@ -1873,7 +2026,7 @@ index 8c24deb..00c3b74 100644
  	_mtlBlitEncoder = nil;
  	_mtlBlitEncoderUse = kMVKCommandUseNone;
  	_pEncodingContext = nullptr;
-@@ -1358,6 +2491,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
+@@ -1358,6 +2504,7 @@ static bool shouldStartNewEncoder(MVKCommandUse prev, MVKCommandUse next) {
  }
  
  MVKCommandEncoder::~MVKCommandEncoder() {
@@ -1976,7 +2129,7 @@ index b659de8..11d8e00 100644
  		type(Memory),
  		srcStageMask(vkBarrier.srcStageMask),
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414..2abee0b 100644
+index 534a414..769498c 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 @@ -31,10 +31,29 @@
@@ -2009,24 +2162,56 @@ index 534a414..2abee0b 100644
  class MVKInstance;
  class MVKDevice;
  class MVKQueue;
-@@ -651,9 +670,16 @@ public:
+@@ -651,9 +670,48 @@ public:
  };
  
  /** Represents a Vulkan logical GPU device, associated with a physical device. */
 +class MVKBinaryArchiveCache;
++class MVKAsyncPipelineScheduler;
 +extern const char kMVKArchiveShaderKey;
++extern const char kMVKPipelineFunctionKey;
++
++// Madeira: identifies which pipeline path paid for a binary-archive miss.
++enum MVKArchivePipelineKind : uint8_t {
++	kMVKArchiveGraphicsAsync,
++	kMVKArchiveGraphicsSyncVariant,
++	kMVKArchiveCompute,
++	kMVKArchiveTessellation,
++	kMVKArchivePipelineKindCount,
++};
 +
  class MVKDevice : public MVKDispatchableVulkanAPIObject {
  
  public:
 +	// Optional iOS backend pipeline cache. A nil result always permits normal compilation.
-+	id<MTLRenderPipelineState> newArchivedPipeline(MTLRenderPipelineDescriptor* descriptor);
-+	id<MTLComputePipelineState> newArchivedPipeline(MTLComputePipelineDescriptor* descriptor);
++	id<MTLRenderPipelineState> newArchivedPipeline(MTLRenderPipelineDescriptor* descriptor, MVKArchivePipelineKind kind, bool synchronous);
++	id<MTLComputePipelineState> newArchivedPipeline(MTLComputePipelineDescriptor* descriptor, MVKArchivePipelineKind kind, bool synchronous);
++	id<MTLRenderPipelineState> getCachedPipeline(MTLRenderPipelineDescriptor* descriptor);
++	id<MTLComputePipelineState> getCachedPipeline(MTLComputePipelineDescriptor* descriptor);
++	void cachePipeline(MTLRenderPipelineDescriptor* descriptor, id<MTLRenderPipelineState> state);
++	void cachePipeline(MTLComputePipelineDescriptor* descriptor, id<MTLComputePipelineState> state);
++	std::string getAsyncPipelineKey(MTLRenderPipelineDescriptor* descriptor);
++	std::string getAsyncPipelineKey(MTLComputePipelineDescriptor* descriptor);
++	bool enqueueAsyncPipeline(const std::string& key,
++						  MTLRenderPipelineDescriptor* descriptor,
++						  bool highPriority,
++						  void (^completion)(id<MTLRenderPipelineState> state));
++	bool enqueueAsyncPipeline(const std::string& key,
++						  MTLComputePipelineDescriptor* descriptor,
++						  void (^completion)(id<MTLComputePipelineState> state));
++	void prioritizeAsyncPipeline(const std::string& key);
++	uint32_t reserveAsyncPipelineFrameBudgetMS();
++	void refundAsyncPipelineFrameBudgetNS(uint64_t nanoseconds);
++	void resetAsyncPipelineFrameBudget();
++	bool asyncPipelinesEnabled() const { return _madeiraAsyncPipelines; }
++	bool asyncComputePipelinesEnabled() const { return _madeiraAsyncComputePipelines; }
++	uint32_t asyncPipelineWaitMS() const { return _madeiraAsyncPipelineWaitMS; }
++	uint32_t asyncPipelineFullscreenWaitMS() const { return _madeiraAsyncPipelineFullscreenWaitMS; }
 +
  
  	/** Returns the Vulkan type of this object. */
  	VkObjectType getVkObjectType() override { return VK_OBJECT_TYPE_DEVICE; }
-@@ -983,7 +1009,14 @@ public:
+@@ -983,7 +1041,14 @@ public:
  	void makeResident(id<MTLAllocation> allocation) {
  		@synchronized(_residencySet) {
  			[_residencySet addAllocation: allocation];
@@ -2042,7 +2227,7 @@ index 534a414..2abee0b 100644
  		}
  	}
  #endif
-@@ -994,11 +1027,36 @@ public:
+@@ -994,11 +1059,36 @@ public:
  	void removeResidency(id<MTLAllocation> allocation) {
  		@synchronized(_residencySet) {
  			[_residencySet removeAllocation:allocation];
@@ -2079,16 +2264,24 @@ index 534a414..2abee0b 100644
  	void addResidencySet(id<MTLCommandQueue> queue) {
  #if MVK_XCODE_16
  		if (_residencySet) [queue addResidencySet:_residencySet];
-@@ -1051,6 +1109,8 @@ public:
+@@ -1051,6 +1141,16 @@ public:
  	}
  
  protected:
 +	MVKBinaryArchiveCache* _binaryArchiveCache = nullptr;
++	MVKAsyncPipelineScheduler* _madeiraAsyncPipelineScheduler = nullptr;
++	std::mutex _madeiraAsyncFrameBudgetLock;
++	uint64_t _madeiraAsyncFrameBudgetRemainingNS = 0;
++	uint32_t _madeiraAsyncPipelineFrameBudgetMS = 8;
++	uint32_t _madeiraAsyncPipelineFullscreenWaitMS = 1000;
++	uint32_t _madeiraAsyncPipelineWaitMS = 0;
++	bool _madeiraAsyncPipelines = false;
++	bool _madeiraAsyncComputePipelines = false;
 +
  	friend class MVKDeviceTrackingMixin;
  
  	void propagateDebugName() override  {}
-@@ -1113,6 +1173,8 @@ protected:
+@@ -1113,6 +1213,8 @@ protected:
  	id<MTLBuffer> _dummyBlitMTLBuffer = nil;
  #if MVK_XCODE_16
  	id<MTLResidencySet> _residencySet = nil;
@@ -2098,19 +2291,32 @@ index 534a414..2abee0b 100644
  	uint32_t _visibilityBufferCount = 0;
  	int _capturePipeFileDesc = -1;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 9772757..3bb640b 100644
+index 9772757..fd50c22 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-@@ -38,6 +38,8 @@
+@@ -32,12 +32,21 @@
+ #include "MVKCommandPool.h"
+ #include "MVKFoundation.h"
+ #include "MVKStrings.h"
++#include "MTLRenderPipelineDescriptor+MoltenVK.h"
+ #include <MoltenVKShaderConverter/SPIRVToMSLConverter.h>
+ 
+ #import "CAMetalLayer+MoltenVK.h"
  
  #include <sys/stat.h>
  #include <cmath>
 +#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <list>
++#include <thread>
++#include <unordered_map>
++#include <sys/sysctl.h>
 +#import <objc/runtime.h>
  
  using namespace std;
  
-@@ -2578,6 +2580,14 @@
+@@ -2578,6 +2587,14 @@
  
  		_metalFeatures.astcHDRTextures = !MVK_TVOS || mvkOSVersionIsAtLeast(16.0);
  		_metalFeatures.residencySets = mvkOSVersionIsAtLeast(15.0, 18.0, 2.0);
@@ -2125,7 +2331,7 @@ index 9772757..3bb640b 100644
  		_metalFeatures.simdPermute = true;
  	}
  
-@@ -3264,6 +3274,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3264,6 +3281,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// This is captured either as the MoltenVK Git revision, or if that's not available, as the MoltenVK version.
  	uint32_t mvkRev = getMoltenVKGitRevision();
  	if ( !mvkRev ) { mvkRev = MVK_VERSION; }
@@ -2136,7 +2342,7 @@ index 9772757..3bb640b 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mvkRev);
  	uuidComponentOffset += sizeof(mvkRev);
  
-@@ -4797,6 +4811,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4797,6 +4818,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -2144,7 +2350,7 @@ index 9772757..3bb640b 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -5130,6 +5145,271 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5130,6 +5152,749 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -2152,6 +2358,395 @@ index 9772757..3bb640b 100644
 +// go through the normal shader-module path. The shader hash only selects a shard;
 +// Metal, not this hash, decides whether the complete pipeline matches.
 +const char kMVKArchiveShaderKey = 0;
++const char kMVKPipelineFunctionKey = 0;
++
++uint64_t mvkTimeNow();
++void mvkTimeAdd(int kind, uint64_t start);
++void mvkTimeAddElapsed(int kind, uint64_t nanoseconds);
++void mvkTimeArchiveResult(bool hit, bool verified, uint64_t nanoseconds, MVKArchivePipelineKind kind);
++void mvkTimeArchiveSyncMiss(MVKArchivePipelineKind kind, uint64_t nanoseconds);
++void mvkTimePSOCacheResult(bool hit);
++void mvkTimeAsyncDedupeHit();
++void mvkTimeAsyncPriorityBump();
++void mvkTimeAsyncQueueDepth(uint32_t depth);
++void mvkTimeAsyncStarted();
++void mvkTimeAsyncCompleted();
++void mvkTimeAsyncFailed();
++
++namespace {
++
++// Madeira: serialize every Metal input MoltenVK can put in these descriptors.
++// The unordered map hashes this byte string; retaining the complete key also makes
++// hash collisions harmless. Binary archives are acceleration inputs, not PSO state.
++template<class T> void mvkPSOKeyAdd(std::string& key, const T& value) {
++	key.append((const char*)&value, sizeof(value));
++}
++void mvkPSOKeyAddString(std::string& key, NSString* value) {
++	const char* text = value.UTF8String;
++	size_t length = text ? strlen(text) : 0;
++	mvkPSOKeyAdd(key, length);
++	if (length) { key.append(text, length); }
++}
++void mvkPSOKeyAddObject(std::string& key, id value) {
++	uintptr_t identity = (uintptr_t)value;
++	mvkPSOKeyAdd(key, identity);
++}
++void mvkPSOKeyAddFunction(std::string& key, id<MTLFunction> function) {
++	uint64_t identity = [objc_getAssociatedObject(function, &kMVKPipelineFunctionKey) unsignedLongLongValue];
++	mvkPSOKeyAdd(key, identity);
++	mvkPSOKeyAddString(key, function.name);
++	if (!identity) { mvkPSOKeyAddObject(key, function); }
++}
++void mvkPSOKeyAddFunctions(std::string& key, NSArray<id<MTLFunction>>* functions) {
++	NSUInteger count = functions.count;
++	mvkPSOKeyAdd(key, count);
++	for (id<MTLFunction> function in functions) { mvkPSOKeyAddFunction(key, function); }
++}
++void mvkPSOKeyAddLinkedFunctions(std::string& key, MTLLinkedFunctions* linked) {
++	mvkPSOKeyAddFunctions(key, linked.functions);
++	mvkPSOKeyAddFunctions(key, linked.binaryFunctions);
++	mvkPSOKeyAddFunctions(key, linked.privateFunctions);
++	NSArray<NSString*>* names = [[linked.groups allKeys] sortedArrayUsingSelector:@selector(compare:)];
++	mvkPSOKeyAdd(key, names.count);
++	for (NSString* name in names) {
++		mvkPSOKeyAddString(key, name);
++		mvkPSOKeyAddFunctions(key, linked.groups[name]);
++	}
++}
++void mvkPSOKeyAddStageInput(std::string& key, MTLStageInputOutputDescriptor* input) {
++	bool present = input != nil;
++	mvkPSOKeyAdd(key, present);
++	if (!present) { return; }
++	mvkPSOKeyAdd(key, input.indexType);
++	mvkPSOKeyAdd(key, input.indexBufferIndex);
++	for (NSUInteger idx = 0; idx < 31; ++idx) {
++		auto layout = input.layouts[idx];
++		mvkPSOKeyAdd(key, layout.stride);
++		mvkPSOKeyAdd(key, layout.stepFunction);
++		mvkPSOKeyAdd(key, layout.stepRate);
++		auto attribute = input.attributes[idx];
++		mvkPSOKeyAdd(key, attribute.format);
++		mvkPSOKeyAdd(key, attribute.offset);
++		mvkPSOKeyAdd(key, attribute.bufferIndex);
++	}
++}
++void mvkPSOKeyAddLibraries(std::string& key, NSArray* libraries) {
++	mvkPSOKeyAdd(key, libraries.count);
++	for (id library in libraries) { mvkPSOKeyAddObject(key, library); }
++}
++
++std::string mvkPSOKey(id<MTLDevice> device, MTLRenderPipelineDescriptor* desc) {
++	std::string key("R", 1);
++	mvkPSOKeyAddObject(key, device);
++	mvkPSOKeyAddString(key, desc.label);
++	mvkPSOKeyAddFunction(key, desc.vertexFunction);
++	mvkPSOKeyAddFunction(key, desc.fragmentFunction);
++	bool hasVertex = desc.vertexDescriptor != nil;
++	mvkPSOKeyAdd(key, hasVertex);
++	if (hasVertex) {
++		for (NSUInteger idx = 0; idx < 31; ++idx) {
++			auto layout = desc.vertexDescriptor.layouts[idx];
++			mvkPSOKeyAdd(key, layout.stride);
++			mvkPSOKeyAdd(key, layout.stepFunction);
++			mvkPSOKeyAdd(key, layout.stepRate);
++			auto attribute = desc.vertexDescriptor.attributes[idx];
++			mvkPSOKeyAdd(key, attribute.format);
++			mvkPSOKeyAdd(key, attribute.offset);
++			mvkPSOKeyAdd(key, attribute.bufferIndex);
++		}
++	}
++	mvkPSOKeyAdd(key, desc.rasterSampleCount);
++	mvkPSOKeyAdd(key, desc.alphaToCoverageEnabled);
++	mvkPSOKeyAdd(key, desc.alphaToOneEnabled);
++	mvkPSOKeyAdd(key, desc.rasterizationEnabled);
++	mvkPSOKeyAdd(key, desc.maxVertexAmplificationCount);
++	for (NSUInteger idx = 0; idx < 8; ++idx) {
++		auto color = desc.colorAttachments[idx];
++		mvkPSOKeyAdd(key, color.pixelFormat);
++		mvkPSOKeyAdd(key, color.blendingEnabled);
++		mvkPSOKeyAdd(key, color.sourceRGBBlendFactor);
++		mvkPSOKeyAdd(key, color.destinationRGBBlendFactor);
++		mvkPSOKeyAdd(key, color.rgbBlendOperation);
++		mvkPSOKeyAdd(key, color.sourceAlphaBlendFactor);
++		mvkPSOKeyAdd(key, color.destinationAlphaBlendFactor);
++		mvkPSOKeyAdd(key, color.alphaBlendOperation);
++		mvkPSOKeyAdd(key, color.writeMask);
++	}
++	mvkPSOKeyAdd(key, desc.depthAttachmentPixelFormat);
++	mvkPSOKeyAdd(key, desc.stencilAttachmentPixelFormat);
++	mvkPSOKeyAdd(key, desc.inputPrimitiveTopology);
++	mvkPSOKeyAdd(key, desc.tessellationPartitionMode);
++	mvkPSOKeyAdd(key, desc.maxTessellationFactor);
++	mvkPSOKeyAdd(key, desc.tessellationFactorScaleEnabled);
++	mvkPSOKeyAdd(key, desc.tessellationFactorFormat);
++	mvkPSOKeyAdd(key, desc.tessellationControlPointIndexType);
++	mvkPSOKeyAdd(key, desc.tessellationFactorStepFunction);
++	mvkPSOKeyAdd(key, desc.tessellationOutputWindingOrder);
++	for (NSUInteger idx = 0; idx < 31; ++idx) {
++		mvkPSOKeyAdd(key, desc.vertexBuffers[idx].mutability);
++		mvkPSOKeyAdd(key, desc.fragmentBuffers[idx].mutability);
++	}
++	mvkPSOKeyAdd(key, desc.supportIndirectCommandBuffers);
++	mvkPSOKeyAddLibraries(key, desc.vertexPreloadedLibraries);
++	mvkPSOKeyAddLibraries(key, desc.fragmentPreloadedLibraries);
++	mvkPSOKeyAddLinkedFunctions(key, desc.vertexLinkedFunctions);
++	mvkPSOKeyAddLinkedFunctions(key, desc.fragmentLinkedFunctions);
++	mvkPSOKeyAdd(key, desc.supportAddingVertexBinaryFunctions);
++	mvkPSOKeyAdd(key, desc.supportAddingFragmentBinaryFunctions);
++	mvkPSOKeyAdd(key, desc.maxVertexCallStackDepth);
++	mvkPSOKeyAdd(key, desc.maxFragmentCallStackDepth);
++	mvkPSOKeyAdd(key, desc.sampleMaskMVK);
++	mvkPSOKeyAdd(key, desc.logicOperationEnabledMVK);
++	mvkPSOKeyAdd(key, desc.logicOperationMVK);
++#if MVK_XCODE_16
++	if (@available(iOS 18.0, macOS 15.0, *)) { mvkPSOKeyAdd(key, desc.shaderValidation); }
++#endif
++	return key;
++}
++
++std::string mvkPSOKey(id<MTLDevice> device, MTLComputePipelineDescriptor* desc) {
++	std::string key("C", 1);
++	mvkPSOKeyAddObject(key, device);
++	mvkPSOKeyAddString(key, desc.label);
++	mvkPSOKeyAddFunction(key, desc.computeFunction);
++	mvkPSOKeyAdd(key, desc.threadGroupSizeIsMultipleOfThreadExecutionWidth);
++	mvkPSOKeyAdd(key, desc.maxTotalThreadsPerThreadgroup);
++	mvkPSOKeyAddStageInput(key, desc.stageInputDescriptor);
++	for (NSUInteger idx = 0; idx < 31; ++idx) { mvkPSOKeyAdd(key, desc.buffers[idx].mutability); }
++	mvkPSOKeyAdd(key, desc.supportIndirectCommandBuffers);
++	mvkPSOKeyAddLibraries(key, desc.preloadedLibraries);
++	mvkPSOKeyAddLinkedFunctions(key, desc.linkedFunctions);
++	mvkPSOKeyAdd(key, desc.supportAddingBinaryFunctions);
++	mvkPSOKeyAdd(key, desc.maxCallStackDepth);
++#if MVK_XCODE_16
++	if (@available(iOS 18.0, macOS 15.0, *)) { mvkPSOKeyAdd(key, desc.shaderValidation); }
++#endif
++	return key;
++}
++
++class MVKPipelineStateCache {
++public:
++	template<class Descriptor, class State> State get(id<MTLDevice> device, Descriptor* desc) {
++		if (!capacity()) { return nil; }
++		auto key = mvkPSOKey(device, desc);
++		std::lock_guard<std::mutex> lock(_lock);
++		auto it = _entries.find(key);
++		if (it == _entries.end()) { mvkTimePSOCacheResult(false); return nil; }
++		_lru.splice(_lru.begin(), _lru, it->second.lru);
++		mvkTimePSOCacheResult(true);
++		return (State)[it->second.state retain];
++	}
++	template<class Descriptor> void put(id<MTLDevice> device, Descriptor* desc, id state) {
++		if (!state || !capacity()) { return; }
++		auto key = mvkPSOKey(device, desc);
++		std::lock_guard<std::mutex> lock(_lock);
++		auto found = _entries.find(key);
++		if (found != _entries.end()) {
++			_lru.splice(_lru.begin(), _lru, found->second.lru);
++			return;
++		}
++		_lru.push_front(key);
++		_entries.emplace(key, Entry{ [state retain], _lru.begin() });
++		while (_entries.size() > capacity()) {
++			auto old = _entries.find(_lru.back());
++			[old->second.state release];
++			_entries.erase(old);
++			_lru.pop_back();
++		}
++	}
++private:
++	struct Entry { id state; std::list<std::string>::iterator lru; };
++	static size_t capacity() {
++		static size_t cap = [] {
++			const char* value = getenv("MVK_MADEIRA_PSO_CACHE");
++			return (value && *value) ? (size_t)strtoull(value, nullptr, 10) : (size_t)4096;
++		}();
++		return cap;
++	}
++	std::mutex _lock;
++	std::list<std::string> _lru;
++	std::unordered_map<std::string, Entry> _entries;
++};
++
++MVKPipelineStateCache& mvkPipelineStateCache() {
++	static MVKPipelineStateCache* cache = new MVKPipelineStateCache();
++	return *cache;
++}
++
++}
++
++// Madeira: one device-wide scheduler owns each queued descriptor and compiles a PSO
++// key once. Re-created Vulkan pipelines subscribe to the same job, and a draw can
++// move a queued job to the front without consuming another worker.
++class MVKAsyncPipelineScheduler {
++public:
++	typedef void (^RenderCompletion)(id<MTLRenderPipelineState>);
++	typedef void (^ComputeCompletion)(id<MTLComputePipelineState>);
++	struct Job {
++		std::string key;
++		id descriptor;
++		bool compute;
++		std::vector<RenderCompletion> renderCompletions;
++		std::vector<ComputeCompletion> computeCompletions;
++		bool running = false;
++	};
++
++	MVKAsyncPipelineScheduler(MVKDevice* device, uint32_t threadCount) : _device(device) {
++		for (uint32_t i = 0; i < threadCount; ++i) { _workers.emplace_back([this]{ worker(); }); }
++	}
++
++	~MVKAsyncPipelineScheduler() {
++		{
++			std::lock_guard<std::mutex> lock(_lock);
++			_stopping = true;
++		}
++		_cv.notify_all();
++		for (auto& worker : _workers) { worker.join(); }
++	}
++
++	bool enqueue(const std::string& key, MTLRenderPipelineDescriptor* descriptor,
++				 bool highPriority, RenderCompletion completion) {
++		std::lock_guard<std::mutex> lock(_lock);
++		auto found = _jobs.find(key);
++		if (found != _jobs.end()) {
++			found->second->renderCompletions.push_back([completion copy]);
++			mvkTimeAsyncDedupeHit();
++			if (highPriority) { prioritizeLocked(found->second); }
++			return false;
++		}
++		Job* job = new Job{key, [descriptor copy], false, {}, {}};
++		job->renderCompletions.push_back([completion copy]);
++		_jobs.emplace(key, job);
++		if (highPriority) { _queue.push_front(job); } else { _queue.push_back(job); }
++		mvkTimeAsyncStarted();
++		mvkTimeAsyncQueueDepth((uint32_t)_queue.size());
++		_cv.notify_one();
++		return true;
++	}
++
++	bool enqueue(const std::string& key, MTLComputePipelineDescriptor* descriptor, ComputeCompletion completion) {
++		std::lock_guard<std::mutex> lock(_lock);
++		auto found = _jobs.find(key);
++		if (found != _jobs.end()) {
++			found->second->computeCompletions.push_back([completion copy]);
++			mvkTimeAsyncDedupeHit();
++			return false;
++		}
++		Job* job = new Job{key, [descriptor copy], true, {}, {}};
++		job->computeCompletions.push_back([completion copy]);
++		_jobs.emplace(key, job);
++		_queue.push_back(job);
++		mvkTimeAsyncStarted();
++		mvkTimeAsyncQueueDepth((uint32_t)_queue.size());
++		_cv.notify_one();
++		return true;
++	}
++
++	void prioritize(const std::string& key) {
++		std::lock_guard<std::mutex> lock(_lock);
++		auto found = _jobs.find(key);
++		if (found != _jobs.end()) { prioritizeLocked(found->second); }
++	}
++
++private:
++	void prioritizeLocked(Job* job) {
++		if (job->running) { return; }
++		auto pos = std::find(_queue.begin(), _queue.end(), job);
++		if (pos != _queue.end() && pos != _queue.begin()) {
++			_queue.erase(pos);
++			_queue.push_front(job);
++			mvkTimeAsyncPriorityBump();
++		}
++	}
++
++	void worker() {
++		for (;;) {
++			Job* job = nullptr;
++			{
++				std::unique_lock<std::mutex> lock(_lock);
++				_cv.wait(lock, [&]{ return _stopping || !_queue.empty(); });
++				if (_stopping && _queue.empty()) { return; }
++				job = _queue.front();
++				_queue.pop_front();
++				job->running = true;
++				mvkTimeAsyncQueueDepth((uint32_t)_queue.size());
++			}
++
++			id state = nil;
++			uint64_t compileStart = mvkTimeNow();
++			@autoreleasepool {
++				if (job->compute) {
++					auto descriptor = (MTLComputePipelineDescriptor*)job->descriptor;
++					state = _device->getCachedPipeline(descriptor); // retained
++					if (!state) { state = _device->newArchivedPipeline(descriptor, kMVKArchiveCompute, false); }
++					if (!state) {
++						NSError* error = nil;
++						uint64_t start = mvkTimeNow();
++						id<MTLDevice> mtlDevice = _device->getPhysicalDevice()->getMTLDevice();
++						@synchronized (mtlDevice) {
++							state = [mtlDevice newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&error];
++						}
++						mvkTimeAdd(4, start);
++						if (!state && error) { fprintf(stderr, "[mvk-async] compute pipeline compile failed: %s\n", error.localizedDescription.UTF8String); }
++					}
++					if (state) { _device->cachePipeline(descriptor, state); }
++				} else {
++					auto descriptor = (MTLRenderPipelineDescriptor*)job->descriptor;
++					state = _device->getCachedPipeline(descriptor); // retained
++					// Madeira: archive probing and miss compilation both stay off the creation thread.
++					if (!state) { state = _device->newArchivedPipeline(descriptor, kMVKArchiveGraphicsAsync, false); }
++					if (!state) {
++					NSError* error = nil;
++					uint64_t start = mvkTimeNow();
++					id<MTLDevice> mtlDevice = _device->getPhysicalDevice()->getMTLDevice();
++					@synchronized (mtlDevice) {
++						state = [mtlDevice newRenderPipelineStateWithDescriptor:descriptor error:&error];
++					}
++					mvkTimeAdd(4, start);
++					if (!state && error) {
++						fprintf(stderr, "[mvk-async] graphics pipeline compile failed: %s\n", error.localizedDescription.UTF8String);
++					}
++					}
++					if (state) { _device->cachePipeline(descriptor, state); }
++				}
++			}
++			uint64_t compileElapsed = mvkTimeNow() - compileStart;
++			if (compileElapsed > 500000000ull) {
++				fprintf(stderr, "[mvk-async] slow-compile %.1fms success=%d\n",
++						compileElapsed / 1e6, state != nil);
++			}
++			if (state) { mvkTimeAsyncCompleted(); } else { mvkTimeAsyncFailed(); }
++
++			std::vector<RenderCompletion> renderCompletions;
++			std::vector<ComputeCompletion> computeCompletions;
++			{
++				std::lock_guard<std::mutex> lock(_lock);
++				renderCompletions.swap(job->renderCompletions);
++				computeCompletions.swap(job->computeCompletions);
++				_jobs.erase(job->key);
++			}
++			for (RenderCompletion completion : renderCompletions) {
++				completion(state);
++				[completion release];
++			}
++			for (ComputeCompletion completion : computeCompletions) {
++				completion(state);
++				[completion release];
++			}
++			[state release];
++			[job->descriptor release];
++			delete job;
++		}
++	}
++
++	MVKDevice* _device;
++	std::mutex _lock;
++	std::condition_variable _cv;
++	std::deque<Job*> _queue;
++	std::unordered_map<std::string, Job*> _jobs;
++	std::vector<std::thread> _workers;
++	bool _stopping = false;
++};
 +
 +const MVKMadeiraCPUOptions& mvkMadeiraCPUOptions() {
 +	static const MVKMadeiraCPUOptions options = [] {
@@ -2266,8 +2861,14 @@ index 9772757..3bb640b 100644
 +		[_directory release];
 +	}
 +
-+	template<class Descriptor> id newPipeline(Descriptor* descriptor, id<MTLFunction> function) {
++	template<class Descriptor> id newPipeline(Descriptor* descriptor, id<MTLFunction> function,
++										 MVKArchivePipelineKind kind, bool synchronous) {
 +		if (!_enabled) { return nil; }
++		uint64_t entireStart = mvkTimeNow();
++		uint64_t creation = ++_creations;
++		bool verify = archiveVerificationEnabled();
++		size_t descriptorHash = verify ? std::hash<std::string>()(mvkPSOKey(_device, descriptor)) : 0;
++		uint64_t lookupStart = mvkTimeNow();
 +		uint64_t hash = 0;
 +		@autoreleasepool {   // an atomic association is returned retained and autoreleased
 +			hash = [objc_getAssociatedObject(function, &kMVKArchiveShaderKey) unsignedLongLongValue];
@@ -2285,12 +2886,29 @@ index 9772757..3bb640b 100644
 +			if (shard.archive) { [archives addObject:shard.archive]; }
 +			descriptor.binaryArchives = archives;
 +			NSError* error = nil;
++			uint64_t stateStart = mvkTimeNow();
 +			id state = compile(descriptor, MTLPipelineOptionFailOnBinaryArchiveMiss, &error);
++			mvkTimeAdd(4, stateStart);
 +			descriptor.binaryArchives = nil;
-+			if (state) { ++_hits; return state; }
++			if (state) {
++				++_hits;
++				uint64_t elapsed = mvkTimeNow() - lookupStart;
++				mvkTimeAddElapsed(5, elapsed);
++				mvkTimeArchiveResult(true, verify, elapsed, kind);
++				if (verify) { fprintf(stderr, "[mvk-archive] create=%llu descriptor=%016llx real-hit=1 fail-on-miss=success\n", (unsigned long long)creation, (unsigned long long)descriptorHash); }
++				return state;
++			}
 +		} }
 +		++_misses;
-+		if (shard.dirty >= 128) { return nil; } // Bound pending additions while the writer catches up.
++		uint64_t lookupElapsed = mvkTimeNow() - lookupStart;
++		mvkTimeAddElapsed(5, lookupElapsed);
++		mvkTimeArchiveResult(false, false, lookupElapsed, kind);
++		if (verify) { fprintf(stderr, "[mvk-archive] create=%llu descriptor=%016llx real-hit=0 fail-on-miss=miss\n", (unsigned long long)creation, (unsigned long long)descriptorHash); }
++		auto finishMiss = [&](id state) {
++			if (synchronous) { mvkTimeArchiveSyncMiss(kind, mvkTimeNow() - entireStart); }
++			return state;
++		};
++		if (shard.dirty >= 128) { return finishMiss(nil); } // Bound pending additions while the writer catches up.
 +		if (!shard.archive) {
 +			if (!shard.pages.empty()) {
 +				shard.archive = load(shard.pages.back());
@@ -2302,15 +2920,17 @@ index 9772757..3bb640b 100644
 +				if (shard.pages.empty()) { appendPage(shard, index); }
 +			}
 +		}
-+		if (!shard.archive) { return nil; }
++		if (!shard.archive) { return finishMiss(nil); }
 +		NSError* error = nil;
 +		if (!add(shard.archive, descriptor, &error)) {
 +			if (_errors.fetch_add(1) < 8) { fprintf(stderr, "[mvk-archive] add failed: %s\n", error.localizedDescription.UTF8String); }
-+			return nil;
++			return finishMiss(nil);
 +		}
 +		++shard.dirty;
 +		descriptor.binaryArchives = @[shard.archive];
++		uint64_t stateStart = mvkTimeNow();
 +		id state = compile(descriptor, MTLPipelineOptionNone, &error);
++		mvkTimeAdd(4, stateStart);
 +		descriptor.binaryArchives = nil;
 +		if (shard.dirty >= 128 && !shard.queued) {
 +			shard.queued = true;
@@ -2321,7 +2941,7 @@ index 9772757..3bb640b 100644
 +				pending.queued = false;
 +			} });
 +		}
-+		return state; // retained, or nil to let the existing compiler report the error
++		return finishMiss(state); // retained, or nil to let the existing compiler report the error
 +	}
 +
 +private:
@@ -2339,7 +2959,12 @@ index 9772757..3bb640b 100644
 +	NSString* _directory;
 +	dispatch_queue_t _queue;
 +	bool _enabled = false;
-+	std::atomic<uint64_t> _hits{0}, _misses{0}, _errors{0};
++	std::atomic<uint64_t> _hits{0}, _misses{0}, _errors{0}, _creations{0};
++
++	static bool archiveVerificationEnabled() {
++		static bool enabled = [] { const char* value = getenv("MVK_MADEIRA_ARCHIVE_VERIFY"); return value && !strcmp(value, "1"); }();
++		return enabled;
++	}
 +
 +	void appendPage(Shard& shard, unsigned index) {
 +		// UUID avoids replacing another process's page. Concurrent processes may
@@ -2405,21 +3030,112 @@ index 9772757..3bb640b 100644
 +	}
 +};
 +
-+id<MTLRenderPipelineState> MVKDevice::newArchivedPipeline(MTLRenderPipelineDescriptor* descriptor) {
-+	return _binaryArchiveCache ? _binaryArchiveCache->newPipeline(descriptor, descriptor.vertexFunction) : nil;
++id<MTLRenderPipelineState> MVKDevice::newArchivedPipeline(MTLRenderPipelineDescriptor* descriptor, MVKArchivePipelineKind kind, bool synchronous) {
++	return _binaryArchiveCache ? _binaryArchiveCache->newPipeline(descriptor, descriptor.vertexFunction, kind, synchronous) : nil;
 +}
 +
-+id<MTLComputePipelineState> MVKDevice::newArchivedPipeline(MTLComputePipelineDescriptor* descriptor) {
-+	return _binaryArchiveCache ? _binaryArchiveCache->newPipeline(descriptor, descriptor.computeFunction) : nil;
++id<MTLComputePipelineState> MVKDevice::newArchivedPipeline(MTLComputePipelineDescriptor* descriptor, MVKArchivePipelineKind kind, bool synchronous) {
++	return _binaryArchiveCache ? _binaryArchiveCache->newPipeline(descriptor, descriptor.computeFunction, kind, synchronous) : nil;
++}
++
++id<MTLRenderPipelineState> MVKDevice::getCachedPipeline(MTLRenderPipelineDescriptor* descriptor) {
++	return mvkPipelineStateCache().get<MTLRenderPipelineDescriptor, id<MTLRenderPipelineState>>(getPhysicalDevice()->getMTLDevice(), descriptor);
++}
++
++id<MTLComputePipelineState> MVKDevice::getCachedPipeline(MTLComputePipelineDescriptor* descriptor) {
++	return mvkPipelineStateCache().get<MTLComputePipelineDescriptor, id<MTLComputePipelineState>>(getPhysicalDevice()->getMTLDevice(), descriptor);
++}
++
++void MVKDevice::cachePipeline(MTLRenderPipelineDescriptor* descriptor, id<MTLRenderPipelineState> state) {
++	mvkPipelineStateCache().put(getPhysicalDevice()->getMTLDevice(), descriptor, state);
++}
++
++void MVKDevice::cachePipeline(MTLComputePipelineDescriptor* descriptor, id<MTLComputePipelineState> state) {
++	mvkPipelineStateCache().put(getPhysicalDevice()->getMTLDevice(), descriptor, state);
++}
++
++std::string MVKDevice::getAsyncPipelineKey(MTLRenderPipelineDescriptor* descriptor) {
++	return mvkPSOKey(getPhysicalDevice()->getMTLDevice(), descriptor);
++}
++
++std::string MVKDevice::getAsyncPipelineKey(MTLComputePipelineDescriptor* descriptor) {
++	return mvkPSOKey(getPhysicalDevice()->getMTLDevice(), descriptor);
++}
++
++bool MVKDevice::enqueueAsyncPipeline(const std::string& key,
++									 MTLRenderPipelineDescriptor* descriptor,
++									 bool highPriority,
++									 void (^completion)(id<MTLRenderPipelineState>)) {
++	return _madeiraAsyncPipelineScheduler->enqueue(key, descriptor, highPriority, completion);
++}
++
++bool MVKDevice::enqueueAsyncPipeline(const std::string& key,
++									 MTLComputePipelineDescriptor* descriptor,
++									 void (^completion)(id<MTLComputePipelineState>)) {
++	return _madeiraAsyncPipelineScheduler->enqueue(key, descriptor, completion);
++}
++
++void MVKDevice::prioritizeAsyncPipeline(const std::string& key) {
++	if (_madeiraAsyncPipelineScheduler) { _madeiraAsyncPipelineScheduler->prioritize(key); }
++}
++
++uint32_t MVKDevice::reserveAsyncPipelineFrameBudgetMS() {
++	std::lock_guard<std::mutex> lock(_madeiraAsyncFrameBudgetLock);
++	uint32_t milliseconds = (uint32_t)((_madeiraAsyncFrameBudgetRemainingNS + 999999ull) / 1000000ull);
++	_madeiraAsyncFrameBudgetRemainingNS = 0;
++	return milliseconds;
++}
++
++void MVKDevice::refundAsyncPipelineFrameBudgetNS(uint64_t nanoseconds) {
++	std::lock_guard<std::mutex> lock(_madeiraAsyncFrameBudgetLock);
++	_madeiraAsyncFrameBudgetRemainingNS = std::min<uint64_t>(_madeiraAsyncFrameBudgetRemainingNS + nanoseconds,
++														(uint64_t)_madeiraAsyncPipelineFrameBudgetMS * 1000000ull);
++}
++
++void MVKDevice::resetAsyncPipelineFrameBudget() {
++	std::lock_guard<std::mutex> lock(_madeiraAsyncFrameBudgetLock);
++	_madeiraAsyncFrameBudgetRemainingNS = (uint64_t)_madeiraAsyncPipelineFrameBudgetMS * 1000000ull;
 +}
 +
  MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
  
  	// If the physical device is lost, bail.
-@@ -5140,6 +5420,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5140,6 +5905,44 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  
  	initPhysicalDevice(physicalDevice, pCreateInfo);
++	{
++		const char* mode = getenv("MVK_MADEIRA_ASYNC_PIPELINES");
++		_madeiraAsyncPipelines = mode && strcmp(mode, "0");
++		const char* computeMode = getenv("MVK_MADEIRA_ASYNC_COMPUTE");
++		_madeiraAsyncComputePipelines = computeMode && !strcmp(computeMode, "1");
++		const char* threadEnv = getenv("MVK_MADEIRA_ASYNC_PIPELINES_THREADS");
++		uint32_t threads = 0;
++		if (threadEnv && *threadEnv) {
++			threads = std::max(1u, std::min((uint32_t)strtoul(threadEnv, nullptr, 10), 16u));
++		} else {
++			// Madeira: compile on the performance cores by default, with enough workers
++			// to drain a level-load burst even when the OS does not expose perf levels.
++			size_t size = sizeof(threads);
++			if (sysctlbyname("hw.perflevel0.physicalcpu", &threads, &size, nullptr, 0) || !threads) {
++				threads = (uint32_t)NSProcessInfo.processInfo.activeProcessorCount;
++			}
++			threads = std::max(4u, std::min(threads, 8u));
++		}
++		const char* waitEnv = getenv("MVK_MADEIRA_ASYNC_PIPELINES_WAIT_MS");
++		_madeiraAsyncPipelineWaitMS = waitEnv && *waitEnv ? (uint32_t)strtoul(waitEnv, nullptr, 10) : 0;
++		const char* budgetEnv = getenv("MVK_MADEIRA_ASYNC_PIPELINES_FRAME_BUDGET_MS");
++		_madeiraAsyncPipelineFrameBudgetMS = budgetEnv && *budgetEnv ? (uint32_t)strtoul(budgetEnv, nullptr, 10) : 8;
++		const char* fullscreenEnv = getenv("MVK_MADEIRA_ASYNC_PIPELINES_FULLSCREEN_WAIT_MS");
++		_madeiraAsyncPipelineFullscreenWaitMS = fullscreenEnv && *fullscreenEnv ? (uint32_t)strtoul(fullscreenEnv, nullptr, 10) : 1000;
++		resetAsyncPipelineFrameBudget();
++		if (_madeiraAsyncPipelines || _madeiraAsyncComputePipelines) {
++			_madeiraAsyncPipelineScheduler = new MVKAsyncPipelineScheduler(this, threads);
++		}
++		fprintf(stderr, "[mvk-async] mode=%d compute=%d threads=%u wait-ms=%u frame-budget-ms=%u fullscreen-wait-ms=%u\n",
++				_madeiraAsyncPipelines, _madeiraAsyncComputePipelines, threads, _madeiraAsyncPipelineWaitMS,
++				_madeiraAsyncPipelineFrameBudgetMS, _madeiraAsyncPipelineFullscreenWaitMS);
++	}
 +	#if MVK_IOS
 +	if (@available(iOS 14.0, *)) {
 +		const char* enabled = getenv("MVK_CONFIG_IOS_BINARY_ARCHIVE");
@@ -2429,7 +3145,7 @@ index 9772757..3bb640b 100644
  	initPerformanceTracking();
  	enableExtensions(pCreateInfo);
  	enableFeatures(pCreateInfo);
-@@ -5223,7 +5509,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5223,7 +6026,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -2442,7 +3158,7 @@ index 9772757..3bb640b 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5448,6 +5738,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5448,6 +6255,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Create the command queues
  void MVKDevice::initQueues(const VkDeviceCreateInfo* pCreateInfo) {
@@ -2451,10 +3167,12 @@ index 9772757..3bb640b 100644
  #if MVK_XCODE_16
  	if (_physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.residencySets) {
  		MTLResidencySetDescriptor *setDescriptor;
-@@ -5532,6 +5824,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5532,6 +6341,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
++	// Madeira: jobs retain pipelines; drain them before device-owned caches disappear.
++	delete _madeiraAsyncPipelineScheduler;
 +	delete _binaryArchiveCache;
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
@@ -2480,10 +3198,18 @@ index ef8ca60..3993b76 100644
  		}
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
-index e385e9b..29301ed 100644
+index e385e9b..7e74908 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
-@@ -229,11 +229,28 @@ typedef std::pair<uint32_t, uint32_t> MVKZeroDivisorVertexBinding;
+@@ -32,6 +32,7 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <ostream>
++#include <condition_variable>
+ 
+ #import <Metal/Metal.h>
+ 
+@@ -229,11 +230,28 @@ typedef std::pair<uint32_t, uint32_t> MVKZeroDivisorVertexBinding;
  typedef MVKSmallVector<MVKGraphicsStage, 4> MVKPiplineStages;
  
  
@@ -2512,7 +3238,26 @@ index e385e9b..29301ed 100644
  };
  
  /** Represents an Vulkan graphics pipeline. */
-@@ -315,6 +332,9 @@ public:
+@@ -254,12 +272,14 @@ public:
+ 	uint32_t getOutputControlPointCount() { return _outputControlPointCount; }
+ 
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+-	id<MTLRenderPipelineState> getMainPipelineState() const { return _mtlPipelineState; }
++	id<MTLRenderPipelineState> getMainPipelineState() const;
+ 
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+-	id<MTLRenderPipelineState> getMultiviewPipelineState(uint32_t mv) const {
+-		return _multiviewMTLPipelineStates.empty() ? _mtlPipelineState : _multiviewMTLPipelineStates.find(mv)->second;
+-	}
++	id<MTLRenderPipelineState> getMultiviewPipelineState(uint32_t mv) const;
++
++	/** Madeira: prioritizes and waits for pending state, then says whether the draw must be skipped. */
++	bool shouldSkipDraw(uint32_t vertexCount = 0, uint32_t instanceCount = 0,
++						bool onlyDrawInSubpass = false, uint32_t drawCount = 1);
+ 
+ 	/** Returns the MTLComputePipelineState object for the vertex stage of a tessellated draw with no indices. */
+ 	id<MTLComputePipelineState> getTessVertexStageState() { return _mtlTessVertexStageState; }
+@@ -315,6 +335,9 @@ public:
  	/** Returns a list of the vertex buffers used by this pipeline by Vulkan buffer ID */
  	const MVKStaticBitSet<kMVKMaxBufferCount>& getVkVertexBuffers() const { return _vkVertexBuffers; }
  	/** Returns a list of the vertex buffers used by this pipeline by Metal buffer ID */
@@ -2522,7 +3267,7 @@ index e385e9b..29301ed 100644
  	const MVKStaticBitSet<kMVKMaxBufferCount>& getMtlVertexBuffers() const { return _mtlVertexBuffers; }
  	const VkViewport* getViewports() const { return _viewports; }
  	const VkRect2D* getScissors() const { return _scissors; }
-@@ -362,6 +382,8 @@ protected:
+@@ -362,6 +385,8 @@ protected:
      bool isRenderingPoints();
      bool isRasterizationDisabled(const VkGraphicsPipelineCreateInfo* pCreateInfo);
      bool isDepthClipNegativeOneToOne(const VkGraphicsPipelineCreateInfo* pCreateInfo);
@@ -2531,17 +3276,65 @@ index e385e9b..29301ed 100644
  	bool verifyImplicitBuffers(MVKShaderStage stage);
  	uint32_t getTranslatedVertexBinding(uint32_t binding, uint32_t translationOffset, uint32_t maxBinding);
  	uint32_t getImplicitBufferIndex(MVKShaderStage stage, uint32_t bufferIndexOffset);
-@@ -392,6 +414,8 @@ protected:
+@@ -392,7 +417,17 @@ protected:
  	id<MTLComputePipelineState> _mtlTessVertexStageIndex16State = nil;
  	id<MTLComputePipelineState> _mtlTessVertexStageIndex32State = nil;
  	id<MTLComputePipelineState> _mtlTessControlStageState = nil;
 +	id<MTLBuffer> _dummyVertexBuffer = nil;
 +	uint32_t _dummyVertexBufferIndex = UINT32_MAX;
  	id<MTLRenderPipelineState> _mtlPipelineState = nil;
++	mutable std::mutex _asyncPipelineLock;
++	std::condition_variable _asyncPipelineCV;
++	std::vector<std::string> _asyncPipelineKeys;
++	uint32_t _asyncPipelinePending = 0;
++	bool _asyncPipelineFailed = false;
++	bool _asyncPipelineFailureLogged = false;
++	bool _asyncPipelineWaitAttempted = false;
++	bool _madeiraHasVertexInput = false;
  
  	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
+ 	VkPrimitiveTopology _vkPrimitiveTopology;
+@@ -427,7 +462,8 @@ public:
+ 	bool allowsDispatchBase() { return _allowsDispatchBase; }
+ 
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+-	id<MTLComputePipelineState> getPipelineState() const { return _mtlPipelineState; }
++	/** Madeira: waits for an optional asynchronous compute compile; dispatches are never skipped. */
++	id<MTLComputePipelineState> getPipelineState();
+ 
+ 	/** Returns a list of implicit buffers used by the given stage. */
+ 	const MVKImplicitBufferBindings& getImplicitBuffers(MVKShaderStage stage = kMVKShaderStageCompute) const { return getStageResources(stage).implicitBuffers; }
+@@ -455,6 +491,10 @@ protected:
+ 	uint32_t getImplicitBufferIndex(uint32_t bufferIndexOffset);
+ 
+     id<MTLComputePipelineState> _mtlPipelineState;
++	std::mutex _asyncPipelineLock;
++	std::condition_variable _asyncPipelineCV;
++	bool _asyncPipelinePending = false;
++	bool _asyncPipelineFailed = false;
+ 	MVKPipelineStageResourceInfo _stageResources = {};
+     MTLSize _mtlThreadgroupSize;
+ 	bool _allowsDispatchBase = false;
+@@ -587,7 +627,8 @@ public:
+ 
+ #pragma mark Construction
+ 
+-	MVKComputePipelineCompiler(MVKVulkanAPIDeviceObject* owner, const char* compilerType = nullptr) : MVKMetalCompiler(owner) {
++	MVKComputePipelineCompiler(MVKVulkanAPIDeviceObject* owner, const char* compilerType = nullptr,
++							   MVKArchivePipelineKind archiveKind = kMVKArchiveCompute) : MVKMetalCompiler(owner), _archiveKind(archiveKind) {
+ 		_compilerType = compilerType ? compilerType : "Compute pipeline";
+ 		_pPerformanceTracker = &getPerformanceStats().shaderCompilation.pipelineCompile;
+ 	}
+@@ -598,6 +639,7 @@ protected:
+ 	bool compileComplete(id<MTLComputePipelineState> pipelineState, NSError *error);
+ 
+ 	id<MTLComputePipelineState> _mtlComputePipelineState = nil;
++	MVKArchivePipelineKind _archiveKind;
+ };
+ 
+ 
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 7eae64c..9084fec 100644
+index 7eae64c..86957b6 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 @@ -17,6 +17,7 @@
@@ -2552,7 +3345,22 @@ index 7eae64c..9084fec 100644
  #include "MVKCommandBuffer.h"
  #include "MVKInlineObjectConstructor.h"
  #include "MVKImage.h"
-@@ -428,7 +429,17 @@ static bool isWriteable(VkDescriptorType type) {
+@@ -43,6 +44,14 @@
+ using namespace mvk;
+ using namespace SPIRV_CROSS_NAMESPACE;
+ 
++uint64_t mvkTimeNow();
++void mvkTimeAsyncStarted();
++void mvkTimeAsyncCompleted();
++void mvkTimeAsyncFailed();
++void mvkTimeAsyncSkippedDraw(uint32_t count);
++void mvkTimeAsyncBudgetWait(uint64_t nanoseconds);
++void mvkTimeAsyncFullscreenWait(uint64_t nanoseconds);
++
+ 
+ #pragma mark - MVKPipelineLayout
+ 
+@@ -428,7 +437,17 @@ static bool isWriteable(VkDescriptorType type) {
  #pragma mark MVKGraphicsPipeline
  
  /** Populate a MVKStageResourceBits based on the resources used by the given shader info. */
@@ -2571,7 +3379,141 @@ index 7eae64c..9084fec 100644
  	dst.usesPhysicalStorageBufferAddresses = results.usesPhysicalStorageBufferAddressesCapability;
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Swizzle,       results.needsSwizzleBuffer);
  	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Output,        results.needsOutputBuffer);
-@@ -1190,7 +1201,9 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -708,6 +727,9 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ {
+ 	// Extract dynamic state first, as it can affect many configurations.
+ 	initDynamicState(pCreateInfo);
++	// Madeira: used to recognize vertex-free full-screen triangle/quad passes.
++	_madeiraHasVertexInput = pCreateInfo->pVertexInputState &&
++		pCreateInfo->pVertexInputState->vertexBindingDescriptionCount != 0;
+ 
+ 	_primitiveTopologyClass = MTLPrimitiveTopologyClassUnspecified;
+ 	if (pCreateInfo->pInputAssemblyState)
+@@ -998,6 +1020,41 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPipelineDescriptor* plDesc,
+ 																	 id<MTLRenderPipelineState>& plState) {
+ 	if ( !plState ) {
++		if (getDevice()->asyncPipelinesEnabled()) {
++			// Madeira: only the in-memory PSO cache is safe on the creation thread. Even
++			// a FailOnBinaryArchiveMiss probe can spend tens of milliseconds on a miss.
++			plState = getDevice()->getCachedPipeline(plDesc); // retained
++			if (plState) { return plState; }
++
++			std::string key = getDevice()->getAsyncPipelineKey(plDesc);
++			id<MTLRenderPipelineState>* stateSlot = &plState;
++			{
++				lock_guard<mutex> lock(_asyncPipelineLock);
++				++_asyncPipelinePending;
++				_asyncPipelineKeys.push_back(key);
++			}
++			retain();
++			getDevice()->enqueueAsyncPipeline(key, plDesc, !_madeiraHasVertexInput, ^(id<MTLRenderPipelineState> state) {
++				{
++					lock_guard<mutex> lock(_asyncPipelineLock);
++					if (state) {
++						*stateSlot = [state retain];
++					} else {
++						_asyncPipelineFailed = true;
++						if (!_asyncPipelineFailureLogged) {
++							_asyncPipelineFailureLogged = true;
++							fprintf(stderr, "[mvk-async] graphics pipeline compile failed; draws will be skipped\n");
++						}
++					}
++					--_asyncPipelinePending;
++					auto found = std::find(_asyncPipelineKeys.begin(), _asyncPipelineKeys.end(), key);
++					if (found != _asyncPipelineKeys.end()) { _asyncPipelineKeys.erase(found); }
++				}
++				_asyncPipelineCV.notify_all();
++				release();
++			});
++			return nil;
++		}
+ 		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
+ 		plState = plc->newMTLRenderPipelineState(plDesc);	// retained
+ 		plc->destroy();
+@@ -1006,12 +1063,68 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 	return plState;
+ }
+ 
++id<MTLRenderPipelineState> MVKGraphicsPipeline::getMainPipelineState() const {
++	lock_guard<mutex> lock(_asyncPipelineLock);
++	return _mtlPipelineState;
++}
++
++id<MTLRenderPipelineState> MVKGraphicsPipeline::getMultiviewPipelineState(uint32_t mv) const {
++	lock_guard<mutex> lock(_asyncPipelineLock);
++	if (_multiviewMTLPipelineStates.empty()) { return _mtlPipelineState; }
++	auto it = _multiviewMTLPipelineStates.find(mv);
++	// Madeira: the first multiview variant aliases the main state during construction.
++	return it == _multiviewMTLPipelineStates.end() || !it->second ? _mtlPipelineState : it->second;
++}
++
++bool MVKGraphicsPipeline::shouldSkipDraw(uint32_t vertexCount, uint32_t instanceCount,
++										 bool onlyDrawInSubpass, uint32_t drawCount) {
++	unique_lock<mutex> lock(_asyncPipelineLock);
++	if (_asyncPipelinePending) {
++		// Madeira: a draw makes all of its queued variants urgent. The scheduler's
++		// deque gives newly needed work LIFO behavior without duplicating compiles.
++		for (const auto& key : _asyncPipelineKeys) { getDevice()->prioritizeAsyncPipeline(key); }
++
++		bool fullscreen = onlyDrawInSubpass ||
++			((_vkVertexBuffers.bits() == 0 || !_madeiraHasVertexInput) &&
++			 (vertexCount == 3 || vertexCount == 4) && instanceCount == 1);
++		uint32_t waitMS = 0;
++		uint32_t reservedBudgetMS = 0;
++		bool budgetWait = false;
++		if (fullscreen) {
++			waitMS = getDevice()->asyncPipelineFullscreenWaitMS();
++		} else {
++			waitMS = getDevice()->reserveAsyncPipelineFrameBudgetMS();
++			reservedBudgetMS = waitMS;
++			budgetWait = waitMS != 0;
++			// Madeira: preserve the old one-time wait knob as a minimum first wait.
++			if (!_asyncPipelineWaitAttempted) { waitMS = std::max(waitMS, getDevice()->asyncPipelineWaitMS()); }
++		}
++		_asyncPipelineWaitAttempted = true;
++		if (waitMS) {
++			uint64_t start = mvkTimeNow();
++			_asyncPipelineCV.wait_for(lock, chrono::milliseconds(waitMS), [&]{ return !_asyncPipelinePending; });
++			uint64_t elapsed = mvkTimeNow() - start;
++			if (fullscreen) {
++				mvkTimeAsyncFullscreenWait(elapsed);
++			} else if (budgetWait) {
++				uint64_t reserved = (uint64_t)reservedBudgetMS * 1000000ull;
++				if (elapsed < reserved) { getDevice()->refundAsyncPipelineFrameBudgetNS(reserved - elapsed); }
++				mvkTimeAsyncBudgetWait(elapsed);
++			}
++		}
++	}
++	bool skip = _asyncPipelinePending || _asyncPipelineFailed;
++	lock.unlock();
++	if (skip) { mvkTimeAsyncSkippedDraw(drawCount); }
++	return skip;
++}
++
+ // Either returns an existing pipeline state or compiles a new one.
+ id<MTLComputePipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLComputePipelineDescriptor* plDesc,
+ 																	  id<MTLComputePipelineState>& plState,
+ 																	  const char* compilerType) {
+ 	if ( !plState ) {
+-		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this, compilerType);
++		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this, compilerType, kMVKArchiveTessellation);
+ 		plState = plc->newMTLComputePipelineState(plDesc);	// retained
+ 		plc->destroy();
+ 		if ( !plState ) { _hasValidMTLPipelineStates = false; }
+@@ -1116,7 +1229,10 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 				adjustVertexInputForMultiview(plDesc.vertexDescriptor, pCreateInfo->pVertexInputState, *count);
+ 				getOrCompilePipeline(plDesc, _mtlPipelineState);
+ 				if (viewCounts.size() > 1) {
+-					_multiviewMTLPipelineStates[*count] = _mtlPipelineState;
++					{
++						lock_guard<mutex> lock(_asyncPipelineLock);
++						_multiviewMTLPipelineStates[*count] = _mtlPipelineState;
++					}
+ 					uint32_t oldCount = *count++;
+ 					for (auto last = viewCounts.cend(); count != last; ++count) {
+ 						if (_multiviewMTLPipelineStates.count(*count)) { continue; }
+@@ -1190,7 +1306,9 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  
  	// Vertex input
  	// This needs to happen before compiling the fragment shader, or we'll lose information on vertex attributes.
@@ -2581,7 +3523,7 @@ index 7eae64c..9084fec 100644
  
  	// Fragment shader - only add if rasterization is enabled
  	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pFragmentSS, pFragmentFB)) { return nil; }
-@@ -1236,6 +1249,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+@@ -1236,6 +1354,15 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
  	// Vertex input
  	plDesc.stageInputDescriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
  	if (!addVertexInputToPipeline(plDesc.stageInputDescriptor, pCreateInfo->pVertexInputState, shaderConfig)) { return nil; }
@@ -2597,7 +3539,7 @@ index 7eae64c..9084fec 100644
  	plDesc.stageInputDescriptor.indexBufferIndex = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids[MVKImplicitBuffer::Index];
  
  	plDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-@@ -1515,7 +1537,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1515,7 +1642,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  
  	auto& funcRslts = func.shaderConversionResults;
  	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
@@ -2606,7 +3548,7 @@ index 7eae64c..9084fec 100644
  	_stageResources[kMVKShaderStageVertex].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
  	_layout->populateBindOperations(_stageResources[kMVKShaderStageVertex].bindScript, shaderConfig, spv::ExecutionModelVertex);
  
-@@ -1562,7 +1584,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1562,7 +1689,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  		pVtxFunctions[i] = func;
  
  		auto& funcRslts = func.shaderConversionResults;
@@ -2615,7 +3557,7 @@ index 7eae64c..9084fec 100644
  	}
  
  	_layout->populateBindOperations(_stageResources[kMVKShaderStageVertex].bindScript, shaderConfig, spv::ExecutionModelVertex);
-@@ -1604,7 +1626,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1604,7 +1731,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  		MVKImplicitBuffer::IndirectParams,
  		MVKImplicitBuffer::TessLevel,
  	});
@@ -2624,7 +3566,7 @@ index 7eae64c..9084fec 100644
  	_layout->populateBindOperations(_stageResources[kMVKShaderStageTessCtl].bindScript, shaderConfig, spv::ExecutionModelTessellationControl);
  
  	return verifyImplicitBuffers(kMVKShaderStageTessCtl);
-@@ -1637,7 +1659,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1637,7 +1764,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  
  	auto& funcRslts = func.shaderConversionResults;
  	plDesc.rasterizationEnabled = !funcRslts.isRasterizationDisabled;
@@ -2633,7 +3575,7 @@ index 7eae64c..9084fec 100644
  	_stageResources[kMVKShaderStageTessEval].implicitBuffers.needed.set(MVKImplicitBuffer::EmulatedReversedDepthViewport, shaderConfig.options.mslOptions.emulate_reversed_depth_viewport);
  	_layout->populateBindOperations(_stageResources[kMVKShaderStageTessEval].bindScript, shaderConfig, spv::ExecutionModelTessellationEvaluation);
  
-@@ -1658,6 +1680,22 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1658,6 +1785,22 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  	auto& mtlFeats = getMetalFeatures();
  	if (pFragmentSS) {
  		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
@@ -2656,7 +3598,7 @@ index 7eae64c..9084fec 100644
  		addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
  		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
  		shaderConfig.options.entryPointName = pFragmentSS->pName;
-@@ -1698,7 +1736,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1698,7 +1841,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  		if ( !mtlFunc ) { return false; }
  
  		auto& funcRslts = func.shaderConversionResults;
@@ -2665,7 +3607,7 @@ index 7eae64c..9084fec 100644
  		_layout->populateBindOperations(_stageResources[kMVKShaderStageFragment].bindScript, shaderConfig, spv::ExecutionModelFragment);
  	}
  	return verifyImplicitBuffers(kMVKShaderStageFragment);
-@@ -1872,6 +1910,68 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1872,6 +2015,68 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  	return true;
  }
  
@@ -2734,7 +3676,7 @@ index 7eae64c..9084fec 100644
  // Adjusts step rates for per-instance vertex buffers based on the number of views to be drawn.
  void MVKGraphicsPipeline::adjustVertexInputForMultiview(MTLVertexDescriptor* inputDesc, const VkPipelineVertexInputStateCreateInfo* pVI, uint32_t viewCount, uint32_t oldViewCount) {
  	uint32_t vbCnt = pVI->vertexBindingDescriptionCount;
-@@ -1949,6 +2049,15 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1949,6 +2154,15 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  
  	// Color attachments - must ignore bad pColorBlendState pointer if rasterization is disabled or subpass has no color attachments
      if (_isRasterizingColor && pCreateInfo->pColorBlendState) {
@@ -2750,7 +3692,7 @@ index 7eae64c..9084fec 100644
          for (uint32_t caIdx = 0; caIdx < pCreateInfo->pColorBlendState->attachmentCount; caIdx++) {
              const VkPipelineColorBlendAttachmentState* pCA = &pCreateInfo->pColorBlendState->pAttachments[caIdx];
  
-@@ -1991,8 +2100,18 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1991,8 +2205,18 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  					plDesc.logicOperationMVK = mvkMTLLogicOperationFromVkLogicOp(pCreateInfo->pColorBlendState->logicOp);
  				}
  #endif
@@ -2771,7 +3713,7 @@ index 7eae64c..9084fec 100644
              }
          }
      }
-@@ -2392,6 +2511,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -2392,6 +2616,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  }
  
  MVKGraphicsPipeline::~MVKGraphicsPipeline() {
@@ -2779,7 +3721,61 @@ index 7eae64c..9084fec 100644
  	@synchronized (getMTLDevice()) {
  		[_mtlTessVertexStageState release];
  		[_mtlTessVertexStageIndex16State release];
-@@ -2545,7 +2665,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -2464,12 +2689,36 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		// The best we can do at this point is set the pipeline name from the layout.
+ 		setMetalObjectLabel(plDesc, ((MVKPipelineLayout*)pCreateInfo->layout)->getDebugName());
+ 
+-		MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
+-		_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
+-		plc->destroy();
++		if (getDevice()->asyncComputePipelinesEnabled()) {
++			// Madeira: move archive probing and compilation ahead of first use. Dispatch
++			// waits for completion, so compute work is never dropped.
++			_mtlPipelineState = getDevice()->getCachedPipeline(plDesc); // retained
++			if (!_mtlPipelineState) {
++				std::string key = getDevice()->getAsyncPipelineKey(plDesc);
++				{
++					lock_guard<mutex> lock(_asyncPipelineLock);
++					_asyncPipelinePending = true;
++				}
++				retain();
++				getDevice()->enqueueAsyncPipeline(key, plDesc, ^(id<MTLComputePipelineState> state) {
++					{
++						lock_guard<mutex> lock(_asyncPipelineLock);
++						if (state) { _mtlPipelineState = [state retain]; }
++						else { _asyncPipelineFailed = true; }
++						_asyncPipelinePending = false;
++					}
++					_asyncPipelineCV.notify_all();
++					release();
++				});
++			}
++		} else {
++			MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
++			_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
++			plc->destroy();
++		}
+ 		[plDesc release];															// temp release
+ 
+-		if ( !_mtlPipelineState ) { _hasValidMTLPipelineStates = false; }
++		if ( !_mtlPipelineState && !getDevice()->asyncComputePipelinesEnabled() ) { _hasValidMTLPipelineStates = false; }
+ 	} else {
+ 		_hasValidMTLPipelineStates = false;
+ 	}
+@@ -2482,6 +2731,12 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	verifyImplicitBuffers(_stageResources.implicitBuffers, "Compute", _descriptorBufferCounts.stages[kMVKShaderStageCompute], this);
+ }
+ 
++id<MTLComputePipelineState> MVKComputePipeline::getPipelineState() {
++	unique_lock<mutex> lock(_asyncPipelineLock);
++	if (_asyncPipelinePending) { _asyncPipelineCV.wait(lock, [&]{ return !_asyncPipelinePending; }); }
++	return _asyncPipelineFailed ? nil : _mtlPipelineState;
++}
++
+ // Returns a MTLFunction to use when creating the MTLComputePipelineState.
+ MVKMTLFunction MVKComputePipeline::getMTLFunction(const VkComputePipelineCreateInfo* pCreateInfo,
+ 												  VkPipelineCreationFeedback* pStageFB) {
+@@ -2545,7 +2800,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  		}
  	}
  	auto& funcRslts = func.shaderConversionResults;
@@ -2788,7 +3784,7 @@ index 7eae64c..9084fec 100644
  	_layout->populateBindOperations(_stageResources.bindScript, shaderConfig, spv::ExecutionModelGLCompute);
  
  	return func;
-@@ -3027,7 +3147,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
+@@ -3027,7 +3282,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionConfiguration& cfg) {
  				cfg.shaderOutputs,
  				cfg.resourceBindings,
  				cfg.discreteDescriptorSets,
@@ -2798,7 +3794,7 @@ index 7eae64c..9084fec 100644
  	}
  
  	template<class Archive>
-@@ -3092,10 +3213,20 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3092,20 +3348,41 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
  #pragma mark -
  #pragma mark MVKRenderPipelineCompiler
  
@@ -2810,7 +3806,14 @@ index 7eae64c..9084fec 100644
 +	uint64_t mvkTimeStart = mvkTimeNow();
  
  	compile(lock, ^{
-+		if (id<MTLRenderPipelineState> state = getDevice()->newArchivedPipeline(mtlRPLDesc)) {
++		if (id<MTLRenderPipelineState> state = getDevice()->getCachedPipeline(mtlRPLDesc)) {
++			bool isLate = compileComplete(state, nil);
++			[state release];
++			if (isLate) { destroy(); }
++			return;
++		}
++		if (id<MTLRenderPipelineState> state = getDevice()->newArchivedPipeline(mtlRPLDesc, kMVKArchiveGraphicsSyncVariant, true)) {
++			getDevice()->cachePipeline(mtlRPLDesc, state);
 +			bool isLate = compileComplete(state, nil);
 +			[state release];
 +			if (isLate) { destroy(); }
@@ -2818,8 +3821,14 @@ index 7eae64c..9084fec 100644
 +		}
  		auto mtlDev = getMTLDevice();
  		@synchronized (mtlDev) {
++			uint64_t stateStart = mvkTimeNow();
  			[mtlDev newRenderPipelineStateWithDescriptor: mtlRPLDesc
-@@ -3106,6 +3237,7 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+ 									   completionHandler: ^(id<MTLRenderPipelineState> ps, NSError* error) {
++										   mvkTimeAdd(4, stateStart);
++										   getDevice()->cachePipeline(mtlRPLDesc, ps);
+ 										   bool isLate = compileComplete(ps, error);
+ 										   if (isLate) { destroy(); }
+ 									   }];
  		}
  	});
  
@@ -2827,11 +3836,21 @@ index 7eae64c..9084fec 100644
  	return [_mtlRenderPipelineState retain];
  }
  
-@@ -3130,6 +3262,12 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+@@ -3128,19 +3405,37 @@ void serialize(Archive & archive, MVKCompressor<C>& comp) {
+ 
+ id<MTLComputePipelineState> MVKComputePipelineCompiler::newMTLComputePipelineState(MTLComputePipelineDescriptor* plDesc) {
  	unique_lock<mutex> lock(_completionLock);
++	uint64_t mvkTimeStart = mvkTimeNow();
  
  	compile(lock, ^{
-+		if (id<MTLComputePipelineState> state = getDevice()->newArchivedPipeline(plDesc)) {
++		if (id<MTLComputePipelineState> state = getDevice()->getCachedPipeline(plDesc)) {
++			bool isLate = compileComplete(state, nil);
++			[state release];
++			if (isLate) { destroy(); }
++			return;
++		}
++		if (id<MTLComputePipelineState> state = getDevice()->newArchivedPipeline(plDesc, _archiveKind, true)) {
++			getDevice()->cachePipeline(plDesc, state);
 +			bool isLate = compileComplete(state, nil);
 +			[state release];
 +			if (isLate) { destroy(); }
@@ -2839,7 +3858,22 @@ index 7eae64c..9084fec 100644
 +		}
  		auto mtlDev = getMTLDevice();
  		@synchronized (mtlDev) {
++			uint64_t stateStart = mvkTimeNow();
  			[mtlDev newComputePipelineStateWithDescriptor: plDesc
+ 												  options: MTLPipelineOptionNone
+ 										completionHandler: ^(id<MTLComputePipelineState> ps, MTLComputePipelineReflection*, NSError* error) {
++											mvkTimeAdd(4, stateStart);
++											getDevice()->cachePipeline(plDesc, ps);
+ 											bool isLate = compileComplete(ps, error);
+ 											if (isLate) { destroy(); }
+ 										}];
+ 		}
+ 	});
+ 
++	mvkTimeAdd(2, mvkTimeStart);
+ 	return [_mtlComputePipelineState retain];
+ }
+ 
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
 index b18549c..3009bdb 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
@@ -2900,7 +3934,7 @@ index b18549c..3009bdb 100644
  	MVKSmallVector<MVKCommandBufferSubmitInfo, N> _cmdBuffers;
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
-index dec4b45..719cec3 100644
+index dec4b45..45f421a 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
 @@ -24,6 +24,10 @@
@@ -3040,7 +4074,19 @@ index dec4b45..719cec3 100644
  	_queue->_submissionCaptureScope->beginScope();
  
  	// If using encoded semaphore waiting, do so now.
-@@ -553,6 +646,7 @@
+@@ -485,7 +578,10 @@
+ // Returns the active MTLCommandBuffer, lazily retrieving it from the queue if needed.
+ id<MTLCommandBuffer> MVKQueueCommandBufferSubmission::getActiveMTLCommandBuffer() {
+ 	if ( !_activeMTLCommandBuffer ) {
+-		bool needsRetain = false;
++		// Madeira: async PSO cache eviction and Vulkan pipeline destruction can release
++		// a Metal pipeline after encoding. Retain all encoded Metal objects until GPU
++		// completion while async compilation is enabled.
++		bool needsRetain = _device->asyncPipelinesEnabled();
+ 		if (!_device->hasResidencySet() && (getEnabledDescriptorIndexingFeatures().descriptorBindingPartiallyBound || getMVKConfig().liveCheckAllResources)) {
+ 			// Partially bound descriptors will get bound by us even if they're not used at runtime by the shader.
+ 			// The application is free to destroy them even if they're not used at runtime even if we bound them.
+@@ -553,6 +649,7 @@
  
  	// Retrieve the result before committing MTLCommandBuffer, because finish() will destroy this instance.
  	VkResult rslt = mtlCmdBuff ? getConfigurationResult() : VK_ERROR_OUT_OF_POOL_MEMORY;
@@ -3048,7 +4094,7 @@ index dec4b45..719cec3 100644
  	[mtlCmdBuff commit];
  	[mtlCmdBuff release];		// retained
  
-@@ -712,7 +806,58 @@
+@@ -712,7 +809,59 @@
  // If the semaphores are encodable, wait on them by encoding them on the MTLCommandBuffer before presenting.
  // If the semaphores are not encodable, wait on them inline after presenting.
  // The semaphores know what to do.
@@ -3102,12 +4148,13 @@ index dec4b45..719cec3 100644
 +}
 +
  VkResult MVKQueuePresentSurfaceSubmission::execute() {
++	_device->resetAsyncPipelineFrameBudget();	// Madeira: vkQueuePresentKHR starts a fresh wait budget.
 +	if (mvkMadeiraCPUOptions().skipEmptySubmit) { _madeiraSeq = _queue->madeiraBeginSubmission(); }	// Madeira: see madeiraBeginSubmission()
 +
  	// MTLCommandBuffer retain references to avoid rare case where objects are destroyed too early.
  	// Although testing could not determine which objects were being lost, queue present MTLCommandBuffers
  	// are used only once per frame, and retain so few objects, that blanket retention is still performant.
-@@ -742,12 +887,16 @@
+@@ -742,12 +891,16 @@
  	// or if the MTLCommandBuffer could not be created, call finish() directly.
  	// Retrieve the result first, because finish() will destroy this instance.
  	VkResult rslt = getConfigurationResult();
@@ -3125,7 +4172,7 @@ index dec4b45..719cec3 100644
  }
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
-index c5b7499..2ccf37b 100644
+index c5b7499..f68fa3e 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
 @@ -39,6 +39,7 @@ class MVKShaderModule;
@@ -3136,7 +4183,7 @@ index c5b7499..2ccf37b 100644
  	id<MTLFunction> getMTLFunction() { return _mtlFunction; }
  
  	MVKMTLFunction(id<MTLFunction> mtlFunc, const mvk::SPIRVToMSLConversionResultInfo scRslts, MTLSize tgSize);
-@@ -149,10 +150,13 @@ protected:
+@@ -149,10 +150,14 @@ protected:
  	void compressMSL(const std::string& msl);
  	void decompressMSL(std::string& msl);
  	MVKCompressor<std::string>& getCompressedMSL() { return _compressedMSL; }
@@ -3147,10 +4194,11 @@ index c5b7499..2ccf37b 100644
  	id<MTLLibrary> _mtlLibrary;
  	MVKCompressor<std::string> _compressedMSL;
 +	uint64_t _madeiraMSL = 0;	// Madeira frame dump: this library's id in the MSL registry
++	uint64_t _madeiraFunctionKey = 0;	// Madeira: stable source and compile-option identity for PSO reuse
  	mvk::SPIRVToMSLConversionResultInfo _shaderConversionResultInfo;
  
  	/** When true, representing a library created with source, but never specialized */
-@@ -162,6 +166,13 @@ protected:
+@@ -162,6 +167,13 @@ protected:
  };
  
  
@@ -3165,10 +4213,10 @@ index c5b7499..2ccf37b 100644
  #pragma mark MVKShaderLibraryCache
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a4..cc2a5b3 100644
+index 3aa44a4..e32e67f 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-@@ -17,9 +17,13 @@
+@@ -17,13 +17,22 @@
   */
  
  #include "MVKShaderModule.h"
@@ -3182,7 +4230,16 @@ index 3aa44a4..cc2a5b3 100644
  
  using namespace std;
  using namespace mvk;
-@@ -34,6 +38,7 @@
+ 
++uint64_t mvkTimeNow();
++void mvkTimeAdd(int kind, uint64_t start);
++void mvkTimeArchiveResult(bool hit, bool verified);
++void mvkTimePSOCacheResult(bool hit);
++
+ MVKMTLFunction::MVKMTLFunction(id<MTLFunction> mtlFunc, const SPIRVToMSLConversionResultInfo scRslts, MTLSize tgSize) {
+ 	_mtlFunction = [mtlFunc retain];		// retained
+ 	shaderConversionResults = scRslts;
+@@ -34,6 +43,7 @@
  	_mtlFunction = [other._mtlFunction retain];		// retained
  	shaderConversionResults = other.shaderConversionResults;
  	threadGroupSize = other.threadGroupSize;
@@ -3190,7 +4247,7 @@ index 3aa44a4..cc2a5b3 100644
  }
  
  MVKMTLFunction& MVKMTLFunction::operator=(const MVKMTLFunction& other) {
-@@ -44,6 +49,7 @@
+@@ -44,6 +54,7 @@
  
  	shaderConversionResults = other.shaderConversionResults;
  	threadGroupSize = other.threadGroupSize;
@@ -3198,7 +4255,36 @@ index 3aa44a4..cc2a5b3 100644
  	return *this;
  }
  
-@@ -166,10 +172,30 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -76,6 +87,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	if ( !_mtlLibrary ) { return MVKMTLFunctionNull; }
+ 
+ 	id<MTLLibrary> lib = _mtlLibrary;
++	uint64_t libraryKey = _madeiraFunctionKey;
+ 
+ 	// If specialization happens on constants mapped to macro, find or compile a library variant
+ 	// with proper macro definition instead of the "generic" library
+@@ -101,10 +113,12 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 			auto entry = _specializationVariants.find(spec_list);
+ 			if (entry != _specializationVariants.end()) {
+ 				lib = entry->second->_mtlLibrary;
++				libraryKey = entry->second->_madeiraFunctionKey;
+ 			} else {
+ 				MVKShaderLibrary *new_mvklib = new MVKShaderLibrary(_owner, _shaderConversionResultInfo, _compressedMSL, &spec_list);
+ 				_specializationVariants[spec_list] = new_mvklib;
+ 				lib = new_mvklib->_mtlLibrary;
++				libraryKey = new_mvklib->_madeiraFunctionKey;
+ 			}
+ 		}
+ 	}
+@@ -113,6 +127,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	@synchronized (getMTLDevice()) {
+ 		@autoreleasepool {
+ 			NSString* mtlFuncName = @(_shaderConversionResultInfo.entryPoint.mtlFunctionName.c_str());
++			uint64_t mvkFunctionStart = mvkTimeNow();
+ 
+ 			uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
+ 			id<MTLFunction> mtlFunc = [[lib newFunctionWithName: mtlFuncName] autorelease];
+@@ -166,10 +181,53 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			if ( !dbName ) { dbName = _owner->getDebugName(); }
  			_owner->setMetalObjectLabel(mtlFunc, dbName);
  
@@ -3219,6 +4305,29 @@ index 3aa44a4..cc2a5b3 100644
 +				objc_setAssociatedObject(mtlFunc, &kMVKArchiveShaderKey,
 +					@(routeHash), OBJC_ASSOCIATION_RETAIN);
 +			}
++			// Madeira: stable function identity for the process-wide PSO cache. Include
++			// the complete library source, exported name, and specialization data; a
++			// newly-created MTLFunction for the same inputs must produce the same key.
++			if (mtlFunc && !objc_getAssociatedObject(mtlFunc, &kMVKPipelineFunctionKey)) {
++				uint64_t functionHash = libraryKey;
++				functionHash = mvkHash(_shaderConversionResultInfo.entryPoint.mtlFunctionName.data(),
++					_shaderConversionResultInfo.entryPoint.mtlFunctionName.size(), functionHash);
++				if (pSpecializationInfo) {
++					vector<const VkSpecializationMapEntry*> entries;
++					for (uint32_t idx = 0; idx < pSpecializationInfo->mapEntryCount; ++idx) { entries.push_back(&pSpecializationInfo->pMapEntries[idx]); }
++					sort(entries.begin(), entries.end(), [](auto* a, auto* b) { return a->constantID < b->constantID; });
++					for (auto* pEntry : entries) {
++						const auto& entry = *pEntry;
++						functionHash = mvkHash((const char*)&entry.constantID, sizeof(entry.constantID), functionHash);
++						functionHash = mvkHash((const char*)&entry.size, sizeof(entry.size), functionHash);
++						functionHash = mvkHash((const char*)pSpecializationInfo->pData + entry.offset,
++							entry.size, functionHash);
++					}
++				}
++				objc_setAssociatedObject(mtlFunc, &kMVKPipelineFunctionKey,
++					@(functionHash), OBJC_ASSOCIATION_RETAIN);
++			}
++			mvkTimeAdd(3, mvkFunctionStart);
 +
  			auto& wgSize = _shaderConversionResultInfo.entryPoint.workgroupSize;
 -			return MVKMTLFunction(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
@@ -3232,7 +4341,7 @@ index 3aa44a4..cc2a5b3 100644
  		}
  	}
  }
-@@ -185,6 +211,33 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -185,6 +243,33 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	wgSize.depth.size = z;
  }
  
@@ -3266,7 +4375,7 @@ index 3aa44a4..cc2a5b3 100644
  // Sets the cached MSL source code, after first compressing it.
  void MVKShaderLibrary::compressMSL(const string& msl) {
  	uint64_t startTime = getPerformanceTimestamp();
-@@ -207,6 +260,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -207,6 +292,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  	_shaderConversionResultInfo = conversionResult.resultInfo;
  	compressMSL(conversionResult.msl);
@@ -3274,7 +4383,7 @@ index 3aa44a4..cc2a5b3 100644
  	compileLibrary(conversionResult.msl);
  }
  
-@@ -220,6 +274,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -220,6 +306,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  
  	_shaderConversionResultInfo = resultInfo;
  	_compressedMSL = compressedMSL;
@@ -3282,15 +4391,50 @@ index 3aa44a4..cc2a5b3 100644
  	string msl;
  	decompressMSL(msl);
  	compileLibrary(msl, specializationMacroDef);
-@@ -276,6 +331,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -240,6 +327,17 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 			}
+ 		}
+ 	}
++	// Madeira: calculate this once per compiled library. Function creation below
++	// only needs to add the entry point and function constants to this identity.
++	_madeiraFunctionKey = mvkHash(msl.data(), msl.size());
++	for (auto& macro : macro_def) {
++		_madeiraFunctionKey = mvkHash(macro.first.name.data(), macro.first.name.size(), _madeiraFunctionKey);
++		_madeiraFunctionKey = mvkHash((const char*)&macro.second, sizeof(macro.second), _madeiraFunctionKey);
++	}
++	auto fastMath = _shaderConversionResultInfo.entryPoint.fpFastMathFlags;
++	_madeiraFunctionKey = mvkHash((const char*)&fastMath, sizeof(fastMath), _madeiraFunctionKey);
++	_madeiraFunctionKey = mvkHash((const char*)&_shaderConversionResultInfo.isPositionInvariant,
++		sizeof(_shaderConversionResultInfo.isPositionInvariant), _madeiraFunctionKey);
+ 
+ 	_mtlLibrary = slc->newMTLLibrary(nsSrc, _shaderConversionResultInfo, macro_def);	// retained
+ 	[nsSrc release];														// release temp string
+@@ -252,6 +350,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	MVKBaseDeviceObject(owner->getDevice()),
+ 	_owner(owner),
+ 	_maySpecializeWithMacro(false) {
++	_madeiraFunctionKey = mvkHash((const char*)mslCompiledCodeData, mslCompiledCodeLength);
+ 
+     uint64_t startTime = getPerformanceTimestamp();
+     @autoreleasepool {
+@@ -276,6 +375,8 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	_mtlLibrary = [other._mtlLibrary retain];
  	_shaderConversionResultInfo = other._shaderConversionResultInfo;
  	_compressedMSL = other._compressedMSL;
++	_madeiraFunctionKey = other._madeiraFunctionKey;
 +	madeiraRegister();
  }
  
  MVKShaderLibrary& MVKShaderLibrary::operator=(const MVKShaderLibrary& other) {
-@@ -306,6 +362,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -286,6 +387,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	_owner = other._owner;
+ 	_shaderConversionResultInfo = other._shaderConversionResultInfo;
+ 	_compressedMSL = other._compressedMSL;
++	_madeiraFunctionKey = other._madeiraFunctionKey;
+ 	return *this;
+ }
+ 
+@@ -306,6 +408,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  }
  
  MVKShaderLibrary::~MVKShaderLibrary() {
@@ -3301,7 +4445,7 @@ index 3aa44a4..cc2a5b3 100644
  	[_mtlLibrary release];
  
  	for (auto& item: _specializationVariants) {
-@@ -415,6 +475,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -415,6 +521,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
  }
  
@@ -3311,7 +4455,7 @@ index 3aa44a4..cc2a5b3 100644
  bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
  							  SPIRVToMSLConversionResult& conversionResult) {
  	const auto& mvkCfg = getMVKConfig();
-@@ -422,7 +485,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -422,7 +531,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
  
  	uint64_t startTime = getPerformanceTimestamp();
@@ -3321,7 +4465,7 @@ index 3aa44a4..cc2a5b3 100644
  	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
  
  	const char* dumpDir = getMVKConfig().shaderDumpDir;
-@@ -554,10 +619,244 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -554,10 +665,309 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  #pragma mark -
  #pragma mark MVKShaderLibraryCompiler
  
@@ -3333,24 +4477,89 @@ index 3aa44a4..cc2a5b3 100644
 +// compiled this run. A summary every 512 events of each kind.
 +#include <chrono>
 +#include <unordered_set>
-+static std::atomic<uint64_t> g_mvkt_n[3], g_mvkt_ns[3], g_mvkt_repeat;
++static std::atomic<uint64_t> g_mvkt_n[6], g_mvkt_ns[6], g_mvkt_repeat;
++static std::atomic<uint64_t> g_mvkt_archiveHits, g_mvkt_archiveMisses, g_mvkt_archiveVerified;
++static std::atomic<uint64_t> g_mvkt_archiveHitNS, g_mvkt_archiveMissNS;
++static std::atomic<uint64_t> g_mvkt_archiveMissKind[kMVKArchivePipelineKindCount];
++static std::atomic<uint64_t> g_mvkt_archiveSyncMissNS[kMVKArchivePipelineKindCount];
++static std::atomic<uint64_t> g_mvkt_psoHits, g_mvkt_psoMisses;
++static std::atomic<uint64_t> g_mvkt_asyncStarted, g_mvkt_asyncCompleted, g_mvkt_asyncFailed, g_mvkt_asyncSkippedDraws;
++static std::atomic<uint64_t> g_mvkt_asyncDedupeHits, g_mvkt_asyncPriorityBumps;
++static std::atomic<uint64_t> g_mvkt_asyncBudgetWaits, g_mvkt_asyncBudgetWaitNS;
++static std::atomic<uint64_t> g_mvkt_asyncFullscreenWaits, g_mvkt_asyncFullscreenWaitNS;
++static std::atomic<uint32_t> g_mvkt_asyncQueueDepth, g_mvkt_asyncQueueDepthMax;
 +static std::mutex g_mvkt_lock;
 +static std::unordered_set<size_t>* g_mvkt_sources;
++void mvkTimeAsyncStarted();
++void mvkTimeAsyncCompleted();
++void mvkTimeAsyncFailed();
++void mvkTimeAsyncSkippedDraw(uint32_t count);
++void mvkTimeAsyncDedupeHit();
++void mvkTimeAsyncPriorityBump();
++void mvkTimeAsyncBudgetWait(uint64_t nanoseconds);
++void mvkTimeAsyncFullscreenWait(uint64_t nanoseconds);
++void mvkTimeAsyncQueueDepth(uint32_t depth);
++void mvkTimeArchiveResult(bool hit, bool verified, uint64_t nanoseconds, MVKArchivePipelineKind kind);
++void mvkTimeArchiveSyncMiss(MVKArchivePipelineKind kind, uint64_t nanoseconds);
 +uint64_t mvkTimeNow() {
 +	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 +}
++void mvkTimeAddElapsed(int kind, uint64_t elapsed);
 +void mvkTimeAdd(int kind, uint64_t start) {
-+	static const char* names[3] = { "convert", "library", "pipeline" };
++	mvkTimeAddElapsed(kind, mvkTimeNow() - start);
++}
++void mvkTimeAddElapsed(int kind, uint64_t elapsed) {
++	static const char* names[6] = { "convert", "library", "pipeline", "function", "pipeline-state", "archive-lookup" };
 +	uint64_t n = ++g_mvkt_n[kind];
-+	g_mvkt_ns[kind] += mvkTimeNow() - start;
++	g_mvkt_ns[kind] += elapsed;
 +	if (n % 512 == 0) {
-+		fprintf(stderr, "[mvk-time] %s#%llu | convert n=%llu avg=%.1fms | library n=%llu avg=%.1fms repeats=%llu | pipeline n=%llu avg=%.1fms\n",
++		fprintf(stderr, "[mvk-time] %s#%llu | convert n=%llu avg=%.1fms | library n=%llu avg=%.1fms repeats=%llu | function-fetch n=%llu avg=%.1fms | pipeline-state n=%llu avg=%.1fms | archive-hit n=%llu avg=%.1fms miss n=%llu avg=%.1fms verified=%llu | archive-misses graphics-async=%llu graphics-sync-variant=%llu/%.1fms compute=%llu/%.1fms tessellation=%llu/%.1fms | pipeline n=%llu avg=%.1fms pso-hits=%llu pso-misses=%llu | async-started=%llu completed=%llu failed=%llu dedupe-hits=%llu priority-bumps=%llu skipped-draws=%llu budget-waits=%llu/%.1fms fullscreen-waits=%llu/%.1fms queue-depth=%u/%u\n",
 +				names[kind], (unsigned long long)n,
 +				(unsigned long long)g_mvkt_n[0].load(), g_mvkt_n[0] ? g_mvkt_ns[0] / 1e6 / g_mvkt_n[0] : 0.0,
 +				(unsigned long long)g_mvkt_n[1].load(), g_mvkt_n[1] ? g_mvkt_ns[1] / 1e6 / g_mvkt_n[1] : 0.0,
 +				(unsigned long long)g_mvkt_repeat.load(),
-+				(unsigned long long)g_mvkt_n[2].load(), g_mvkt_n[2] ? g_mvkt_ns[2] / 1e6 / g_mvkt_n[2] : 0.0);
++				(unsigned long long)g_mvkt_n[3].load(), g_mvkt_n[3] ? g_mvkt_ns[3] / 1e6 / g_mvkt_n[3] : 0.0,
++				(unsigned long long)g_mvkt_n[4].load(), g_mvkt_n[4] ? g_mvkt_ns[4] / 1e6 / g_mvkt_n[4] : 0.0,
++				(unsigned long long)g_mvkt_archiveHits.load(), g_mvkt_archiveHits ? g_mvkt_archiveHitNS / 1e6 / g_mvkt_archiveHits : 0.0,
++				(unsigned long long)g_mvkt_archiveMisses.load(), g_mvkt_archiveMisses ? g_mvkt_archiveMissNS / 1e6 / g_mvkt_archiveMisses : 0.0,
++				(unsigned long long)g_mvkt_archiveVerified.load(),
++				(unsigned long long)g_mvkt_archiveMissKind[kMVKArchiveGraphicsAsync].load(),
++				(unsigned long long)g_mvkt_archiveMissKind[kMVKArchiveGraphicsSyncVariant].load(), g_mvkt_archiveSyncMissNS[kMVKArchiveGraphicsSyncVariant] / 1e6,
++				(unsigned long long)g_mvkt_archiveMissKind[kMVKArchiveCompute].load(), g_mvkt_archiveSyncMissNS[kMVKArchiveCompute] / 1e6,
++				(unsigned long long)g_mvkt_archiveMissKind[kMVKArchiveTessellation].load(), g_mvkt_archiveSyncMissNS[kMVKArchiveTessellation] / 1e6,
++				(unsigned long long)g_mvkt_n[2].load(), g_mvkt_n[2] ? g_mvkt_ns[2] / 1e6 / g_mvkt_n[2] : 0.0,
++				(unsigned long long)g_mvkt_psoHits.load(), (unsigned long long)g_mvkt_psoMisses.load(),
++				(unsigned long long)g_mvkt_asyncStarted.load(), (unsigned long long)g_mvkt_asyncCompleted.load(),
++				(unsigned long long)g_mvkt_asyncFailed.load(), (unsigned long long)g_mvkt_asyncDedupeHits.load(),
++				(unsigned long long)g_mvkt_asyncPriorityBumps.load(), (unsigned long long)g_mvkt_asyncSkippedDraws.load(),
++				(unsigned long long)g_mvkt_asyncBudgetWaits.load(), g_mvkt_asyncBudgetWaitNS.load() / 1e6,
++				(unsigned long long)g_mvkt_asyncFullscreenWaits.load(), g_mvkt_asyncFullscreenWaitNS.load() / 1e6,
++				g_mvkt_asyncQueueDepth.load(), g_mvkt_asyncQueueDepthMax.load());
 +	}
++}
++void mvkTimeArchiveResult(bool hit, bool verified, uint64_t nanoseconds, MVKArchivePipelineKind kind) {
++	if (hit) { ++g_mvkt_archiveHits; g_mvkt_archiveHitNS += nanoseconds; }
++	else { ++g_mvkt_archiveMisses; g_mvkt_archiveMissNS += nanoseconds; ++g_mvkt_archiveMissKind[kind]; }
++	if (verified) { ++g_mvkt_archiveVerified; }
++}
++void mvkTimeArchiveSyncMiss(MVKArchivePipelineKind kind, uint64_t nanoseconds) {
++	g_mvkt_archiveSyncMissNS[kind] += nanoseconds;
++}
++void mvkTimePSOCacheResult(bool hit) {
++	if (hit) { ++g_mvkt_psoHits; } else { ++g_mvkt_psoMisses; }
++}
++void mvkTimeAsyncStarted() { ++g_mvkt_asyncStarted; }
++void mvkTimeAsyncCompleted() { ++g_mvkt_asyncCompleted; }
++void mvkTimeAsyncFailed() { ++g_mvkt_asyncFailed; }
++void mvkTimeAsyncSkippedDraw(uint32_t count) { g_mvkt_asyncSkippedDraws += count; }
++void mvkTimeAsyncDedupeHit() { ++g_mvkt_asyncDedupeHits; }
++void mvkTimeAsyncPriorityBump() { ++g_mvkt_asyncPriorityBumps; }
++void mvkTimeAsyncBudgetWait(uint64_t nanoseconds) { ++g_mvkt_asyncBudgetWaits; g_mvkt_asyncBudgetWaitNS += nanoseconds; }
++void mvkTimeAsyncFullscreenWait(uint64_t nanoseconds) { ++g_mvkt_asyncFullscreenWaits; g_mvkt_asyncFullscreenWaitNS += nanoseconds; }
++void mvkTimeAsyncQueueDepth(uint32_t depth) {
++	g_mvkt_asyncQueueDepth = depth;
++	uint32_t maximum = g_mvkt_asyncQueueDepthMax.load();
++	while (maximum < depth && !g_mvkt_asyncQueueDepthMax.compare_exchange_weak(maximum, depth)) {}
 +}
 +static void mvkTimeNoteSource(NSString* src, const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& macros) {
 +	size_t h = (size_t)src.hash ^ (src.length * 0x9e3779b97f4a7c15ull);
@@ -3566,7 +4775,7 @@ index 3aa44a4..cc2a5b3 100644
  
  	compile(lock, ^{
  		auto mtlDev = getMTLDevice();
-@@ -578,10 +877,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -578,10 +988,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  																						 count: macro_count];
  				}
  				logCompilation(mtlCompileOptions);
@@ -3583,7 +4792,7 @@ index 3aa44a4..cc2a5b3 100644
  							bool isLate = compileComplete(mtlLib, error);
  							if (isLate) { destroy(); }
  						}];
-@@ -589,6 +894,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -589,6 +1005,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  		}
  	});
  

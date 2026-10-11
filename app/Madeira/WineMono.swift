@@ -434,10 +434,12 @@ struct WineMonoSettingsSection: View {
             if !WineMonoModel.bundled && !mono.busy {
                 if mono.installed {
                     Button("Remove Wine Mono", role: .destructive) { confirmRemove = true }
+                        .controllerFocusableRow(activate: { confirmRemove = true })
                 } else {
                     Button { mono.install() } label: {
                         Label(mono.error == nil ? "Download Wine Mono" : "Try again", systemImage: "arrow.down.circle")
                     }
+                    .controllerFocusableRow(activate: { mono.install() })
                 }
             }
         } header: {

@@ -26,8 +26,8 @@ TEB ClientId.UniqueThread; `name` is the host thread name.
 | game | JIT pool outside registered PE copies and the selected EC dispatcher |
 | dxmt | d3d11, d3d10core, dxgi, d3d9, d3d9-emulated, winemetal PE copies |
 | winePE | Other registered native PE copies |
-| wineUnix | Madeira's main Mach-O executable |
-| fex | libarm64ecfex/libwow64fex/xtajit* PE copies, EC dispatcher, FEX arena |
+| wineUnix | Madeira's main Mach-O executable, corrected at report time when its symbol belongs to statically linked FEXCore |
+| fex | libarm64ecfex/libwow64fex/xtajit* PE copies, EC dispatcher, FEX arena, and symbol-identified FEXCore code in Madeira |
 | mvk/metal | MoltenVK, Metal, IOGPU, AGX Mach-O images |
 | system | Remaining Mach-O dylibs |
 | blocked | Cached kernel wait/trap function PC ranges |
@@ -49,6 +49,22 @@ relative to the loaded image header. Buckets combine copies of the same named
 module for a given thread. These can be resolved against matching binaries
 without runtime symbolication of every sample.
 
+`[perf-classify-fex]` separately lists the top 25 FEX symbols for the sampled
+threads. Raw PCs are accumulated in a fixed table and passed to `dladdr()` only
+at report time. When `dli_sname` is unavailable (JIT dispatcher, PE copy, FEX
+arena, or a stripped/private symbol), the report uses image/region + 4 KB
+offset. `pct` is the symbol's share of that thread's attributed FEX samples in
+the 30-second window. The five-second line also splits FEX into dispatcher and
+lookup, compile, syscall and thunk, signal and fault, and other groups. These
+groups are report-time symbol-name heuristics; unsymbolized dispatcher pages
+are still recognized from their known allocation.
+
+`[perf-classify-game]` lists the top ten guest module + 4 KB offsets for JIT-pool
+samples. It records the sampled PC and x28 block pointer, then reuses the
+existing perf-stack host-PC-to-guest-RIP decoder and guest loader module map at
+report time. A block retired before the report cannot be resolved and is
+omitted.
+
 ## Implementation and limits
 
 - The PE-copy registry owns cached export names. Publication, retirement and
@@ -69,6 +85,11 @@ without runtime symbolication of every sample.
   it to 16 KB. This identifies its range without changing FEX or calling into
   it from the sampler. This depends on the current FEX/EC layout. The WOW64
   dispatcher is not identified this way and may count as game.
+- FEXCore and the iOS syscall/signal glue are static archives linked into the
+  Madeira executable, not a framework. Image-range classification therefore
+  initially sees that native code as wineUnix. The raw-PC report pass recognizes
+  FEX symbol names and corrects the five-second totals without putting `dladdr`
+  in the sampling loop.
 - `game` means translated/generated pool code, not proof of the original x86
   module's identity: translated x86 Wine code and standalone pool trampolines
   also land there. PE-contained ARM64EC thunks count with their module; x18
@@ -76,13 +97,12 @@ without runtime symbolication of every sample.
   main executable, including app glue, counts as wineUnix. There is no LR
   reassignment (LR is read alongside PC).
 - The existing `[perf-stack]` resolves guest RIP using x28's block metadata.
-  This sampler deliberately avoids walking mutable block/RIP tables on every
-  unsuspended tick. Use those stack reports when original guest identity is
-  needed.
+  The classifier reads only BlockBegin while sampling and walks the mutable
+  block/RIP tables at report time.
 - Storage is fixed: 512 Wine threads/PE copies, 2048 Mach-O text ranges, 1024
-  top buckets, eight per-report target rows. Overflowed top buckets are counted
-  explicitly as `bucket-table-full dropped=...`; a saturated table biases the
-  top list toward buckets first seen in the interval. There are no explicit
+  top buckets, 4096 native PCs, 2048 guest PCs, and eight per-report target
+  rows. Overflowed tables are counted explicitly; a saturated table biases the
+  top list toward PCs first seen in the interval. There are no explicit
   heap/VM allocations in the sampling loop, nor task_threads enumeration.
   Dyld refresh and logging may use library-internal allocation/locks. Logging,
   Mach queries and the one-second registry copy add profiling overhead.

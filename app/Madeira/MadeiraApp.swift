@@ -13,6 +13,10 @@ struct MadeiraApp: App {
             ContentView()
                 .modifier(ClaimGamepadEvents())
                 .overlay { JITProgressOverlay() }
+                .onReceive(LibraryController.shared.commands) { ControllerNavigation.shared.handle($0) }
+                .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { _ in
+                    ControllerNavigation.shared.hideIndicator()
+                })
                 .onAppear {
                     GamepadInput.shared.start()
                     HardwareInput.shared.start()

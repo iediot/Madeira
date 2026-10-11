@@ -15521,6 +15521,14 @@ static const char *ios_guest_module_for( uint64_t rip, uint64_t *rva )
     return NULL;
 }
 
+/* Sampling reports run after the target resumes; reuse the bounded guest map
+ * here instead of walking the loader list in the 5 ms sampling path. */
+const char *ios_guest_module_from_rip( uint64_t teb, uint64_t rip, uint64_t *rva )
+{
+    ios_guest_modmap_build( teb );
+    return ios_guest_module_for( rip, rva );
+}
+
 /* ============================================================================
  * ml688 BOUNDED ALL-THREAD PROFILE
  *

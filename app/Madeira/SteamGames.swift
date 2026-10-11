@@ -532,7 +532,7 @@ struct SteamGamesSection: View {
             SteamGameSheet(appID: selection.id) { entry in
                 // Let the download sheet finish dismissing before presenting the details page.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
-            }
+            }.controllerDismiss()
         }
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
         .sheet(isPresented: $showAddApp) {
@@ -660,6 +660,7 @@ struct SteamGamesSection: View {
     private func cell(_ item: SteamGamesRules.Item, list: Bool, dense: Bool) -> some View {
         Button { select(item) } label: { SteamGameCell(item: item, list: list, dense: dense) }
             .libraryCardButtonStyle(grid: !list)
+            .controllerFocusable(cornerRadius: list ? 16 : 12, primary: true, activate: { select(item) })
             .libraryHideMenu(LibraryHidden.steam(item.id))
     }
 
@@ -1540,9 +1541,9 @@ struct LibraryAllGames<OtherCell: View>: View {
         .sheet(item: $steamSelected) { selection in
             SteamGameSheet(appID: selection.id) { entry in
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
-            }
+            }.controllerDismiss()
         }
-        .sheet(item: $epicSelected) { game in EpicGameSheet(game: game, open: open) }
+        .sheet(item: $epicSelected) { game in EpicGameSheet(game: game, open: open).controllerDismiss() }
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
     }
 
@@ -1558,6 +1559,7 @@ struct LibraryAllGames<OtherCell: View>: View {
                 if let add {
                     Button(action: add) { LibraryAddCard() }
                         .libraryCardButtonStyle(grid: true)
+                        .controllerFocusable(cornerRadius: 12, activate: add)
                         .frame(width: LibraryLayout.shelfCard(width))
                 }
             } cell: { item in
@@ -1625,6 +1627,10 @@ struct LibraryAllGames<OtherCell: View>: View {
                 else { steamSelected = SteamGameSelection(id: s.id) }
             } label: { SteamGameCell(item: s, list: list, dense: dense) }
                 .libraryCardButtonStyle(grid: !list)
+                .controllerFocusable(cornerRadius: list ? 16 : 12, activate: {
+                    if let installed = s.installed { open(LibraryModel.shared.steamEntry(installed, title: s.name)) }
+                    else { steamSelected = SteamGameSelection(id: s.id) }
+                })
                 .libraryHideMenu(LibraryHidden.steam(s.id))
         case .epic(let g):
             Button {
@@ -1633,6 +1639,10 @@ struct LibraryAllGames<OtherCell: View>: View {
                 else { epicSelected = g }
             } label: { EpicGameCard(game: g, list: list) }
                 .libraryCardButtonStyle(grid: !list)
+                .controllerFocusable(cornerRadius: list ? 16 : 12, activate: {
+                    if !epicInstaller.isDownloading(g.appName), let entry = epicInstaller.entry(g.appName) { open(entry) }
+                    else { epicSelected = g }
+                })
                 .libraryHideMenu(LibraryHidden.epic(g.appName))
         case .other(let e):
             otherCell(e, list, dense)

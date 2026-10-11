@@ -1326,7 +1326,7 @@ struct ios_xp_nt_view
     uint64_t cs_ring[1024];
     struct ios_xp_nt_view_qpc qpc[256];
 };
-#define IOS_XP_FEX_WORDS 4496
+#define IOS_XP_FEX_WORDS 4768
 struct ios_xp_mod { uint64_t base, size; char name[40]; };
 static struct ios_xp_mod ios_xp_mods[160];
 static int ios_xp_nmods;
@@ -1453,7 +1453,7 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     extern volatile long long ios_xp_yield, ios_xp_yield_slept, ios_xp_delay, ios_xp_delay_hist[6];
     extern volatile long long ios_alert_wakes, ios_alert_waits;
     static uint64_t *fex, *fex_prev; static struct ios_xp_nt_view *nt, *nt_prev;
-    static long long u_prev[18]; static int have_fex, have_nt, have_u, map_age = 1000, said_nf;
+    static long long u_prev[18]; static int have_fex, have_nt, have_u, map_age = 1000, said_nf, said_alias_size;
     static double last_s;
     static uint64_t sorted[4096];
     long long u[18]; double dt; char line[3000]; int n, i;
@@ -1504,11 +1504,16 @@ static void ios_xp_api_report( const char *wall, double wall_s )
         int got_nt = ios_xp_nt_addr && ios_ts_read( ios_xp_nt_addr, nt, sizeof(*nt) ) && nt->magic == 0x31544e5058444d41ull;
         if (dt > 0.2)
         {
-            double ecc = 0, fp = 0, cb = 0, cfreq = nt->freq ? (double)nt->freq : 24e6;
+            double ecc = 0, fp = 0, cb = 0, pe_walk = 0, jit_walk = 0, cfreq = nt->freq ? (double)nt->freq : 24e6;
             #define XPR(x) ((double)(x) / dt)
             if (got_fex && have_fex)
-                for (i = 0; i < 16; i++) { ecc += fex[8 + i * 8] - fex_prev[8 + i * 8]; fp += fex[136 + i * 8] - fex_prev[136 + i * 8]; cb += fex[264 + i * 8] - fex_prev[264 + i * 8]; }
-            n = snprintf( line, sizeof(line), "[xp-api] %s x64->EC %.0f/s FPCR-writes %.0f/s EC->x64 %.0f/s", wall, ecc / dt, fp / dt, cb / dt );
+                for (i = 0; i < 16; i++) { ecc += fex[8 + i * 8] - fex_prev[8 + i * 8]; fp += fex[136 + i * 8] - fex_prev[136 + i * 8]; cb += fex[264 + i * 8] - fex_prev[264 + i * 8]; pe_walk += fex[4512 + i * 8] - fex_prev[4512 + i * 8]; jit_walk += fex[4640 + i * 8] - fex_prev[4640 + i * 8]; }
+            n = snprintf( line, sizeof(line), "[xp-api] %s x64->EC %.0f/s FPCR-writes %.0f/s EC->x64 %.0f/s xlate-walk PE %.0f/s JIT %.0f/s aliases %llu/%llu", wall, ecc / dt, fp / dt, cb / dt, pe_walk / dt, jit_walk / dt, (unsigned long long)fex[4496], (unsigned long long)fex[4497] );
+            if (got_fex && !said_alias_size && fex[4497] > 64)
+            {
+                wine_log_write( "[xp-alias] table grew past 64 slots: %llu live, %llu allocated", (unsigned long long)fex[4496], (unsigned long long)fex[4497] );
+                said_alias_size = 1;
+            }
             if (got_nt && have_nt)
             {
                 double waitms = (double)(nt->cs_wait_ticks - nt_prev->cs_wait_ticks) / cfreq * 1000.0;

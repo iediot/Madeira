@@ -903,7 +903,12 @@ final class PassthroughWindow: UIWindow {
 /// sessionBody asks for them in SwiftUI. So those roots answer from here.
 enum GameSessionChrome {
     static var active = false {
-        didSet { if active != oldValue { refresh() } }
+        didSet {
+            if active != oldValue {
+                HardwareInput.shared.sessionChanged(active: active, menuOpen: LibraryModel.shared.menu)
+                refresh()
+            }
+        }
     }
 
     /// Re-ask every window's root controller, then log what iPadOS did.
@@ -1295,6 +1300,8 @@ final class InputSettings: ObservableObject {
     /// "Right stick controls mouse" (HardwareInput.swift, PadStickMouse). Off by
     /// default: a program that reads the controller already gets the stick.
     @Published var padRightStickMouse = false { didSet { save() } }
+    /// Keep the iPad pointer captured while a game session is in front.
+    @Published var keepPointerInGame = true { didSet { save() } }
 
     /// didSet fires for assignments made in init() because the properties are
     /// already initialised by then; without this the first launch would write
@@ -1318,6 +1325,7 @@ final class InputSettings: ObservableObject {
             sensMouse = j["sensMouse"] as? Double ?? 1.0
             ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
             padRightStickMouse = j["padRightStickMouse"] as? Bool ?? false
+            keepPointerInGame = j["keepPointerInGame"] as? Bool ?? true
         }
         loading = false
         madeira_set_diag_enabled(diagnostics ? 1 : 0)   // push the restored value down
@@ -1328,6 +1336,7 @@ final class InputSettings: ObservableObject {
         let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics,
                                 "sensMouse": sensMouse, "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
                                 "padRightStickMouse": padRightStickMouse,
+                                "keepPointerInGame": keepPointerInGame,
                                 "touchMode": touchMode]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)

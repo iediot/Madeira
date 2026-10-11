@@ -381,6 +381,8 @@ static void *perf_reporter( void *arg )
  */
 #define CLASS_DYLIBS 2048
 #define CLASS_BUCKETS 1024
+#define CLASS_PCS 4096
+#define CLASS_GAME_PCS 2048
 #define CLASS_ROWS 8
 #define CLASS_TRAPS 16
 
@@ -402,14 +404,30 @@ struct class_bucket
     enum perf_class kind;
     char name[96];
 };
+struct class_pc_bucket
+{
+    uint64_t id;
+    uintptr_t pc, offset;
+    unsigned tid, hits, window_hits;
+    enum perf_class kind;
+    char name[64];
+};
+struct class_game_bucket
+{
+    uint64_t id, block, teb;
+    uintptr_t pc;
+    unsigned tid, hits;
+};
 static struct ios_perf_image class_pe[IOS_PERF_IMAGES];
 static struct class_image class_dylibs[CLASS_DYLIBS];
 static struct { uintptr_t lo, hi; } class_traps[CLASS_TRAPS];
 static struct class_bucket class_buckets[CLASS_BUCKETS];
+static struct class_pc_bucket class_pcs[CLASS_PCS];
+static struct class_game_bucket class_game_pcs[CLASS_GAME_PCS];
 static struct class_row class_rows[CLASS_ROWS];
 static struct perf_thread class_threads[PERF_THREADS];
 static enum perf_class class_pe_classes[IOS_PERF_IMAGES];
-static unsigned class_npe, class_ndylibs, class_ntraps, class_dropped;
+static unsigned class_npe, class_ndylibs, class_ntraps, class_dropped, class_pc_dropped, class_game_dropped;
 static uint32_t class_dyld_count = UINT32_MAX;
 extern void *ios_jit_rx_base_global;
 extern size_t ios_jit_pool_size_global;
@@ -523,11 +541,19 @@ static enum perf_class class_pc(uintptr_t pc, uintptr_t dispatcher, const char *
         /* FEX Dispatcher.cpp allocates four 4K FEX pages. The EC CPU area's
          * EnterEC pointer lies in that 16K-aligned allocation. Blocks use
          * separate buffers; do not mistake all FEX-produced code for FEX overhead. */
-        if (dispatcher && pc >= dispatcher && pc - dispatcher < 0x4000) return C_FEX;
+        if (dispatcher && pc >= dispatcher && pc - dispatcher < 0x4000)
+        {
+            *name = "jit-dispatcher"; *offset = pc - dispatcher;
+            return C_FEX;
+        }
+        *name = "jit-pool"; *offset = pc - (uintptr_t)ios_jit_rx_base_global;
         return C_GAME;
     }
     if (ios_fex_arena_base_unix && pc >= ios_fex_arena_base_unix && pc < ios_fex_arena_end_unix)
+    {
+        *name = "fex-arena"; *offset = pc - ios_fex_arena_base_unix;
         return C_FEX;
+    }
     for (i = 0; i < class_ndylibs; ++i)
         if (pc >= class_dylibs[i].lo && pc < class_dylibs[i].hi)
         {
@@ -627,25 +653,145 @@ static void class_bucket_add(struct class_row *row, enum perf_class kind, const 
     ++class_dropped;
 }
 
+/* Keep raw PCs cheap to record. dladdr may take dyld locks, so it is used only
+ * by the reporter, after the sampled thread is running again. C_UNIX is kept
+ * because FEXCore is statically linked into Madeira's main executable. */
+static void class_pc_add(struct class_row *row, enum perf_class kind, uintptr_t pc,
+                         const char *name, uintptr_t offset)
+{
+    unsigned i, h;
+    if (kind != C_FEX && kind != C_UNIX) return;
+    h = (unsigned)(((pc >> 2) ^ row->id) * 2654435761u) % CLASS_PCS;
+    for (i = 0; i < CLASS_PCS; ++i, h = (h + 1) % CLASS_PCS)
+    {
+        struct class_pc_bucket *b = &class_pcs[h];
+        if (!b->hits || (b->id == row->id && b->pc == pc))
+        {
+            if (!b->hits)
+            {
+                b->id = row->id; b->tid = row->tid; b->pc = pc; b->kind = kind; b->offset = offset;
+                snprintf(b->name, sizeof(b->name), "%s", name);
+            }
+            ++b->hits; ++b->window_hits;
+            return;
+        }
+    }
+    ++class_pc_dropped;
+}
+
+static void class_game_add(struct class_row *row, uintptr_t pc, uint64_t x28, uintptr_t teb)
+{
+    uint64_t block = 0;
+    unsigned i, h;
+    if (!perf_read(x28, &block, sizeof(block)) || !block) return;
+    h = (unsigned)(((pc >> 2) ^ block ^ row->id) * 2654435761u) % CLASS_GAME_PCS;
+    for (i = 0; i < CLASS_GAME_PCS; ++i, h = (h + 1) % CLASS_GAME_PCS)
+    {
+        struct class_game_bucket *b = &class_game_pcs[h];
+        if (!b->hits || (b->id == row->id && b->pc == pc && b->block == block))
+        {
+            if (!b->hits)
+            { b->id = row->id; b->tid = row->tid; b->pc = pc; b->block = block; b->teb = teb; }
+            ++b->hits;
+            return;
+        }
+    }
+    ++class_game_dropped;
+}
+
+enum class_fex_sub { FEX_DISPATCH, FEX_COMPILE, FEX_SYSCALL, FEX_SIGNAL, FEX_OTHER, FEX_SUB_COUNT };
+
+static int class_is_fex_symbol(const char *s)
+{
+    return s && (strstr(s, "FEXCore") || strstr(s, "fextl") || strstr(s, "Arm64JIT") ||
+                 strstr(s, "iOSSyscallHandler") || strstr(s, "iOSSignalDelegator"));
+}
+
+static enum class_fex_sub class_fex_sub(const char *s)
+{
+    if (!s) return FEX_OTHER;
+    if (strstr(s, "Compile") || strstr(s, "Frontend") || strstr(s, "Decoder") ||
+        strstr(s, "IR::") || strstr(s, "Backend") || strstr(s, "Emitter") || strstr(s, "JIT::"))
+        return FEX_COMPILE;
+    if (strstr(s, "Syscall") || strstr(s, "Thunk") || strstr(s, "HLE")) return FEX_SYSCALL;
+    if (strstr(s, "Signal") || strstr(s, "Fault") || strstr(s, "Exception")) return FEX_SIGNAL;
+    if (strstr(s, "Dispatch") || strstr(s, "Lookup") || strstr(s, "FindBlock") ||
+        strstr(s, "GuestToHost") || strstr(s, "jit-dispatcher")) return FEX_DISPATCH;
+    return FEX_OTHER;
+}
+
+static int class_pc_symbol(struct class_pc_bucket *b, char *out, size_t cap,
+                           enum class_fex_sub *sub)
+{
+    Dl_info di = {0};
+    const char *symbol = NULL, *image;
+    int is_fex = b->kind == C_FEX;
+    if (dladdr((void *)b->pc, &di) && di.dli_fname)
+    {
+        symbol = di.dli_sname;
+        if (class_is_fex_symbol(symbol)) is_fex = 1;
+        if (symbol) snprintf(out, cap, "%s", symbol);
+        else
+        {
+            image = class_basename(di.dli_fname);
+            snprintf(out, cap, "%s+0x%llx", image,
+                     (unsigned long long)((b->pc - (uintptr_t)di.dli_fbase) & ~(uintptr_t)0xfff));
+        }
+    }
+    else snprintf(out, cap, "%s+0x%llx", b->name,
+                  (unsigned long long)(b->offset & ~(uintptr_t)0xfff));
+    *sub = class_fex_sub(symbol ? symbol : b->name);
+    return is_fex;
+}
+
+static void class_adjust_fex(struct class_row *row, unsigned sub[FEX_SUB_COUNT])
+{
+    unsigned i;
+    memset(sub, 0, FEX_SUB_COUNT * sizeof(*sub));
+    for (i = 0; i < CLASS_PCS; ++i)
+    {
+        struct class_pc_bucket *b = &class_pcs[i];
+        enum class_fex_sub which;
+        char desc[192];
+        unsigned hits;
+        if (b->id != row->id || !(hits = b->window_hits)) continue;
+        b->window_hits = 0;
+        if (!class_pc_symbol(b, desc, sizeof(desc), &which)) continue;
+        sub[which] += hits;
+        if (b->kind == C_UNIX && row->counts[C_UNIX] >= hits)
+        { row->counts[C_UNIX] -= hits; row->counts[C_FEX] += hits; }
+    }
+}
+
 static void class_report(void)
 {
     unsigned i, j, rows = 0;
     for (i = 0; i < CLASS_ROWS; ++i)
     {
         struct class_row *r = &class_rows[i];
+        unsigned fex_sub[FEX_SUB_COUNT];
         char line[1024];
         int len;
         if (!r->id) continue;
         ++rows;
+        class_adjust_fex(r, fex_sub);
         len = snprintf(line, sizeof(line), "[perf-classify] tid=%04x name=%s samples=%u", r->tid, r->name, r->samples);
         for (j = 0; j < C_COUNT; ++j)
             len += snprintf(line + len, sizeof(line) - len, " | %s %.1f%%", class_names[j],
                             r->samples ? 100.0 * r->counts[j] / r->samples : 0.0);
+        len += snprintf(line + len, sizeof(line) - len,
+                        " | fex(dispatch %.1f%% compile %.1f%% syscall %.1f%% signal %.1f%% other %.1f%%)",
+                        r->samples ? 100.0 * fex_sub[FEX_DISPATCH] / r->samples : 0.0,
+                        r->samples ? 100.0 * fex_sub[FEX_COMPILE] / r->samples : 0.0,
+                        r->samples ? 100.0 * fex_sub[FEX_SYSCALL] / r->samples : 0.0,
+                        r->samples ? 100.0 * fex_sub[FEX_SIGNAL] / r->samples : 0.0,
+                        r->samples ? 100.0 * fex_sub[FEX_OTHER] / r->samples : 0.0);
         dprintf(2, "%s\n", line);
         dprintf(2, "[perf-classify-state] tid=%04x running=%u blocked=%u other=%u unknown=%u missed=%u\n",
                 r->tid, r->running, r->waiting, r->state_other, r->state_failed, r->failed);
     }
     if (!rows) dprintf(2, "[perf-classify] tid=0000 name=(no-active-Wine-thread) samples=0\n");
+    for (i = 0; i < CLASS_PCS; ++i) class_pcs[i].window_hits = 0;
     memset(class_rows, 0, sizeof(class_rows));
 }
 
@@ -671,6 +817,106 @@ static void class_report_top(void)
     memset(class_buckets, 0, sizeof(class_buckets)); class_dropped = 0;
 }
 
+struct class_named_bucket
+{
+    uint64_t id;
+    unsigned tid, hits;
+    char name[192];
+};
+
+static void class_named_add(struct class_named_bucket *out, unsigned cap, unsigned *count,
+                            uint64_t id, unsigned tid, const char *name, unsigned hits)
+{
+    unsigned i;
+    for (i = 0; i < *count; ++i)
+        if (out[i].id == id && !strcmp(out[i].name, name)) { out[i].hits += hits; return; }
+    if (*count >= cap) return;
+    out[*count].id = id; out[*count].tid = tid; out[*count].hits = hits;
+    snprintf(out[*count].name, sizeof(out[*count].name), "%s", name);
+    ++*count;
+}
+
+static void class_report_fex(void)
+{
+    static struct class_named_bucket named[CLASS_PCS];
+    unsigned totals[CLASS_ROWS * 2] = {0};
+    uint64_t total_id[CLASS_ROWS * 2] = {0};
+    unsigned count = 0, ntotal = 0, i, rank;
+    memset(named, 0, sizeof(named));
+    for (i = 0; i < CLASS_PCS; ++i)
+    {
+        struct class_pc_bucket *b = &class_pcs[i];
+        enum class_fex_sub sub;
+        char desc[192];
+        unsigned j;
+        if (!b->hits || !class_pc_symbol(b, desc, sizeof(desc), &sub)) continue;
+        class_named_add(named, CLASS_PCS, &count, b->id, b->tid, desc, b->hits);
+        for (j = 0; j < ntotal && total_id[j] != b->id; ++j) ;
+        if (j == ntotal && ntotal < sizeof(totals)/sizeof(totals[0]))
+        { total_id[ntotal] = b->id; ++ntotal; }
+        if (j < ntotal) totals[j] += b->hits;
+    }
+    for (rank = 0; rank < 25; ++rank)
+    {
+        unsigned best = ~0u, j;
+        for (i = 0; i < count; ++i)
+            if (named[i].hits && (best == ~0u || named[i].hits > named[best].hits)) best = i;
+        if (best == ~0u) break;
+        for (j = 0; j < ntotal && total_id[j] != named[best].id; ++j) ;
+        dprintf(2, "[perf-classify-fex] tid=%04x %s samples=%u pct=%.1f\n",
+                named[best].tid, named[best].name, named[best].hits,
+                j < ntotal && totals[j] ? 100.0 * named[best].hits / totals[j] : 0.0);
+        named[best].hits = 0;
+    }
+    if (class_pc_dropped)
+        dprintf(2, "[perf-classify-fex] pc-table-full dropped=%u\n", class_pc_dropped);
+    memset(class_pcs, 0, sizeof(class_pcs)); class_pc_dropped = 0;
+}
+
+static void class_report_game(void)
+{
+    extern uint64_t ios_native_rip_from_hostpc(uint64_t, uint64_t, const char **);
+    extern const char *ios_guest_module_from_rip(uint64_t, uint64_t, uint64_t *);
+    static struct class_named_bucket named[CLASS_GAME_PCS];
+    unsigned totals[CLASS_ROWS * 2] = {0};
+    uint64_t total_id[CLASS_ROWS * 2] = {0};
+    unsigned count = 0, ntotal = 0, i, rank;
+    memset(named, 0, sizeof(named));
+    for (i = 0; i < CLASS_GAME_PCS; ++i)
+    {
+        struct class_game_bucket *b = &class_game_pcs[i];
+        uint64_t rip, rva;
+        const char *module;
+        char desc[192];
+        unsigned j;
+        if (!b->hits || !(rip = ios_native_rip_from_hostpc(b->block, b->pc, NULL))) continue;
+        module = ios_guest_module_from_rip(b->teb, rip, &rva);
+        if (module) snprintf(desc, sizeof(desc), "%s+0x%llx", module,
+                             (unsigned long long)(rva & ~0xfffull));
+        else snprintf(desc, sizeof(desc), "guest+0x%llx", (unsigned long long)(rip & ~0xfffull));
+        class_named_add(named, CLASS_GAME_PCS, &count, b->id, b->tid, desc, b->hits);
+        for (j = 0; j < ntotal && total_id[j] != b->id; ++j) ;
+        if (j == ntotal && ntotal < sizeof(totals)/sizeof(totals[0]))
+        { total_id[ntotal] = b->id; ++ntotal; }
+        if (j < ntotal) totals[j] += b->hits;
+    }
+    for (rank = 0; rank < 10; ++rank)
+    {
+        unsigned best = ~0u, j;
+        for (i = 0; i < count; ++i)
+            if (named[i].hits && (best == ~0u || named[i].hits > named[best].hits)) best = i;
+        if (best == ~0u) break;
+        for (j = 0; j < ntotal && total_id[j] != named[best].id; ++j) ;
+        dprintf(2, "[perf-classify-game] tid=%04x %s samples=%u pct=%.1f\n",
+                named[best].tid, named[best].name, named[best].hits,
+                j < ntotal && totals[j] ? 100.0 * named[best].hits / totals[j] : 0.0);
+        named[best].hits = 0;
+    }
+    if (class_game_dropped)
+        dprintf(2, "[perf-classify-game] pc-table-full dropped=%u\n", class_game_dropped);
+    memset(class_game_pcs, 0, sizeof(class_game_pcs)); class_game_dropped = 0;
+}
+
 static void *perf_classifier(void *arg)
 {
     thread_t selected = MACH_PORT_NULL;
@@ -686,7 +932,11 @@ static void *perf_classifier(void *arg)
     {
         now = perf_now_ns();
         if (now >= report) { class_report(); report = now + 5000000000ull; }
-        if (now >= top) { class_report_top(); top = now + 30000000000ull; }
+        if (now >= top)
+        {
+            class_report_top(); class_report_fex(); class_report_game();
+            top = now + 30000000000ull;
+        }
         if (now >= refresh)
         {
             uintptr_t area = 0, entry = 0;
@@ -720,6 +970,8 @@ static void *perf_classifier(void *arg)
                 (void)lr; /* Deliberately PC-only: LR attribution would double-count leaf calls. */
                 ++r->samples; ++r->counts[kind];
                 class_bucket_add(r, kind, module, offset);
+                class_pc_add(r, kind, pc, module, offset);
+                if (kind == C_GAME) class_game_add(r, pc, st.__x[28], teb);
                 n = THREAD_BASIC_INFO_COUNT;
                 if (thread_info(selected, THREAD_BASIC_INFO, (thread_info_t)&basic, &n)) ++r->state_failed;
                 else if (basic.run_state == TH_STATE_WAITING || basic.run_state == TH_STATE_UNINTERRUPTIBLE) ++r->waiting;
@@ -746,7 +998,7 @@ void ios_perf_init( void )
 
     if (done++) return;
     /* MADEIRA_PERF_CLASSIFY: sample the busiest Wine thread every 5 ms; print
-     * PC classes every 5 seconds and top module+4K buckets every 30 seconds.
+     * PC classes every 5 seconds and native/guest hot spots every 30 seconds.
      * Default off. Works standalone; MADEIRA_PERF=1 is not required. */
     s = getenv( "MADEIRA_PERF_CLASSIFY" );
     if (s && *s == '1')

@@ -194,6 +194,7 @@ struct JITSettingsSection: View {
     var body: some View {
         Section {
             Toggle("Enable JIT automatically", isOn: autoEnable)
+                .controllerFocusableRow(activate: { autoEnable.wrappedValue.toggle() })
         } header: {
             Text("JIT")
         }

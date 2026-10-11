@@ -197,7 +197,7 @@ struct EpicGamesSection: View {
             }
         }
         .onAppear { library.refreshIfStale() }
-        .sheet(item: $selected) { game in EpicGameSheet(game: game, open: open) }
+        .sheet(item: $selected) { game in EpicGameSheet(game: game, open: open).controllerDismiss() }
     }
 
     /// An installed game opens its Game details page directly, as Steam's do; any other
@@ -210,6 +210,7 @@ struct EpicGamesSection: View {
     private func card(_ game: EpicGame, list: Bool) -> some View {
         Button { openOrShow(game) } label: { EpicGameCard(game: game, list: list) }
             .libraryCardButtonStyle(grid: !list)
+            .controllerFocusable(cornerRadius: list ? 16 : 12, primary: true, activate: { openOrShow(game) })
             .libraryHideMenu(LibraryHidden.epic(game.appName))
     }
 }

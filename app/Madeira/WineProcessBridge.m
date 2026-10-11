@@ -1138,6 +1138,32 @@ static void *wine_process_thread(void *arg) {
                           aerr.localizedDescription.UTF8String);
             else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
                      session.sampleRate, session.outputLatency * 1000.0);
+
+            /* A phone call (even a missed one) interrupts the session and iOS
+             * stops the RemoteIO unit; nothing restarted it, so the game stayed
+             * muted. Reactivate and restart when the interruption ends, and on
+             * returning to the foreground, since an interruption does not always
+             * deliver its end notification. */
+            extern void madeira_audio_resume(void);
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+                void (^resume)(void) = ^{
+                    NSError *e = nil;
+                    [[AVAudioSession sharedInstance] setActive:YES error:&e];
+                    if (e) LOG("AVAudioSession reactivate failed: %{public}s", e.localizedDescription.UTF8String);
+                    madeira_audio_resume();
+                };
+                NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+                [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:nil
+                            usingBlock:^(NSNotification *n) {
+                    if ([n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue] == AVAudioSessionInterruptionTypeEnded)
+                        resume();
+                }];
+                [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:nil
+                            usingBlock:^(NSNotification *n) { resume(); }];
+                [nc addObserverForName:@"UIApplicationDidBecomeActiveNotification" object:nil queue:nil
+                            usingBlock:^(NSNotification *n) { resume(); }];
+            });
         }
 
         /* ml2106: map the RemoteIO stack now, while the address space is roomy.

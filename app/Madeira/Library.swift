@@ -76,7 +76,7 @@ enum BuildStamp {
 /// 1's physical pad) so there is no second timer. While the library owns input
 /// (no session, or the in-game menu is open) GamepadInput publishes a neutral
 /// pad to Windows. D-pad or left stick moves the focus, A opens, B goes back,
-/// Y adds a game, a shoulder switches tabs; in a session Back+Start opens the
+/// Y opens the focused item's context action, L1/R1 cycle sections; in a session Back+Start opens the
 /// menu. MADEIRA_FRONTEND_CONTROLLER=0 turns navigation off.
 final class LibraryController: ObservableObject, @unchecked Sendable {
     static let shared = LibraryController()
@@ -86,6 +86,8 @@ final class LibraryController: ObservableObject, @unchecked Sendable {
     private var enabled = false
     private var owns = false
     private var last: UInt16 = 0
+    private var heldDirection: UInt16 = 0
+    private var nextRepeat = 0.0
     private var announced = false
     private let allowed = MadeiraConfig.flag("MADEIRA_FRONTEND_CONTROLLER")
     var ownsInput: Bool { lock.lock(); defer { lock.unlock() }; return enabled && owns }
@@ -102,6 +104,13 @@ final class LibraryController: ObservableObject, @unchecked Sendable {
             if ly > 16000 { buttons |= 1 }; if ly < -16000 { buttons |= 2 }
         }
         let pressed = buttons & ~last; last = buttons
+        let directions = buttons & 0x000f
+        let now = CACurrentMediaTime()
+        var repeated: UInt16 = 0
+        if owns, directions != 0 {
+            if directions != heldDirection { heldDirection = directions; nextRepeat = now + 0.38 }
+            else if now >= nextRepeat { repeated = directions; nextRepeat = now + 0.11 }
+        } else { heldDirection = 0; nextRepeat = 0 }
         let own = owns, announce = !announced; announced = true
         lock.unlock()
         if announce { DispatchQueue.main.async { self.connected = true; fputs("[frontend-controller] navigation active\n", stderr) } }
@@ -109,12 +118,336 @@ final class LibraryController: ObservableObject, @unchecked Sendable {
         // Reserve the Back+Start chord in gameplay, leaving ordinary Start intact.
         if !own, buttons & 0x30 == 0x30, pressed & 0x30 != 0 { command = "menu" }
         if own {
-            for (mask, name): (UInt16, String) in [(1, "up"), (2, "down"), (4, "left"), (8, "right"), (0x1000, "accept"), (0x2000, "back"), (0x8000, "add"), (0x10, "menu"), (0x100, "tab"), (0x200, "tab")] {
-                if pressed & mask != 0 { command = name; break }
+            let moved = pressed | repeated
+            for (mask, name): (UInt16, String) in [(1, "up"), (2, "down"), (4, "left"), (8, "right")] {
+                if moved & mask != 0 { command = name; break }
+            }
+            if command == nil {
+                for (mask, name): (UInt16, String) in [(0x1000, "accept"), (0x2000, "back"), (0x8000, "context"), (0x10, "menu"), (0x100, "previousTab"), (0x200, "nextTab")] {
+                    if pressed & mask != 0 { command = name; break }
+                }
             }
         }
         if let command { DispatchQueue.main.async { self.commands.send(command) } }
     }
+}
+
+/// Focus shared by the library, stores and sheets. Each modifier contributes a
+/// UIKit marker, which also lets the coordinator reveal it in its scroll view.
+@MainActor final class ControllerNavigation: ObservableObject {
+    static let shared = ControllerNavigation()
+    final class Item {
+        weak var view: UIView?
+        var activate: () -> Void
+        var context: (() -> Void)?
+        /// In the side menu: never where focus lands on its own (LB/RB, first move).
+        var sideMenu: Bool
+        /// A Settings-style list row: up/down step strictly to the next row.
+        var row: Bool
+        /// A page's main content (a game, a store, the hero's Play): where a new section starts.
+        var primary: Bool
+        init(view: UIView, activate: @escaping () -> Void, context: (() -> Void)?, sideMenu: Bool, row: Bool, primary: Bool) {
+            self.view = view; self.activate = activate; self.context = context
+            self.sideMenu = sideMenu; self.row = row; self.primary = primary
+        }
+    }
+    @Published private(set) var focused: UUID?
+    @Published private(set) var indicatorVisible = false
+    private var items: [UUID: Item] = [:]
+    var previousTab: (() -> Void)?
+    var nextTab: (() -> Void)?
+    var menu: (() -> Void)?
+
+    func register(_ id: UUID, view: UIView, activate: @escaping () -> Void, context: (() -> Void)?,
+                  sideMenu: Bool = false, row: Bool = false, primary: Bool = false) {
+        items[id] = Item(view: view, activate: activate, context: context, sideMenu: sideMenu, row: row, primary: primary)
+    }
+    func unregister(_ id: UUID) {
+        items[id] = nil
+        if focused == id { focused = nil }
+    }
+    func hideIndicator() { indicatorVisible = false }
+    /// A new section (LB/RB or the side menu): focus moves to the first item of the
+    /// page once it has laid out, never staying behind or landing on the side menu.
+    func sectionChanged(after delay: TimeInterval = 0.12) {
+        focused = nil
+        focusFirstContent(tries: 8, after: delay)
+    }
+    private func focusFirstContent(tries: Int, after delay: TimeInterval = 0.12) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [self] in
+            prune()
+            let page = items.compactMap { id, item in
+                item.sideMenu ? nil : rect(item).map { (id, item, $0, presentationDepth(item.view)) }
+            }
+            let top = page.map(\.3).max() ?? 0
+            // The first game, store or setting; anything else (search, sort) only without one.
+            let visible = page.filter { $0.3 == top }
+            let main = visible.filter { $0.1.primary || $0.1.row }
+            let first = (main.isEmpty ? visible : main)
+                .min { $0.2.minY == $1.2.minY ? $0.2.minX < $1.2.minX : $0.2.minY < $1.2.minY }
+            if let first { select((first.0, first.1, first.2)) }
+            else if tries > 0 { focusFirstContent(tries: tries - 1) }
+        }
+    }
+    func handle(_ command: String) {
+        guard LibraryController.shared.ownsInput, LibraryModel.shared.current == nil else { return }
+        indicatorVisible = true
+        prune()
+        switch command {
+        case "up", "down", "left", "right": move(command)
+        case "accept": focused.flatMap { items[$0] }?.activate()
+        case "context": focused.flatMap { items[$0] }?.context?()
+        case "previousTab": previousTab?()
+        case "nextTab": nextTab?()
+        case "menu": menu?()
+        default: break
+        }
+    }
+    private func prune() { items = items.filter { $0.value.view?.window != nil } }
+    private func rect(_ item: Item) -> CGRect? {
+        guard let view = item.view, let window = view.window, !view.isHidden, view.alpha > 0.01 else { return nil }
+        let result = view.convert(view.bounds, to: window)
+        return result.width > 1 && result.height > 1 ? result : nil
+    }
+    private func move(_ direction: String) {
+        let all = items.compactMap { id, item in rect(item).map { (id, item, $0, presentationDepth(item.view)) } }
+        let top = all.map(\.3).max() ?? 0
+        let candidates = all.filter { $0.3 == top }.map { ($0.0, $0.1, $0.2) }
+        guard !candidates.isEmpty else { return }
+        guard let currentID = focused, let current = candidates.first(where: { $0.0 == currentID }) else {
+            let page = candidates.filter { !$0.1.sideMenu }
+            select((page.isEmpty ? candidates : page).min { $0.2.minY == $1.2.minY ? $0.2.minX < $1.2.minX : $0.2.minY < $1.2.minY }!)
+            return
+        }
+        let origin = CGPoint(x: current.2.midX, y: current.2.midY)
+        let vertical = direction == "up" || direction == "down"
+        let sign: CGFloat = direction == "up" || direction == "left" ? -1 : 1
+        // Settings rows: up/down go to the very next row above or below, nothing else.
+        if current.1.row && vertical {
+            let rows = candidates.filter { $0.1.row && $0.0 != currentID && ($0.2.midY - origin.y) * sign > 4 }
+            if let next = rows.min(by: { abs($0.2.midY - origin.y) < abs($1.2.midY - origin.y) }) { select(next) }
+            else { nudgeScroll(direction) }
+            return
+        }
+        if current.1.row && !vertical && direction == "right" { return }
+        let choices = candidates.filter { candidate in
+            guard candidate.0 != currentID else { return false }
+            let primary = vertical ? candidate.2.midY - origin.y : candidate.2.midX - origin.x
+            return primary * sign > 4
+        }
+        let chosen = choices.min { lhs, rhs in
+            func score(_ rect: CGRect) -> CGFloat {
+                let primary = abs(vertical ? rect.midY - origin.y : rect.midX - origin.x)
+                let cross = abs(vertical ? rect.midX - origin.x : rect.midY - origin.y)
+                return primary + cross * 2.2
+            }
+            return score(lhs.2) < score(rhs.2)
+        }
+        if let chosen { select(chosen) }
+        else { nudgeScroll(direction) }
+    }
+    private func presentationDepth(_ view: UIView?) -> Int {
+        var responder: UIResponder? = view
+        var controller: UIViewController?
+        while let current = responder {
+            if let found = current as? UIViewController { controller = found; break }
+            responder = current.next
+        }
+        var depth = 0
+        while controller?.presentingViewController != nil { depth += 1; controller = controller?.presentingViewController }
+        return depth
+    }
+    private func select(_ candidate: (UUID, Item, CGRect)) {
+        focused = candidate.0
+        guard let view = candidate.1.view else { return }
+        reveal(view)
+    }
+    private func reveal(_ view: UIView) {
+        var ancestor = view.superview
+        while let current = ancestor {
+            if let scroll = current as? UIScrollView {
+                scroll.layoutIfNeeded()
+                let target = view.convert(view.bounds.insetBy(dx: -8, dy: -8), to: scroll)
+                let offset = centeredOffset(for: target, in: scroll)
+                if abs(offset.x - scroll.contentOffset.x) > 0.5 || abs(offset.y - scroll.contentOffset.y) > 0.5 {
+                    if UIAccessibility.isReduceMotionEnabled {
+                        scroll.setContentOffset(offset, animated: false)
+                    } else {
+                        UIView.animate(withDuration: 0.18, delay: 0,
+                                       options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]) {
+                            scroll.contentOffset = offset
+                        }
+                    }
+                }
+            }
+            ancestor = current.superview
+        }
+    }
+    private func centeredOffset(for target: CGRect, in scroll: UIScrollView) -> CGPoint {
+        let inset = scroll.adjustedContentInset
+        var offset = scroll.contentOffset
+        let scrollsX = scroll.contentSize.width + inset.left + inset.right > scroll.bounds.width + 1
+        let scrollsY = scroll.contentSize.height + inset.top + inset.bottom > scroll.bounds.height + 1
+        if scrollsX {
+            offset.x = target.midX - (scroll.bounds.width + inset.left - inset.right) / 2
+        }
+        if scrollsY {
+            offset.y = target.midY - (scroll.bounds.height + inset.top - inset.bottom) / 2
+        }
+        return clampedOffset(offset, in: scroll)
+    }
+    private func clampedOffset(_ proposed: CGPoint, in scroll: UIScrollView) -> CGPoint {
+        let inset = scroll.adjustedContentInset
+        var offset = proposed
+        offset.x = min(max(offset.x, -inset.left), max(-inset.left, scroll.contentSize.width - scroll.bounds.width + inset.right))
+        offset.y = min(max(offset.y, -inset.top), max(-inset.top, scroll.contentSize.height - scroll.bounds.height + inset.bottom))
+        return offset
+    }
+    private func nudgeScroll(_ direction: String) {
+        guard let id = focused, let view = items[id]?.view else { return }
+        let vertical = direction == "up" || direction == "down"
+        var ancestor = view.superview
+        while let current = ancestor {
+            if let scroll = current as? UIScrollView {
+                let inset = scroll.adjustedContentInset
+                let scrolls = vertical
+                    ? scroll.contentSize.height + inset.top + inset.bottom > scroll.bounds.height + 1
+                    : scroll.contentSize.width + inset.left + inset.right > scroll.bounds.width + 1
+                guard scrolls else { ancestor = current.superview; continue }
+                let amount = (vertical ? scroll.bounds.height : scroll.bounds.width) * 0.55
+                var offset = scroll.contentOffset
+                if vertical { offset.y += direction == "up" ? -amount : amount }
+                else { offset.x += direction == "left" ? -amount : amount }
+                let target = clampedOffset(offset, in: scroll)
+                if UIAccessibility.isReduceMotionEnabled {
+                    scroll.setContentOffset(target, animated: false)
+                } else {
+                    UIView.animate(withDuration: 0.18, delay: 0,
+                                   options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut]) {
+                        scroll.contentOffset = target
+                    }
+                }
+                return
+            }
+            ancestor = current.superview
+        }
+    }
+}
+
+private final class ControllerFocusMarkerView: UIView {
+    var update: (() -> Void)?
+    override func didMoveToWindow() { super.didMoveToWindow(); update?() }
+    override func layoutSubviews() { super.layoutSubviews(); update?() }
+}
+
+private struct ControllerFocusMarker: UIViewRepresentable {
+    let id: UUID
+    let activate: () -> Void
+    let context: (() -> Void)?
+    var sideMenu = false
+    var row = false
+    var primary = false
+    func makeUIView(context: Context) -> ControllerFocusMarkerView {
+        let view = ControllerFocusMarkerView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        view.update = { [weak view] in
+            guard let view, view.window != nil else { return }
+            ControllerNavigation.shared.register(id, view: view, activate: activate, context: self.context,
+                                                 sideMenu: sideMenu, row: row, primary: primary)
+        }
+        return view
+    }
+    func updateUIView(_ view: ControllerFocusMarkerView, context: Context) {
+        ControllerNavigation.shared.register(id, view: view, activate: activate, context: self.context,
+                                             sideMenu: sideMenu, row: row, primary: primary)
+    }
+    static func dismantleUIView(_ view: ControllerFocusMarkerView, coordinator: Void) {
+        // Registration has a weak view and is pruned before the next command.
+    }
+}
+
+private struct ControllerSideMenuKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    /// Set on the side menu, so its items are left out of automatic focus.
+    var controllerSideMenu: Bool {
+        get { self[ControllerSideMenuKey.self] }
+        set { self[ControllerSideMenuKey.self] = newValue }
+    }
+}
+
+private struct ControllerFocusableModifier: ViewModifier {
+    @Environment(\.controllerSideMenu) private var sideMenu
+    @State private var id = UUID()
+    @ObservedObject private var navigation = ControllerNavigation.shared
+    let cornerRadius: CGFloat
+    let activate: () -> Void
+    let context: (() -> Void)?
+    let primary: Bool
+    func body(content: Content) -> some View {
+        let focused = navigation.indicatorVisible && navigation.focused == id
+        content
+            .background { ControllerFocusMarker(id: id, activate: activate, context: context, sideMenu: sideMenu, primary: primary) }
+            // A soft gradient plate under the focused item, showing as a margin around it:
+            // quieter than an outline, and no glow.
+            .background {
+                if focused {
+                    // Even under the item, fading out only across its edges.
+                    RoundedRectangle(cornerRadius: cornerRadius + 4)
+                        .fill(.white.opacity(0.24))
+                        .padding(-5)
+                        .blur(radius: 5)
+                }
+            }
+            .scaleEffect(focused ? 1.05 : 1)
+            .shadow(color: focused ? .black.opacity(0.34) : .clear, radius: 9, y: 5)
+            .animation(UIAccessibility.isReduceMotionEnabled ? nil : .easeOut(duration: 0.14), value: focused)
+    }
+}
+
+/// Focus for a Form/List row (Settings): the whole cell takes a quiet solid fill,
+/// shaped by the list itself; no plate, lift or shadow, which a cell clips and misplaces.
+private struct ControllerFocusableRowModifier: ViewModifier {
+    @State private var id = UUID()
+    @ObservedObject private var navigation = ControllerNavigation.shared
+    let activate: () -> Void
+    let context: (() -> Void)?
+    func body(content: Content) -> some View {
+        let focused = navigation.indicatorVisible && navigation.focused == id
+        content
+            .background { ControllerFocusMarker(id: id, activate: activate, context: context, row: true) }
+            .listRowBackground(focused ? AnyView(ZStack {
+                Color(uiColor: .secondarySystemGroupedBackground)
+                // Solid, filling the cell to its own edges (the list shapes and clips it).
+                Color.white.opacity(0.14)
+            }) : nil)
+            .animation(UIAccessibility.isReduceMotionEnabled ? nil : .easeOut(duration: 0.14), value: focused)
+            // Our fill is the only marker: no system focus ring (the blue one) on the row.
+            .focusEffectDisabled()
+    }
+}
+
+private struct ControllerDismissModifier: ViewModifier {
+    @Environment(\.dismiss) private var dismiss
+    @State private var id = UUID()
+    func body(content: Content) -> some View {
+        content
+            .background { ControllerFocusMarker(id: id, activate: {}, context: nil) }
+            .onReceive(LibraryController.shared.commands) { command in
+                if command == "back" { dismiss() }
+            }
+    }
+}
+
+extension View {
+    func controllerFocusable(cornerRadius: CGFloat = 14, primary: Bool = false, activate: @escaping () -> Void,
+                             context: (() -> Void)? = nil) -> some View {
+        modifier(ControllerFocusableModifier(cornerRadius: cornerRadius, activate: activate, context: context, primary: primary))
+    }
+    func controllerFocusableRow(activate: @escaping () -> Void, context: (() -> Void)? = nil) -> some View {
+        modifier(ControllerFocusableRowModifier(activate: activate, context: context))
+    }
+    func controllerDismiss() -> some View { modifier(ControllerDismissModifier()) }
 }
 
 /// Which interface Madeira starts with: the library (the default) or the
@@ -662,7 +995,10 @@ final class LibraryModel: ObservableObject {
     @Published var activeEntry: LibraryEntry?
     /// Closing the in-game menu saves what was changed in it to the game's profile.
     @Published var menu = false {
-        didSet { if oldValue && !menu && current != nil { saveCurrentProfile() } }
+        didSet {
+            if oldValue && !menu && current != nil { saveCurrentProfile() }
+            if menu != oldValue { HardwareInput.shared.sessionChanged(active: GameSessionChrome.active, menuOpen: menu) }
+        }
     }
     @Published var performance = false
     @Published var liveLogs = false
@@ -2256,7 +2592,7 @@ struct LibraryGroupedGames<LocalCell: View>: View {
             SteamGameSheet(appID: selection.id) { entry in
                 // Let the download sheet finish dismissing before presenting the details page.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
-            }
+            }.controllerDismiss()
         }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
@@ -2282,6 +2618,10 @@ struct LibraryGroupedGames<LocalCell: View>: View {
                     else { steamSheet = SteamSelection(id: appID) }
                 } label: { SteamGameCell(item: item, list: list, dense: dense) }
                     .libraryCardButtonStyle(grid: !list)
+                    .controllerFocusable(cornerRadius: list ? 16 : 12, activate: {
+                        if let installed = item.installed { open(library.steamEntry(installed, title: item.name)) }
+                        else { steamSheet = SteamSelection(id: appID) }
+                    })
             }
         }
     }
@@ -2318,8 +2658,10 @@ struct LibraryView: View {
     @ObservedObject private var controller = LibraryController.shared
     @ObservedObject private var input = InputSettings.shared
     @State private var tab = 0
+    @State private var controllerMenu = false
     /// A wide screen: the side menu instead of the tab bar and navigation bar.
     @State private var wide = false
+    @State private var landscape = false
     /// The side menu folded to its icons (LibrarySideMenu).
     @AppStorage("madeiraSideMenuFolded") private var menuFolded = false
     // The interface the next start uses (FrontendChoice).
@@ -2367,9 +2709,10 @@ struct LibraryView: View {
                         // Settings places its own column (settings): a Form does not animate
                         // a changing safe area, and jumped under the menu as it folded.
                         .safeAreaPadding(.leading, tab == 3 ? 0 : menuFolded ? LibrarySideMenu.foldedWidth : LibrarySideMenu.width)
-                    LibrarySideMenu(tab: Binding(get: { tab }, set: { switchTab(to: $0) }), folded: $menuFolded,
-                                    enableJIT: enableJIT,
+                    LibrarySideMenu(tab: Binding(get: { tab }, set: { switchTab(to: $0) }),
+                                    folded: $menuFolded, enableJIT: enableJIT, landscapeStyle: landscape,
                                     desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry })
+                        .environment(\.controllerSideMenu, true)
                 }
                 // The menu and the page move together when the menu folds.
                 .animation(UIAccessibility.isReduceMotionEnabled ? nil : .snappy(duration: 0.32), value: menuFolded)
@@ -2386,8 +2729,20 @@ struct LibraryView: View {
         .background {
             GeometryReader { root in
                 Color.clear
-                    .onAppear { setWide(root.size.width) }
-                    .onChange(of: root.size.width) { _, width in setWide(width) }
+                    .onAppear { setGeometry(root.size) }
+                    .onChange(of: root.size) { _, size in setGeometry(size) }
+            }
+        }
+        .overlay(alignment: .leading) {
+            if controllerMenu && !wide {
+                ZStack(alignment: .leading) {
+                    Color.black.opacity(0.28).ignoresSafeArea().onTapGesture { controllerMenu = false }
+                    LibrarySideMenu(tab: Binding(get: { tab }, set: { switchTab(to: $0); controllerMenu = false }),
+                                    folded: .constant(false), enableJIT: enableJIT, landscapeStyle: false,
+                                    desktop: { controllerMenu = false; selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry })
+                        .environment(\.controllerSideMenu, true)
+                        .transition(.move(edge: .leading))
+                }
             }
         }
         // The system search field (Liquid Glass on iOS 26) under the title on every
@@ -2437,13 +2792,22 @@ struct LibraryView: View {
         .onAppear { GlassSkin.shared.start() }
         .onDisappear { GlassSkin.shared.stop() }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: (tab + 1) % 4) }
+            guard selected == nil, !browser, !onboarding.presented else { return }
+            if command == "back", controllerMenu { controllerMenu = false }
+        }
+        .onAppear {
+            let navigation = ControllerNavigation.shared
+            navigation.previousTab = { switchTab(to: (tab + 3) % 4) }
+            navigation.nextTab = { switchTab(to: (tab + 1) % 4) }
+            navigation.menu = {
+                if wide { menuFolded = false } else { withAnimation(.snappy) { controllerMenu.toggle() } }
+            }
         }
         // The details page and the executable browser open from Home and Library alike.
         .sheet(isPresented: $browser) {
             NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
                 model.save(entry); browser = false; selected = entry
-            } }
+            } }.controllerDismiss()
         }
         .sheet(item: $selected) { entry in
             // The details page stays up until the session's starting screen takes
@@ -2513,13 +2877,16 @@ struct LibraryView: View {
         UserDefaults.standard.set(now, forKey: key)
         enableJIT()
     }
-    private func setWide(_ width: CGFloat) {
-        let now = width >= 700
+    private func setGeometry(_ size: CGSize) {
+        let now = size.width >= 700
         if now != wide { wide = now }
+        let horizontal = size.width > size.height
+        if horizontal != landscape { landscape = horizontal }
         if LibraryChrome.shared.sideMenu != now { LibraryChrome.shared.sideMenu = now }
     }
     private func switchTab(to newTab: Int) {
         guard newTab != tab else { return }
+        ControllerNavigation.shared.sectionChanged()
         withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) { tab = newTab }
     }
     /// Settings search: a section shows when the search is empty or matches one of its words.
@@ -2562,7 +2929,9 @@ struct LibraryView: View {
             if settingsShow("appearance", "liquid metal", "metal", "glass", "glow", "light") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
+                        .controllerFocusableRow(activate: { liquidMetal.on.toggle() })
                     Toggle("Card glow", isOn: $cardGlow.on)
+                        .controllerFocusableRow(activate: { cardGlow.on.toggle() })
                 } header: { Text("Appearance") } footer: {
                     Text("Liquid metal turns the app's glass buttons to flowing chrome. Card glow lights the page around installed games' artwork.")
                 }
@@ -2592,9 +2961,13 @@ struct LibraryView: View {
                     // First-run setup again (sign-ins, Dock components): for whoever skipped it.
                     RunSetupAgainRow()
                     Toggle("Extended logging", isOn: $input.diagnostics)
+                        .controllerFocusableRow(activate: { input.diagnostics.toggle() })
                     Toggle("Developer interface", isOn: Binding(get: { developerUI }, set: { on in
                         developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
                     }))
+                    .controllerFocusableRow(activate: {
+                        developerUI.toggle(); FrontendChoice.choose(new: !developerUI); restartNotice = true
+                    })
                 } header: { Text("Advanced") }
             }
             // Memory and synchronisation: the technical settings, last before the credits.
@@ -2632,12 +3005,14 @@ struct LibraryView: View {
         // may rebuild its rows while a sheet slides up over it, and a sheet whose
         // owning row is rebuilt closes again at once.
         .sheet(item: $settingsSheet, onDismiss: { settingsRefresh += 1 }) { sheet in
-            switch sheet {
-            case .allSettings: AllSettingsView()
-            case .steamSignIn: SteamSignInView()
-            case .epicSignIn: EpicSignInView()
-            case .dock: MadeiraDockView(start: startDock)
-            }
+            Group {
+                switch sheet {
+                case .allSettings: AllSettingsView()
+                case .steamSignIn: SteamSignInView()
+                case .epicSignIn: EpicSignInView()
+                case .dock: MadeiraDockView(start: startDock)
+                }
+            }.controllerDismiss()
         }
     }
     /// A round button in the row's style (library options, add executable).
@@ -2662,7 +3037,8 @@ struct LibraryView: View {
         case 0: home.background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         case 1: library.background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         case 2: StoreView(search: $storeSearch, destination: $storeDestination, wide: wide, open: { selected = $0 })
-        default: settings
+        // Settings rows are marked by the controller's own fill; no blue system focus ring.
+        default: settings.focusEffectDisabled()
         }
     }
 
@@ -2741,21 +3117,6 @@ struct LibraryView: View {
                                  add: { desktopMenu = false; browser = true })
         }
 
-        .onReceive(controller.commands) { command in
-            guard tab == 1, selected == nil, !browser, !onboarding.presented else { return }
-            let items = entries
-            let ids = [LibraryEntry.desktopID] + items.map(\.id)
-            let index = ids.firstIndex(where: { $0 == focused }) ?? 0
-            if command == "add" { browser = true }
-            else if command == "accept" {
-                if index == 0 { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry }
-                else { selected = items[index - 1] }
-            }
-            else if ["left", "right", "up", "down"].contains(command) {
-                let delta = command == "left" || command == "up" ? -1 : 1
-                withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeOut(duration: 0.18)) { focused = ids[(index + delta + ids.count) % ids.count] }
-            }
-        }
         .onAppear {
             if focused == nil { focused = LibraryEntry.desktopID }
             GlassSkin.shared.start()   // liquid metal on the navigation bar's glass pills
@@ -2936,7 +3297,7 @@ struct LibraryView: View {
                 }
             }.foregroundStyle(.primary)
         }.libraryCardButtonStyle(grid: !list)
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(focused == entry.id && controller.connected ? Color.accentColor : .clear, lineWidth: 2))
+            .controllerFocusable(cornerRadius: list ? 16 : 12, primary: true, activate: { selected = entry }, context: { play(entry) })
             .id(entry.id)
             .task(id: entry.id, priority: .utility) { await model.refreshMetadata(entry.id) }
     }
@@ -3077,6 +3438,7 @@ struct LibraryDetail: View {
                 .font(.headline).frame(maxWidth: .infinity, minHeight: 34)
             }
             .buttonStyle(LibraryPlayStyle(pending: leaving)).disabled(leaving)
+            .controllerFocusable(activate: start, context: start)
         }
         .padding(.bottom, 8)
     }
@@ -3301,7 +3663,7 @@ struct LibraryDetail: View {
             .onReceive(LibraryController.shared.commands) { command in
                 guard !leaving, !findCover, !importCover, !remove else { return }
                 if command == "back" { model.save(entry); dismiss() }
-                if command == "accept" { start() }
+                if command == "accept" || command == "context" { start() }
             }
         }
     }
@@ -3662,11 +4024,13 @@ struct DisplayRateSettings: View {
 
     var body: some View {
         Section {
-            Toggle("Hold the display at its maximum rate", isOn: Binding(get: { hold }, set: { on in
+            let holdBinding = Binding(get: { hold }, set: { on in
                 hold = on
                 MadeiraConfig.set("env.MADEIRA_PROMOTE", on ? "1" : nil)
                 LogStore.shared.log("[runtime-settings] promote=\(on ? 1 : 0)")
-            }))
+            })
+            Toggle("Hold the display at its maximum rate", isOn: holdBinding)
+                .controllerFocusableRow(activate: { holdBinding.wrappedValue.toggle() })
         } header: { Text("Display") }
     }
 }
@@ -3779,14 +4143,18 @@ struct RuntimeMemorySyncSettings: View {
 
     private func mbPicker(_ title: String, key: String, value: Binding<Int>, choices: [Int],
                           zero: String, label: @escaping (Int) -> String) -> some View {
-        Picker(title, selection: Binding(get: { value.wrappedValue }, set: { mb in
+        let selection = Binding(get: { value.wrappedValue }, set: { mb in
             value.wrappedValue = mb; changed = true
             MadeiraConfig.set(key, mb > 0 ? String(mb) : nil)
             LogStore.shared.log("[runtime-settings] \(key)=\(mb)")
-        })) {
+        })
+        return Picker(title, selection: selection) {
             ForEach(choices, id: \.self) { mb in Text(mb == 0 ? zero : label(mb)).tag(mb) }
             if !choices.contains(value.wrappedValue) { Text("\(value.wrappedValue) MB").tag(value.wrappedValue) }
         }
+        .controllerFocusableRow(activate: {
+            selection.wrappedValue = choices[((choices.firstIndex(of: selection.wrappedValue) ?? -1) + 1) % choices.count]
+        })
     }
 
     var body: some View {
@@ -3797,31 +4165,45 @@ struct RuntimeMemorySyncSettings: View {
                      zero: "Automatic", label: Self.gb)
             mbPicker("Swap tier", key: "swap-mb", value: $swapMB, choices: Self.swapChoices,
                      zero: "Off", label: Self.gb)
-            Picker("Swap coverage", selection: Binding(get: { coverage }, set: { mode in
+            let coverageBinding = Binding(get: { coverage }, set: { (mode: String) in
                 coverage = mode; changed = true
                 // With swap-mode = 2 no key means broad, so classic is written out.
                 MadeiraConfig.set("env.MADEIRA_SWAP_COVERAGE", mode.isEmpty ? (Self.swapModeBroad ? "classic" : nil) : mode)
                 LogStore.shared.log("[runtime-settings] swap-coverage=\(mode.isEmpty ? "classic" : mode)")
-            })) {
+            })
+            Picker("Swap coverage", selection: coverageBinding) {
                 ForEach(Self.coverageChoices, id: \.0) { Text($0.1).tag($0.0) }
                 if !Self.coverageChoices.contains(where: { $0.0 == coverage }) { Text(coverage).tag(coverage) }
             }
             .disabled(swapMB == 0)
-            Picker("Sync engine", selection: Binding(get: { engine }, set: { choice in
+            .controllerFocusableRow(activate: {
+                guard swapMB != 0 else { return }
+                let keys = Self.coverageChoices.map(\.0)
+                coverageBinding.wrappedValue = keys[((keys.firstIndex(of: coverage) ?? -1) + 1) % keys.count]
+            })
+            let engineBinding = Binding(get: { engine }, set: { (choice: SyncEngine) in
                 engine = choice; changed = true
                 SyncEngine.apply(choice)
                 LogStore.shared.log("[runtime-settings] sync-engine=\(choice.rawValue)")
-            })) {
+            })
+            Picker("Sync engine", selection: engineBinding) {
                 ForEach(SyncEngine.allCases) { Text($0.label).tag($0) }
             }
-            Toggle("Eco mode", isOn: Binding(get: { eco }, set: { on in
+            .controllerFocusableRow(activate: {
+                let all = Array(SyncEngine.allCases)
+                engineBinding.wrappedValue = all[((all.firstIndex(of: engine) ?? -1) + 1) % all.count]
+            })
+            let ecoBinding = Binding(get: { eco }, set: { (on: Bool) in
                 eco = on; changed = true
                 MadeiraConfig.set("eco", on ? "1" : nil)
                 LogStore.shared.log("[runtime-settings] eco=\(on ? 1 : 0)")
-            }))
+            })
+            Toggle("Eco mode", isOn: ecoBinding)
+                .controllerFocusableRow(activate: { ecoBinding.wrappedValue.toggle() })
             Button { open(.allSettings) } label: {
                 Label("All settings (\(ConfigCatalog.generated.count - Self.featuredKeys.count) more)", systemImage: "slider.horizontal.3")
             }
+            .controllerFocusableRow(activate: { open(.allSettings) })
         } header: { Text("Memory & sync") }
         .onChange(of: refresh) { _, _ in
             poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb")
@@ -3835,7 +4217,10 @@ struct RuntimeMemorySyncSettings: View {
 /// button and the in-game menu toggle too.
 struct OnScreenControlsToggle: View {
     @ObservedObject private var touch = TouchControlsModel.shared
-    var body: some View { Toggle("On-screen controls", isOn: $touch.visible) }
+    var body: some View {
+        Toggle("On-screen controls", isOn: $touch.visible)
+            .controllerFocusableRow(activate: { touch.visible.toggle() })
+    }
 }
 
 struct LibraryPointerSettings: View {
@@ -3848,12 +4233,23 @@ struct LibraryPointerSettings: View {
         })
     }
     var body: some View {
+        Toggle("Keep pointer in game", isOn: $input.keepPointerInGame)
+            .controllerFocusableRow(activate: { input.keepPointerInGame.toggle() })
         Picker("Pointer mode", selection: mode) {
             Text("Absolute").tag("absolute"); Text("Relative").tag("relative"); Text("Touch").tag("touch")
         }.pickerStyle(.segmented)
+        .controllerFocusableRow(activate: {
+            let order = ["absolute", "relative", "touch"]
+            mode.wrappedValue = order[((order.firstIndex(of: mode.wrappedValue) ?? -1) + 1) % order.count]
+        })
         LabeledContent("Touch sensitivity") {
             Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8)
         }
+        // A steps the sensitivity up by 0.5, wrapping to the lowest.
+        .controllerFocusableRow(activate: {
+            let value = input.relative ? $input.sensRel : $input.sensAbs
+            value.wrappedValue = value.wrappedValue + 0.5 > 8 ? 0.1 : value.wrappedValue + 0.5
+        })
     }
 }
 

@@ -62,9 +62,9 @@ import ObjectiveC
 //     lock; iPhone): device motion is posted RELATIVE. The wineserver adds it
 //     to its own cursor and hands raw input exactly the delta before any
 //     ClipCursor clamping, so aiming never stalls at a screen edge.
-// On iPad, while the program hides its cursor and the pointer is over the game
-// view, the pointer is locked (hidden and pinned, deltas keep coming at the
-// screen edges); the lock is released when the program shows a cursor again.
+// On iPad, a foreground game session locks the pointer by default. Visible
+// cursor motion uses a clamped virtual position; hidden-cursor mouse-look keeps
+// raw relative motion. The session menu temporarily releases the lock.
 //
 // CURSOR: with no virtual desktop (a program on the game view) nothing drew a
 // Windows cursor: the finger is the pointer there. While the mouse is in use,
@@ -89,7 +89,7 @@ import ObjectiveC
 // button). Documents/madeira-input.json holds the settings: `sensMouse` (mouse
 // gain over one screen point per delta unit, default 1.0), `padRightStickMouse` (default false) and
 // `ignoreTouchesWithMouse` (default true; false disables the AssistiveTouch
-// click filter). The driver side has MADEIRA_NAV_KEYS_E0. Log tag:
+// click filter), and `keepPointerInGame` (default true). The driver side has MADEIRA_NAV_KEYS_E0. Log tag:
 // `[hwinput]`. See docs/KEYBOARD_MOUSE.md.
 // ============================================================================
 
@@ -438,6 +438,8 @@ enum PointerRoute: String {
     case relative
     /// The iOS pointer's position on the game view, posted as absolute moves.
     case absolute
+    /// Locked device deltas accumulated into a clamped guest position.
+    case virtualAbsolute
 }
 
 enum PointerPolicy {
@@ -611,6 +613,10 @@ final class HardwareInput: ObservableObject {
     /// absolute route (the driver's report would trail it).
     private var lastAbsolute: (x: Int32, y: Int32)?
     private var lockedByUs = false
+    private var lockedForSession = false
+    private var sessionActive = false
+    private var sessionMenuOpen = false
+    private var sessionLockSuppressed = false
     /// The user released an automatic lock: leave it off until the program's
     /// cursor next changes visibility.
     private var autoLockSuppressed = false
@@ -624,6 +630,8 @@ final class HardwareInput: ObservableObject {
     private let mouseQueue = DispatchQueue(label: "madeira.hwinput.mouse", qos: .userInteractive)
     private let motionLock = NSLock()
     private var carry = MotionCarry()
+    private var virtualX = 0.0
+    private var virtualY = 0.0
     /// Guest pixels per screen point across the game surface. Relative deltas
     /// are screen points; scaling them by this moves the program's cursor the
     /// same distance on screen at any guest resolution (1048x720 and 2816x1940
@@ -671,6 +679,7 @@ final class HardwareInput: ObservableObject {
     private var hintArmed = false
     private var ticker: Timer?
     private var tickKeys = 0
+    private var keepPointerSink: AnyCancellable?
 
     private static let moveFlag: UInt32 = 0x0001
     private static let absoluteFlag: UInt32 = 0x8000
@@ -698,6 +707,9 @@ final class HardwareInput: ObservableObject {
             }
         }
         PadStickMouse.shared.start()
+        keepPointerSink = InputSettings.shared.$keepPointerInGame.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.refreshFocus("keep pointer setting") }
+        }
 
         let nc = NotificationCenter.default
         nc.addObserver(forName: .GCKeyboardDidConnect, object: nil, queue: .main) { [weak self] n in
@@ -730,6 +742,7 @@ final class HardwareInput: ObservableObject {
         nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.appActive = true
             self?.refreshFocus("app active")
+            PointerLock.refresh()
         }
         // Not on memory warnings: games here run close to the memory limit and
         // get them mid-play, and a key released while still physically held
@@ -854,6 +867,7 @@ final class HardwareInput: ObservableObject {
     /// the scene's windows.
     private func computeBaseFocus() -> Bool {
         guard appActive, UIApplication.shared.applicationState == .active else { return false }
+        guard !LibraryModel.shared.blocksGameplayTouch else { return false }
         guard Self.focusEnabled else { return true }
         guard let v = MetalBackedView.keyboardTarget, let w = v.window,
               !v.isHidden, !w.isHidden, v.alpha > 0.01 else { return false }
@@ -1069,6 +1083,7 @@ final class HardwareInput: ObservableObject {
         motionLock.unlock()
         // Post before the main hop: the delta is the thing with a deadline.
         if r == .relative { postMotion(dx, -dy) }
+        else if r == .virtualAbsolute { postVirtualMotion(dx, -dy) }
         if first || wake {
             let isFirst = first
             DispatchQueue.main.async { [weak self] in
@@ -1095,6 +1110,30 @@ final class HardwareInput: ObservableObject {
         let d = carry.add(dx, dy, gain: sens * pixelsPerPoint)
         motionLock.unlock()
         postRelative(d.dx, d.dy)
+    }
+
+    /// Locked visible cursor: integrate raw counts in guest space and clamp to
+    /// the Windows surface, then use the absolute event Wine already reads.
+    private func postVirtualMotion(_ dx: Double, _ dy: Double) {
+        let sens = InputSettings.shared.sensMouse
+        var sw: Int32 = 0, sh: Int32 = 0
+        winios_screen_size(&sw, &sh)
+        motionLock.lock()
+        let d = carry.add(dx, dy, gain: sens * pixelsPerPoint)
+        virtualX = min(max(virtualX + Double(d.dx), 0), Double(max(sw - 1, 0)))
+        virtualY = min(max(virtualY + Double(d.dy), 0), Double(max(sh - 1, 0)))
+        let x = Int32(virtualX), y = Int32(virtualY)
+        tickDX += Double(d.dx); tickDY += Double(d.dy)
+        motionLock.unlock()
+        guard d.dx != 0 || d.dy != 0 else { return }
+        winios_pointer(x, y, Self.moveFlag | Self.absoluteFlag, 0)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.currentRoute == .virtualAbsolute else { return }
+            self.lastAbsolute = (x, y)
+            if Self.desktopMode { MetalBackedView.cursor = CGPoint(x: Int(x), y: Int(y)) }
+            self.renderCursor()
+        }
+        bumpTicker()
     }
 
     /// Post one integer relative move (RELATIVE: see the header comment).
@@ -1273,12 +1312,23 @@ final class HardwareInput: ObservableObject {
     }
 
     private func updateRoute() {
-        let r = PointerPolicy.route(focused: mouseFocused, hover: hoverSeen, locked: pointerLocked,
+        var r = PointerPolicy.route(focused: mouseFocused, hover: hoverSeen, locked: pointerLocked,
                                     cursorShown: cursorShownForRoute, absoluteAllowed: Self.absoluteEnabled)
+        if mouseFocused && pointerLocked && lockedForSession && cursorShownForRoute && Self.absoluteEnabled {
+            r = .virtualAbsolute
+        }
         if r != currentRoute {
             currentRoute = r
-            if r != .absolute { lastAbsolute = nil }
-            motionLock.lock(); route = r; carry.reset(); motionLock.unlock()
+            if r == .virtualAbsolute {
+                let p = lastAbsolute ?? (x: cursorState.x, y: cursorState.y)
+                motionLock.lock()
+                virtualX = Double(p.x); virtualY = Double(p.y)
+                route = r; carry.reset()
+                motionLock.unlock()
+            } else {
+                if r != .absolute { lastAbsolute = nil }
+                motionLock.lock(); route = r; carry.reset(); motionLock.unlock()
+            }
             if diagnostics { log("pointer route: \(r.rawValue)") }
         }
         updateTracking()
@@ -1337,6 +1387,8 @@ final class HardwareInput: ObservableObject {
     }
 
     private func updateAutoLock() {
+        updateSessionLock()
+        if lockedForSession { return }
         guard Self.autoLockEnabled, cursorReportsLive, Self.pointerLockAvailable, mousePath == .gcmouse else {
             if pointerLocked && lockedByUs { setPointerLocked(false, byUs: true, why: "automatic lock unavailable") }
             return
@@ -1541,6 +1593,7 @@ final class HardwareInput: ObservableObject {
     func togglePointerLock(why: String = "toggle") {
         if pointerLocked {
             if lockedByUs { autoLockSuppressed = true }
+            if lockedForSession { sessionLockSuppressed = true }
             setPointerLocked(false, byUs: false, why: why)
         } else {
             setPointerLocked(true, byUs: false, why: why)
@@ -1568,9 +1621,47 @@ final class HardwareInput: ObservableObject {
         guard want != pointerLocked else { return }
         pointerLocked = want
         lockedByUs = want && byUs
+        if !want { lockedForSession = false }
         PointerLock.refresh()
         log("pointer lock \(want ? "ON" : "OFF") (\(why)) path=\(mousePath.rawValue)")
         refreshFocus("pointer lock")
+    }
+
+    /// The session menu always wins so its controls remain reachable. Closing
+    /// it requests containment again.
+    func sessionChanged(active: Bool, menuOpen: Bool? = nil) {
+        if active != sessionActive {
+            sessionActive = active
+            sessionLockSuppressed = false
+        }
+        if let menuOpen, menuOpen != sessionMenuOpen {
+            sessionMenuOpen = menuOpen
+            sessionLockSuppressed = false
+        }
+        refreshFocus("session state")
+        PointerLock.refresh()
+    }
+
+    private func updateSessionLock() {
+        let want = sessionActive && appActive && !sessionMenuOpen
+            && !LibraryModel.shared.blocksGameplayTouch
+            && InputSettings.shared.keepPointerInGame && !sessionLockSuppressed
+            && mousePath == .gcmouse && mouseConnected && Self.pointerLockAvailable
+        if want {
+            if pointerLocked {
+                if !lockedForSession {
+                    lockedForSession = true
+                    lockedByUs = false
+                    updateRoute()
+                }
+            } else {
+                lockedForSession = true
+                setPointerLocked(true, byUs: false, why: "game session")
+                lockedForSession = pointerLocked
+            }
+        } else if !want, pointerLocked && lockedForSession {
+            setPointerLocked(false, byUs: false, why: sessionMenuOpen ? "session menu" : "session inactive")
+        }
     }
 
     // MARK: - 1 Hz activity line (diagnostics only)

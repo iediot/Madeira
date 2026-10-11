@@ -984,6 +984,30 @@ static void ios_dev_start(void)
     pthread_mutex_unlock(&g_dev_lock);
 }
 
+/* Called by the app after an audio-session interruption (a phone call, even a
+ * missed one) or on returning to the foreground. iOS stops the RemoteIO unit
+ * during the interruption but g_dev.running stays set, so ios_dev_start()
+ * never started it again and the game stayed silent. Restart it if a client
+ * still wants output. */
+__attribute__((visibility("default"))) void madeira_audio_resume(void)
+{
+    int i, any = 0;
+
+    pthread_mutex_lock(&g_dev_lock);
+    for (i = 0; i < IOS_MAX_STREAMS; i++) {
+        struct ios_stream *m = atomic_load_explicit(&g_mix[i], memory_order_relaxed);
+        if (m && m->started) { any = 1; break; }
+    }
+    if (g_dev.au && (g_dev.running || any)) {
+        OSStatus err;
+        AudioOutputUnitStop(g_dev.au);
+        err = AudioOutputUnitStart(g_dev.au);
+        g_dev.running = !err;
+        fprintf(stderr, "[ios_audio] resume after interruption: start=%d clients=%d\n", (int)err, any);
+    }
+    pthread_mutex_unlock(&g_dev_lock);
+}
+
 static void ios_dev_stop_if_idle(void)
 {
     int i, any = 0;

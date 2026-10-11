@@ -69,6 +69,7 @@ struct LibraryShelf<Item: Identifiable, Cell: View, Trailing: View>: View {
                             .padding(.horizontal, 14).frame(minHeight: 34)
                             .libraryRowGlass(Capsule())
                     }.buttonStyle(.plain)
+                        .controllerFocusable(cornerRadius: 17, activate: seeAll)
                 }
             }
             .accessibilityElement(children: .contain)
@@ -199,12 +200,14 @@ struct LibraryHero: View {
                 }
                 .buttonStyle(LibraryPlayStyle(pending: model.startingJIT != nil))
                 .disabled(model.startingJIT != nil)
+                .controllerFocusable(primary: true, activate: play)
                 Button(action: open) {
                     Label("Game page", systemImage: "info.circle")
                         .font(.subheadline.weight(.medium)).padding(.horizontal, 16).frame(minHeight: 50)
                         .libraryRowGlass(Capsule())
                 }
                 .buttonStyle(.plain)
+                .controllerFocusable(cornerRadius: 25, activate: open)
             }
             .padding(.top, 6)
         }
@@ -266,6 +269,7 @@ struct LibraryHome: View {
     private func card(_ entry: LibraryEntry) -> some View {
         Button { open(entry) } label: { LibraryEntryCard(entry: entry) }
             .libraryCardButtonStyle(grid: true)
+            .controllerFocusable(cornerRadius: 12, activate: { open(entry) }, context: { play(entry) })
             .task(id: entry.id, priority: .utility) { await model.refreshMetadata(entry.id) }
     }
 
@@ -279,6 +283,7 @@ struct LibraryHome: View {
                 Label("Add a game", systemImage: "plus").font(.headline).frame(minWidth: 140, minHeight: 30)
             }
             .buttonStyle(LibraryPlayStyle(pending: false))
+            .controllerFocusable(activate: add)
             .padding(.top, 6)
         }
         .padding(.horizontal, LibraryLayout.margin(width))
@@ -317,9 +322,7 @@ struct LibrarySearchField: View {
 }
 
 /// The side menu of a wide screen, as SteamOS's: Madeira's name with the button that
-/// folds the menu to its icons, the pages (the chosen one in the row glass with an
-/// accent mark), then at the bottom JIT and Memory+, small, and the Windows desktop
-/// (SteamOS's Switch to Desktop).
+/// folds the menu to its icons, the pages, then Enable JIT at the bottom while JIT is off.
 struct LibrarySideMenu: View {
     static let width: CGFloat = 230
     static let foldedWidth: CGFloat = 72
@@ -327,7 +330,8 @@ struct LibrarySideMenu: View {
     /// Folded to its icons; kept by LibraryView, which animates the change.
     @Binding var folded: Bool
     let enableJIT: () -> Void
-    let desktop: () -> Void
+    var landscapeStyle = true
+    var desktop: (() -> Void)?
     @ObservedObject private var jitState = LibraryJITState.shared
     @Environment(\.displayScale) private var displayScale
 
@@ -336,6 +340,7 @@ struct LibrarySideMenu: View {
             HStack(spacing: 8) {
                 if !folded {
                     Text(LibraryHeaderAlignment.title).font(.title2.bold()).lineLimit(1)
+                        .foregroundStyle(landscapeStyle ? Color.white : Color.primary)
                         .padding(.leading, 6)
                         .accessibilityAddTraits(.isHeader)
                     Spacer(minLength: 0)
@@ -347,7 +352,9 @@ struct LibrarySideMenu: View {
                         .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .buttonStyle(.plain)
+                .foregroundStyle(landscapeStyle ? Color.white.opacity(0.68) : Color.secondary)
+                .controllerFocusable(cornerRadius: 12, activate: { folded.toggle() })
                 .accessibilityLabel(folded ? "Show menu" : "Hide menu")
             }
             .frame(maxWidth: .infinity, alignment: folded ? .center : .leading)
@@ -357,22 +364,69 @@ struct LibrarySideMenu: View {
             item("Store", "bag.fill", 2)
             item("Settings", "gearshape.fill", 3)
             Spacer(minLength: 16)
-            status
-            Button(action: desktop) { row("Desktop", "desktopcomputer", selected: false) }
-                .buttonStyle(.plain)
+            if landscapeStyle {
+                // Only while JIT is off: once enabled there is nothing to do here,
+                // and the Memory+/JIT status dots stay off the main screen.
+                if !jitState.enabled { jitButton }
+            } else {
+                legacyStatus
+                if let desktop {
+                    Button(action: desktop) { row("Desktop", "desktopcomputer", selected: false) }
+                        .buttonStyle(.plain)
+                        .controllerFocusable(activate: desktop)
+                }
+            }
         }
         .padding(.horizontal, folded ? 10 : 12).padding(.vertical, 12)
         .frame(width: folded ? Self.foldedWidth : Self.width, alignment: .leading)
         .frame(maxHeight: .infinity, alignment: .top)
         .clipped()   // the labels slide out of sight under the edge as it narrows
-        .background { Rectangle().fill(.ultraThinMaterial).ignoresSafeArea() }
+        .background { panelBackground }
         .overlay(alignment: .trailing) {
+            panelEdge
+        }
+    }
+
+    /// Landscape: black under the menu that keeps going past its edge and fades out over
+    /// the page, so there is no line and the hero art's edge is hidden under the fade.
+    @ViewBuilder private var panelBackground: some View {
+        if landscapeStyle {
+            let width = folded ? Self.foldedWidth : Self.width, fade: CGFloat = 150
+            let edge = width / (width + fade)
+            LinearGradient(stops: [
+                .init(color: .black.opacity(0.95), location: 0),
+                .init(color: .black.opacity(0.92), location: edge * 0.8),
+                .init(color: .black.opacity(0.78), location: edge),
+                .init(color: .black.opacity(0.45), location: edge + (1 - edge) * 0.35),
+                .init(color: .black.opacity(0.16), location: edge + (1 - edge) * 0.7),
+                .init(color: .clear, location: 1),
+            ], startPoint: .leading, endPoint: .trailing)
+            .frame(width: width + fade)
+            .frame(width: width, alignment: .leading)   // drawn past the menu's edge
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+        } else {
+            Rectangle().fill(.ultraThinMaterial).ignoresSafeArea()
+        }
+    }
+
+    @ViewBuilder private var panelEdge: some View {
+        if landscapeStyle {
+            EmptyView()
+        } else {
             Rectangle().fill(Color(uiColor: .separator)).frame(width: 1 / displayScale).ignoresSafeArea()
         }
     }
 
-    /// JIT and Memory+ as two small dots; while JIT is off, Enable JIT.
-    @ViewBuilder private var status: some View {
+    /// Enable JIT as one more row, exactly like Home, Library, Store and Settings.
+    private var jitButton: some View {
+        Button { if !jitState.enabled { enableJIT() } } label: { row("Enable JIT", "bolt.fill", selected: false) }
+            .buttonStyle(.plain)
+            .controllerFocusable(activate: { if !jitState.enabled { enableJIT() } })
+            .accessibilityLabel("Enable JIT")
+    }
+
+    @ViewBuilder private var legacyStatus: some View {
         if !jitState.enabled {
             Button(action: enableJIT) {
                 Label { Text("Enable JIT").font(.subheadline.weight(.semibold)) } icon: { Image(systemName: "bolt.fill") }
@@ -382,6 +436,7 @@ struct LibrarySideMenu: View {
                     .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 14))
             }
             .buttonStyle(.plain)
+            .controllerFocusable(activate: enableJIT)
             .padding(.bottom, 6)
         }
         Group {
@@ -412,28 +467,48 @@ struct LibrarySideMenu: View {
             tab = index
         } label: { row(title, symbol, selected: tab == index) }
             .buttonStyle(.plain)
+            .controllerFocusable(activate: { tab = index })
             .accessibilityLabel(title)
             .accessibilityAddTraits(tab == index ? .isSelected : [])
     }
 
+    /// Landscape rows and the Enable JIT button share one height and corner.
+    static let landscapeRowHeight: CGFloat = 38
+    static let landscapeRowCorner: CGFloat = 11
+
     @ViewBuilder private func row(_ title: String, _ symbol: String, selected: Bool) -> some View {
+        let weight: Font.Weight = landscapeStyle ? (selected ? .semibold : .medium) : .semibold
+        let corner = landscapeStyle ? Self.landscapeRowCorner : 14
         let label = Label {
-            Text(title).font(.headline)
+            Text(title).font((landscapeStyle ? Font.subheadline : .headline).weight(weight))
         } icon: {
-            Image(systemName: symbol).font(.body.weight(.semibold)).frame(width: 26)
+            Image(systemName: symbol).font((landscapeStyle ? Font.subheadline : .body).weight(weight)).frame(width: 26)
         }
         .labelStyle(FoldableLabel(folded: folded))
-        .padding(.horizontal, folded ? 0 : 14)
-        .frame(maxWidth: .infinity, minHeight: 50, alignment: folded ? .center : .leading)
+        .padding(.horizontal, folded ? 0 : 12)
+        .frame(maxWidth: .infinity, minHeight: landscapeStyle ? Self.landscapeRowHeight : 50, alignment: folded ? .center : .leading)
         .contentShape(Rectangle())
         if selected {
-            label.foregroundStyle(.primary)
-                .libraryRowGlass(RoundedRectangle(cornerRadius: 14))
-                .overlay(alignment: .leading) {
-                    Capsule().fill(Color.accentColor).frame(width: 4, height: 24).padding(.leading, 4)
-                }
+            if landscapeStyle {
+                label.foregroundStyle(.white)
+                    .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: corner))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: corner)
+                            .stroke(
+                                LinearGradient(colors: [.white.opacity(0.24), .white.opacity(0.06)],
+                                               startPoint: .topLeading, endPoint: .bottomTrailing),
+                                lineWidth: 1
+                            )
+                    }
+            } else {
+                label.foregroundStyle(.primary)
+                    .libraryRowGlass(RoundedRectangle(cornerRadius: 14))
+                    .overlay(alignment: .leading) {
+                        Capsule().fill(Color.accentColor).frame(width: 4, height: 24).padding(.leading, 4)
+                    }
+            }
         } else {
-            label.foregroundStyle(.secondary)
+            label.foregroundStyle(landscapeStyle ? Color.white.opacity(0.62) : Color.secondary)
         }
     }
 }

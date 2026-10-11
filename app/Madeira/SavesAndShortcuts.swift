@@ -309,37 +309,41 @@ struct SavesSection: View {
     @State private var importing = false
     @State private var pendingRestore: URL?
 
-    var body: some View {
-        Section {
-            Button {
-                busy = true; SaveBackup.running += 1
-                message = nil
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let r = Swift.Result { try SaveBackup.backup() }
-                    DispatchQueue.main.async {
-                        busy = false; SaveBackup.running -= 1
-                        switch r {
-                        case .success(let b):
-                            message = "\(b.files) files, \(ByteCountFormatter.string(fromByteCount: Int64(b.bytes), countStyle: .file))"
-                                + (b.leftOut > 0 ? "; \(b.leftOut) very large files left out" : "")
-                            shareURL = b.url
-                        case .failure(let e):
-                            message = e.localizedDescription
-                        }
+    private func backup() {
+            busy = true; SaveBackup.running += 1
+            message = nil
+            DispatchQueue.global(qos: .userInitiated).async {
+                let r = Swift.Result { try SaveBackup.backup() }
+                DispatchQueue.main.async {
+                    busy = false; SaveBackup.running -= 1
+                    switch r {
+                    case .success(let b):
+                        message = "\(b.files) files, \(ByteCountFormatter.string(fromByteCount: Int64(b.bytes), countStyle: .file))"
+                            + (b.leftOut > 0 ? "; \(b.leftOut) very large files left out" : "")
+                        shareURL = b.url
+                    case .failure(let e):
+                        message = e.localizedDescription
                     }
                 }
-            } label: {
+            }
+    }
+
+    var body: some View {
+        Section {
+            Button(action: backup) {
                 HStack {
                     Label("Back up saves", systemImage: "externaldrive.badge.icloud")
                     if busy { Spacer(); ProgressView() }
                 }
             }
             .disabled(busy)
+            .controllerFocusableRow(activate: { if !busy { backup() } })
             .settingsSeparator()
             Button { importing = true } label: {
                 Label("Restore saves from a backup…", systemImage: "arrow.uturn.backward.circle")
             }
             .disabled(busy)
+            .controllerFocusableRow(activate: { if !busy { importing = true } })
             .settingsSeparator()
             if let m = message { Text(m).font(.caption).foregroundStyle(.secondary) }
         } header: {

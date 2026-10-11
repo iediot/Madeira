@@ -446,6 +446,7 @@ struct SteamSettingsSection: View {
         .contextMenu {
             if name != nil { Button("Log Out", systemImage: "rectangle.portrait.and.arrow.right", action: signOut) }
         }
+        .controllerFocusableRow(activate: { if name == nil { signIn() } }, context: { if name != nil { signOut() } })
         .settingsSeparator()
         .id(store)
     }
@@ -457,6 +458,7 @@ struct RunSetupAgainRow: View {
     var body: some View {
         if onboarding.available {
             Button { onboarding.rerun() } label: { Label("Run setup again", systemImage: "wand.and.stars") }
+                .controllerFocusableRow(activate: { onboarding.rerun() })
                 .settingsSeparator()
         }
     }
@@ -470,6 +472,7 @@ struct MadeiraDockRow: View {
 
     var body: some View {
         Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
+            .controllerFocusableRow(activate: { open(.dock) })
             .settingsSeparator()
         if let status = dock.status {
             Text(status).font(.caption).foregroundStyle(.secondary)

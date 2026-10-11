@@ -13,11 +13,13 @@ def section(start, end):
 
 code = r'''
 #include <assert.h>
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 #include "perf_ios.h"
 #define MAXTHREADNAMESIZE 64
 #define PERF_THREADS 512
@@ -26,6 +28,11 @@ struct perf_thread { uint64_t id, cpu_ns; uint32_t seen; };
 void *ios_jit_rx_base_global;
 size_t ios_jit_pool_size_global;
 uintptr_t ios_fex_arena_base_unix, ios_fex_arena_end_unix;
+static int perf_read(uint64_t address, void *out, size_t size) { (void)address; (void)out; (void)size; return 0; }
+uint64_t ios_native_rip_from_hostpc(uint64_t block, uint64_t pc, const char **why)
+{ (void)block; (void)pc; (void)why; return 0; }
+const char *ios_guest_module_from_rip(uint64_t teb, uint64_t rip, uint64_t *rva)
+{ (void)teb; (void)rip; (void)rva; return NULL; }
 '''
 code += section('#define CLASS_DYLIBS', 'static void class_refresh_dyld')
 code += section('static enum perf_class class_pc(', 'static thread_t class_pick(')
@@ -54,6 +61,8 @@ int main(void) {
     class_pe[0] = (struct ios_perf_image){ .base=0x110000, .size=0x2000, .name="d3d11.dll" };
     class_pe_classes[0] = class_pe_kind(class_pe[0].name);
     assert(classify(0x100000) == C_GAME);
+    assert(class_pc(0x100000, 0, &name, &offset) == C_GAME);
+    assert(!strcmp(name, "jit-pool") && offset == 0);
     assert(classify(0x10ffff) == C_GAME);
     assert(class_pc(0x110123, 0, &name, &offset) == C_DXMT);
     assert(!strcmp(name, "d3d11.dll") && offset == 0x123);
@@ -61,12 +70,16 @@ int main(void) {
     assert(classify(0x112000) == C_GAME);
     assert(classify(0x13ffff) == C_GAME);
     assert(classify(0x140000) == C_FEX);
+    assert(class_pc(0x140123, 0x140000, &name, &offset) == C_FEX);
+    assert(!strcmp(name, "jit-dispatcher") && offset == 0x123);
     assert(classify(0x143fff) == C_FEX);
     assert(classify(0x144000) == C_GAME);
     assert(classify(0x200000) == C_OTHER);
     ios_fex_arena_base_unix = 0x300000;
     ios_fex_arena_end_unix = 0x400000;
     assert(classify(0x300000) == C_FEX);
+    assert(class_pc(0x301234, 0, &name, &offset) == C_FEX);
+    assert(!strcmp(name, "fex-arena") && offset == 0x1234);
     assert(classify(0x400000) == C_OTHER);
     class_ndylibs = 3;
     class_dylibs[0] = (struct class_image){ .lo=0x500000, .hi=0x510000, .base=0x500000, .kind=C_UNIX, .name="Madeira" };
@@ -80,6 +93,11 @@ int main(void) {
     assert(classify(0x70101f) == C_BLOCKED);
     assert(classify(0x701020) == C_SYSTEM);
     assert(classify(0x710000) == C_OTHER);
+    assert(class_is_fex_symbol("__ZN7FEXCore11LookupCache9FindBlockEv"));
+    assert(class_fex_sub("jit-dispatcher") == FEX_DISPATCH);
+    assert(class_fex_sub("FEXCore::Context::CompileBlock") == FEX_COMPILE);
+    assert(class_fex_sub("iOSSyscallHandler::HandleSyscall") == FEX_SYSCALL);
+    assert(class_fex_sub("iOSSignalDelegator::HandleSignal") == FEX_SIGNAL);
     struct class_row r = { .id=1, .tid=0x42 };
     for (unsigned i=0; i<12; ++i)
         for (unsigned j=0; j<=i; ++j) class_bucket_add(&r, C_DXMT, "d3d11.dll", i*0x1000+3);
@@ -95,7 +113,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-classify-') as tmp:
     test = Path(tmp) / 'test.c'
     exe = Path(tmp) / 'test'
     test.write_text(code)
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_DARWIN_C_SOURCE',
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_DARWIN_C_SOURCE', '-D_GNU_SOURCE',
                     '-I', str(root), str(test), '-o', str(exe)], check=True)
     result = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
     lines = result.stderr.splitlines()
