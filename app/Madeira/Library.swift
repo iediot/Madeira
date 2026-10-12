@@ -166,7 +166,10 @@ final class LibraryController: ObservableObject, @unchecked Sendable {
         items[id] = nil
         if focused == id { focused = nil }
     }
-    func hideIndicator() { indicatorVisible = false }
+    /// Only on a real change: assigning the same value still re-renders every focusable
+    /// view, and doing that on each touch rebuilt Settings' rows under a sheet being
+    /// presented (the Steam sign-in sheet came up empty).
+    func hideIndicator() { if indicatorVisible { indicatorVisible = false } }
     /// A new section (LB/RB or the side menu): focus moves to the first item of the
     /// page once it has laid out, never staying behind or landing on the side menu.
     func sectionChanged(after delay: TimeInterval = 0.12) {
@@ -191,7 +194,7 @@ final class LibraryController: ObservableObject, @unchecked Sendable {
     }
     func handle(_ command: String) {
         guard LibraryController.shared.ownsInput, LibraryModel.shared.current == nil else { return }
-        indicatorVisible = true
+        if !indicatorVisible { indicatorVisible = true }
         prune()
         switch command {
         case "up", "down", "left", "right": move(command)
@@ -2909,6 +2912,21 @@ struct LibraryView: View {
                 settingsForm.formStyle(.grouped)
             }
         }
+        // The Settings sheets hang off this container, never off one of the Form's rows
+        // (a Form may rebuild its rows while a sheet slides up, and a sheet whose owning
+        // row is rebuilt closes again at once), and not off the Form either: the Form's
+        // wide-screen contentMargins are inherited by a sheet presented from it, which
+        // pushed the sheet's own Form off to the right (Steam sign-in, All settings).
+        .sheet(item: $settingsSheet, onDismiss: { settingsRefresh += 1 }) { sheet in
+            Group {
+                switch sheet {
+                case .allSettings: AllSettingsView()
+                case .steamSignIn: SteamSignInView()
+                case .epicSignIn: EpicSignInView()
+                case .dock: MadeiraDockView(start: startDock)
+                }
+            }.controllerDismiss()
+        }
     }
     private var settingsForm: some View {
         Form {
@@ -3000,19 +3018,6 @@ struct LibraryView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("Close Madeira from the app switcher and open it again to switch interfaces.")
-        }
-        // The Settings sheets hang off the Form, never off one of its rows: a Form
-        // may rebuild its rows while a sheet slides up over it, and a sheet whose
-        // owning row is rebuilt closes again at once.
-        .sheet(item: $settingsSheet, onDismiss: { settingsRefresh += 1 }) { sheet in
-            Group {
-                switch sheet {
-                case .allSettings: AllSettingsView()
-                case .steamSignIn: SteamSignInView()
-                case .epicSignIn: EpicSignInView()
-                case .dock: MadeiraDockView(start: startDock)
-                }
-            }.controllerDismiss()
         }
     }
     /// A round button in the row's style (library options, add executable).
