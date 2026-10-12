@@ -105,6 +105,7 @@ git-ignored and consumed by the app project.
    DLLs over Wine's opengl32 stub for x64 games (`env.MADEIRA_OPENGL = 0`
    keeps the stub); without them nothing changes. Verified on the development
    machine 2026-10-06.
+   `faultrep.dll` (Windows Error Reporting stubs; Wine's faultrep lacks `WerReportHang`, and Ghost of Tsushima imports it): `build/faultrep/build.sh` -> `app/Madeira/arm64ec-windows/faultrep.dll` (tracked like the other builtins).
 6. App: `xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -destination 'generic/platform=iOS' -allowProvisioningUpdates build` (Debug is the configuration that runs the games; Release builds have crashed the guest), then zip `Payload/Madeira.app` into an IPA and sideload. Verified this session on the development machine.
 7. WoW64 (32-bit programs, optional): `build/wine-i386/build.sh` (i386 Wine farm
    -> `app/Madeira/i386-windows/`), `build/fex-wow64/build.sh` (FEX WOW64 module
