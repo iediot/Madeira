@@ -44,7 +44,8 @@ updating Madeira's gitlink so recursive clones can fetch it.
 - `wine-opengl-winios.patch` (from c-gow's fork): opengl32 for iOS -- 32-bit
   guest-pointer conversion in the generated wow64 thunks, OpenGL ES context
   handling, a GL_EXTENSIONS cap for old 32-bit games, and a normal ARM64EC
-  image base. Apply with `git -C wine apply ../patches/wine-opengl-winios.patch`,
+  image base. For porting to its original baseline only, apply with
+  `git -C wine apply ../patches/wine-opengl-winios.patch`,
   then rebuild `build/ntdll-unix/build.sh` (opengl32's unix side) and
   `make -C wine/build-arm64ec dlls/opengl32/arm64ec-windows/opengl32.dll`
   (Homebrew bison first in PATH), strip it, copy to app/Madeira/arm64ec-windows/.

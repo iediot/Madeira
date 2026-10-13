@@ -14,6 +14,13 @@ available in its public upstream repository. No local-only submodule commit is
 required for these source checkouts. The `.gitmodules` URLs and exact gitlinks,
 not the latest upstream default branches, select the source used by Madeira.
 
+Verified on 2026-10-13 at commit `30de29fa`: a fresh HTTPS clone with Git's
+global/system configuration and credential prompts disabled completed
+`--recurse-submodules --shallow-submodules`. All 24 recursive submodules were
+initialized, clean and at their exact pinned commits. FEX, DXMT, Wine and nested
+rpmalloc HEADs matched the development checkout. This verifies public source
+availability, not the complete native/app build chain.
+
 The patch snapshots in `patches/` preserve the full FEX/DXMT/Wine changes against
 their previous pins for review/porting. They are already present in the new
 submodule commits: **do not apply them again after this recursive clone**.
