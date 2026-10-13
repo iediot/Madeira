@@ -1646,7 +1646,9 @@ final class HardwareInput: ObservableObject {
         let want = sessionActive && appActive && !sessionMenuOpen
             && !LibraryModel.shared.blocksGameplayTouch
             && InputSettings.shared.keepPointerInGame && !sessionLockSuppressed
-            && mousePath == .gcmouse && mouseConnected && Self.pointerLockAvailable
+            // Any connected mouse or trackpad: waiting for the GCMouse path to be
+            // seen first left the pointer free for minutes after a game started.
+            && mouseConnected && Self.pointerLockAvailable
         if want {
             if pointerLocked {
                 if !lockedForSession {

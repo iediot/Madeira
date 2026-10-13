@@ -824,6 +824,8 @@ struct class_named_bucket
     char name[192];
 };
 
+#include "perf_guest_pc.h"
+
 static void class_named_add(struct class_named_bucket *out, unsigned cap, unsigned *count,
                             uint64_t id, unsigned tid, const char *name, unsigned hits)
 {
@@ -878,10 +880,14 @@ static void class_report_game(void)
     extern uint64_t ios_native_rip_from_hostpc(uint64_t, uint64_t, const char **);
     extern const char *ios_guest_module_from_rip(uint64_t, uint64_t, uint64_t *);
     static struct class_named_bucket named[CLASS_GAME_PCS];
+    static struct class_named_bucket detail[CLASS_GAME_PCS];
+    const char *fine_env = getenv("MADEIRA_PERF_CLASSIFY_FINE");
+    int fine = !fine_env || *fine_env != '0';
     unsigned totals[CLASS_ROWS * 2] = {0};
     uint64_t total_id[CLASS_ROWS * 2] = {0};
-    unsigned count = 0, ntotal = 0, i, rank;
+    unsigned count = 0, detail_count = 0, ntotal = 0, i, rank;
     memset(named, 0, sizeof(named));
+    if (fine) memset(detail, 0, sizeof(detail));
     for (i = 0; i < CLASS_GAME_PCS; ++i)
     {
         struct class_game_bucket *b = &class_game_pcs[i];
@@ -891,10 +897,13 @@ static void class_report_game(void)
         unsigned j;
         if (!b->hits || !(rip = ios_native_rip_from_hostpc(b->block, b->pc, NULL))) continue;
         module = ios_guest_module_from_rip(b->teb, rip, &rva);
-        if (module) snprintf(desc, sizeof(desc), "%s+0x%llx", module,
-                             (unsigned long long)(rva & ~0xfffull));
-        else snprintf(desc, sizeof(desc), "guest+0x%llx", (unsigned long long)(rip & ~0xfffull));
+        ios_perf_guest_pc_name(desc, sizeof(desc), module, rva, rip, 0);
         class_named_add(named, CLASS_GAME_PCS, &count, b->id, b->tid, desc, b->hits);
+        if (fine)
+        {
+            ios_perf_guest_pc_name(desc, sizeof(desc), module, rva, rip, 1);
+            class_named_add(detail, CLASS_GAME_PCS, &detail_count, b->id, b->tid, desc, b->hits);
+        }
         for (j = 0; j < ntotal && total_id[j] != b->id; ++j) ;
         if (j == ntotal && ntotal < sizeof(totals)/sizeof(totals[0]))
         { total_id[ntotal] = b->id; ++ntotal; }
@@ -911,6 +920,21 @@ static void class_report_game(void)
                 named[best].tid, named[best].name, named[best].hits,
                 j < ntotal && totals[j] ? 100.0 * named[best].hits / totals[j] : 0.0);
         named[best].hits = 0;
+    }
+    /* Same samples and per-thread denominator, no additional suspensions or
+     * guest walks. 16-byte buckets distinguish loops within the hot 4 KiB page.
+     * These are addresses, not inferred function names or whole-process CPU %. */
+    if (fine) for (rank = 0; rank < 10; ++rank)
+    {
+        unsigned best = ~0u, j;
+        for (i = 0; i < detail_count; ++i)
+            if (detail[i].hits && (best == ~0u || detail[i].hits > detail[best].hits)) best = i;
+        if (best == ~0u) break;
+        for (j = 0; j < ntotal && total_id[j] != detail[best].id; ++j) ;
+        dprintf(2, "[perf-classify-game-detail] tid=%04x %s samples=%u pct=%.1f bucket=16B\n",
+                detail[best].tid, detail[best].name, detail[best].hits,
+                j < ntotal && totals[j] ? 100.0 * detail[best].hits / totals[j] : 0.0);
+        detail[best].hits = 0;
     }
     if (class_game_dropped)
         dprintf(2, "[perf-classify-game] pc-table-full dropped=%u\n", class_game_dropped);

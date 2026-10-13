@@ -712,7 +712,8 @@ struct SteamGameArtwork: View {
     init(appID: Int, notDownloaded: Bool = false) {
         self.appID = appID
         self.notDownloaded = notDownloaded
-        let urls = SteamGamesRules.artwork(appID: appID) { SteamOwnedLibrary.shared.game($0) }
+        let urls = [ArtworkCache.resolved("steamcard:\(appID)")].compactMap { $0 }
+            + SteamGamesRules.artwork(appID: appID) { SteamOwnedLibrary.shared.game($0) }
         _image = State(initialValue: urls.lazy.compactMap { ArtworkCache.cached($0) }.first)
     }
 
@@ -733,14 +734,20 @@ struct SteamGameArtwork: View {
         .accessibilityHidden(true)
         // Decoded once at card size and cached (ArtworkCache); the first URL that loads wins.
         .task(id: appID) {
-            var urls = SteamGamesRules.artwork(appID: appID) { steam.game($0) }
+            // Where this card's art was found last time (often the store's hashed
+            // address) first: the guessed ones may all fail again.
+            var urls = [ArtworkCache.resolved("steamcard:\(appID)")].compactMap { $0 }
+                + SteamGamesRules.artwork(appID: appID) { steam.game($0) }
             if let hit = urls.lazy.compactMap({ ArtworkCache.cached($0) }).first { image = hit }
             // Last, the store service's real (hashed) addresses: newer games have none
             // of the guessed ones (SteamStore.artwork).
             var tried = false
             while true {
                 for url in urls {
-                    if image == nil { image = await ArtworkCache.image(url) }
+                    if image == nil {
+                        image = await ArtworkCache.image(url)
+                        if image != nil { ArtworkCache.remember("steamcard:\(appID)", url) }
+                    }
                     if image != nil {
                         if notDownloaded { blurred = await ArtworkCache.blur(url, fraction: 0.03) }
                         return

@@ -2125,8 +2125,10 @@ struct CachedArtworkImage: View {
         self.fallbacks = fallbacks
         self.steamAppID = steamAppID
         self.wide = wide
-        _image = State(initialValue: ([url].compactMap { $0 } + fallbacks).lazy.compactMap { ArtworkCache.cached($0) }.first)
+        let known = steamAppID.flatMap { ArtworkCache.resolved("steam:\($0):\(wide ? "wide" : "tall")") }
+        _image = State(initialValue: ([known, url].compactMap { $0 } + fallbacks).lazy.compactMap { ArtworkCache.cached($0) }.first)
     }
+    private var slot: String? { steamAppID.map { "steam:\($0):\(wide ? "wide" : "tall")" } }
 
     var body: some View {
         GeometryReader { geometry in
@@ -2137,13 +2139,22 @@ struct CachedArtworkImage: View {
         }
         .task(id: url) {
             guard image == nil else { return }
-            for candidate in [url].compactMap({ $0 }) + fallbacks {
+            let known = slot.flatMap { ArtworkCache.resolved($0) }
+            for candidate in [known, url].compactMap({ $0 }) + fallbacks {
                 if Task.isCancelled { return }
-                if let found = await ArtworkCache.image(candidate) { image = found; return }
+                if let found = await ArtworkCache.image(candidate) {
+                    image = found
+                    if let slot { ArtworkCache.remember(slot, candidate) }
+                    return
+                }
             }
             guard let steamAppID, !Task.isCancelled else { return }
             for candidate in await SteamStore.shared.artwork(steamAppID, wide: wide) {
-                if let found = await ArtworkCache.image(candidate) { image = found; return }
+                if let found = await ArtworkCache.image(candidate) {
+                    image = found
+                    if let slot { ArtworkCache.remember(slot, candidate) }
+                    return
+                }
             }
         }
     }
@@ -5055,16 +5066,41 @@ enum ArtworkCache {
     }
     static func cachedBlur(_ url: URL) -> UIImage? { blurred.object(forKey: url as NSURL) }
 
+    /// Where a game's art was actually found (a fallback or the store's hashed
+    /// address), by slot, kept across launches: a card that comes back into view goes
+    /// straight to that image instead of retrying every address that failed before.
+    private static let resolvedKey = "madeira.artworkResolved"
+    private static let resolvedLock = NSLock()
+    private static var resolvedMap: [String: String] = UserDefaults.standard.dictionary(forKey: resolvedKey) as? [String: String] ?? [:]
+    static func resolved(_ slot: String) -> URL? {
+        resolvedLock.lock(); defer { resolvedLock.unlock() }
+        return resolvedMap[slot].flatMap(URL.init(string:))
+    }
+    static func remember(_ slot: String, _ url: URL) {
+        resolvedLock.lock()
+        let changed = resolvedMap[slot] != url.absoluteString
+        if changed { resolvedMap[slot] = url.absoluteString }
+        let snapshot = resolvedMap
+        resolvedLock.unlock()
+        if changed { UserDefaults.standard.set(snapshot, forKey: resolvedKey) }
+    }
+    /// Addresses that answered with no image this run: never fetched twice.
+    private static let missesLock = NSLock()
+    private static var misses = Set<URL>()
+    private static func isMiss(_ url: URL) -> Bool { missesLock.lock(); defer { missesLock.unlock() }; return misses.contains(url) }
+    private static func noteMiss(_ url: URL) { missesLock.lock(); misses.insert(url); missesLock.unlock() }
+
     /// The image at `url` (a web or file URL), downsized; nil when it cannot be had.
     static func image(_ url: URL) async -> UIImage? {
         if let hit = cached(url) { return hit }
+        if isMiss(url) { return nil }
         let data: Data
         if url.isFileURL {
             guard let d = try? Data(contentsOf: url) else { return nil }
             data = d
         } else {
-            guard let (d, response) = try? await URLSession.shared.data(from: url),
-                  (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            guard let (d, response) = try? await URLSession.shared.data(from: url) else { return nil }
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { noteMiss(url); return nil }
             data = d
         }
         let image = await Task.detached(priority: .utility) { downsample(data) }.value

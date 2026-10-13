@@ -396,22 +396,14 @@ final class DockStartScreen: ObservableObject {
 /// library hero, else the cover (public store artwork by App ID, no account data).
 struct SteamLaunchBackdrop: View {
     let appID: Int
-    @State private var useCover = false
     var body: some View {
         GeometryReader { geometry in
             ZStack {
                 Color.black
-                AsyncImage(url: useCover ? SteamGamesRules.cover(appID) : Self.hero(appID)) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable().scaledToFill()
-                            .frame(width: geometry.size.width, height: geometry.size.height).clipped()
-                    case .failure:
-                        Color.clear.onAppear { useCover = true }
-                    default:
-                        Color.clear
-                    }
-                }
+                CachedArtworkImage(url: Self.hero(appID),
+                                   fallbacks: [SteamGamesRules.cover(appID)].compactMap { $0 },
+                                   steamAppID: appID, wide: true)
+                    .id(appID)
             }
             .frame(width: geometry.size.width, height: geometry.size.height).clipped()
         }

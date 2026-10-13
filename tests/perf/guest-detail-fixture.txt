@@ -1,0 +1,2 @@
+[perf-classify-game-detail] tid=01a0 DetroitBecomeHuman.exe+0x64d8b0 samples=12 pct=60.0 bucket=16B
+[perf-classify-game-detail] tid=01a0 DetroitBecomeHuman.exe+0x64d0f0 samples=8 pct=40.0 bucket=16B
