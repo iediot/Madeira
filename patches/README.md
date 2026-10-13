@@ -1,8 +1,22 @@
-# Local FEX and DXMT changes
+# Madeira dependency patch snapshots
 
-The FEX and DXMT submodules point at upstream's pinned commits; this fork's
-changes to them are kept here and applied on top (`git -C FEX apply --3way
-../patches/fex-iediot.patch`, same for `dxmt`), then the DLLs are rebuilt with
+FEX, DXMT and Wine now point at public `iediot` fork commits that already include
+all this fork's local changes. A recursive clone gets the complete source; do
+not apply these snapshots again to those pins. They remain here for review and
+porting to their previous baseline commits:
+
+| Snapshot | Previous baseline |
+| --- | --- |
+| `fex-iediot.patch` | `3bec2ac498bf78156ab47c0c194b0e8cb2849756` |
+| `dxmt-iediot.patch` | `db546ee466ad50ec6463edb5fa183de11db43761` |
+| `wine-iediot.patch` | `257f271cfffed9f22f7987cac53bc00095d092fe` |
+
+The full Wine snapshot includes the older OpenGL-specific snapshot plus the
+other current Wine edits; the older file is retained as a historical porting
+reference, not an additional patch to apply. MoltenVK's fetched source still
+receives `moltenvk-iediot.patch` through its build script.
+
+After source changes, the DLLs are rebuilt with
 `build/fex-arm64ec/build.sh`, `build/fex-wow64/build.sh`,
 `build/dxmt-pe/build.sh d3d11` and `build/dxmt-ios/build.sh`.
 
@@ -21,8 +35,11 @@ changes to them are kept here and applied on top (`git -C FEX apply --3way
 - `dxmt-iediot.patch`: single-level texture halving for BC1/BC3, RGBA8 and R8/A8
   at any size (ml2100/2101/2113), texture census, Metal 4 atomic fix.
 
-Regenerate both after editing a submodule; `dxmt_bcn_downscale.hpp` is a new
-file, so add it with `git -C dxmt add -N` before `git -C dxmt diff`.
+To refresh a snapshot after committing dependency changes, diff its recorded
+baseline against the new HEAD (`git -C FEX diff <baseline> HEAD`, similarly for
+DXMT/Wine). Before committing, use `git diff <baseline>` and include any new
+source files in that diff with `git add -N`. Publish the dependency commit before
+updating Madeira's gitlink so recursive clones can fetch it.
 
 - `wine-opengl-winios.patch` (from c-gow's fork): opengl32 for iOS -- 32-bit
   guest-pointer conversion in the generated wow64 thunks, OpenGL ES context

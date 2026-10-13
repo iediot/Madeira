@@ -1,3 +1,15 @@
+diff --git a/.gitmodules b/.gitmodules
+index 3c3b060..117c1f6 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -51,5 +51,5 @@
+ 	url = https://github.com/martinus/unordered_dense.git
+ [submodule "External/rpmalloc"]
+ 	path = External/rpmalloc
+-	url = https://github.com/willfaust/rpmalloc.git
+-	branch = ios-madeira
++	url = https://github.com/iediot/rpmalloc.git
++	branch = madeira
 diff --git a/FEXCore/Source/CMakeLists.txt b/FEXCore/Source/CMakeLists.txt
 index 40b9214..29ba340 100644
 --- a/FEXCore/Source/CMakeLists.txt

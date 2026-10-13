@@ -74,9 +74,13 @@ iOS apps can't start other programs, so everything runs in one process, Wine's s
 git clone --recurse-submodules https://github.com/iediot/Madeira.git
 ```
 
-The submodules point at Madeira's own forks of FEX, Wine, DXMT and Madeira Dock. This fork's
-changes to FEX, DXMT, MoltenVK and Wine live in [`patches/`](patches). The full walkthrough is in
-[`docs/BUILDING.md`](docs/BUILDING.md).
+FEX, Wine and DXMT are pinned to public forks under `iediot` containing this fork's
+complete source changes; FEX's nested rpmalloc dependency is public there too. Madeira Dock
+uses its pinned public upstream source. A recursive clone fetches these sources without
+access to this development machine. Matching patch snapshots and the MoltenVK changes are
+also in [`patches/`](patches); do not reapply a snapshot to a submodule that already contains it.
+Building still requires the toolchains and native-library steps in
+[`docs/BUILDING.md`](docs/BUILDING.md), not just opening Xcode after cloning.
 
 | Path | Contents |
 |---|---|

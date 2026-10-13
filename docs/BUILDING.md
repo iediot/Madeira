@@ -1,4 +1,31 @@
-# Building Madeira from a clean checkout (reproducibility record, 2026-09-16)
+# Building Madeira from a clean checkout
+
+## Public source checkout (2026-10-13)
+
+```sh
+git clone --recurse-submodules https://github.com/iediot/Madeira.git
+cd Madeira
+```
+
+FEX, Wine and DXMT are pinned to public `iediot` forks. Their `madeira` branches
+contain the local changes used by this fork; FEX's nested rpmalloc pin is also
+published at `iediot/rpmalloc`. Madeira Dock's unchanged pinned commit is
+available in its public upstream repository. No local-only submodule commit is
+required for these source checkouts. The `.gitmodules` URLs and exact gitlinks,
+not the latest upstream default branches, select the source used by Madeira.
+
+The patch snapshots in `patches/` preserve the full FEX/DXMT/Wine changes against
+their previous pins for review/porting. They are already present in the new
+submodule commits: **do not apply them again after this recursive clone**.
+MoltenVK remains a fetched build dependency with its patch applied by its build
+script.
+
+A complete source checkout is not a prebuilt development environment. The
+toolchains, runtime downloads, native-library builds, signing and JIT setup
+below are still needed. No app build was run to certify those historical build
+steps during the public-source publication.
+
+## Historical clean-build record (2026-09-16)
 
 This is the "scripts to control compilation and installation" record the
 LGPL relink obligation depends on (docs/LICENSING.md). Each step says
@@ -8,10 +35,12 @@ the submodule URLs redirected to the local forks, since nothing is pushed):
 the app target does NOT build from the clone alone, because the inputs
 marked "not in the repository" below are absent. Two further findings:
 `app/Madeira/x86_64-vcruntime` is required by the project but ignored, and
-the submodule commits (FEX, its nested rpmalloc fork, wine branch
+the submodule commits at that time (FEX, its nested rpmalloc fork, wine branch
 `madeira-lgpl`, dxmt) exist only locally: the forks named in `.gitmodules`
 (all under github.com/willfaust) do not yet carry them, so a recipient's
-recursive clone fails at the first submodule until every fork is pushed. This document is the
+recursive clone failed at the first submodule until every fork was pushed. The
+public-source checkout above supersedes that source-availability limitation.
+The remaining historical build findings are preserved here. This document is the
 remediation; steps marked UNVERIFIED have not yet been re-run from scratch.
 
 ## Inputs that are not in the repository
@@ -46,15 +75,15 @@ git-ignored and consumed by the app project.
    AudioToolbox and CoreFoundation). The configure arguments are the ones the
    port was built and device-tested with on the WSL toolchain; the macOS form
    of the script is UNVERIFIED.
-2. FEX (submodule, branch ios-port-2607):
+2. FEX (submodule, `iediot/FEX` branch `madeira`; based on ios-port-2607):
    - `FEX/build-ios`: `build/fex-ios/build.sh` (same options as the development CMakeCache) -> `FEX/build-ios/FEXCore/Source/lib{FEXCore,FEXCore_Base,JemallocLibs}.a` and the `External/{cephes,fmt,SoftFloat-3e,xxhash}` archives. UNVERIFIED from clean.
    - `FEX/build-arm64ec`: `build/fex-arm64ec/build.sh` (configures with `FEX/Data/CMake/toolchain_mingw.cmake` and the recorded options on first run, builds target `arm64ecfex`, copies `Bin/libarm64ecfex.dll` to `app/Madeira/arm64ec-windows/xtajit64.dll`). The build step was verified this session; the first-run configure in the script is reconstructed from CMakeCache and UNVERIFIED.
-3. Wine (submodule, branch madeira-lgpl):
+3. Wine (submodule, `iediot/wine` branch `madeira`; based on madeira-lgpl):
    - unix side: `build/ntdll-unix/build.sh`, `build/wineserver/build.sh`,
      `build/win32u-unix/build.sh` -> `app/Madeira/lib{ntdll_unix,wineserver,win32u_unix}.a`. Verified on the development machine.
    - PE side: `build/wine-pe/build-ntdll.sh` (configures `wine/build-arm64ec` with `--enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer` on first run, builds `dlls/ntdll`, strips, pads to SizeOfImage + 0x50000, copies to the app). Other PE modules: `build/wine-pe/build-modules.sh <name>...` (same tree; it builds each module's DLL target `dlls/<name>/arm64ec-windows/<name>.dll`, strips it with `--strip-debug` like every shipped builtin and installs it into `app/Madeira/arm64ec-windows/`, or into `$DEST`). Building the DLL target rather than `make -C dlls/<name>` is also what winegstreamer needs (enabled by `--enable-winegstreamer` although GStreamer is absent, since its unix side is `build/ntdll-unix/winegstreamer_unixlib_ios.c`). Without arguments the script rebuilds the stock builtins added for games: `cryptsp`, `d3dx11_43`, `msvcp110`, `msvcr110` and `xaudio2_7` (committed in `app/Madeira/arm64ec-windows/` like every other builtin). It needs bison 3 for `tools/wrc` (macOS ships 2.3; Homebrew's is used when installed). The strip/pad step was verified this session; the configure step is UNVERIFIED from clean; build-modules.sh reproduced the five default DLLs at their shipped sizes on the development machine (2026-10-03).
    - `app/Madeira/arm64ec-windows/` is the DLL farm: every file in it is linked into the prefix (`system32` for x64 sessions, and `sysx64`), so a Wine module is only available if it was built and copied there. The native D3D12 path needs two stock modules in addition to the existing ones: `dcomp.dll` (`make -C dlls/dcomp`; a 64-bit Godot 4 engine loads it before it creates its D3D12 device, and gives up on D3D12 without it) and `ktmw32.dll` (`make -C dlls/ktmw32`; an optional import the same engine probes).
-4. DXMT (submodule, branch ios-port):
+4. DXMT (submodule, `iediot/dxmt` branch `madeira`; based on ios-port):
    - unix side: `build/dxmt-ios/build.sh` (needs `toolchains/llvm-ios-build`) -> `app/Madeira/libdxmt_combined.a` (ignored; the app links it). Verified this session.
    - PE side: `meson setup dxmt/build-arm64ec dxmt -Dbuildtype=release -Dwine_build_path=../../wine/build-arm64ec --cross-file=dxmt/build-arm64ec-win.txt` then `ninja -C dxmt/build-arm64ec src/winemetal/winemetal.dll` (and d3d11.dll) -> copied to `app/Madeira/arm64ec-windows/`. Verified this session (winemetal.dll).
 5. Native D3D12 runtime: `build/madeira-d3d12/build-pe.sh` -> `d3d12.dll`, `madeira_d3d12.dll` and the test executables in `app/Madeira/arm64ec-windows/` (tracked). Verified this session. `build/madeira-d3d12/fetch-converter.sh` re-verifies the converter library; `build/stage-licenses.sh` refreshes the bundled licence copies (the Xcode build fails if they are stale).
