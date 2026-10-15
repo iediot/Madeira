@@ -17,6 +17,9 @@ prefix=r'''
 #include <algorithm>
 #include <thread>
 #include <cassert>
+#include "MVKMadeiraMemoryPressure.h"
+static bool testPressure;
+bool mvkMadeiraMemoryPressureActive() { return testPressure; }
 enum MVKArchivePipelineKind { kTest };
 static const char kMVKArchiveShaderKey=0;
 static NSString* testDirectory;
@@ -55,9 +58,21 @@ int main() { @autoreleasepool {
     assert([NSFileManager.defaultManager fileExistsAtPath:path]);
   }
   assert(cache._frozenCount==4 && cache._evictions==124);
-  cache._budget=0;
+  /* Lower configured budgets are never raised by pressure mode. */
+  testPressure=true;
   cache.trimFrozenPages();
   assert(cache._frozenCount==4);
+  testPressure=false;
+  cache._budget=512ull<<20;
+  for(auto& shard:cache._shards) for(auto& page:shard.frozen) page.bytes=128ull<<20;
+  cache._frozenBytes=512ull<<20;
+  testPressure=true;
+  cache.trimFrozenPages();
+  assert(cache._frozenCount==2 && cache._frozenBytes==(256ull<<20));
+  testPressure=false;
+  cache._budget=0;
+  cache.trimFrozenPages();
+  assert(cache._frozenCount==2);
   stop=true; reader.join();
   cache.logMemory();
   NSLog(@"PASS actual archive class: cap, cross-shard eviction, concurrent readers, disk preserved, unlimited mode");
@@ -66,5 +81,6 @@ int main() { @autoreleasepool {
 '''
 with tempfile.TemporaryDirectory(prefix='madeira-archive-test-') as scratch:
     binary=str(Path(scratch) / 'archive-check')
-    subprocess.run(['xcrun','clang++','-std=c++17','-x','objective-c++','-fblocks','-fsanitize=address,undefined','-framework','Foundation','-framework','Metal','-o',binary,'-'],input=prefix+source[start:end]+suffix,text=True,check=True)
+    include=Path(__file__).resolve().parents[1] / 'research/MoltenVK/MoltenVK/MoltenVK/GPUObjects'
+    subprocess.run(['xcrun','clang++','-std=c++17','-I',str(include),'-x','objective-c++','-fblocks','-fsanitize=address,undefined','-framework','Foundation','-framework','Metal','-o',binary,'-'],input=prefix+source[start:end]+suffix,text=True,check=True)
     subprocess.run([binary],check=True)

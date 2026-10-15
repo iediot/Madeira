@@ -76,12 +76,18 @@ enum SteamInstallFiles {
             try? fm.removeItem(at: folder)
         }
         if let state = record(appID: appID, steamApps: steamApps) {
-            for (_, owner) in (state["SharedDepots"]?.fields ?? [:]).sorted(by: { $0.key < $1.key }).prefix(64) {
+            let shared = (state["SharedDepots"]?.fields ?? [:]).sorted(by: { $0.key < $1.key }).prefix(64)
+            for (_, owner) in shared {
                 guard let ownerID = owner.string.flatMap({ Int($0) }), ownerID > 0, ownerID != appID,
                       let ownerState = record(appID: ownerID, steamApps: steamApps),
-                      let dir = ownerState["installdir"]?.string,
-                      safeFolderName(dir).caseInsensitiveCompare(safeFolderName(folderName)) == .orderedSame
+                      let dir = ownerState["installdir"]?.string
                 else { continue }
+                // Remove a shared-only owner's record, not an independently
+                // installed game that happens to lend some of its depots.
+                let mine = Set(shared.filter { $0.value.string == owner.string }.map { $0.key })
+                let held = Set((ownerState["InstalledDepots"]?.fields ?? [:]).keys)
+                guard safeFolderName(dir).caseInsensitiveCompare(safeFolderName(folderName)) == .orderedSame ||
+                      held.isSubset(of: mine) else { continue }
                 try? fm.removeItem(at: steamApps.appendingPathComponent("appmanifest_\(ownerID).acf"))
             }
         }

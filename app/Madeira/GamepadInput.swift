@@ -66,6 +66,7 @@ final class GamepadInput: @unchecked Sendable {
     /// exists before the game enumerates, so a change applies at the next start.
     static let padModeKey = "env.MADEIRA_PAD_MODE"
     static func configuredPadMode() -> (value: String, source: String) {
+        if let v = MadeiraConfig.gameValue(padModeKey), !v.isEmpty { return (v.lowercased(), "game") }
         if let v = MadeiraConfig.get(padModeKey), !v.isEmpty { return (v.lowercased(), "cfg") }
         if let v = ProcessInfo.processInfo.environment["MADEIRA_PAD_MODE"], !v.isEmpty { return (v.lowercased(), "env") }
         // ml2300: an Xbox controller every API can see (XInput, DirectInput, raw HID),
@@ -79,7 +80,8 @@ final class GamepadInput: @unchecked Sendable {
     /// lightbar, player LEDs) on player 1's pad. `env.MADEIRA_PAD_OUTPUT`:
     /// unset or 1 both, 0 none, hid only the DualSense's, xinput only XInput rumble.
     static func configuredPadOutput() -> (xinput: Bool, hid: Bool, value: String) {
-        let value = (MadeiraConfig.get("env.MADEIRA_PAD_OUTPUT")
+        let value = (MadeiraConfig.gameValue("env.MADEIRA_PAD_OUTPUT")
+            ?? MadeiraConfig.get("env.MADEIRA_PAD_OUTPUT")
             ?? ProcessInfo.processInfo.environment["MADEIRA_PAD_OUTPUT"]
             ?? "1").lowercased()
         switch value {

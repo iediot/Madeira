@@ -8,6 +8,8 @@ struct MVKShaderModuleKey { size_t codeSize, codeHash; };
 static NSString* directory;
 static std::atomic<unsigned> loads{0}, putCalls{0};
 static bool cacheHit=false;
+static bool pressure=false;
+static bool mvkMadeiraMemoryPressureActive() { return pressure; }
 static size_t mvkLibCacheCap() { return 256; }
 static NSString* mvkPrecompDirectory(id<MTLDevice>) { return directory; }
 static NSString* mvkPrecompKeyString(uint64_t key) { return [NSString stringWithFormat:@"%016llx", (unsigned long long)key]; }
@@ -41,10 +43,18 @@ int main() { @autoreleasepool {
     });
     mvkShaderPrewarmRequest(nil,module); drain();
     assert(loads==2 && putCalls==1 && g_mvkWarmLoaded==1 && g_mvkWarmPending==0);
+    assert(g_mvkWarmDiskMiss==1);
     cacheHit=true;
     mvkShaderPrewarmRequest(nil,module); drain();
     assert(loads==2 && putCalls==1);
+    assert(g_mvkWarmCached==2);
     cacheHit=false;
+    pressure=true;
+    mvkShaderPrewarmRequest(nil,module); drain();
+    assert(loads==2 && g_mvkWarmPressureSkipped==2);
+    pressure=false;
+    mvkShaderPrewarmRequest(nil,{128,99999}); drain();
+    assert(g_mvkWarmNoHint==1);
     // Metadata mutation is queue-confined, bounded independently of admission.
     for(unsigned i=0;i<600;++i) { mvkShaderPrewarmRemember(nil,{128,100+i},1,128,"main0"); drain(); }
     dispatch_sync(mvkShaderPrewarmQueue(), ^{

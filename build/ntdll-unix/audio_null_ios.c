@@ -39,6 +39,8 @@
 #include <time.h>
 #include <math.h>
 #include <AudioToolbox/AudioToolbox.h>
+#include <dispatch/dispatch.h>
+#include "audio_stream_lifetime.h"
 
 /* Struct/enum mirrors from wine/dlls/mmdevapi/unixlib.h. Repeating the
  * essential layout here avoids include-path drama with Wine's COM
@@ -331,8 +333,9 @@ static const char IOS_DEVICE_NAME[] = "ios-null";
  * second concurrent stream we'd need a table. Not worried about that
  * for the Tier-1 silent driver. */
 struct ios_stream {
-    int valid;
-    int started;
+    _Atomic int valid;
+    _Atomic int started;
+    struct ios_stream *retire_next; /* protected by g_dev_lock, never read by RT */
     uint64_t start_mach;        /* mach_absolute_time() at start() (null-mode clock) */
     uint64_t accumulated_frames; /* null-mode: frames "played" before last stop */
     UINT32 sample_rate;
@@ -382,7 +385,7 @@ struct ios_stream {
  * The registry exists only for handle validation and process-detach cleanup.
  * It is never touched from the RemoteIO callback, which reaches its stream
  * through inputProcRefCon. */
-#define IOS_MAX_STREAMS 16
+#define IOS_MAX_STREAMS IOS_AUDIO_MIX_SLOTS
 static struct ios_stream *g_streams[IOS_MAX_STREAMS];
 static pthread_mutex_t g_streams_lock;   /* ml739: init at process_attach */
 
@@ -426,6 +429,7 @@ static struct ios_audio_device g_dev;
 static pthread_mutex_t g_dev_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Published to the RT callback. Written with release, read with acquire. */
 static _Atomic(struct ios_stream *) g_mix[IOS_MAX_STREAMS];
+static struct ios_audio_readers g_audio_readers = { .rendering = ATOMIC_FLAG_INIT };
 
 static struct ios_stream *stream_from_handle(stream_handle h)
 {
@@ -767,9 +771,13 @@ static OSStatus ios_audio_render_cb(void *refcon, AudioUnitRenderActionFlags *fl
     }
 
     memset(out, 0, total * sizeof(float));
+    if (!ios_audio_reader_begin(&g_audio_readers)) return noErr;
     for (i = 0; i < IOS_MAX_STREAMS; i++) {
-        struct ios_stream *s = atomic_load_explicit(&g_mix[i], memory_order_acquire);
-        if (s) ios_mix_stream(s, out, nframes, dev_ch, dev_rate);
+        struct ios_stream *s = ios_audio_reader_acquire(&g_audio_readers, g_mix, i);
+        if (s) {
+            ios_mix_stream(s, out, nframes, dev_ch, dev_rate);
+            ios_audio_reader_release(&g_audio_readers, i);
+        }
     }
     /* A mix past full scale goes through a limiter, as in Windows' shared-mode
      * engine: the gain drops at once to keep the frame's loudest channel at the
@@ -806,6 +814,7 @@ static OSStatus ios_audio_render_cb(void *refcon, AudioUnitRenderActionFlags *fl
     }
     if (clamped) atomic_fetch_add_explicit(&g_dev.clamped, clamped, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_dev.cb_epoch, 1, memory_order_release);
+    ios_audio_reader_end(&g_audio_readers);
     return noErr;
 }
 
@@ -913,7 +922,7 @@ static int ios_dev_attach(struct ios_stream *s, const struct WAVEFORMATEX_stub *
     if (ios_dev_create_locked(s)) { pthread_mutex_unlock(&g_dev_lock); return -1; }
     for (i = 0; i < IOS_MAX_STREAMS; i++)
         if (!atomic_load_explicit(&g_mix[i], memory_order_relaxed)) { slot = i; break; }
-    if (slot >= 0) atomic_store_explicit(&g_mix[slot], s, memory_order_release);
+    if (slot >= 0) atomic_store_explicit(&g_mix[slot], s, memory_order_seq_cst);
     pthread_mutex_unlock(&g_dev_lock);
 
     if (slot < 0) {
@@ -940,35 +949,18 @@ static int ios_dev_attach(struct ios_stream *s, const struct WAVEFORMATEX_stub *
     return 0;
 }
 
-/* Unpublish a stream and wait until the RT callback cannot be inside it.
- *
- * The callback holds no reference across passes, so two completed passes since
- * the slot was cleared is enough. Bounded, because a stopped or never-started
- * endpoint never advances the epoch. The endpoint itself is deliberately NOT
- * disposed: keeping it for the process lifetime is what removes the
- * create/release/create churn that trapped caulk. */
+/* Unpublish without waiting for future callbacks: an interrupted endpoint may
+ * never advance cb_epoch. Disposal checks the actual reader hazards instead.
+ * The shared device remains alive for the process lifetime. */
 static void ios_dev_detach(struct ios_stream *s)
 {
-    int i, spins = 0;
-    int cleared = 0;
-    uint64_t e0;
-
+    int i;
+    pthread_mutex_lock(&g_dev_lock);
     for (i = 0; i < IOS_MAX_STREAMS; i++)
         if (atomic_load_explicit(&g_mix[i], memory_order_relaxed) == s) {
-            atomic_store_explicit(&g_mix[i], NULL, memory_order_release);
-            cleared = 1;
+            atomic_store_explicit(&g_mix[i], NULL, memory_order_seq_cst);
         }
-    if (!cleared || !g_dev.running) return;
-
-    e0 = atomic_load_explicit(&g_dev.cb_epoch, memory_order_acquire);
-    while (atomic_load_explicit(&g_dev.cb_epoch, memory_order_acquire) - e0 < 2) {
-        if (++spins > 500) {
-            fprintf(stderr, "[ios_audio] ml1026 detach quiesce TIMED OUT after %d ms "
-                            "(endpoint running=%d) -- proceeding\n", spins, g_dev.running);
-            break;
-        }
-        usleep(1000);
-    }
+    pthread_mutex_unlock(&g_dev_lock);
 }
 
 /* Start/stop the shared endpoint. It runs while at least one client is
@@ -1080,6 +1072,77 @@ static void ios_audio_free_scratch(BYTE *scratch, int is_guest)
         UINT_PTR z = 0;
         NtFreeVirtualMemory(IOS_CURRENT_PROCESS, &addr, &z, IOS_MEM_RELEASE);
     }
+}
+
+/* Reader-safe stream retirement. Nothing here runs on the audio callback.
+ * At each release, finished retirees are drained before scheduling one shared
+ * utility retry. A stopped callback retains only streams it actually holds,
+ * not every stream released while the endpoint is stopped. */
+static struct ios_stream *g_audio_retired;
+static int g_audio_retire_scheduled;
+
+static struct ios_stream *ios_audio_collect_retired_locked(void)
+{
+    struct ios_stream **link = &g_audio_retired, *ready = NULL;
+    while (*link) {
+        struct ios_stream *s = *link;
+        if (ios_audio_stream_busy(&g_audio_readers, s)) { link = &s->retire_next; continue; }
+        *link = s->retire_next;
+        s->retire_next = ready;
+        ready = s;
+    }
+    return ready;
+}
+
+static void ios_audio_free_retired(struct ios_stream *ready)
+{
+    while (ready) {
+        struct ios_stream *next = ready->retire_next;
+        ios_audio_free_scratch(ready->render_scratch, ready->scratch_guest);
+        free(ready->ring);
+        free(ready);
+        ready = next;
+    }
+}
+
+static void ios_audio_retire_tick(void);
+static void ios_audio_schedule_retire_tick(void)
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_audio_retire_tick(); });
+}
+
+static void ios_audio_retire_tick(void)
+{
+    struct ios_stream *ready;
+    int again;
+    pthread_mutex_lock(&g_dev_lock);
+    ready = ios_audio_collect_retired_locked();
+    again = g_audio_retired != NULL;
+    if (!again) g_audio_retire_scheduled = 0;
+    pthread_mutex_unlock(&g_dev_lock);
+    ios_audio_free_retired(ready);
+    if (again) ios_audio_schedule_retire_tick();
+}
+
+static void ios_audio_dispose_stream(struct ios_stream *s)
+{
+    struct ios_stream *ready;
+    int schedule = 0;
+    static unsigned deferred;
+    pthread_mutex_lock(&g_dev_lock);
+    s->retire_next = g_audio_retired;
+    g_audio_retired = s;
+    ready = ios_audio_collect_retired_locked();
+    if (g_audio_retired && !g_audio_retire_scheduled) {
+        g_audio_retire_scheduled = 1;
+        schedule = 1;
+        if (++deferred <= 8)
+            fprintf(stderr, "[ios-audio-retire] active callback: disposal deferred without blocking the game\n");
+    }
+    pthread_mutex_unlock(&g_dev_lock);
+    ios_audio_free_retired(ready);
+    if (schedule) ios_audio_schedule_retire_tick();
 }
 
 static NTSTATUS ios_process_attach(void *args) {
@@ -1223,7 +1286,7 @@ static NTSTATUS ios_create_stream(void *args) {
     if (stream_register(s)) {
         fprintf(stderr, "[ios-astream] ml739 too many streams -- refusing\n");
         ios_dev_detach(s);
-        ios_audio_free_scratch(s->render_scratch, s->scratch_guest); free(s->ring); free(s);
+        ios_audio_dispose_stream(s);
         /* the handle was published above; it now points at freed memory */
         if (p->stream) *p->stream = 0;
         p->result = E_OUTOFMEMORY;
@@ -1252,9 +1315,7 @@ static NTSTATUS ios_release_stream(void *args) {
     ios_dev_detach(s);
     ios_dev_stop_if_idle();
     stream_unregister(s);
-    ios_audio_free_scratch(s->render_scratch, s->scratch_guest);
-    free(s->ring);
-    free(s);
+    ios_audio_dispose_stream(s);
     p->result = S_OK;
     return STATUS_SUCCESS;
 }

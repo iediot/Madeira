@@ -673,6 +673,19 @@ extern int ios_fast_footprint;
  * pool warming and the footprint line are functional and always run. */
 int madeira_get_diag_enabled( void );
 
+#include "runtime_diagnostics_policy.h"
+static unsigned ios_warmer_sweep_cycles(void)
+{
+    static unsigned cycles;
+    if (!cycles) {
+        cycles = ios_diagnostics_sweep_cycles(getenv("MADEIRA_WARMER_SWEEP_CYCLES"),
+                                               getenv("MADEIRA_LEAN_DIAG"));
+        if (madeira_get_diag_enabled())
+            dprintf(2, "[diag-sweep] full map/inventory every %u ~2s cycles\n", cycles);
+    }
+    return cycles;
+}
+
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -813,7 +826,7 @@ static void *ios_pool_warmer_thread( void *arg )
                     dprintf(2, "[pool-rot] clean: %lu .text pages sampled across %u mappings (cycle=%u)\n",
                             (unsigned long)checked, ios_jit_mapping_count, cycle);
             }
-            if ((cycle == 1 || (cycle % 15) == 0) && madeira_get_diag_enabled())
+            if ((cycle == 1 || (cycle % ios_warmer_sweep_cycles()) == 0) && madeira_get_diag_enabled())
             {
                 /* ml469 (wall #79): one-shot proof of whether TCP loopback
                  * works at all under this port — the webhelper's transport
@@ -959,7 +972,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * addresses identify the owner offline (pool = RX base, FEX bands,
              * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
              * walk is tens of thousands of kernel calls. */
-            if ((cycle == 2 || (cycle % 5) == 0) && madeira_get_diag_enabled())
+            if ((cycle == 2 || (cycle % ios_warmer_sweep_cycles()) == 0) && madeira_get_diag_enabled())
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];

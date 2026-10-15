@@ -1026,7 +1026,11 @@ static void ios_guest_rip_profile( int gen )
         for (k = 0; k < tc && ntg < ML979_MAXTHREADS; k++) {
             arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
             uint64_t bb = 0;
+            pthread_t pt;
             if (tl[k] == self_port) continue;
+            /* libpthread's thread-list lock may be owned by this thread. Never
+             * look it up while suspended, or the sampler can freeze the app. */
+            pt = pthread_from_mach_thread_np( tl[k] );
             if (thread_suspend( tl[k] ) != KERN_SUCCESS) continue;
             /* ml981: a guest thread is one whose frame yields a plausible RIP at
              * x28+0x18 -- the same test the sampling loop uses, so a thread can
@@ -1034,7 +1038,7 @@ static void ios_guest_rip_profile( int gen )
             if (thread_get_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
                 && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
                 && bb > 0x10000 && bb < 0x8000000000ull
-                && ios_ts_teb( pthread_from_mach_thread_np( tl[k] ) ))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
+                && ios_ts_teb( pt ))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
             {
                 tg[ntg] = tl[k];
                 mach_port_mod_refs( mach_task_self(), tl[k], MACH_PORT_RIGHT_SEND, 1 ); /* keep it */
@@ -2129,6 +2133,8 @@ static void ios_stuck_store_check( void )
     vm_deallocate( mach_task_self(), (vm_address_t)tl, tc * sizeof(*tl) );
 }
 
+#include "runtime_diagnostics_policy.h"
+static int ios_lean_diag;
 static void ios_thread_sampler_main(void)
 {
     int gen = 0;
@@ -2146,8 +2152,10 @@ static void ios_thread_sampler_main(void)
             usleep( 100000 );
             if (stuck_check) ios_stuck_store_check();
         }
-        for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
-        wine_log_write("[thread-sample] ml876 burst done");
+        if (!ios_lean_diag) {
+            for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
+            wine_log_write("[thread-sample] ml876 burst done");
+        }
         {   /* ml1115: alert (futex) traffic since the last burst, per second */
             extern volatile long long ios_alert_wakes, ios_alert_waits, ios_qpc_syscalls, ios_affinity_sets; extern volatile int ios_srv_req_count;
             extern volatile long long ios_alert_lat_n, ios_alert_lat_ticks, ios_alert_lat_hist[6], ios_alert_spin_tries, ios_alert_spin_hits;
@@ -2178,7 +2186,7 @@ static void ios_thread_sampler_main(void)
         /* ml979: profile the guest every third burst (~once a minute). Two
          * successive profiles are what distinguish a loop from a sweep: a
          * sweep's span and bucket set move, a loop's do not. */
-        ++gen; ios_guest_rip_profile( gen );   /* ml1123: every burst (was every third) */
+        if (!ios_lean_diag) { ++gen; ios_guest_rip_profile( gen ); }
     }
 }
 
@@ -4915,6 +4923,9 @@ void server_init_process_done(void)
                 mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
                 kern_return_t kr = thread_get_state(wine_mach_thread, ARM_THREAD_STATE64,
                                                     (thread_state_t)&state, &state_count);
+                /* Logging allocates and enters the app's log store. Resume
+                 * first: the sampled thread might own either of those locks. */
+                thread_resume(wine_mach_thread);
                 if (kr == KERN_SUCCESS) {
                     wine_log_write("[Wine WATCHDOG %ds] PC=0x%llx LR=0x%llx SP=0x%llx FP=0x%llx",
                         secs,
@@ -4965,7 +4976,6 @@ void server_init_process_done(void)
                     wine_log_write("[Wine WATCHDOG %ds] thread_get_state failed: %d", secs, kr);
                 }
 
-                thread_resume(wine_mach_thread);
             };
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
@@ -4996,10 +5006,13 @@ void server_init_process_done(void)
              * suspension) stays on. */
             const char *ts = getenv( "MADEIRA_THREAD_SAMPLE" );
             const int sample = ts && *ts && *ts != '0';
+            ios_lean_diag = ios_diagnostics_lean(getenv("MADEIRA_LEAN_DIAG"));
+            if (ios_lean_diag)
+                wine_log_write("[lean-diag] suspended profiler bursts off; counters, fine classifier and enabled stuck-store check retained");
             if (sample)
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
-            if (sample)
+            if (sample && !ios_lean_diag)
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
             else
                 wine_log_write( "[thread-sample] ml2105 thread-suspending samplers off (env.MADEIRA_THREAD_SAMPLE = 1 arms them)" );

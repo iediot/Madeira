@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-precomp-') as scratch:
     tmp = Path(scratch)
     source = (ROOT / 'research/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm').read_text()
     key_function = source[source.index('uint64_t mvkLibCacheKey('):source.index('id<MTLLibrary> mvkLibCacheGet(')]
-    helpers = source[source.index('// Disk I/O is serialized'):source.index('\n}\n\nvoid mvkMadeiraShaderPrewarmLog')]
+    helpers = source[source.index('// Disk I/O is serialized'):source.index('\n}\n\nvoid mvkMadeiraTrimLibraryCache')]
     # Prefetch has its own actual-header test; this harness isolates collection.
     helpers = helpers.replace('#include "MVKMadeiraShaderPrewarm.h"', '')
     harness = r'''

@@ -15,6 +15,15 @@ import struct
 EXE_SHA256 = 'ecf52321921387e683904e089082d76b973326fc093af14e524056715519c1cf'
 KNOWN = {0x64cf80:'VMA allocation-request search (source match)',
          0x64d8b0:'VMA allocation feasibility/alignment (source match)',
+         0x64d790:'VMA free by allocation: linked-list search (source match)',
+         0x64d7f0:'VMA free by offset: linked-list search (source match)',
+         0x5df3f0:'nested object-list lookup/cache fill (decompiled; purpose inferred)',
+         0x5a5030:'size-bin heap allocation search (decompiled)',
+         0x5a5130:'heap free-list candidate/split (decompiled)',
+         0x5a8c90:'bytewise buffered reader (decompiled)',
+         0x5a3000:'scheduler job dequeue/execute (decompiled)',
+         0x6674b0:'buffer binding-table update (decompiled; purpose inferred)',
+         0x669ce0:'binding-state update (decompiled; purpose inferred)',
          0x65d640:'loading/compile job',0x65dbb0:'graphics build/cache/job routing',
          0x65ebf0:'graphics pipeline builder',0x65fd80:'compute pipeline builder',
          0x65f3c0:'render-time graphics lookup/wait',0x647b80:'compute bind/cache miss'}

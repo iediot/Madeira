@@ -388,6 +388,7 @@ __attribute__((constructor)) static void madeira_docs_dir_ctor(void)
  * Only LocalLow is created. Roaming is left alone: Wine populates it itself and
  * decides by existence (see madeira_undo_appdata_skeleton). Local already
  * exists on every start (the TEMP directory is in it). */
+#include "ProfileFolders.h"
 static void madeira_ensure_locallow(NSString *prefix)
 {
     /* 0 leaves the profile's AppData\LocalLow folder missing, as before. */
@@ -409,13 +410,9 @@ static void madeira_ensure_locallow(NSString *prefix)
     if ((slash = strrchr( name, '\\' ))) name = slash + 1;   /* ml1236: as ntdll's set_home_dir */
     if (!name[0]) return;
 
-    NSString *path = [prefix stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"drive_c/users/%s/AppData/LocalLow", name]];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:path]) return;
-    BOOL made = [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+    NSInteger made = madeira_repair_profile_folders(prefix, @[@(name)]);
     extern void ws_log(const char *fmt, ...);
-    ws_log( "[profile] users/%s/AppData/LocalLow %s", name, made ? "created" : "could NOT be created" );
+    if (made) ws_log("[profile] users/%s/AppData/LocalLow created", name);
 }
 
 /* Unity dynamic fonts that name an OS font "Arial" (RimWorld's Arial_small and

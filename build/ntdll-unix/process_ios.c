@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "process_startup_helpers.h"
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -566,6 +567,13 @@ static void *ios_child_thread_entry( void *arg )
     } else {
         dprintf(STDERR_FILENO, "[Wine child thread] child exited with code %d\n", wine_ios_exit_code);
     }
+    if (args->socketfd >= 0 && ios_child_socket_is_unclaimed(ios_child_boot_stage)) {
+        /* The duplicated socket has not entered the server's thread state yet.
+         * Close it so the parent sees failed boot rather than an immortal child. */
+        dprintf(2, "[child-boot-fail] stage=%s: closing unclaimed child socket\n", ios_child_boot_stage);
+        close(args->socketfd);
+        args->socketfd = -1;
+    }
     {   /* ml1213: never leave the child-boot lock held by a dead boot */
         extern void ios_child_boot_unlock( void );
         ios_child_boot_unlock();
@@ -626,8 +634,12 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 
     /* dup the socketfd — parent will close the original after we return */
     args->socketfd = dup( socketfd );
+    if (args->socketfd == -1) { free(argv); free(args); return STATUS_TOO_MANY_OPENED_FILES; }
     /* dup the unixdir — parent will also close the original (iOS shares fd table) */
     args->unixdir = (unixdir != -1) ? dup( unixdir ) : -1;
+    if (unixdir != -1 && args->unixdir == -1) {
+        close(args->socketfd); free(argv); free(args); return STATUS_TOO_MANY_OPENED_FILES;
+    }
     args->argv = argv;
     args->argc = argc;
     args->pe_info = *pe_info;
@@ -649,6 +661,8 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     if (ret) {
         ERR("spawn_process: pthread_create failed: %d\n", ret);
         ios_child_slot_release( args->slot );
+        close(args->socketfd);
+        if (args->unixdir != -1) close(args->unixdir);
         free( argv );
         free( args );
         return STATUS_NO_MEMORY;
@@ -1087,6 +1101,10 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     const PS_ATTRIBUTE *handles_attr = NULL, *jobs_attr = NULL;
     data_size_t handles_size, jobs_size;
     obj_handle_t *handles, *jobs;
+#ifdef WINE_IOS
+    WCHAR *jit_environment = NULL;
+    RTL_USER_PROCESS_PARAMETERS jit_params;
+#endif
 
     if (thread_flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER)
     {
@@ -1621,9 +1639,27 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     if (machine == IMAGE_FILE_MACHINE_I386 && !(pe_info.image_flags & IMAGE_FLAGS_ComPlusNativeReady))
         ios_wow_session_arm();
 #endif
+    env_size = get_env_size( params, &winedebug );
+#ifdef WINE_IOS
+    {
+        const char *inherit = getenv("MADEIRA_JIT_ENV_INHERIT");
+        size_t units = 0;
+        unsigned added = 0;
+        if (!inherit || inherit[0] != '0')
+            jit_environment = ios_jit_environment(params->Environment, env_size / sizeof(WCHAR),
+                                                   getenv, &units, &added);
+        if (jit_environment) {
+            jit_params = *params;
+            jit_params.Environment = jit_environment;
+            jit_params.EnvironmentSize = units * sizeof(WCHAR);
+            params = &jit_params;
+            env_size = units * sizeof(WCHAR);
+            dprintf(2, "[jit-env] filled missing child pool variables mask=%x\n", added);
+        }
+    }
+#endif
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;
-    env_size = get_env_size( params, &winedebug );
 
     if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
 
@@ -1790,6 +1826,9 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     status = STATUS_SUCCESS;
 
 done:
+#ifdef WINE_IOS
+    free(jit_environment);
+#endif
     if (file_handle) NtClose( file_handle );
     if (process_info) NtClose( process_info );
     if (process_handle) NtClose( process_handle );

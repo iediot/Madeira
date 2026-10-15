@@ -34,7 +34,7 @@ for (f64, slot), (f32, _) in zip(t64, t32):
 print("PASS: 37 slots in the same order; shared entries ignore their args or carry no pointers")
 
 a = src.index("static BYTE *ios_audio_alloc_scratch(")
-b = src.index("static NTSTATUS ios_process_attach(void *args)")
+b = src.index("/* Reader-safe stream retirement.")
 alloc = src[a:b]
 harness = r"""
 #include <stdio.h>
