@@ -105,6 +105,7 @@ struct EpicSettingsSection: View {
         Section {
             if let name = auth.accountName {
                 LabeledContent("Signed in as", value: name.isEmpty ? "Epic account" : name)
+                EpicCloudSettingRows()
                 Button("Sign out of Epic Games", role: .destructive) { confirmSignOut = true }
             } else {
                 Button { open(.epicSignIn) } label: { Label("Sign in to Epic Games", systemImage: "person.crop.circle.badge.plus") }

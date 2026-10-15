@@ -49,6 +49,8 @@ final class EpicAuth: ObservableObject {
     private let store = EpicTokenStore()
 
     var signedIn: Bool { accountName != nil }
+    /// The signed-in account's ID (for Epic Cloud saves).
+    var accountID: String? { store.loadTokens()?.accountID }
 
     /// The saved login is read at start, so the library shows the account's games
     /// without visiting Settings first.
