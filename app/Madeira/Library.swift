@@ -2981,6 +2981,7 @@ struct LibraryDetail: View {
                 if let epic = entry.epicAppName {
                     EpicEntrySection(appName: epic, run: { prerequisite in leaving = true; play(prerequisite) },
                                      leave: { leaving = true; dismiss() })
+                    EpicCloudSection(appName: epic)
                 }
                 Section {
                     // The Windows screen the game renders for (and the Desktop's size).

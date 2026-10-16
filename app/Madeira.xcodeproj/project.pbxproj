@@ -31,6 +31,8 @@
 		B1000784 /* EpicManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000784 /* EpicManifest.swift */; };
 		B1000785 /* EpicChunk.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000785 /* EpicChunk.swift */; };
 		B1000786 /* EpicInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000786 /* EpicInstaller.swift */; };
+		B1000790 /* EpicCloudSaves.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000790 /* EpicCloudSaves.swift */; };
+		B1000791 /* EpicCloud.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000791 /* EpicCloud.swift */; };
 		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
 		A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000609 /* ContentDecryptor.swift */; };
 		A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060A /* DepotDownloader.swift */; };
@@ -204,6 +206,8 @@
 		B2000784 /* EpicManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicManifest.swift; sourceTree = "<group>"; };
 		B2000785 /* EpicChunk.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicChunk.swift; sourceTree = "<group>"; };
 		B2000786 /* EpicInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicInstaller.swift; sourceTree = "<group>"; };
+		B2000790 /* EpicCloudSaves.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicCloudSaves.swift; sourceTree = "<group>"; };
+		B2000791 /* EpicCloud.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicCloud.swift; sourceTree = "<group>"; };
 		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
 		A2000609 /* ContentDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/ContentDecryptor.swift"; sourceTree = "<group>"; };
 		A200060A /* DepotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotDownloader.swift"; sourceTree = "<group>"; };
@@ -424,6 +428,8 @@
 				B2000784 /* EpicManifest.swift */,
 				B2000785 /* EpicChunk.swift */,
 				B2000786 /* EpicInstaller.swift */,
+				B2000790 /* EpicCloudSaves.swift */,
+				B2000791 /* EpicCloud.swift */,
 				A2000600 /* SteamInstall.swift */,
 				A2000609 /* ContentDecryptor.swift */,
 				A200060A /* DepotDownloader.swift */,
@@ -757,6 +763,8 @@
 				B1000784 /* EpicManifest.swift in Sources */,
 				B1000785 /* EpicChunk.swift in Sources */,
 				B1000786 /* EpicInstaller.swift in Sources */,
+				B1000790 /* EpicCloudSaves.swift in Sources */,
+				B1000791 /* EpicCloud.swift in Sources */,
 				A1000600 /* SteamInstall.swift in Sources */,
 				A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */,
 				A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */,
