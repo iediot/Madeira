@@ -3548,6 +3548,7 @@ struct LibraryDetail: View {
                 if let epic = entry.epicAppName {
                     EpicEntrySection(appName: epic, run: { prerequisite in leaving = true; play(prerequisite) },
                                      leave: { leaving = true; dismiss() })
+                    EpicCloudSection(appName: epic)
                 }
                 // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam
                 // game started through Madeira Dock, whose desktop and command are Dock's:

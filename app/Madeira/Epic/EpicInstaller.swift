@@ -68,6 +68,7 @@ struct EpicInstalledGame: Codable {
                 for id in pending.keys { installs[id] = Install(state: .paused) }
                 attachBackground()
                 ready = true
+                EpicCloud.shared.startupCheck()
             } catch { self.error = "Could not read Epic installs: " + error.localizedDescription }
         }
     }

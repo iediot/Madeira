@@ -43,8 +43,8 @@ struct Scheduler {
 int main(int argc, char**) {
  if (argc > 2) {
    unsetenv("MVK_MADEIRA_ASYNC_ADMISSION");
-   assert(mvkMadeiraAdmissionEnabled());
-   puts("PASS: default admission restored for corrected-settings device retest");
+   assert(!mvkMadeiraAdmissionEnabled());
+   puts("PASS: admission is off unless MVK_MADEIRA_ASYNC_ADMISSION=1");
    return 0;
  }
  if (argc > 1) {
@@ -98,7 +98,7 @@ with tempfile.TemporaryDirectory(prefix='mvk-admission-') as directory:
                    input=harness, text=True, check=True)
     subprocess.run([str(exe)], check=True, timeout=20)
     subprocess.run([str(exe), 'default-off'], check=True, timeout=20)
-    subprocess.run([str(exe), 'default-on', 'retest'], check=True, timeout=20)
+    subprocess.run([str(exe), 'default-is-off', 'check'], check=True, timeout=20)
 for signature in ('MTLRenderPipelineDescriptor* descriptor,', 'MTLComputePipelineDescriptor* descriptor, ComputeCompletion'):
     section = device[device.index('bool enqueue(const std::string& key, ' + signature):]
     assert section.index('waitForAdmission(lock, key)') < section.index('[descriptor copy]')

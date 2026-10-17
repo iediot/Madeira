@@ -334,10 +334,19 @@ index 9aebb24..b53186e 100644
  
  	MVKSmallVector<VkBufferImageCopy2, N> _bufferImageCopyRegions;
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
-index ab318c5..5048ff8 100644
+index ab318c5..2f2ac26 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
-@@ -309,16 +309,81 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -134,6 +134,8 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ 
+ template <size_t N>
+ void MVKCmdCopyImage<N>::encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse commandUse) {
++	_srcImage->markStoreElisionConsumed("copy-source");
++	_dstImage->markStoreElisionConsumed("copy-destination");
+     MVKPixelFormats* pixFmts = cmdEncoder->getPixelFormats();
+     uint32_t copyCnt = (uint32_t)_vkImageCopies.size();
+     VkBufferImageCopy vkSrcCopies[copyCnt];
+@@ -309,16 +311,81 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
          // Create and execute a temporary buffer image command.
          // To be threadsafe...do NOT acquire and return the command from the pool.
          cpyCmd.setContent(cmdEncoder->_cmdBuffer, tempBuff, (VkImage)_srcImage, _srcLayout, copyCnt, vkSrcCopies, false);
@@ -421,7 +430,16 @@ index ab318c5..5048ff8 100644
  template class MVKCmdCopyImage<1>;
  template class MVKCmdCopyImage<4>;
  
-@@ -725,11 +790,43 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -480,6 +547,8 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ 
+ template <size_t N>
+ void MVKCmdBlitImage<N>::encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse commandUse) {
++	_srcImage->markStoreElisionConsumed("blit-source");
++	_dstImage->markStoreElisionConsumed("blit-destination");
+ 
+ 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
+ 	size_t vkIBCnt = _vkImageBlits.size();
+@@ -725,11 +794,43 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  
  				[mtlRendEnc popDebugGroup];
                  [mtlRendEnc endEncoding];
@@ -465,7 +483,7 @@ index ab318c5..5048ff8 100644
  template class MVKCmdBlitImage<1>;
  template class MVKCmdBlitImage<4>;
  
-@@ -804,8 +901,20 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -804,8 +905,22 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
      return VK_SUCCESS;
  }
  
@@ -482,11 +500,13 @@ index ab318c5..5048ff8 100644
 +
  template <size_t N>
  void MVKCmdResolveImage<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	_srcImage->markStoreElisionConsumed("resolve-source");
++	_dstImage->markStoreElisionConsumed("resolve-destination");
 +	if (cmdEncoder->_madeiraDump) { madeiraDumpTransfer(cmdEncoder); }	// Madeira
  
  	auto& mtlFeats = cmdEncoder->getMetalFeatures();
  	size_t vkIRCnt = _vkImageResolves.size();
-@@ -956,6 +1065,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -956,6 +1071,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  		cmdEncoder->barrierUpdate(kMVKBarrierStageCopy, mtlRendEnc, MTLRenderStageFragment);
  
  		[mtlRendEnc endEncoding];
@@ -494,10 +514,11 @@ index ab318c5..5048ff8 100644
  	}
  }
  
-@@ -1131,6 +1241,50 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -1131,6 +1247,51 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
      
  template <size_t N>
  void MVKCmdBufferImageCopy<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	_image->markStoreElisionConsumed(_toImage ? "buffer-copy-destination" : "buffer-copy-source");
 +	if (cmdEncoder->_madeiraDump) { madeiraDumpTransfer(cmdEncoder); }	// Madeira
 +	encodeRegions(cmdEncoder);
 +	// Madeira: frame dump of a vkCmdCopyBufferToImage destination (first region).
@@ -545,7 +566,15 @@ index ab318c5..5048ff8 100644
      id<MTLBuffer> mtlBuffer = _buffer->getMTLBuffer();
      if ( !mtlBuffer ) { return; }
  
-@@ -1653,6 +1807,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -1532,6 +1693,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ 
+ template <size_t N>
+ void MVKCmdClearImage<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	_image->markStoreElisionConsumed("clear-image-destination");
+ 	bool isDS = isDepthStencilClear();
+ 	NSString* mtlRendEncName = (isDS
+ 								? mvkMTLRenderCommandEncoderLabel(kMVKCommandUseClearDepthStencilImage)
+@@ -1653,6 +1815,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  				cmdEncoder->barrierUpdate(kMVKBarrierStageCopy, mtlRendEnc, MTLRenderStageFragment);
  
                  [mtlRendEnc endEncoding];
@@ -553,7 +582,7 @@ index ab318c5..5048ff8 100644
              } else {
                  for (uint32_t layer = layerStart; layer < layerEnd; layer++) {
                      if (is3D) {
-@@ -1672,6 +1827,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -1672,6 +1835,7 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
  					cmdEncoder->barrierUpdate(kMVKBarrierStageCopy, mtlRendEnc, MTLRenderStageFragment);
  
  					[mtlRendEnc endEncoding];
@@ -561,7 +590,7 @@ index ab318c5..5048ff8 100644
                  }
              }
          }
-@@ -1792,8 +1948,6 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+@@ -1792,8 +1956,6 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
                            size: _dataSize];
  
      // Return the MTLBuffer allocation to the pool once the command buffer is done with it
@@ -2035,10 +2064,20 @@ index 8c24deb..0ba0f2c 100644
  	[_mtlComputeEncoder release];
  	[_mtlBlitEncoder release];
 diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
-index 7d16b94..e164ebb 100644
+index 7d16b94..f573da6 100644
 --- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
 +++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
-@@ -1418,7 +1418,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -454,6 +454,9 @@ static void executeBindOp(id<MTLCommandEncoder> encoder,
+ 	MVKDevice* dev = mvkEncoder.getDevice();
+ 	for (uint32_t i = 0; i < count; i++, src += stride) {
+ 		id resource = *reinterpret_cast<const id*>(src);
++		// Madeira: descriptor images are considered consumed when the draw/dispatch makes
++		// the resource resident or binds it. Non-texture resources miss the registry cheaply.
++		dev->markStoreElisionTextureConsumed(resource, "descriptor-read");
+ 		switch (Op) {
+ 			case MVKDescriptorBindOperationCode::BindBytes:
+ 				assert(0); // Handled above
+@@ -1418,7 +1421,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
    const MVKVulkanGraphicsCommandEncoderState& vk,
    const MVKVulkanSharedCommandEncoderState& vkShared) {
  	MVKGraphicsPipeline* pipeline = vk._pipeline;
@@ -2047,7 +2086,7 @@ index 7d16b94..e164ebb 100644
  		return;
  
  	// Pipeline
-@@ -1446,6 +1446,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1446,6 +1449,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	} else {
  		bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageVertex,   MVKMetalGraphicsStage::Vertex);
  		bindVertexBuffers(encoder, vk, _exists.vertex(), _bindings.vertex(), MVKVertexBufferBinder::Vertex());
@@ -2064,7 +2103,7 @@ index 7d16b94..e164ebb 100644
  	}
  	bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageFragment, MVKMetalGraphicsStage::Fragment);
  	mvkEncoder.getState().mtlShared()._useResource.bindAndResetGraphics(encoder);
-@@ -1609,7 +1619,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1609,7 +1622,7 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	MVKShaderStage stage)
  {
  	MVKGraphicsPipeline* pipeline = vk._pipeline;
@@ -2073,7 +2112,7 @@ index 7d16b94..e164ebb 100644
  		return;
  
  
-@@ -1647,8 +1657,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+@@ -1647,8 +1660,16 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
  	}
  
  	bindVulkanGraphicsToMetalCompute(encoder, mvkEncoder, vk, vkShared, *this, pipeline, stage);
@@ -2091,7 +2130,7 @@ index 7d16b94..e164ebb 100644
  	mvkEncoder.getState().mtlShared()._useResource.bindAndResetCompute(encoder);
  }
  
-@@ -1722,6 +1740,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+@@ -1722,6 +1743,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
  }
  
  void MVKCommandEncoderState::bindGraphicsPipeline(MVKGraphicsPipeline* pipeline) {
@@ -2099,7 +2138,7 @@ index 7d16b94..e164ebb 100644
  	_mtlGraphics.changePipeline(_vkGraphics._pipeline, pipeline);
  	_vkGraphics._pipeline = pipeline;
  	MVKPipelineLayout* layout = pipeline->getLayout();
-@@ -1735,6 +1754,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
+@@ -1735,6 +1757,7 @@ static void invalidateImplicitBuffer(MVKCommandEncoderState& state, VkPipelineBi
  }
  
  void MVKCommandEncoderState::bindComputePipeline(MVKComputePipeline* pipeline) {
@@ -2228,10 +2267,18 @@ index 3cdc623..cbca748 100644
  }
  
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-index 534a414..6a66d06 100644
+index 534a414..38482e6 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
-@@ -31,10 +31,31 @@
+@@ -24,6 +24,7 @@
+ #include "MVKLayers.h"
+ #include "MVKObjectPool.h"
+ #include "MVKSmallVector.h"
++#include "MVKMadeiraStoreElision.h"
+ #include "MVKPixelFormats.h"
+ #include "MVKOSExtensions.h"
+ #include "mvk_datatypes.hpp"
+@@ -31,10 +32,31 @@
  #include <string>
  #include <mutex>
  #include <os/lock.h>
@@ -2263,7 +2310,7 @@ index 534a414..6a66d06 100644
  class MVKInstance;
  class MVKDevice;
  class MVKQueue;
-@@ -74,6 +95,24 @@ class MVKPrivateDataSlot;
+@@ -74,6 +96,24 @@ class MVKPrivateDataSlot;
  struct MVKUseResourceHelper;
  enum class MVKResourceUsageStages : uint8_t;
  
@@ -2288,7 +2335,7 @@ index 534a414..6a66d06 100644
  
  /** The buffer index to use for vertex content. */
  static constexpr uint32_t kMVKVertexContentBufferIndex = 0;
-@@ -614,7 +653,9 @@ public:
+@@ -614,7 +654,9 @@ public:
  		id<MTLFence> prevRead; ///< The read fence from the previous use of the buffer, waited on by writes to prevent WAR hazards
  	};
  private:
@@ -2298,7 +2345,7 @@ index 534a414..6a66d06 100644
  	uint32_t _currentOffset = 0;
  	uint32_t _halfSize;
  	id<MTLFence> _fences[3][2] = {};
-@@ -628,10 +669,12 @@ public:
+@@ -628,10 +670,12 @@ public:
  		return { _fences[0][idx], _fences[1][idx], _fences[2][idx] };
  	}
  	MVKVisibilityBuffer() = default;
@@ -2312,7 +2359,7 @@ index 534a414..6a66d06 100644
  		_currentOffset = other._currentOffset;
  		_halfSize = other._halfSize;
  		for (uint32_t i = 0; i < std::size(_fences); i++)
-@@ -651,9 +694,58 @@ public:
+@@ -651,9 +695,58 @@ public:
  };
  
  /** Represents a Vulkan logical GPU device, associated with a physical device. */
@@ -2371,7 +2418,22 @@ index 534a414..6a66d06 100644
  
  	/** Returns the Vulkan type of this object. */
  	VkObjectType getVkObjectType() override { return VK_OBJECT_TYPE_DEVICE; }
-@@ -983,7 +1075,14 @@ public:
+@@ -672,6 +765,14 @@ public:
+ 	/** Returns the list of live resources. */
+ 	MVKLiveResourceSet& getLiveResources() { return _liveResources; }
+ 
++	/** Madeira: tracks image reads and attachment stores for opt-in tile-store elision. */
++	MVKMadeiraStoreElisionTracker& getStoreElisionTracker() { return _madeiraStoreElision; }
++	uint64_t getStoreElisionFrame() const { return _madeiraStoreElisionFrame.load(std::memory_order_relaxed); }
++	void advanceStoreElisionFrame() { _madeiraStoreElisionFrame.fetch_add(1, std::memory_order_relaxed); }
++	void registerStoreElisionTexture(id<MTLTexture> texture, MVKImage* image);
++	void unregisterStoreElisionTexture(id<MTLTexture> texture, MVKImage* image);
++	void markStoreElisionTextureConsumed(id<MTLTexture> texture, const char* reason);
++
+     /** Returns the common resource factory for creating command resources. */
+     MVKCommandResourceFactory* getCommandResourceFactory() { return _commandResourceFactory; }
+ 
+@@ -983,7 +1084,14 @@ public:
  	void makeResident(id<MTLAllocation> allocation) {
  		@synchronized(_residencySet) {
  			[_residencySet addAllocation: allocation];
@@ -2387,7 +2449,7 @@ index 534a414..6a66d06 100644
  		}
  	}
  #endif
-@@ -994,11 +1093,36 @@ public:
+@@ -994,11 +1102,36 @@ public:
  	void removeResidency(id<MTLAllocation> allocation) {
  		@synchronized(_residencySet) {
  			[_residencySet removeAllocation:allocation];
@@ -2424,7 +2486,7 @@ index 534a414..6a66d06 100644
  	void addResidencySet(id<MTLCommandQueue> queue) {
  #if MVK_XCODE_16
  		if (_residencySet) [queue addResidencySet:_residencySet];
-@@ -1019,6 +1143,13 @@ public:
+@@ -1019,6 +1152,13 @@ public:
  #endif
  	}
  
@@ -2438,7 +2500,7 @@ index 534a414..6a66d06 100644
  #pragma mark Construction
  
  	/** Constructs an instance on the specified physical device. */
-@@ -1051,6 +1182,16 @@ public:
+@@ -1051,6 +1191,20 @@ public:
  	}
  
  protected:
@@ -2451,11 +2513,15 @@ index 534a414..6a66d06 100644
 +	uint32_t _madeiraAsyncPipelineWaitMS = 0;
 +	bool _madeiraAsyncPipelines = false;
 +	bool _madeiraAsyncComputePipelines = false;
++	MVKMadeiraStoreElisionTracker _madeiraStoreElision;
++	std::atomic<uint64_t> _madeiraStoreElisionFrame { 1 };
++	std::mutex _madeiraStoreElisionTextureLock;
++	std::unordered_map<id, std::vector<MVKImage*>> _madeiraStoreElisionTextures;
 +
  	friend class MVKDeviceTrackingMixin;
  
  	void propagateDebugName() override  {}
-@@ -1077,6 +1218,11 @@ protected:
+@@ -1077,6 +1231,11 @@ protected:
  														   VkDescriptorSetLayoutSupport* pSupport,
  														   VkDescriptorSetVariableDescriptorCountLayoutSupport* pVarDescSetCountSupport);
  	bool readGPUCapturePipe() { char dummy; return _capturePipeFileDesc >= 0 && read(_capturePipeFileDesc, &dummy, 1) > 0; };
@@ -2467,7 +2533,7 @@ index 534a414..6a66d06 100644
  
  	MVKPhysicalDevice* _physicalDevice = nullptr;
  	MVKExtensionList _enabledExtensions;
-@@ -1108,11 +1254,24 @@ protected:
+@@ -1108,11 +1267,28 @@ protected:
  	std::mutex _sem4Lock;
      std::mutex _perfLock;
  	std::mutex _vizLock;
@@ -2482,6 +2548,10 @@ index 534a414..6a66d06 100644
 +	bool _memoryLogStop = false;
 +	bool _memoryLogEnabled = false;
 +	bool _memoryPressureEnabled = false;
++#if MVK_IOS
++	dispatch_queue_t _memoryPressureQueue = nullptr;
++	dispatch_source_t _memoryPressureSource = nullptr;
++#endif
  	std::string _capturePipeFileName;
  	id<MTLSamplerState> _defaultMTLSamplerState = nil;
  	id<MTLBuffer> _dummyBlitMTLBuffer = nil;
@@ -2493,7 +2563,7 @@ index 534a414..6a66d06 100644
  	uint32_t _visibilityBufferCount = 0;
  	int _capturePipeFileDesc = -1;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 9772757..a2e0a16 100644
+index 9772757..d2a7caa 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -25,6 +25,11 @@
@@ -2508,7 +2578,7 @@ index 9772757..a2e0a16 100644
  #include "MVKPipeline.h"
  #include "MVKFramebuffer.h"
  #include "MVKRenderPass.h"
-@@ -32,12 +37,25 @@
+@@ -32,12 +37,30 @@
  #include "MVKCommandPool.h"
  #include "MVKFoundation.h"
  #include "MVKStrings.h"
@@ -2529,12 +2599,17 @@ index 9772757..a2e0a16 100644
 +#include <unordered_set>
 +#include <sys/sysctl.h>
 +#include <mach/mach.h>
++#include <malloc/malloc.h>
 +#include <pthread/qos.h>
 +#import <objc/runtime.h>
++
++// Exported on iOS, but the public iOS SDK deliberately rejects <mach/mach_vm.h>.
++extern "C" kern_return_t mach_vm_region_recurse(vm_map_t, mach_vm_address_t*, mach_vm_size_t*,
++											 natural_t*, vm_region_recurse_info_t, mach_msg_type_number_t*);
  
  using namespace std;
  
-@@ -2578,6 +2596,14 @@
+@@ -2578,6 +2601,14 @@
  
  		_metalFeatures.astcHDRTextures = !MVK_TVOS || mvkOSVersionIsAtLeast(16.0);
  		_metalFeatures.residencySets = mvkOSVersionIsAtLeast(15.0, 18.0, 2.0);
@@ -2549,7 +2624,7 @@ index 9772757..a2e0a16 100644
  		_metalFeatures.simdPermute = true;
  	}
  
-@@ -3264,6 +3290,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3264,6 +3295,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	// This is captured either as the MoltenVK Git revision, or if that's not available, as the MoltenVK version.
  	uint32_t mvkRev = getMoltenVKGitRevision();
  	if ( !mvkRev ) { mvkRev = MVK_VERSION; }
@@ -2560,7 +2635,7 @@ index 9772757..a2e0a16 100644
  	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mvkRev);
  	uuidComponentOffset += sizeof(mvkRev);
  
-@@ -3771,13 +3801,16 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3771,13 +3806,16 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  #pragma mark - MVKVisibilityBuffer
  
@@ -2578,7 +2653,7 @@ index 9772757..a2e0a16 100644
  			[_buffer setLabel:[NSString stringWithFormat:@"Metal Visibility Result Buffer %d", nameIdx]];
  			for (uint32_t gid = 0; gid < std::size(_fences); gid++) {
  				for (uint32_t lohi = 0; lohi < std::size(_fences[0]); lohi++) {
-@@ -3791,6 +3824,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -3791,6 +3829,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  MVKVisibilityBuffer::~MVKVisibilityBuffer() {
  	if (_buffer) {
@@ -2586,7 +2661,7 @@ index 9772757..a2e0a16 100644
  		[_buffer release];
  		for (auto& groups : _fences)
  			for (auto& fence : groups)
-@@ -4797,6 +4831,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4797,6 +4836,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -2594,7 +2669,7 @@ index 9772757..a2e0a16 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -4881,7 +4916,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4881,7 +4921,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  MVKVisibilityBuffer MVKDevice::getVisibilityBuffer() {
  	std::lock_guard<std::mutex> guard(_vizLock);
  	if (_visibilityBuffers.empty())
@@ -2603,7 +2678,7 @@ index 9772757..a2e0a16 100644
  	MVKVisibilityBuffer res = std::move(_visibilityBuffers.back());
  	_visibilityBuffers.pop_back();
  	return res;
-@@ -4917,6 +4952,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4917,6 +4957,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		if ( !_dummyBlitMTLBuffer ) {
  			@autoreleasepool {
  				_dummyBlitMTLBuffer = [_physicalDevice->_mtlDevice newBufferWithLength: 1 options: MTLResourceStorageModePrivate];
@@ -2613,7 +2688,7 @@ index 9772757..a2e0a16 100644
  			}
  		}
  	}
-@@ -5130,6 +5168,1130 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5130,6 +5173,1398 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -2854,6 +2929,22 @@ index 9772757..a2e0a16 100644
 +static std::atomic<bool> g_mvkMemoryPressure{false};
 +bool mvkMadeiraMemoryPressureActive() { return g_mvkMemoryPressure.load(std::memory_order_relaxed); }
 +
++struct MVKMadeiraAsyncMemoryStats {
++	uint64_t jobs = 0, queued = 0, running = 0, completions = 0, ownedMinBytes = 0;
++};
++static std::atomic<uint64_t> g_mvkAsyncJobs{0}, g_mvkAsyncQueued{0}, g_mvkAsyncRunning{0};
++static std::atomic<uint64_t> g_mvkAsyncCompletions{0}, g_mvkAsyncOwnedMinBytes{0};
++static std::atomic<uint64_t> g_mvkArchiveFrozenPages{0}, g_mvkArchiveFrozenFileBytes{0};
++static std::atomic<uint64_t> g_mvkArchiveBudgetFileBytes{0};
++static MVKMadeiraAsyncMemoryStats mvkMadeiraAsyncMemoryStats() {
++	return { g_mvkAsyncJobs.load(std::memory_order_relaxed), g_mvkAsyncQueued.load(std::memory_order_relaxed),
++		g_mvkAsyncRunning.load(std::memory_order_relaxed), g_mvkAsyncCompletions.load(std::memory_order_relaxed),
++		g_mvkAsyncOwnedMinBytes.load(std::memory_order_relaxed) };
++}
++static uint64_t mvkMadeiraMallocSize(id object) {
++	return object ? malloc_size((const void*)object) : 0;
++}
++
 +static bool mvkMadeiraUpdateMemoryPressure(uint64_t available) {
 +	static std::mutex lock;
 +	static MVKMadeiraMemoryPressurePolicy policy;
@@ -2863,6 +2954,24 @@ index 9772757..a2e0a16 100644
 +	bool changed = policy.update(available, now);
 +	g_mvkMemoryPressure.store(policy.active, std::memory_order_relaxed);
 +	return changed;
++}
++
++static uint64_t mvkMadeiraConversionPressureBytes() {
++	static uint64_t bytes = [] {
++		const char* value = getenv("MVK_MADEIRA_CONVERSION_PRESSURE_MB");
++		uint64_t mb = (value && *value) ? strtoull(value, nullptr, 10) : 8;
++		return std::min<uint64_t>(mb, 256) << 20;
++	}();
++	return bytes;
++}
++
++static bool mvkMadeiraMallocPressureReliefEnabled() {
++	const char* value = getenv("MVK_MADEIRA_MALLOC_PRESSURE_RELIEF");
++	return !value || strcmp(value, "0");
++}
++
++static size_t mvkMadeiraRelieveMallocPressure() {
++	return mvkMadeiraMallocPressureReliefEnabled() ? malloc_zone_pressure_relief(nullptr, 0) : 0;
 +}
 +
 +void MVKDevice::trackMemoryAllocation(MVKMemoryAllocationType type, uint64_t bytes) {
@@ -2892,9 +3001,97 @@ index 9772757..a2e0a16 100644
 +	else { value.fetch_sub((uint64_t)-delta, std::memory_order_relaxed); }
 +}
 +
++void MVKDevice::registerStoreElisionTexture(id<MTLTexture> texture, MVKImage* image) {
++	if (!_madeiraStoreElision.enabled() || !texture || !image) { return; }
++	std::lock_guard<std::mutex> lock(_madeiraStoreElisionTextureLock);
++	auto& images = _madeiraStoreElisionTextures[texture];
++	if (std::find(images.begin(), images.end(), image) == images.end()) { images.push_back(image); }
++}
++
++void MVKDevice::unregisterStoreElisionTexture(id<MTLTexture> texture, MVKImage* image) {
++	if (!_madeiraStoreElision.enabled() || !texture || !image) { return; }
++	std::lock_guard<std::mutex> lock(_madeiraStoreElisionTextureLock);
++	auto it = _madeiraStoreElisionTextures.find(texture);
++	if (it == _madeiraStoreElisionTextures.end()) { return; }
++	auto& images = it->second;
++	images.erase(std::remove(images.begin(), images.end(), image), images.end());
++	if (images.empty()) { _madeiraStoreElisionTextures.erase(it); }
++}
++
++void MVKDevice::markStoreElisionTextureConsumed(id<MTLTexture> texture, const char* reason) {
++	if (!_madeiraStoreElision.enabled() || !texture) { return; }
++	std::lock_guard<std::mutex> lock(_madeiraStoreElisionTextureLock);
++	auto it = _madeiraStoreElisionTextures.find(texture);
++	if (it == _madeiraStoreElisionTextures.end()) { return; }
++	for (MVKImage* image : it->second) { image->markStoreElisionConsumed(reason); }
++}
++
 +void MVKDevice::trackPipelineCacheOccupancy(int64_t bucketDelta, int64_t entryDelta) {
 +	mvkAddMemoryCount(_pipelineCacheBuckets, bucketDelta);
 +	mvkAddMemoryCount(_pipelineCacheEntries, entryDelta);
++}
++
++struct MVKMadeiraVMUsage { uint64_t resident = 0, dirty = 0, swapped = 0; };
++struct MVKMadeiraMallocZoneUsage { char name[40] = {}; uint64_t used = 0, allocated = 0; };
++
++static uint64_t mvkMadeiraParseAddress(const char* name) {
++	const char* value = getenv(name);
++	return (value && *value) ? strtoull(value, nullptr, 16) : 0;
++}
++
++static void mvkMadeiraVMUsageSnapshot(MVKMadeiraVMUsage tags[256], MVKMadeiraVMUsage& jitRX,
++									  MVKMadeiraVMUsage& jitRW) {
++	uint64_t rx = mvkMadeiraParseAddress("WINE_IOS_JIT_RX");
++	uint64_t rw = mvkMadeiraParseAddress("WINE_IOS_JIT_RW");
++	uint64_t jitSize = mvkMadeiraParseAddress("WINE_IOS_JIT_SIZE");
++	mach_vm_address_t address = 0;
++	natural_t depth = 0;
++	for (unsigned guard = 0; guard < 131072; ++guard) {
++		vm_region_submap_info_data_64_t info = {};
++		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
++		mach_vm_size_t size = 0;
++		if (mach_vm_region_recurse(mach_task_self(), &address, &size, &depth,
++								   (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS) break;
++		if (info.is_submap) { ++depth; continue; }
++		uint64_t pageSize = vm_page_size;
++		MVKMadeiraVMUsage usage = { (uint64_t)info.pages_resident * pageSize,
++			(uint64_t)info.pages_dirtied * pageSize, (uint64_t)info.pages_swapped_out * pageSize };
++		auto& tag = tags[info.user_tag & 255];
++		tag.resident += usage.resident; tag.dirty += usage.dirty; tag.swapped += usage.swapped;
++		uint64_t end = address + size;
++		auto overlaps = [&](uint64_t base) { return base && jitSize && address < base + jitSize && end > base; };
++		if (overlaps(rx)) { jitRX.resident += usage.resident; jitRX.dirty += usage.dirty; jitRX.swapped += usage.swapped; }
++		if (overlaps(rw)) { jitRW.resident += usage.resident; jitRW.dirty += usage.dirty; jitRW.swapped += usage.swapped; }
++		if (!size || end <= address) break;
++		address = end;
++		depth = 0;
++	}
++}
++
++static unsigned mvkMadeiraMallocZoneSnapshot(MVKMadeiraMallocZoneUsage usages[32],
++										 uint64_t& used, uint64_t& allocated) {
++	vm_address_t* addresses = nullptr;
++	unsigned count = 0;
++	used = allocated = 0;
++	if (malloc_get_all_zones(mach_task_self(), nullptr, &addresses, &count) != KERN_SUCCESS) return 0;
++	unsigned reported = std::min(count, 32u);
++	for (unsigned i = 0; i < count; ++i) {
++		auto zone = (malloc_zone_t*)addresses[i];
++		malloc_statistics_t stats = {};
++		malloc_zone_statistics(zone, &stats);
++		used += stats.size_in_use;
++		allocated += stats.size_allocated;
++		if (i >= reported) continue;
++		const char* name = malloc_get_zone_name(zone);
++		if (!name) name = "unnamed";
++		for (unsigned j = 0; name[j] && j + 1 < sizeof(usages[i].name); ++j) {
++			char c = name[j];
++			usages[i].name[j] = (c == ' ' || c == ',' || c == '=') ? '_' : c;
++		}
++		usages[i].used = stats.size_in_use;
++		usages[i].allocated = stats.size_allocated;
++	}
++	return reported;
 +}
 +
 +void MVKDevice::logMemoryBreakdown() {
@@ -2921,39 +3118,88 @@ index 9772757..a2e0a16 100644
 +	auto msl = load(MVKMemoryAllocationType::ShaderMSL);
 +	uint64_t pendingResidency = 0;
 +	auto conversions = mvkMadeiraConversionCacheStats();
++	auto libraries = mvkMadeiraLibraryStats();
++	auto async = mvkMadeiraAsyncMemoryStats();
++	MVKMadeiraVMUsage tags[256] = {}, jitRX = {}, jitRW = {};
++	mvkMadeiraVMUsageSnapshot(tags, jitRX, jitRW);
++	MVKMadeiraMallocZoneUsage zones[32] = {};
++	uint64_t mallocUsed = 0, mallocAllocated = 0;
++	unsigned zoneCount = mvkMadeiraMallocZoneSnapshot(zones, mallocUsed, mallocAllocated);
 +#if MVK_XCODE_16
 +	@synchronized(_residencySet) { pendingResidency = _residencyPendingRemovalBytes; }
 +#endif
-+	fprintf(stderr,
-+			"[mvk-memory] phys_footprint=%llu metal_current_allocated=%llu "
-+			"vk_device_memory=%llu/%llu metal_heap_backing=%llu/%llu "
-+			"metal_device_memory_buffer=%llu/%llu metal_buffer=%llu/%llu metal_heap_buffer_placements=%llu/%llu "
-+			"metal_texture=%llu/%llu metal_heap_texture_placements=%llu/%llu "
-+			"residency_pending_removal=%llu pipelines_live=%llu pso_cache=%lu/%lu "
-+			"pipeline_cache_objects=%llu pipeline_cache_buckets=%llu pipeline_cache_entries=%llu "
-+			"shader_spirv_payload=%llu/%llu shader_msl_compressed_payload=%llu/%llu "
-+			"conversion_cache=%llu/%llu conversion_cache_cap=%llu conversion_hits=%llu conversion_misses=%llu conversion_evictions=%llu "
-+			"driver_pipeline_bytes=unknown\n",
-+			(unsigned long long)footprint,
-+			(unsigned long long)_physicalDevice->getCurrentAllocatedSize(),
-+			(unsigned long long)vkMem.first, (unsigned long long)vkMem.second,
-+			(unsigned long long)heaps.first, (unsigned long long)heaps.second,
-+			(unsigned long long)deviceBuffers.first, (unsigned long long)deviceBuffers.second,
-+			(unsigned long long)buffers.first, (unsigned long long)buffers.second,
-+			(unsigned long long)heapBuffers.first, (unsigned long long)heapBuffers.second,
-+			(unsigned long long)textures.first, (unsigned long long)textures.second,
-+			(unsigned long long)heapTextures.first, (unsigned long long)heapTextures.second,
-+			(unsigned long long)pendingResidency,
-+			(unsigned long long)_livePipelines.load(std::memory_order_relaxed),
-+			(unsigned long)pso.first, (unsigned long)pso.second,
-+			(unsigned long long)_livePipelineCaches.load(std::memory_order_relaxed),
-+			(unsigned long long)_pipelineCacheBuckets.load(std::memory_order_relaxed),
-+			(unsigned long long)_pipelineCacheEntries.load(std::memory_order_relaxed),
-+			(unsigned long long)spirv.first, (unsigned long long)spirv.second,
-+			(unsigned long long)msl.first, (unsigned long long)msl.second,
-+			(unsigned long long)conversions.entries, (unsigned long long)conversions.bytes,
-+			(unsigned long long)conversions.cap, (unsigned long long)conversions.hits,
-+			(unsigned long long)conversions.misses, (unsigned long long)conversions.evictions);
++	char line[8192];
++	size_t length = 0;
++	auto append = [&](const char* format, auto... args) {
++		if (length >= sizeof(line)) return;
++		int written = snprintf(line + length, sizeof(line) - length, format, args...);
++		if (written > 0) length += std::min<size_t>((size_t)written, sizeof(line) - length - 1);
++	};
++	append("[mem-breakdown] phys=%llu internal=%llu compressed=%llu external=%llu reusable=%llu metal=%llu ",
++		(unsigned long long)footprint, (unsigned long long)vmInfo.internal,
++		(unsigned long long)vmInfo.compressed, (unsigned long long)vmInfo.external,
++		(unsigned long long)vmInfo.reusable, (unsigned long long)_physicalDevice->getCurrentAllocatedSize());
++	append("malloc=%llu/%llu malloc_zones=%u[", (unsigned long long)mallocUsed,
++		(unsigned long long)mallocAllocated, zoneCount);
++	for (unsigned i = 0; i < zoneCount; ++i) {
++		append("%s%s:%llu/%llu", i ? "," : "", zones[i].name,
++			(unsigned long long)zones[i].used, (unsigned long long)zones[i].allocated);
++	}
++	append("] jit_reserved=%llu jit_rx=%llu/%llu/%llu jit_rw=%llu/%llu/%llu ",
++		(unsigned long long)mvkMadeiraParseAddress("WINE_IOS_JIT_SIZE"),
++		(unsigned long long)jitRX.dirty, (unsigned long long)jitRX.swapped, (unsigned long long)jitRX.resident,
++		(unsigned long long)jitRW.dirty, (unsigned long long)jitRW.swapped, (unsigned long long)jitRW.resident);
++	append("async_jobs=%llu/%llu/%llu completions=%llu owned_min=%llu ",
++		(unsigned long long)async.jobs, (unsigned long long)async.queued, (unsigned long long)async.running,
++		(unsigned long long)async.completions, (unsigned long long)async.ownedMinBytes);
++	append("pso=%lu/%lu pipelines=%llu shader_libraries=%llu lib_cache=%llu/%llu lib_hits=%llu/%llu ",
++		(unsigned long)pso.first, (unsigned long)pso.second,
++		(unsigned long long)_livePipelines.load(std::memory_order_relaxed),
++		(unsigned long long)libraries.liveLibraries, (unsigned long long)libraries.entries,
++		(unsigned long long)libraries.sourceBytes, (unsigned long long)libraries.hits,
++		(unsigned long long)libraries.misses);
++	append("spirv=%llu/%llu msl_compressed=%llu/%llu conversion=%llu/%llu/%llu precompile_pending=%llu ",
++		(unsigned long long)spirv.first, (unsigned long long)spirv.second,
++		(unsigned long long)msl.first, (unsigned long long)msl.second,
++		(unsigned long long)conversions.entries, (unsigned long long)conversions.bytes,
++		(unsigned long long)conversions.cap, (unsigned long long)libraries.precompilePendingBytes);
++	append("archive_file_proxy=%llu/%llu/%llu vk_memory=%llu/%llu heaps=%llu/%llu buffers=%llu/%llu heap_buffers=%llu/%llu textures=%llu/%llu heap_textures=%llu/%llu residency_pending=%llu ",
++		(unsigned long long)g_mvkArchiveFrozenPages.load(std::memory_order_relaxed),
++		(unsigned long long)g_mvkArchiveFrozenFileBytes.load(std::memory_order_relaxed),
++		(unsigned long long)mvkMadeiraPressureCapacity(g_mvkArchiveBudgetFileBytes.load(std::memory_order_relaxed), 128 * 1024 * 1024, 2),
++		(unsigned long long)vkMem.first, (unsigned long long)vkMem.second,
++		(unsigned long long)heaps.first, (unsigned long long)heaps.second,
++		(unsigned long long)buffers.first, (unsigned long long)buffers.second,
++		(unsigned long long)heapBuffers.first, (unsigned long long)heapBuffers.second,
++		(unsigned long long)textures.first, (unsigned long long)textures.second,
++		(unsigned long long)heapTextures.first, (unsigned long long)heapTextures.second,
++		(unsigned long long)pendingResidency);
++	append("%s", "vm_tags=");
++	bool selected[256] = {};
++	uint64_t otherResident = 0, otherDirty = 0, otherSwapped = 0;
++	unsigned printed = 0;
++	for (; printed < 16; ++printed) {
++		unsigned best = 256; uint64_t bestBytes = 0;
++		for (unsigned tag = 0; tag < 256; ++tag) {
++			uint64_t bytes = tags[tag].dirty + tags[tag].swapped;
++			if (!selected[tag] && bytes > bestBytes) { best = tag; bestBytes = bytes; }
++		}
++		if (best == 256 || !bestBytes) break;
++		selected[best] = true;
++		append("%s%u:%llu/%llu/%llu", printed ? "," : "", best,
++			(unsigned long long)tags[best].dirty, (unsigned long long)tags[best].swapped,
++			(unsigned long long)tags[best].resident);
++	}
++	for (unsigned tag = 0; tag < 256; ++tag) if (!selected[tag]) {
++		otherResident += tags[tag].resident; otherDirty += tags[tag].dirty; otherSwapped += tags[tag].swapped;
++	}
++	append(" vm_tags_other=%llu/%llu/%llu pipeline_cache=%llu/%llu/%llu device_memory_buffers=%llu/%llu driver_pipeline_bytes=unknown\n",
++		(unsigned long long)otherDirty, (unsigned long long)otherSwapped, (unsigned long long)otherResident,
++		(unsigned long long)_livePipelineCaches.load(std::memory_order_relaxed),
++		(unsigned long long)_pipelineCacheBuckets.load(std::memory_order_relaxed),
++		(unsigned long long)_pipelineCacheEntries.load(std::memory_order_relaxed),
++		(unsigned long long)deviceBuffers.first, (unsigned long long)deviceBuffers.second);
++	fwrite(line, 1, length, stderr);
 +	logBinaryArchiveMemory();
 +	mvkMadeiraShaderPrewarmLog();
 +}
@@ -2964,8 +3210,28 @@ index 9772757..a2e0a16 100644
 +	const char* pressure = getenv("MVK_MADEIRA_MEMORY_PRESSURE");
 +	_memoryPressureEnabled = !pressure || strcmp(pressure, "0");
 +	fprintf(stderr, "[mvk-memory] enabled=%d interval=30s (MVK_MADEIRA_MEMORY_LOG=0 disables)\n", _memoryLogEnabled);
-+	fprintf(stderr, "[mvk-memory-pressure] enabled=%d low=512MiB recover=1024MiB/30s interval=2s\n", _memoryPressureEnabled);
++	fprintf(stderr, "[mvk-memory-pressure] enabled=%d low=512MiB recover=1024MiB/30s interval=2s conversion=%lluMiB malloc-relief=%s\n",
++		_memoryPressureEnabled, (unsigned long long)(mvkMadeiraConversionPressureBytes() >> 20),
++		mvkMadeiraMallocPressureReliefEnabled() ? "on" : "off");
 +	if (!_memoryLogEnabled && !_memoryPressureEnabled) { return; }
++#if MVK_IOS
++	const char* source = getenv("MVK_MADEIRA_MEMORYPRESSURE_SOURCE");
++	if (_memoryPressureEnabled && (!source || strcmp(source, "0"))) {
++		_memoryPressureQueue = dispatch_queue_create("MoltenVK.memory-pressure", DISPATCH_QUEUE_SERIAL);
++		dispatch_set_target_queue(_memoryPressureQueue, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
++		_memoryPressureSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
++			DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, _memoryPressureQueue);
++		dispatch_source_set_event_handler(_memoryPressureSource, ^{
++			unsigned long event = dispatch_source_get_data(_memoryPressureSource);
++			g_mvkMemoryPressure.store(true, std::memory_order_relaxed);
++			trimMemoryCaches();
++			size_t relieved = mvkMadeiraRelieveMallocPressure();
++			fprintf(stderr, "[mvk-memory-pressure] dispatch=%s malloc_relief_bytes=%llu\n",
++				(event & DISPATCH_MEMORYPRESSURE_CRITICAL) ? "critical" : "warn", (unsigned long long)relieved);
++		});
++		dispatch_resume(_memoryPressureSource);
++	}
++#endif
 +	_memoryLogThread = std::thread([this] {
 +		pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 +		unsigned ticks = 0;
@@ -2976,9 +3242,16 @@ index 9772757..a2e0a16 100644
 +#if MVK_IOS
 +				if (_memoryPressureEnabled) {
 +					uint64_t available = os_proc_available_memory();
-+					if (mvkMadeiraUpdateMemoryPressure(available))
++					if (mvkMadeiraUpdateMemoryPressure(available)) {
 +						fprintf(stderr, "[mvk-memory-pressure] active=%d available_mib=%llu (cache references only; disk preserved)\n",
 +							mvkMadeiraMemoryPressureActive(), (unsigned long long)(available >> 20));
++						if (mvkMadeiraMemoryPressureActive()) {
++							if (mvkMadeiraMallocPressureReliefEnabled()) {
++								size_t bytes = mvkMadeiraRelieveMallocPressure();
++								fprintf(stderr, "[mvk-memory-pressure] malloc_relief_bytes=%llu\n", (unsigned long long)bytes);
++							}
++						}
++					}
 +					if (mvkMadeiraMemoryPressureActive()) trimMemoryCaches();
 +				}
 +#endif
@@ -2990,7 +3263,18 @@ index 9772757..a2e0a16 100644
 +}
 +
 +void MVKDevice::stopMemoryLogging() {
-+    if (!_memoryLogThread.joinable()) { return; }
++#if MVK_IOS
++	if (_memoryPressureSource) {
++		dispatch_source_set_event_handler(_memoryPressureSource, ^{});
++		dispatch_source_cancel(_memoryPressureSource);
++		dispatch_sync(_memoryPressureQueue, ^{});
++		dispatch_release(_memoryPressureSource);
++		dispatch_release(_memoryPressureQueue);
++		_memoryPressureSource = nullptr;
++		_memoryPressureQueue = nullptr;
++	}
++#endif
++	if (!_memoryLogThread.joinable()) { return; }
 +	{
 +		std::lock_guard<std::mutex> lock(_memoryLogLock);
 +		_memoryLogStop = true;
@@ -3018,6 +3302,7 @@ index 9772757..a2e0a16 100644
 +		pthread_t worker = nullptr;
 +		pthread_override_t qosOverride = nullptr;
 +		std::unordered_set<uint64_t> urgentWaits;
++		uint64_t ownedMinBytes = 0;
 +	};
 +	struct WaitRecord {
 +		std::vector<std::string> keys;
@@ -3049,7 +3334,12 @@ index 9772757..a2e0a16 100644
 +		waitForAdmission(lock, key);
 +		auto found = _jobs.find(key);
 +		if (found != _jobs.end()) {
-+			found->second->renderCompletions.push_back([completion copy]);
++			RenderCompletion copied = [completion copy];
++			found->second->renderCompletions.push_back(copied);
++			uint64_t bytes = mvkMadeiraMallocSize(copied);
++			found->second->ownedMinBytes += bytes;
++			g_mvkAsyncOwnedMinBytes.fetch_add(bytes, std::memory_order_relaxed);
++			g_mvkAsyncCompletions.fetch_add(1, std::memory_order_relaxed);
 +			mvkTimeAsyncDedupeHit();
 +			if (highPriority) { prioritizeLocked(found->second); }
 +			return false;
@@ -3059,9 +3349,15 @@ index 9772757..a2e0a16 100644
 +		job->descriptor = [descriptor copy];
 +		job->compute = false;
 +		job->queuedAt = mvkTimeNow();
-+		job->renderCompletions.push_back([completion copy]);
++		RenderCompletion copied = [completion copy];
++		job->renderCompletions.push_back(copied);
++		job->ownedMinBytes = sizeof(Job) + job->key.capacity() + mvkMadeiraMallocSize(job->descriptor) + mvkMadeiraMallocSize(copied);
 +		_jobs.emplace(key, job);
 +		if (highPriority) { _queue.push_front(job); } else { _queue.push_back(job); }
++		g_mvkAsyncJobs.fetch_add(1, std::memory_order_relaxed);
++		g_mvkAsyncQueued.fetch_add(1, std::memory_order_relaxed);
++		g_mvkAsyncCompletions.fetch_add(1, std::memory_order_relaxed);
++		g_mvkAsyncOwnedMinBytes.fetch_add(job->ownedMinBytes, std::memory_order_relaxed);
 +		mvkTimeAsyncStarted();
 +		mvkTimeAsyncQueueDepth((uint32_t)_queue.size());
 +		_cv.notify_all();
@@ -3073,7 +3369,12 @@ index 9772757..a2e0a16 100644
 +		waitForAdmission(lock, key);
 +		auto found = _jobs.find(key);
 +		if (found != _jobs.end()) {
-+			found->second->computeCompletions.push_back([completion copy]);
++			ComputeCompletion copied = [completion copy];
++			found->second->computeCompletions.push_back(copied);
++			uint64_t bytes = mvkMadeiraMallocSize(copied);
++			found->second->ownedMinBytes += bytes;
++			g_mvkAsyncOwnedMinBytes.fetch_add(bytes, std::memory_order_relaxed);
++			g_mvkAsyncCompletions.fetch_add(1, std::memory_order_relaxed);
 +			mvkTimeAsyncDedupeHit();
 +			return false;
 +		}
@@ -3082,9 +3383,15 @@ index 9772757..a2e0a16 100644
 +		job->descriptor = [descriptor copy];
 +		job->compute = true;
 +		job->queuedAt = mvkTimeNow();
-+		job->computeCompletions.push_back([completion copy]);
++		ComputeCompletion copied = [completion copy];
++		job->computeCompletions.push_back(copied);
++		job->ownedMinBytes = sizeof(Job) + job->key.capacity() + mvkMadeiraMallocSize(job->descriptor) + mvkMadeiraMallocSize(copied);
 +		_jobs.emplace(key, job);
 +		_queue.push_back(job);
++		g_mvkAsyncJobs.fetch_add(1, std::memory_order_relaxed);
++		g_mvkAsyncQueued.fetch_add(1, std::memory_order_relaxed);
++		g_mvkAsyncCompletions.fetch_add(1, std::memory_order_relaxed);
++		g_mvkAsyncOwnedMinBytes.fetch_add(job->ownedMinBytes, std::memory_order_relaxed);
 +		mvkTimeAsyncStarted();
 +		mvkTimeAsyncQueueDepth((uint32_t)_queue.size());
 +		_cv.notify_all();
@@ -3182,6 +3489,8 @@ index 9772757..a2e0a16 100644
 +				job = *next;
 +				_queue.erase(next);
 +				job->running = true;
++				g_mvkAsyncQueued.fetch_sub(1, std::memory_order_relaxed);
++				g_mvkAsyncRunning.fetch_add(1, std::memory_order_relaxed);
 +				job->worker = pthread_self();
 +				job->compileStartedAt = mvkTimeNow();
 +				boostLocked(job);
@@ -3270,6 +3579,10 @@ index 9772757..a2e0a16 100644
 +			}
 +			[state release];
 +			[job->descriptor release];
++			g_mvkAsyncCompletions.fetch_sub(renderCompletions.size() + computeCompletions.size(), std::memory_order_relaxed);
++			g_mvkAsyncOwnedMinBytes.fetch_sub(job->ownedMinBytes, std::memory_order_relaxed);
++			g_mvkAsyncRunning.fetch_sub(1, std::memory_order_relaxed);
++			g_mvkAsyncJobs.fetch_sub(1, std::memory_order_relaxed);
 +			delete job;
 +		}
 +	}
@@ -3326,7 +3639,27 @@ index 9772757..a2e0a16 100644
 +	return mode;
 +}
 +
++static NSString* mvkMadeiraGameCacheDirectoryUncached(id<MTLDevice> device);
++
 +NSString* mvkMadeiraGameCacheDirectory(id<MTLDevice> device) {
++	// Called for every pipeline: the environment dictionary and the Caches path
++	// lookup (a stat per call) only change with the device, so remember the result.
++	static std::mutex lock;
++	static uint64_t cachedID = 0;
++	static NSString* cached = nil;
++	{
++		std::lock_guard<std::mutex> guard(lock);
++		if (cached && cachedID == device.registryID) { return cached; }
++	}
++	NSString* result = mvkMadeiraGameCacheDirectoryUncached(device);
++	std::lock_guard<std::mutex> guard(lock);
++	[cached release];
++	cached = [result retain];
++	cachedID = device.registryID;
++	return cached;
++}
++
++static NSString* mvkMadeiraGameCacheDirectoryUncached(id<MTLDevice> device) {
 +	NSString* root = NSProcessInfo.processInfo.environment[@"MVK_CONFIG_IOS_BINARY_ARCHIVE_DIR"];
 +	if (!root.length) { root = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"mvk-binary-archive"]; }
 +	NSString* game = NSProcessInfo.processInfo.environment[@"MADEIRA_GAME_KEY"];
@@ -3345,6 +3678,7 @@ index 9772757..a2e0a16 100644
 +		char* end = nullptr;
 +		unsigned long long configured = mb ? strtoull(mb, &end, 10) : 1536;
 +		_budget = ((mb && (*mb == '-' || !*mb || !end || *end || configured > 65536)) ? 1536 : configured) << 20;
++		g_mvkArchiveBudgetFileBytes.store(_budget, std::memory_order_relaxed);
 +		_queue = dispatch_queue_create("MoltenVK.binary-archive", DISPATCH_QUEUE_SERIAL);
 +		_directory = [mvkMadeiraGameCacheDirectory(device) retain];
 +		NSError* error = nil;
@@ -3412,7 +3746,11 @@ index 9772757..a2e0a16 100644
 +			flush(shard, i);
 +			[shard.archive release];
 +			for (NSURL* url : shard.pages) { [url release]; }
-+			for (auto& page : shard.frozen) { [page.archive release]; }
++			for (auto& page : shard.frozen) {
++				g_mvkArchiveFrozenFileBytes.fetch_sub(page.bytes, std::memory_order_relaxed);
++				g_mvkArchiveFrozenPages.fetch_sub(1, std::memory_order_relaxed);
++				[page.archive release];
++			}
 +		}
 +		fprintf(stderr, "[mvk-archive] close hits=%llu misses=%llu\n", (unsigned long long)_hits.load(), (unsigned long long)_misses.load());
 +		dispatch_release(_queue);
@@ -3557,6 +3895,8 @@ index 9772757..a2e0a16 100644
 +		shard.frozen.insert(position, {[archive retain], bytes, age});
 +		_frozenBytes.fetch_add(bytes);
 +		_frozenCount.fetch_add(1);
++		g_mvkArchiveFrozenFileBytes.fetch_add(bytes, std::memory_order_relaxed);
++		g_mvkArchiveFrozenPages.fetch_add(1, std::memory_order_relaxed);
 +	}
 +
 +	void trimFrozenPages() {
@@ -3580,6 +3920,8 @@ index 9772757..a2e0a16 100644
 +			pages.erase(pages.begin());
 +			_frozenBytes.fetch_sub(page.bytes);
 +			_frozenCount.fetch_sub(1);
++			g_mvkArchiveFrozenFileBytes.fetch_sub(page.bytes, std::memory_order_relaxed);
++			g_mvkArchiveFrozenPages.fetch_sub(1, std::memory_order_relaxed);
 +			++_evictions;
 +			[page.archive release];
 +			// Keep the disk file. A miss can rebuild its pipeline; evicting the
@@ -3663,6 +4005,7 @@ index 9772757..a2e0a16 100644
 +void MVKDevice::trimMemoryCaches() {
 +	mvkPipelineStateCache().trim();
 +	mvkMadeiraTrimLibraryCache();
++	mvkMadeiraTrimConversionCache(mvkMadeiraConversionPressureBytes());
 +	if (_binaryArchiveCache) _binaryArchiveCache->trimForPressure();
 +}
 +
@@ -3744,7 +4087,7 @@ index 9772757..a2e0a16 100644
  MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
  
  	// If the physical device is lost, bail.
-@@ -5140,6 +6302,44 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5140,6 +6575,44 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  
  	initPhysicalDevice(physicalDevice, pCreateInfo);
@@ -3789,7 +4132,7 @@ index 9772757..a2e0a16 100644
  	initPerformanceTracking();
  	enableExtensions(pCreateInfo);
  	enableFeatures(pCreateInfo);
-@@ -5210,6 +6410,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5210,6 +6683,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  	MVKLogInfo("Created VkDevice to run on GPU %s with the following %d Vulkan extensions enabled:%s",
  			   getName(), _enabledExtensions.getEnabledCount(), _enabledExtensions.enabledNamesString("\n\t", true).c_str());
@@ -3797,7 +4140,7 @@ index 9772757..a2e0a16 100644
  }
  
  // Perf stats that last the duration of the app process.
-@@ -5223,7 +6424,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5223,7 +6697,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -3810,7 +4153,7 @@ index 9772757..a2e0a16 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5448,6 +6653,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5448,6 +6926,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Create the command queues
  void MVKDevice::initQueues(const VkDeviceCreateInfo* pCreateInfo) {
@@ -3819,7 +4162,7 @@ index 9772757..a2e0a16 100644
  #if MVK_XCODE_16
  	if (_physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.residencySets) {
  		MTLResidencySetDescriptor *setDescriptor;
-@@ -5532,6 +6739,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5532,6 +7012,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -3830,7 +4173,7 @@ index 9772757..a2e0a16 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5556,6 +6767,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5556,6 +7040,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	[_residencySet release];
  #endif
  	[_defaultMTLSamplerState release];
@@ -3949,10 +4292,18 @@ index 0ba8164..c670a89 100644
  	[_mtlDummyTex release];
  }
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
-index 45ddd3a..9272540 100644
+index 45ddd3a..d48c894 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
-@@ -93,6 +93,9 @@ protected:
+@@ -25,6 +25,7 @@
+ #include <MoltenVKShaderConverter/SPIRVToMSLConverter.h>
+ #include <unordered_map>
+ #include <mutex>
++#include <atomic>
+ 
+ #import <IOSurface/IOSurfaceRef.h>
+ 
+@@ -93,6 +94,9 @@ protected:
      std::unordered_map<NSUInteger, id<MTLTexture>> _mtlTextureViews;
      MVKSmallVector<MVKImageSubresource, 1> _subresources;
      HeapAllocation _heapAllocation;
@@ -3962,7 +4313,7 @@ index 45ddd3a..9272540 100644
  };
  
  
-@@ -145,6 +148,9 @@ protected:
+@@ -145,6 +149,9 @@ protected:
      NSUInteger _mtlTexelBufferOffset = 0;
      uint8_t _planeIndex;
      bool _ownsTexelBuffer = false;
@@ -3972,7 +4323,33 @@ index 45ddd3a..9272540 100644
  };
  
  
-@@ -508,6 +514,7 @@ protected:
+@@ -178,6 +185,14 @@ public:
+ 	/** Returns whether this image has a depth or stencil format. */
+ 	bool getIsDepthStencil();
+ 
++	/** Madeira: image identity and conservative consumption tracking for tile-store elision. */
++	uint64_t getStoreElisionID() const { return _madeiraStoreElisionID; }
++	uint64_t getStoreElisionConsumptionSerial() const { return _madeiraConsumptionSerial.load(std::memory_order_acquire); }
++	VkImageUsageFlags getUsageFlags() { return getCombinedUsage(); }
++	void markStoreElisionConsumed(const char* reason);
++	void markStoreElisionOverwrite();
++	void markStoreElisionStored(uint64_t consumptionSerial);
++
+ 	/** Returns whether this image is compressed. */
+ 	bool getIsCompressed();
+ 
+@@ -402,6 +417,10 @@ protected:
+ 	bool _isLinearForAtomics;
+ 	bool _is2DViewOn3DImageCompatible = false;
+ 	bool _isBlockTexelViewCompatible = false;
++	uint64_t _madeiraStoreElisionID = 0;
++	std::atomic<uint64_t> _madeiraLastConsumedFrame { 0 };
++	std::atomic<uint64_t> _madeiraConsumptionSerial { 0 };
++	std::atomic<bool> _madeiraStorePending { false };
+ };
+ 
+ 
+@@ -508,6 +527,7 @@ protected:
  
  	id<CAMetalDrawable> _mtlDrawable = nil;
  	id<MTLTexture> _mtlTextureHeadless = nil;
@@ -3981,10 +4358,19 @@ index 45ddd3a..9272540 100644
  	MVKSmallVector<MVKSwapchainSignaler, 1> _availabilitySignalers;
  	MVKSwapchainSignaler _preSignaler = {};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index ef8ca60..31b7784 100644
+index ef8ca60..7f15dcd 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-@@ -78,6 +78,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -34,6 +34,8 @@
+ using namespace std;
+ using namespace SPIRV_CROSS_NAMESPACE;
+ 
++static atomic<uint64_t> _mvkMadeiraNextStoreElisionImageID { 1 };
++
+ static id<MTLTexture> mvkGetRootMTLTexture(id<MTLTexture> tex) {
+     while (tex.parentTexture && tex.parentTexture != tex) {
+       tex = tex.parentTexture;
+@@ -78,6 +80,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
          }
  
          id<MTLTexture> tex;
@@ -3993,7 +4379,7 @@ index ef8ca60..31b7784 100644
          // Use imported texture if we are binding to a VkDeviceMemory that was created with an import operation
          if (dvcMem && (dvcMem->_externalMemoryHandleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) && dvcMem->_mtlTexture) {
              tex = dvcMem->_mtlTexture;
-@@ -101,6 +103,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -101,6 +105,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              tex = [_heapAllocation.heap
                             newTextureWithDescriptor: mtlTexDesc
                             offset: _heapAllocation.offset];
@@ -4002,7 +4388,7 @@ index ef8ca60..31b7784 100644
              if (_image->_isAliasable) { [_mtlTexture makeAliasable]; }
          } else if (_image->_isAliasable && dvcMem && dvcMem->isDedicatedAllocation() &&
              !mvkContains(dvcMem->_imageMemoryBindings, memoryBinding)) {
-@@ -111,7 +115,16 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -111,12 +117,22 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              tex = [dvcMem->_imageMemoryBindings[0]->_image->getMTLTexture(_planeIndex, mtlTexDesc.pixelFormat) retain];
          } else {
              tex = [_image->getMTLDevice() newTextureWithDescriptor: mtlTexDesc];
@@ -4019,8 +4405,25 @@ index ef8ca60..31b7784 100644
          if (tex.storageMode != MTLStorageModeMemoryless) {
              _image->_device->makeResident(tex);
              _image->_device->getLiveResources().add(tex);
-@@ -149,6 +162,13 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+         }
+         _mtlTexture = tex;
++		_image->_device->registerStoreElisionTexture(_mtlTexture, _image);
+ 
+         [mtlTexDesc release];                                            // temp release
+         propagateDebugName();
+@@ -137,6 +153,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+         if ( !mtlTex ) {
+             mtlTex = [baseTexture newTextureViewWithPixelFormat: mtlPixFmt];    // retained
+             _image->_device->getLiveResources().add(mtlTex);
++			_image->_device->registerStoreElisionTexture(mtlTex, _image);
+             _mtlTextureViews[mtlPixFmt] = mtlTex;
+         }
+     }
+@@ -147,13 +164,22 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     MVKDevice* dev = _image->_device;
+     MVKLiveResourceSet& live = dev->getLiveResources();
      if (id<MTLTexture> tex = _mtlTexture) {
++		dev->unregisterStoreElisionTexture(tex, _image);
          dev->removeResidency(tex);
          live.remove(tex);
 +		if (_tracksMTLTexture) {
@@ -4033,7 +4436,23 @@ index ef8ca60..31b7784 100644
          [tex release];
          _mtlTexture = nil;
      }
-@@ -496,6 +516,21 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+ 
+     for (auto& elem : _mtlTextureViews) {
++		dev->unregisterStoreElisionTexture(elem.second, _image);
+         live.remove(elem.second);
+         [elem.second release];
+     }
+@@ -414,6 +440,9 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+ 					  memBind->isMemoryHostCoherent() &&
+ 					  barrier.newLayout == VK_IMAGE_LAYOUT_GENERAL &&
+ 					  mvkIsAnyFlagEnabled(barrier.dstAccessMask, (VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT)));
++	if (needsSync || needsPull || mvkIsAnyFlagEnabled(barrier.dstAccessMask, VK_ACCESS_HOST_READ_BIT)) {
++		_image->markStoreElisionConsumed("host-read-barrier");
++	}
+ 	MVKDeviceMemory* dvcMem = memBind->getDeviceMemory();
+ 	const MVKMappedMemoryRange& mappedRange = dvcMem ? dvcMem->getMappedRange() : MVKMappedMemoryRange();
+ 
+@@ -496,6 +525,21 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
  // Memory may have been mapped before image was bound, and needs to be loaded into the MTLTexture.
  VkResult MVKImageMemoryBinding::bindDeviceMemory(MVKDeviceMemory* mvkMem, VkDeviceSize memOffset) {
      if (_deviceMemory) { MVKDeviceMemory::removeImageMemoryBinding(&_deviceMemory, this); }
@@ -4055,7 +4474,7 @@ index ef8ca60..31b7784 100644
      MVKResource::bindDeviceMemory(mvkMem, memOffset);
  
      if (!_deviceMemory) { return VK_SUCCESS; }
-@@ -509,7 +544,6 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -509,7 +553,6 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              _mtlTexelBufferOffset = getDeviceMemoryOffset();
          } else {
              // Create our own buffer for this.
@@ -4063,7 +4482,7 @@ index ef8ca60..31b7784 100644
              if (_deviceMemory->_mtlHeap && _image->getMTLStorageMode() == _deviceMemory->_mtlStorageMode) {
                  _mtlTexelBuffer = [_deviceMemory->_mtlHeap newBufferWithLength: _byteCount options: _deviceMemory->getMTLResourceOptions() offset: getDeviceMemoryOffset()];
                  if (_image->_isAliasable) { [_mtlTexelBuffer makeAliasable]; }
-@@ -519,6 +553,13 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -519,6 +562,13 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              if (!_mtlTexelBuffer) {
                  return reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "Could not create an MTLBuffer for an image that requires a buffer backing store. Images that can be used for atomic accesses must have a texel buffer backing them.");
              }
@@ -4077,7 +4496,15 @@ index ef8ca60..31b7784 100644
              _device->makeResident(_mtlTexelBuffer);
              _device->getLiveResources().add(_mtlTexelBuffer);
              _mtlTexelBufferOffset = 0;
-@@ -627,6 +668,11 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -592,6 +642,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+ // Pulls content from the MTLTexture into memory at the specified memory range.
+ // Pulls from all subresources that overlap the specified range and are in an updatable layout state.
+ VkResult MVKImageMemoryBinding::pullFromDevice(VkDeviceSize offset, VkDeviceSize size) {
++	_image->markStoreElisionConsumed("host-read");
+     if (shouldFlushHostMemory()) {
+         for(uint8_t planeIndex = beginPlaneIndex(); planeIndex < endPlaneIndex(); planeIndex++) {
+             for (auto& subRez : _image->_planes[planeIndex]->_subresources) {
+@@ -627,6 +678,11 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
  	if (_ownsTexelBuffer) {
  		_device->removeResidency(_mtlTexelBuffer);
  		_device->getLiveResources().remove(_mtlTexelBuffer);
@@ -4089,7 +4516,26 @@ index ef8ca60..31b7784 100644
  		[_mtlTexelBuffer release];
  	}
  }
-@@ -816,6 +862,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -727,6 +783,10 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ // Host-copy content between images by allocating a temporary memory buffer, copying into it from the
+ // source image, and then copying from the memory buffer into the destination image, all using the CPU.
+ VkResult MVKImage::copyImageToImage(const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
++	MVKImage* source = (MVKImage*)pCopyImageToImageInfo->srcImage;
++	MVKImage* destination = (MVKImage*)pCopyImageToImageInfo->dstImage;
++	if (source) { source->markStoreElisionConsumed("host-copy-source"); }
++	if (destination) { destination->markStoreElisionConsumed("host-copy-destination"); }
+ 	for (uint32_t imgRgnIdx = 0; imgRgnIdx < pCopyImageToImageInfo->regionCount; imgRgnIdx++) {
+ 		auto& imgRgn = pCopyImageToImageInfo->pRegions[imgRgnIdx];
+ 
+@@ -793,6 +853,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ }
+ 
+ VkResult MVKImage::copyImageToMemory(const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
++	markStoreElisionConsumed("host-copy-to-memory");
+ #if MVK_MACOS
+ 	// On macOS, if the device doesn't have unified memory, and the texture is using managed memory, we need
+ 	// to sync the managed memory from the GPU, so the texture content is accessible to be copied by the CPU.
+@@ -816,6 +877,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  			}
  
  			[mtlBlitEnc endEncoding];
@@ -4097,7 +4543,65 @@ index ef8ca60..31b7784 100644
  			[mtlCmdBuff commit];
  			[mtlCmdBuff waitUntilCompleted];
  		}
-@@ -1590,6 +1637,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -826,6 +888,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ }
+ 
+ VkResult MVKImage::copyMemoryToImage(const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
++	markStoreElisionConsumed("host-copy-destination");
+ 	return copyContent(pCopyMemoryToImageInfo);
+ }
+ 
+@@ -1040,6 +1103,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ 	releaseIOSurface();
+     _planes[planeIndex]->releaseMTLTexture();
+ 	_planes[planeIndex]->_mtlTexture = [mtlTexture retain];		// retained
++	_device->registerStoreElisionTexture(_planes[planeIndex]->_mtlTexture, this);
+ 
+ 	if (_planes[planeIndex]->_mtlTexture.storageMode != MTLStorageModeMemoryless) {
+ 		_device->makeResident(_planes[planeIndex]->_mtlTexture);
+@@ -1184,6 +1248,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ 
+ MVKImage::MVKImage(MVKDevice* device, const VkImageCreateInfo* pCreateInfo) : MVKVulkanAPIDeviceObject(device) {
+ 	_ioSurface = nil;
++	_madeiraStoreElisionID = _mvkMadeiraNextStoreElisionImageID.fetch_add(1, memory_order_relaxed);
+ 
+ 	// Stencil usage is implied to be the same as usage, unless overridden in the pNext chain.
+ 	_usage = pCreateInfo->usage;
+@@ -1490,9 +1555,33 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ MVKImage::~MVKImage() {
+ 	mvkDestroyContainerContents(_memoryBindings);
+ 	mvkDestroyContainerContents(_planes);
++	_device->getStoreElisionTracker().forgetImage(_madeiraStoreElisionID);
+     releaseIOSurface();
+ }
+ 
++void MVKImage::markStoreElisionConsumed(const char* reason) {
++	if (!_device->getStoreElisionTracker().enabled()) { return; }
++	uint64_t frame = _device->getStoreElisionFrame();
++	_madeiraLastConsumedFrame.store(frame, memory_order_relaxed);
++	_madeiraConsumptionSerial.fetch_add(1, memory_order_release);
++	if (!_madeiraStorePending.exchange(false, memory_order_acq_rel)) { return; }
++	_device->getStoreElisionTracker().consume(_madeiraStoreElisionID, frame, reason);
++}
++
++void MVKImage::markStoreElisionOverwrite() {
++	if (!_device->getStoreElisionTracker().enabled()) { return; }
++	_madeiraConsumptionSerial.fetch_add(1, memory_order_release);
++	if (!_madeiraStorePending.exchange(false, memory_order_acq_rel)) { return; }
++	_device->getStoreElisionTracker().overwrite(_madeiraStoreElisionID, _device->getStoreElisionFrame());
++}
++
++void MVKImage::markStoreElisionStored(uint64_t consumptionSerial) {
++	_madeiraStorePending.store(true, memory_order_release);
++	if (_madeiraConsumptionSerial.load(memory_order_acquire) != consumptionSerial) {
++		markStoreElisionConsumed("concurrent-read");
++	}
++}
++
+ 
+ #pragma mark -
+ #pragma mark MVKSwapchainImage
+@@ -1590,6 +1679,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			}
  			signal(signaler.semaphore, signaler.semaphoreSignalToken, mtlCmdBuff);
  			signal(signaler.fence);
@@ -4105,7 +4609,57 @@ index ef8ca60..31b7784 100644
  			[mtlCmdBuff commit];
  		}
  
-@@ -1800,7 +1848,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1632,13 +1722,17 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ // If not headless, retrieve the MTLTexture directly from the CAMetalDrawable.
+ id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
+-	return _mtlTextureHeadless ? _mtlTextureHeadless : getCAMetalDrawable().texture;
++	id<MTLTexture> texture = _mtlTextureHeadless ? _mtlTextureHeadless : getCAMetalDrawable().texture;
++	getDevice()->registerStoreElisionTexture(texture, this);
++	return texture;
+ }
+ 
+ // Present the drawable and make myself available only once the command buffer has completed.
+ // Pass MVKImagePresentInfo by value because it may not exist when the callback runs.
+ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
+ 															  MVKImagePresentInfo presentInfo) {
++	markStoreElisionConsumed("present");
++	getDevice()->advanceStoreElisionFrame();
+ 	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
+ 
+ 	// According to Apple, it is more performant to call MTLDrawable present from within a
+@@ -1656,8 +1750,22 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 		if (presentInfo.presentMode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
+ 			mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
+ 		}
++		// Madeira: MVK_MADEIRA_FPS_CAP=N holds each frame on screen for at least 1/N s.
++		// The swapchain then runs out of free drawables, so the game's CPU and GPU
++		// work waits too: less heat, no throttling later. 40 needs a 120 Hz panel
++		// (three refreshes); half a millisecond of slack keeps vsync rounding from
++		// adding a fourth.
++		static const double minFrameSeconds = [] {
++			const char* v = getenv("MVK_MADEIRA_FPS_CAP");
++			long cap = v ? strtol(v, nullptr, 10) : 0;
++			if (cap < 10 || cap > 240) { return 0.0; }
++			fprintf(stderr, "[mvk-fps-cap] presents held >= 1/%ld s\n", cap);
++			return 1.0 / cap - 0.0005;
++		}();
+ 		if (presentInfo.desiredPresentTime) {
+ 			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
++		} else if (minFrameSeconds > 0) {
++			[mtlDrwbl presentAfterMinimumDuration: minFrameSeconds];
+ 		} else {
+ 			[mtlDrwbl present];
+ 		}
+@@ -1760,6 +1868,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ // Releases the CAMetalDrawable underlying this image.
+ void MVKPresentableSwapchainImage::releaseMetalDrawable() {
++	if (_mtlDrawable) { getDevice()->unregisterStoreElisionTexture(_mtlDrawable.texture, this); }
+     [_mtlDrawable release];
+ 	_mtlDrawable = nil;
+ }
+@@ -1800,7 +1909,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			mtlTexDesc.usage = MTLTextureUsageRenderTarget;
  			mtlTexDesc.storageMode = MTLStorageModePrivate;
  
@@ -4118,23 +4672,40 @@ index ef8ca60..31b7784 100644
  		}
  	}
  }
-@@ -1808,6 +1860,10 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1808,6 +1921,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  void MVKPresentableSwapchainImage::destroy() {
  	releaseMetalDrawable();
 +	if (_mtlTextureHeadless) {
++		getDevice()->unregisterStoreElisionTexture(_mtlTextureHeadless, this);
 +		getDevice()->trackMemoryRelease(MVKMemoryAllocationType::MetalTexture, _trackedHeadlessTextureBytes);
 +		_trackedHeadlessTextureBytes = 0;
 +	}
  	[_mtlTextureHeadless release];
  	_mtlTextureHeadless = nil;
  	MVKSwapchainImage::destroy();
+@@ -1929,6 +2047,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+     if ( !mtlTexture ) { return; }
+ 
+     getDevice()->getLiveResources().add(mtlTexture);
++	getDevice()->registerStoreElisionTexture(mtlTexture, _imageView->_image);
+     _mtlTexture = mtlTexture;
+ 
+     propagateDebugName();
+@@ -2189,6 +2308,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ void MVKImageViewPlane::releaseMTLTexture() {
+ 	if (id<MTLTexture> tex = _mtlTexture) {
++		getDevice()->unregisterStoreElisionTexture(tex, _imageView->_image);
+ 		getDevice()->getLiveResources().remove(tex);
+ 		[tex release];
+ 		_mtlTexture = nil;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraAdmission.h b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraAdmission.h
 new file mode 100644
-index 0000000..b814434
+index 0000000..36030f9
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraAdmission.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,31 @@
 +#pragma once
 +#include <algorithm>
 +#include <cerrno>
@@ -4148,7 +4719,9 @@ index 0000000..b814434
 +inline bool mvkMadeiraAdmissionEnabled() {
 +    static const bool enabled = [] {
 +        const char* value = getenv("MVK_MADEIRA_ASYNC_ADMISSION");
-+        return !(value && value[0] == '0' && !value[1]);
++        // Off unless =1: blocking admission froze Detroit for 9-12 s at a time
++        // (hundreds of producer waits up to 1.9 s; Oct 14 and Oct 16 runs).
++        return value && value[0] == '1' && !value[1];
 +    }();
 +    return enabled;
 +}
@@ -4233,10 +4806,10 @@ index 0000000..0d4e6a8
 +}
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraConversionCache.h b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraConversionCache.h
 new file mode 100644
-index 0000000..0c6a669
+index 0000000..6d31f83
 --- /dev/null
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraConversionCache.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,88 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
 +#include <cstdint>
@@ -4310,6 +4883,19 @@ index 0000000..0c6a669
 +		auto stats = _stats;
 +		stats.entries = _lru.size();
 +		return stats;
++	}
++	void trim(uint64_t targetBytes) {
++		std::lock_guard<std::mutex> guard(_lock);
++		while (!_lru.empty() && _stats.bytes > targetBytes) {
++			auto old = std::prev(_lru.end());
++			auto bucket = _index.find(old->hash);
++			auto& items = bucket->second;
++			items.erase(std::find(items.begin(), items.end(), old));
++			if (items.empty()) { _index.erase(bucket); }
++			_stats.bytes -= old->bytes;
++			_lru.erase(old);
++			++_stats.evictions;
++		}
 +	}
 +};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraJobQueue.h b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraJobQueue.h
@@ -4544,6 +5130,274 @@ index 0000000..d2f13c3
 +		--g_mvkWarmPending;
 +	} });
 +}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraStoreElision.h b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraStoreElision.h
+new file mode 100644
+index 0000000..0cfdeed
+--- /dev/null
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraStoreElision.h
+@@ -0,0 +1,262 @@
++/*
++ * MVKMadeiraStoreElision.h
++ *
++ * Copyright (c) 2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++struct MVKMadeiraStoreSignature {
++	uint64_t renderPass = 0;
++	uint32_t subpass = 0;
++	uint32_t attachment = 0;
++	uint32_t aspect = 0;
++	uint32_t width = 0;
++	uint32_t height = 0;
++
++	bool operator==(const MVKMadeiraStoreSignature& other) const {
++		return renderPass == other.renderPass && subpass == other.subpass &&
++			attachment == other.attachment && aspect == other.aspect &&
++			width == other.width && height == other.height;
++	}
++};
++
++struct MVKMadeiraStoreSignatureHash {
++	size_t operator()(const MVKMadeiraStoreSignature& sig) const {
++		uint64_t hash = sig.renderPass;
++		auto add = [&](uint64_t value) { hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2); };
++		add(sig.subpass); add(sig.attachment); add(sig.aspect); add(sig.width); add(sig.height);
++		return (size_t)hash;
++	}
++};
++
++struct MVKMadeiraStoreMetadata {
++	uint64_t bytes = 0;
++	uint32_t format = 0;
++	uint32_t width = 0;
++	uint32_t height = 0;
++	const char* formatName = nullptr;
++};
++
++struct MVKMadeiraStoreElisionSnapshot {
++	uint64_t tracked = 0;
++	uint64_t eligible = 0;
++	uint64_t elided = 0;
++	uint64_t reverted = 0;
++	uint64_t estimatedBytesPerFrame = 0;
++};
++
++class MVKMadeiraStoreElisionTracker {
++public:
++	MVKMadeiraStoreElisionTracker() {
++		const char* mode = getenv("MVK_MADEIRA_STORE_ELISION");
++		_mode = mode ? std::max(0, std::min(atoi(mode), 2)) : 0;
++		const char* frames = getenv("MVK_MADEIRA_STORE_ELISION_FRAMES");
++		_threshold = frames && *frames ? std::max(1u, (uint32_t)strtoul(frames, nullptr, 10)) : 240;
++		_lastLog = std::chrono::steady_clock::now();
++		if (_mode) {
++			fprintf(stderr, "[mvk-store-elision] mode=%d frames=%u (1=learn, 2=apply)\n", _mode, _threshold);
++		}
++	}
++
++	MVKMadeiraStoreElisionTracker(int mode, uint32_t threshold) :
++		_lastLog(std::chrono::steady_clock::now()), _threshold(std::max(1u, threshold)),
++		_mode(std::max(0, std::min(mode, 2))) {}
++
++	bool enabled() const { return _mode != 0; }
++	int mode() const { return _mode; }
++
++	void overwrite(uint64_t image, uint64_t frame) {
++		if (!_mode || !image) { return; }
++		std::lock_guard<std::mutex> lock(_lock);
++		auto imgIt = _pending.find(image);
++		if (imgIt == _pending.end()) { maybeLogLocked(); return; }
++		for (const Pending& pending : imgIt->second) {
++			if (!pending.active) { continue; }
++			auto& state = _signatures[pending.signature];
++			if (state.lastWastedFrame != frame) {
++				state.streak = state.lastWastedFrame + 1 == frame ? state.streak + 1 : 1;
++				state.lastWastedFrame = frame;
++				state.wastedBytes += state.metadata.bytes;
++			}
++			if (!state.ineligible && state.streak >= _threshold) { state.eligible = true; }
++		}
++		_pending.erase(imgIt);
++		maybeLogLocked();
++	}
++
++	void consume(uint64_t image, uint64_t frame, const char* reason) {
++		if (!_mode || !image) { return; }
++		std::lock_guard<std::mutex> lock(_lock);
++		auto imgIt = _pending.find(image);
++		if (imgIt == _pending.end()) { maybeLogLocked(); return; }
++		for (const Pending& pending : imgIt->second) {
++			if (!pending.active) { continue; }
++			auto& state = _signatures[pending.signature];
++			bool wasElided = pending.elided;
++			state.ineligible = true;
++			state.eligible = false;
++			state.eliding = false;
++			state.streak = 0;
++			if (wasElided) {
++				++_reverted;
++				fprintf(stderr, "[mvk-store-elision] ERROR consumed-after-elision image=%llu pass=%llu subpass=%u attachment=%u aspect=0x%x extent=%ux%u frame=%llu reason=%s; disabling signature forever\n",
++					(unsigned long long)image, (unsigned long long)pending.signature.renderPass,
++					pending.signature.subpass, pending.signature.attachment, pending.signature.aspect,
++					pending.signature.width, pending.signature.height, (unsigned long long)frame,
++					reason ? reason : "unknown");
++			}
++		}
++		_pending.erase(imgIt);
++		maybeLogLocked();
++	}
++
++	bool shouldElide(const MVKMadeiraStoreSignature& signature,
++					 const MVKMadeiraStoreMetadata& metadata,
++					 bool staticallySafe) {
++		if (!_mode) { return false; }
++		std::lock_guard<std::mutex> lock(_lock);
++		auto& state = _signatures[signature];
++		state.metadata = metadata;
++		if (state.ineligible) { return false; }
++		if (staticallySafe) { state.eligible = true; }
++		bool elide = staticallySafe || (_mode == 2 && state.eligible);
++		state.eliding = elide;
++		maybeLogLocked();
++		return elide;
++	}
++
++	void stored(uint64_t image, uint32_t aspect,
++				const MVKMadeiraStoreSignature& signature,
++				const MVKMadeiraStoreMetadata& metadata,
++				bool elided, uint64_t frame) {
++		if (!_mode || !image) { return; }
++		std::lock_guard<std::mutex> lock(_lock);
++		auto& state = _signatures[signature];
++		state.metadata = metadata;
++		if (elided) {
++			if (state.lastElidedFrame == frame) {
++				++state.elidedStoresInFrame;
++			} else {
++				state.lastElidedFrame = frame;
++				state.elidedStoresInFrame = 1;
++			}
++			++state.elidedStores;
++		}
++		auto& pending = _pending[image];
++		for (Pending& old : pending) {
++			if (old.active && old.aspect == aspect) {
++				// A render-load/overwrite event should always precede this. Missing one is unsafe.
++				auto& oldState = _signatures[old.signature];
++				oldState.ineligible = true;
++				oldState.eligible = false;
++				oldState.eliding = false;
++				old.active = false;
++			}
++		}
++		pending.push_back({ signature, aspect, elided, true });
++		maybeLogLocked();
++	}
++
++	void forgetImage(uint64_t image) {
++		if (!_mode || !image) { return; }
++		std::lock_guard<std::mutex> lock(_lock);
++		_pending.erase(image);
++	}
++
++	MVKMadeiraStoreElisionSnapshot snapshot() {
++		std::lock_guard<std::mutex> lock(_lock);
++		return snapshotLocked();
++	}
++
++private:
++	struct SignatureState {
++		MVKMadeiraStoreMetadata metadata;
++		uint64_t lastWastedFrame = 0;
++		uint64_t wastedBytes = 0;
++		uint64_t lastElidedFrame = 0;
++		uint64_t elidedStores = 0;
++		uint32_t streak = 0;
++		uint32_t elidedStoresInFrame = 0;
++		bool eligible = false;
++		bool ineligible = false;
++		bool eliding = false;
++	};
++	struct Pending {
++		MVKMadeiraStoreSignature signature;
++		uint32_t aspect;
++		bool elided;
++		bool active;
++	};
++
++	MVKMadeiraStoreElisionSnapshot snapshotLocked() const {
++		MVKMadeiraStoreElisionSnapshot result;
++		result.tracked = _signatures.size();
++		result.reverted = _reverted;
++		for (const auto& entry : _signatures) {
++			const SignatureState& state = entry.second;
++			if (state.eligible && !state.ineligible) { ++result.eligible; }
++			if (state.eliding && state.elidedStores && !state.ineligible) {
++				++result.elided;
++				result.estimatedBytesPerFrame += state.metadata.bytes * state.elidedStoresInFrame;
++			}
++		}
++		return result;
++	}
++
++	void maybeLogLocked() {
++		auto now = std::chrono::steady_clock::now();
++		if (now - _lastLog < std::chrono::seconds(10)) { return; }
++		_lastLog = now;
++		auto snapshot = snapshotLocked();
++		std::array<std::pair<MVKMadeiraStoreSignature, const SignatureState*>, 5> top = {};
++		for (const auto& entry : _signatures) {
++			for (size_t i = 0; i < top.size(); ++i) {
++				if (!top[i].second || entry.second.wastedBytes > top[i].second->wastedBytes) {
++					for (size_t j = top.size() - 1; j > i; --j) { top[j] = top[j - 1]; }
++					top[i] = { entry.first, &entry.second };
++					break;
++				}
++			}
++		}
++		fprintf(stderr, "[mvk-store-elision] tracked=%llu eligible=%llu elided=%llu reverted=%llu estimated-bytes/frame=%llu top=",
++			(unsigned long long)snapshot.tracked, (unsigned long long)snapshot.eligible,
++			(unsigned long long)snapshot.elided, (unsigned long long)snapshot.reverted,
++			(unsigned long long)snapshot.estimatedBytesPerFrame);
++		bool first = true;
++		for (const auto& item : top) {
++			if (!item.second || !item.second->wastedBytes) { continue; }
++			fprintf(stderr, "%s{att=%u aspect=0x%x fmt=%s(%u) extent=%ux%u wasted=%llu}", first ? "" : ",",
++				item.first.attachment, item.first.aspect,
++				item.second->metadata.formatName ? item.second->metadata.formatName : "unknown",
++				item.second->metadata.format,
++				item.second->metadata.width, item.second->metadata.height,
++				(unsigned long long)item.second->wastedBytes);
++			first = false;
++		}
++		fprintf(stderr, "%s\n", first ? "none" : "");
++	}
++
++	std::mutex _lock;
++	std::unordered_map<MVKMadeiraStoreSignature, SignatureState, MVKMadeiraStoreSignatureHash> _signatures;
++	std::unordered_map<uint64_t, std::vector<Pending>> _pending;
++	std::chrono::steady_clock::time_point _lastLog;
++	uint64_t _reverted = 0;
++	uint32_t _threshold = 240;
++	int _mode = 0;
++};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
 index e385e9b..081a213 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
@@ -5773,8 +6627,79 @@ index dec4b45..45f421a 100644
  	return rslt;
  }
  
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+index b684166..dcc7170 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+@@ -812,7 +812,19 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+     }
+ 
+ 	// Memoryless can be cleared, but can't be loaded, so force load to don't care.
+-	if (isMemorylessAttachment && mtlLA == MTLLoadActionLoad) { mtlLA = MTLLoadActionDontCare; }
++	bool requestedLoad = mtlLA == MTLLoadActionLoad;
++	if (isMemorylessAttachment && requestedLoad) { mtlLA = MTLLoadActionDontCare; }
++
++	// Madeira: the first full clear/discard is a proven overwrite of the preceding
++	// contents. A LOAD is a consumption even when memoryless Metal storage cannot honor it.
++	MVKImage* image = attachment->getImage();
++	if (requestedLoad) {
++		image->markStoreElisionConsumed("render-load");
++	} else if (isRenderingEntireAttachment && isFirstUseOfAttachment(subpass) &&
++			   !loadOverride && !isResuming &&
++			   (mtlLA == MTLLoadActionClear || mtlLA == MTLLoadActionDontCare)) {
++		image->markStoreElisionOverwrite();
++	}
+ 
+ 	mtlAttDesc.loadAction = mtlLA;
+ 
+@@ -850,6 +862,45 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ 	bool isMemorylessAttachment = attachment->getImage()->getMTLStorageMode() == MTLStorageModeMemoryless;
+ 	MTLStoreAction storeAction = getMTLStoreAction(subpass, isRenderingEntireAttachment, isMemorylessAttachment,
+ 												   hasResolveAttachment, canResolveFormat, isStencil, storeOverride);
++	bool stores = storeAction == MTLStoreActionStore || storeAction == MTLStoreActionStoreAndMultisampleResolve;
++	bool canTrack = stores && isRenderingEntireAttachment && isLastUseOfAttachment(subpass) && !storeOverride &&
++					!mvkIsAnyFlagEnabled(_renderPass->getRenderingFlags(), VK_RENDERING_SUSPENDING_BIT);
++	if (canTrack && _renderPass->getDevice()->getStoreElisionTracker().enabled()) {
++		MVKImage* image = attachment->getImage();
++		VkExtent2D extent = cmdEncoder->getFramebufferExtent();
++		uint32_t aspect = isStencil ? VK_IMAGE_ASPECT_STENCIL_BIT :
++			(isDepthFormat ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
++		MVKMadeiraStoreSignature signature = {
++			(uint64_t)(uintptr_t)_renderPass, subpass->getSubpassIndex(), _attachmentIndex,
++			aspect, extent.width, extent.height
++		};
++		uint64_t bytesPerRow = pixFmts->getBytesPerRow(getFormat(), extent.width);
++		uint64_t bytes = pixFmts->getBytesPerLayer(getFormat(), bytesPerRow, extent.height);
++		bytes *= std::max(1u, cmdEncoder->getFramebufferLayerCount());
++		bytes *= mvkSampleCountFromVkSampleCountFlagBits(image->getSampleCount());
++		MVKMadeiraStoreMetadata metadata = { bytes, (uint32_t)getFormat(), extent.width, extent.height,
++			pixFmts->getName(getFormat()) };
++
++		VkImageUsageFlags readUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
++			VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
++		bool noDeclaredReadUsage = !mvkIsAnyFlagEnabled(image->getUsageFlags(), readUsage);
++		bool transientAttachment = mvkIsAnyFlagEnabled(image->getUsageFlags(), VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
++		VkAttachmentStoreOp vkStoreOp = isStencil ? _info.stencilStoreOp : _info.storeOp;
++		bool staticDepthStencil = (isDepthFormat || isStencilFormat) &&
++			vkStoreOp == VK_ATTACHMENT_STORE_OP_STORE && noDeclaredReadUsage && transientAttachment;
++		bool staticMSAAResolve = hasResolveAttachment && canResolveFormat &&
++			image->getSampleCount() != VK_SAMPLE_COUNT_1_BIT && noDeclaredReadUsage && transientAttachment;
++		uint64_t consumptionSerial = image->getStoreElisionConsumptionSerial();
++		bool elided = _renderPass->getDevice()->getStoreElisionTracker().shouldElide(signature, metadata,
++			staticDepthStencil || staticMSAAResolve);
++		if (elided) {
++			storeAction = storeAction == MTLStoreActionStoreAndMultisampleResolve
++				? MTLStoreActionMultisampleResolve : MTLStoreActionDontCare;
++		}
++		_renderPass->getDevice()->getStoreElisionTracker().stored(image->getStoreElisionID(), aspect,
++			signature, metadata, elided, _renderPass->getDevice()->getStoreElisionFrame());
++		image->markStoreElisionStored(consumptionSerial);
++	}
+ 	if (isColorFormat) {
+ 		[cmdEncoder->_mtlRenderEncoder setColorStoreAction: storeAction atIndex: caIdx];
+ 	} else if (isDepthFormat && !isStencil) {
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
-index c5b7499..ed735b2 100644
+index c5b7499..8a5c38d 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
 @@ -21,6 +21,7 @@
@@ -5821,7 +6746,7 @@ index c5b7499..ed735b2 100644
  	mvk::SPIRVToMSLConversionResultInfo _shaderConversionResultInfo;
  
  	/** When true, representing a library created with source, but never specialized */
-@@ -162,6 +174,17 @@ protected:
+@@ -162,6 +174,24 @@ protected:
  };
  
  
@@ -5834,12 +6759,19 @@ index c5b7499..ed735b2 100644
 +/** Madeira diagnostics: slow shader-preparation logging threshold, or zero when disabled. */
 +uint64_t mvkShaderPrepLogThresholdNS();
 +MVKMadeiraConversionStats mvkMadeiraConversionCacheStats();
++void mvkMadeiraTrimConversionCache(uint64_t targetBytes);
++
++struct MVKMadeiraLibraryStats {
++	uint64_t entries = 0, sourceBytes = 0, hits = 0, misses = 0;
++	uint64_t liveLibraries = 0, precompilePendingBytes = 0;
++};
++MVKMadeiraLibraryStats mvkMadeiraLibraryStats();
 +
 +
  #pragma mark -
  #pragma mark MVKShaderLibraryCache
  
-@@ -185,9 +208,13 @@ public:
+@@ -185,9 +215,13 @@ public:
  	MVKShaderLibrary* getShaderLibrary(mvk::SPIRVToMSLConversionConfiguration* pShaderConfig,
  									   MVKShaderModule* shaderModule, MVKPipeline* pipeline,
  									   bool* pWasAdded, VkPipelineCreationFeedback* pShaderFeedback,
@@ -5855,7 +6787,7 @@ index c5b7499..ed735b2 100644
  
  	~MVKShaderLibraryCache() override;
  
-@@ -208,6 +235,8 @@ protected:
+@@ -208,6 +242,8 @@ protected:
  
  	MVKVulkanAPIDeviceObject* _owner;
  	MVKSmallVector<std::pair<mvk::SPIRVToMSLConversionConfiguration, MVKShaderLibrary*>> _shaderLibraries;
@@ -5864,7 +6796,7 @@ index c5b7499..ed735b2 100644
  };
  
  
-@@ -279,6 +308,7 @@ protected:
+@@ -279,6 +315,7 @@ protected:
  	mvk::SPIRVToMSLConverter _spvConverter;
  	MVKShaderLibrary* _directMSLLibrary;
  	MVKShaderModuleKey _key;
@@ -5872,7 +6804,7 @@ index c5b7499..ed735b2 100644
      std::mutex _accessLock;
  };
  
-@@ -303,7 +333,8 @@ public:
+@@ -303,7 +340,8 @@ public:
  	 */
  	id<MTLLibrary> newMTLLibrary(NSString* mslSourceCode,
  								 const mvk::SPIRVToMSLConversionResultInfo& shaderConversionResults,
@@ -5883,7 +6815,7 @@ index c5b7499..ed735b2 100644
  
  #pragma mark Construction
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
-index 3aa44a4..6f3ff78 100644
+index 3aa44a4..241a7a9 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
 @@ -17,13 +17,27 @@
@@ -5930,7 +6862,16 @@ index 3aa44a4..6f3ff78 100644
  	return *this;
  }
  
-@@ -76,6 +92,8 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -55,6 +71,8 @@
+ #pragma mark -
+ #pragma mark MVKShaderLibrary
+ 
++static std::atomic<uint64_t> g_mvkLiveShaderLibraries{0};
++
+ // If the size of the workgroup dimension is specialized, extract it from the
+ // specialization info, otherwise use the value specified in the SPIR-V shader code.
+ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgDim, const VkSpecializationInfo* pSpecInfo) {
+@@ -76,6 +94,8 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	if ( !_mtlLibrary ) { return MVKMTLFunctionNull; }
  
  	id<MTLLibrary> lib = _mtlLibrary;
@@ -5939,7 +6880,7 @@ index 3aa44a4..6f3ff78 100644
  
  	// If specialization happens on constants mapped to macro, find or compile a library variant
  	// with proper macro definition instead of the "generic" library
-@@ -101,18 +119,28 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -101,18 +121,28 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			auto entry = _specializationVariants.find(spec_list);
  			if (entry != _specializationVariants.end()) {
  				lib = entry->second->_mtlLibrary;
@@ -5968,7 +6909,7 @@ index 3aa44a4..6f3ff78 100644
  
  			uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
  			id<MTLFunction> mtlFunc = [[lib newFunctionWithName: mtlFuncName] autorelease];
-@@ -166,10 +194,53 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -166,10 +196,53 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			if ( !dbName ) { dbName = _owner->getDebugName(); }
  			_owner->setMetalObjectLabel(mtlFunc, dbName);
  
@@ -6025,7 +6966,7 @@ index 3aa44a4..6f3ff78 100644
  		}
  	}
  }
-@@ -185,13 +256,53 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -185,13 +258,53 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	wgSize.depth.size = z;
  }
  
@@ -6079,24 +7020,28 @@ index 3aa44a4..6f3ff78 100644
  // Decompresses the cached MSL into the string.
  void MVKShaderLibrary::decompressMSL(string& msl) {
  	uint64_t startTime = getPerformanceTimestamp();
-@@ -207,6 +318,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -206,7 +319,9 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	_maySpecializeWithMacro(true) {
  
  	_shaderConversionResultInfo = conversionResult.resultInfo;
++	++g_mvkLiveShaderLibraries;
  	compressMSL(conversionResult.msl);
 +	madeiraRegister();
  	compileLibrary(conversionResult.msl);
  }
  
-@@ -220,6 +332,8 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -219,7 +334,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	_maySpecializeWithMacro(specializationMacroDef == nullptr) {
  
  	_shaderConversionResultInfo = resultInfo;
++	++g_mvkLiveShaderLibraries;
  	_compressedMSL = compressedMSL;
 +	accountCompressedMSL();
 +	madeiraRegister();
  	string msl;
  	decompressMSL(msl);
  	compileLibrary(msl, specializationMacroDef);
-@@ -240,8 +354,20 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -240,8 +358,20 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			}
  		}
  	}
@@ -6118,15 +7063,20 @@ index 3aa44a4..6f3ff78 100644
  	[nsSrc release];														// release temp string
  	slc->destroy();
  }
-@@ -252,6 +378,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -252,6 +382,8 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	MVKBaseDeviceObject(owner->getDevice()),
  	_owner(owner),
  	_maySpecializeWithMacro(false) {
++	++g_mvkLiveShaderLibraries;
 +	_madeiraFunctionKey = mvkHash((const char*)mslCompiledCodeData, mslCompiledCodeLength);
  
      uint64_t startTime = getPerformanceTimestamp();
      @autoreleasepool {
-@@ -276,6 +403,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -273,9 +405,15 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	_maySpecializeWithMacro(other._maySpecializeWithMacro),
+ 	_specializationVariants(other._specializationVariants) {
+ 
++	++g_mvkLiveShaderLibraries;
  	_mtlLibrary = [other._mtlLibrary retain];
  	_shaderConversionResultInfo = other._shaderConversionResultInfo;
  	_compressedMSL = other._compressedMSL;
@@ -6138,7 +7088,7 @@ index 3aa44a4..6f3ff78 100644
  }
  
  MVKShaderLibrary& MVKShaderLibrary::operator=(const MVKShaderLibrary& other) {
-@@ -286,6 +418,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -286,6 +424,10 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	_owner = other._owner;
  	_shaderConversionResultInfo = other._shaderConversionResultInfo;
  	_compressedMSL = other._compressedMSL;
@@ -6149,10 +7099,11 @@ index 3aa44a4..6f3ff78 100644
  	return *this;
  }
  
-@@ -306,7 +442,15 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -306,7 +448,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  }
  
  MVKShaderLibrary::~MVKShaderLibrary() {
++	--g_mvkLiveShaderLibraries;
 +	if (_madeiraMSL) {
 +		std::lock_guard<std::mutex> guard(mvkMadeiraMSLLock());
 +		mvkMadeiraMSLLibs().erase(_madeiraMSL);
@@ -6165,7 +7116,7 @@ index 3aa44a4..6f3ff78 100644
  
  	for (auto& item: _specializationVariants) {
  		delete item.second;
-@@ -317,24 +461,50 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -317,24 +468,50 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  #pragma mark -
  #pragma mark MVKShaderLibraryCache
  
@@ -6217,7 +7168,7 @@ index 3aa44a4..6f3ff78 100644
  
  	return shLib;
  }
-@@ -362,6 +532,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -362,6 +539,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  														  const SPIRVToMSLConversionResult& conversionResult) {
  	MVKShaderLibrary* shLib = new MVKShaderLibrary(_owner, conversionResult);
  	_shaderLibraries.emplace_back(*pShaderConfig, shLib);
@@ -6225,7 +7176,7 @@ index 3aa44a4..6f3ff78 100644
  	return shLib;
  }
  
-@@ -371,6 +542,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -371,6 +549,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  														  const MVKCompressor<std::string> compressedMSL) {
  	MVKShaderLibrary* shLib = new MVKShaderLibrary(_owner, resultInfo, compressedMSL);
  	_shaderLibraries.emplace_back(*pShaderConfig, shLib);
@@ -6233,7 +7184,7 @@ index 3aa44a4..6f3ff78 100644
  	return shLib;
  }
  
-@@ -381,11 +553,15 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -381,11 +560,15 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  		if ( !findShaderLibrary(&otherPair.first) ) {
  			_shaderLibraries.emplace_back(otherPair.first, new MVKShaderLibrary(*otherPair.second));
  			_shaderLibraries.back().second->_owner = _owner;
@@ -6249,7 +7200,7 @@ index 3aa44a4..6f3ff78 100644
  	for (auto& slPair : _shaderLibraries) { slPair.second->destroy(); }
  }
  
-@@ -400,11 +576,19 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -400,11 +583,19 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	MVKShaderLibrary* mvkLib = _directMSLLibrary;
  	if ( !mvkLib ) {
  		uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
@@ -6270,7 +7221,7 @@ index 3aa44a4..6f3ff78 100644
  			mvkLib = _shaderLibraryCache.getShaderLibrary(pShaderConfig, this, pipeline, nullptr, pShaderFeedback, startTime);
  		}
  	} else {
-@@ -415,17 +599,59 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -415,17 +606,60 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
  }
  
@@ -6287,6 +7238,7 @@ index 3aa44a4..6f3ff78 100644
 +}
 +
 +MVKMadeiraConversionStats mvkMadeiraConversionCacheStats() { return mvkConversionCache().snapshot(); }
++void mvkMadeiraTrimConversionCache(uint64_t targetBytes) { mvkConversionCache().trim(targetBytes); }
 +
 +static uint64_t mvkConversionBytes(const vector<uint32_t>& spirv,
 +		const SPIRVToMSLConversionConfiguration& config, const SPIRVToMSLConversionResult& result) {
@@ -6331,7 +7283,7 @@ index 3aa44a4..6f3ff78 100644
  	if (dumpDir && *dumpDir) {
  		char path[PATH_MAX];
  		const char* type;
-@@ -505,6 +731,8 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -505,6 +739,8 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  			addPerformanceInterval(getPerformanceStats().shaderCompilation.hashShaderCode, startTime);
  
  			_spvConverter.setSPIRV(pCreateInfo->pCode, spvCount);
@@ -6340,7 +7292,7 @@ index 3aa44a4..6f3ff78 100644
  
  			break;
  		}
-@@ -544,20 +772,355 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -544,20 +780,371 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  	}
  
  	_key = MVKShaderModuleKey(codeSize, codeHash);
@@ -6659,6 +7611,22 @@ index 3aa44a4..6f3ff78 100644
 +	}
 +}
 +
++MVKMadeiraLibraryStats mvkMadeiraLibraryStats() {
++	MVKMadeiraLibraryStats stats;
++	{
++		std::lock_guard<std::mutex> lock(g_mvkLibCacheLock);
++		if (g_mvkLibCache) {
++			stats.entries = g_mvkLibCache->size();
++			for (auto& entry : *g_mvkLibCache) { stats.sourceBytes += entry.second.length; }
++		}
++	}
++	stats.hits = g_mvkLibHits.load(std::memory_order_relaxed);
++	stats.misses = g_mvkLibMisses.load(std::memory_order_relaxed);
++	stats.liveLibraries = g_mvkLiveShaderLibraries.load(std::memory_order_relaxed);
++	stats.precompilePendingBytes = g_mvkPrecompPending.load(std::memory_order_relaxed);
++	return stats;
++}
++
 +void mvkMadeiraShaderPrewarmLog() {
 +	fprintf(stderr, "[mvk-shader-prefetch] enabled=%d requests=%llu loaded=%llu learned=%llu pending=%llu dropped=%llu write_failures=%llu modules_cap=512 variants_cap=2 jobs_cap=32\n",
 +		mvkShaderPrewarmEnabled(), (unsigned long long)g_mvkWarmRequests.load(),
@@ -6697,7 +7665,7 @@ index 3aa44a4..6f3ff78 100644
  
  	compile(lock, ^{
  		auto mtlDev = getMTLDevice();
-@@ -578,10 +1141,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -578,10 +1165,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  																						 count: macro_count];
  				}
  				logCompilation(mtlCompileOptions);
@@ -6714,7 +7682,7 @@ index 3aa44a4..6f3ff78 100644
  							bool isLate = compileComplete(mtlLib, error);
  							if (isLate) { destroy(); }
  						}];
-@@ -589,6 +1158,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+@@ -589,6 +1182,11 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
  		}
  	});
  

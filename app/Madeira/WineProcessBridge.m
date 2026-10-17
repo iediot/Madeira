@@ -388,6 +388,78 @@ __attribute__((constructor)) static void madeira_docs_dir_ctor(void)
  * Only LocalLow is created. Roaming is left alone: Wine populates it itself and
  * decides by existence (see madeira_undo_appdata_skeleton). Local already
  * exists on every start (the TEMP directory is in it). */
+/* FEX's code cache (env.MADEIRA_FEX_CODE_CACHE) names a file after the module,
+ * its file id and the address it loaded at: <name>-<fileid>-<base>.mfc. A module
+ * that loads somewhere else next time starts a new file and the old one is never
+ * read again. Detroit's exe left 26 of them, 1.9 GB. Keep the two newest per
+ * module; this runs before any Wine process, so none is open. */
+static void madeira_prune_fex_cache(NSString *prefix)
+{
+    NSString *dir = [prefix stringByAppendingPathComponent:@"drive_c/users/Public/madeira-fex-cache"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSURL *> *files = [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir]
+                                includingPropertiesForKeys:@[NSURLContentModificationDateKey, NSURLFileSizeKey]
+                                                   options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    if (!files.count) return;
+    NSMutableDictionary<NSString *, NSMutableArray<NSURL *> *> *modules = [NSMutableDictionary dictionary];
+    for (NSURL *url in files) {
+        NSString *name = url.lastPathComponent;
+        NSRange dash = [name rangeOfString:@"-" options:NSBackwardsSearch];
+        if (![name.pathExtension isEqualToString:@"mfc"] || dash.location == NSNotFound) continue;
+        NSString *module = [name substringToIndex:dash.location];
+        if (!modules[module]) modules[module] = [NSMutableArray array];
+        [modules[module] addObject:url];
+    }
+    unsigned long long freed = 0;
+    unsigned removed = 0;
+    for (NSMutableArray<NSURL *> *group in modules.allValues) {
+        if (group.count <= 2) continue;
+        [group sortUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
+            NSDate *da = nil, *db = nil;
+            [a getResourceValue:&da forKey:NSURLContentModificationDateKey error:nil];
+            [b getResourceValue:&db forKey:NSURLContentModificationDateKey error:nil];
+            return [db ?: NSDate.distantPast compare:da ?: NSDate.distantPast];   /* newest first */
+        }];
+        for (NSUInteger i = 2; i < group.count; i++) {
+            NSNumber *size = nil;
+            [group[i] getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+            if ([fm removeItemAtURL:group[i] error:nil]) { freed += size.unsignedLongLongValue; removed++; }
+        }
+    }
+    if (removed) {
+        extern void ws_log(const char *fmt, ...);
+        ws_log("[fex-cache] pruned %u stale files (%llu MB)", removed, freed >> 20);
+    }
+}
+
+/* Metal makes a scratch folder, Caches/<bundle id>/com.apple.gpuarchiver/gpuarchiver-XXXXXX,
+ * each time MoltenVK serializes a binary archive, and leaves it there: 1,795 of
+ * them, 11 GB, on the test iPad. Nothing reads them back. Remove the ones not
+ * touched in the last ten minutes, so a serialization still running is left alone. */
+static void madeira_prune_gpuarchiver_scratch(void)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *caches = [fm URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
+    NSString *bundle = NSBundle.mainBundle.bundleIdentifier;
+    if (!caches || !bundle) return;
+    NSURL *dir = [[caches URLByAppendingPathComponent:bundle] URLByAppendingPathComponent:@"com.apple.gpuarchiver"];
+    NSArray<NSURL *> *items = [fm contentsOfDirectoryAtURL:dir includingPropertiesForKeys:@[NSURLContentModificationDateKey]
+                                                   options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-600];
+    unsigned removed = 0;
+    for (NSURL *url in items) {
+        NSDate *modified = nil;
+        if (![url.lastPathComponent hasPrefix:@"gpuarchiver-"]) continue;
+        [url getResourceValue:&modified forKey:NSURLContentModificationDateKey error:nil];
+        if (modified && [modified compare:cutoff] == NSOrderedDescending) continue;
+        if ([fm removeItemAtURL:url error:nil]) removed++;
+    }
+    if (removed) {
+        extern void ws_log(const char *fmt, ...);
+        ws_log("[gpuarchiver] removed %u stale Metal archive scratch folders", removed);
+    }
+}
+
 #include "ProfileFolders.h"
 static void madeira_ensure_locallow(NSString *prefix)
 {
@@ -508,6 +580,8 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         madeira_undo_appdata_skeleton( prefix );
         madeira_ensure_locallow( prefix );
         madeira_ensure_arial_fonts( prefix );
+        madeira_prune_fex_cache( prefix );
+        madeira_prune_gpuarchiver_scratch();
     }
 }
 

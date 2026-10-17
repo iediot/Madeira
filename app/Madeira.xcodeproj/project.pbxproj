@@ -32,6 +32,8 @@
 		A1000705 /* gl in Resources */ = {isa = PBXBuildFile; fileRef = A2000705 /* gl */; };
 		A1000711 /* WineMono.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000711 /* WineMono.swift */; };
 		A1000602 /* SteamDownloadBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000602 /* SteamDownloadBackground.swift */; };
+		B1000790 /* EpicCloudSaves.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000790 /* EpicCloudSaves.swift */; };
+		B1000791 /* EpicCloud.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000791 /* EpicCloud.swift */; };
 		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
 		A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000609 /* ContentDecryptor.swift */; };
 		A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060A /* DepotDownloader.swift */; };
@@ -179,6 +181,8 @@
 		A2000705 /* gl */ = {isa = PBXFileReference; lastKnownFileType = folder; path = gl; sourceTree = "<group>"; };
 		A2000711 /* WineMono.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "WineMono.swift"; sourceTree = "<group>"; };
 		A2000602 /* SteamDownloadBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamDownloadBackground.swift"; sourceTree = "<group>"; };
+		B2000790 /* EpicCloudSaves.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicCloudSaves.swift; sourceTree = "<group>"; };
+		B2000791 /* EpicCloud.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicCloud.swift; sourceTree = "<group>"; };
 		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
 		A2000609 /* ContentDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/ContentDecryptor.swift"; sourceTree = "<group>"; };
 		A200060A /* DepotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotDownloader.swift"; sourceTree = "<group>"; };
@@ -394,6 +398,8 @@
 				A2000705 /* gl */,
 				A2000711 /* WineMono.swift */,
 				A2000602 /* SteamDownloadBackground.swift */,
+				B2000790 /* EpicCloudSaves.swift */,
+				B2000791 /* EpicCloud.swift */,
 				A2000600 /* SteamInstall.swift */,
 				A2000609 /* ContentDecryptor.swift */,
 				A200060A /* DepotDownloader.swift */,
@@ -686,6 +692,8 @@
 				A1000710 /* SavesAndShortcuts.swift in Sources */,
 				A1000711 /* WineMono.swift in Sources */,
 				A1000602 /* SteamDownloadBackground.swift in Sources */,
+				B1000790 /* EpicCloudSaves.swift in Sources */,
+				B1000791 /* EpicCloud.swift in Sources */,
 				A1000600 /* SteamInstall.swift in Sources */,
 				A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */,
 				A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */,

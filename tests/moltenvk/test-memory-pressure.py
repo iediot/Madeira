@@ -11,7 +11,7 @@ shader = (objects / 'MVKShaderModule.mm').read_text()
 cache = device[device.index('class MVKPipelineStateCache {'):device.index('\nMVKPipelineStateCache& mvkPipelineStateCache()')]
 library = shader[shader.index('struct MVKLibCacheEntry'):shader.index('uint64_t mvkLibCacheKey(')]
 library += shader[shader.index('id<MTLLibrary> mvkLibCacheGet('):shader.index('void mvkLibCacheNote(')]
-library += shader[shader.index('void mvkMadeiraTrimLibraryCache()'):shader.index('void mvkMadeiraShaderPrewarmLog()')]
+library += shader[shader.index('void mvkMadeiraTrimLibraryCache()'):shader.index('MVKMadeiraLibraryStats mvkMadeiraLibraryStats()')]
 harness = r'''
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -22,10 +22,17 @@ harness = r'''
 #include <cassert>
 #include <atomic>
 #include "MVKMadeiraMemoryPressure.h"
+#include "MVKMadeiraConversionCache.h"
 static bool pressure;
 bool mvkMadeiraMemoryPressureActive() { return pressure; }
 static void mvkTimePSOCacheResult(bool) {}
 template<class D> std::string mvkPSOKey(id<MTLDevice>, D *desc) { return std::to_string([desc unsignedLongLongValue]); }
+struct TestConfig {
+    int value;
+    bool matches(const TestConfig& other) const { return value == other.value; }
+    void alignWith(const TestConfig& other) { value = other.value; }
+};
+struct TestResult { std::vector<int> payload; };
 ''' + cache + library + r'''
 int main() { @autoreleasepool {
     MVKMadeiraMemoryPressurePolicy policy;
@@ -68,9 +75,18 @@ int main() { @autoreleasepool {
     assert(g_mvkLibCache->size() == 64 && !mvkLibCacheGet(0, 32));
     assert([heldLibrary isKindOfClass:NSObject.class]); [heldLibrary release];
     pressure = false; assert(mvkLibCacheCap() == 256);
+    MVKMadeiraConversionCache<TestConfig, TestResult> conversions(1024, 8);
+    for (uint64_t i = 0; i < 6; ++i) {
+        std::vector<uint32_t> spirv = {(uint32_t)i};
+        conversions.put(i, spirv, TestConfig{(int)i}, TestResult{{(int)i}}, 128);
+    }
+    assert(conversions.snapshot().bytes == 768);
+    conversions.trim(256);
+    assert(conversions.snapshot().entries == 2 && conversions.snapshot().bytes == 256);
+    assert(conversions.snapshot().evictions == 4);
     for (auto& entry : *g_mvkLibCache) [entry.second.lib release];
     delete g_mvkLibCache; delete g_mvkLibLRU;
-    puts("PASS: pressure hysteresis, unknown/reset headroom, explicit small/disabled caps, actual PSO/library trims and evicted held references");
+    puts("PASS: pressure hysteresis, actual PSO/library/conversion trims and evicted held references");
 } }
 '''
 # Fix test-owned state references: cache.put retains its own reference.
@@ -85,3 +101,4 @@ with tempfile.TemporaryDirectory(prefix='madeira-pressure-test-') as directory:
 assert 'while (g_mvkLibCache->size() > mvkLibCacheCap())' in shader
 assert 'if (!_memoryLogThread.joinable())' in device
 assert '#if MVK_IOS\n' in device and 'os_proc_available_memory()' in device
+assert '[mem-breakdown]' in device and 'malloc_zone_pressure_relief(nullptr, 0)' in device

@@ -91,7 +91,65 @@ Live account/CDN downloads, on-device pause/background behavior, prerequisite
 execution and Wine/FEX gameplay still require device testing. Launch arguments
 do not supply EOS overlays, ownership-ticket files, third-party launchers or
 anti-cheat support; games requiring those may not run. Updates, delta manifests,
-DLC selection and cloud saves are outside this milestone.
+DLC selection are outside this milestone. Cloud saves are Milestone 3.
+
+## Milestone 3 — cloud saves
+
+Installed Epic games sync their saves with the account's Epic Cloud, like Steam's
+(`docs/STEAM_CLOUD.md`). Code: `EpicCloudSaves.swift` (protocol, formats and the decision, Foundation
+only) and `EpicCloud.swift` (when it runs, the page section, the switches).
+
+**Format.** A cloud save is a snapshot: `manifests/<yyyy.MM.dd-HH.mm.ss>.manifest` and the 1 MiB
+chunks it names, under `savesync/<account>/<app>/` on Epic's datastorage service
+(`datastorage-public-service-liveegs.live.use1a.on.epicgames.com`). Madeira reads and writes them
+exactly as Legendary does (`legendary/core.py` upload_save / download_saves,
+`utils/savegame_helper.py`, the chunk and manifest writers): header v3 chunks padded to 1 MiB with
+Epic's rolling hash and a SHA-1, a feature-level 18 manifest, files sorted case-insensitively,
+`CloudSaveFolder` as a custom field. A new upload is a new snapshot; older ones stay.
+
+**Where the saves are.** The game's catalog entry (`customAttributes`: `CloudSaveFolder`,
+`CloudIncludeList`, `CloudExcludeList`) gives a folder such as `{AppData}/Game/Saved`. Madeira maps
+`{AppData}`, `{UserDir}`, `{UserProfile}`, `{UserSavedGames}`, `{InstallDir}` and `{EpicID}` to the
+Wine prefix (`drive_c/users/<name>/...`, the install folder, the account ID), matching names without
+regard to case. A path that leaves `drive_c` or uses another variable is refused. A game with no
+`CloudSaveFolder` has no cloud saves and no section.
+
+**What it does.**
+1. Scans the save folder (include/exclude lists as Legendary applies them; symlinks never followed;
+   at most 2000 files and 128 MB) and fetches the newest snapshot's manifest.
+2. Compares file SHA-1s with a record of what both sides had at the last sync
+   (`epic-cloud-sync.json` in Application Support):
+   - the cloud changed only: **download**; the device changed only: **upload** as a new snapshot;
+   - both changed, or they differ with no record: a **conflict**, nothing is replaced until the user
+     chooses **Keep Epic's saves** or **Keep this device's saves**;
+   - nothing left in the cloud: not fetched back; not a conflict.
+3. A download fetches and checks every chunk and every file's SHA-1 in memory first, then writes the
+   files (each atomically, with the snapshot's date). If anything is missing or wrong, nothing is
+   written. A file it replaces is first copied to `Documents/Epic Cloud Backups/<game> (<app>)/<time>/`
+   (Files › Madeira). Files the snapshot does not name are left alone.
+4. An upload re-reads each file and checks it against the scan (a game still writing makes it stop),
+   uploads the chunks, then the manifest last.
+
+**When.** For every installed game when Madeira starts and when its page opens (downloads only, plus
+uploads if `env.MADEIRA_EPIC_CLOUD_AUTO_UPLOAD = 1`), and on **Sync now**. Not while a game runs: Madeira
+cannot tell when a game ends, so what was played is uploaded by the next start (with the automatic
+upload on) or by Sync now. **Settings › Epic Games** has the switches: *Sync saves with Epic Cloud*
+(`env.MADEIRA_EPIC_CLOUD`, on unless 0) and *Upload newer saves automatically* (off by default).
+Uploading is off by default because an upload becomes the newest snapshot, which Epic's own launcher
+on a PC may then offer; the first one deserves a deliberate press of Sync now.
+
+**Limits.** Nothing is ever deleted in the cloud. Encrypted save chunks are not supported (the chunk
+reader rejects them). A `CloudSaveFolder` that uses Mac-only variables or the legacy `locallow` /
+`roaming` forms is refused. The sync has not been run against a live account by its author; the
+formats were checked against Legendary (below).
+
+**Tests.** `python3 tests/host/check-epic-cloud.py` builds the production Swift with `swiftc`
+and checks: the decision table, filters and save-folder variables; a save written by the Swift
+code and read back by Legendary's own `Manifest` and `Chunk` classes (every file byte for byte, every
+chunk's rolling hash and SHA-1, manifest re-serialisation); a snapshot written by Legendary's
+`SaveGameHelper` restored by the Swift code (including backup of a replaced file and the snapshot's
+date); and a damaged chunk aborting a download without writing. It needs a copy of Legendary in
+`$LEGENDARY_SRC` (default `~/ref/legendary`); without it only the first group runs. Works on macOS and Linux.
 
 ### Credits
 
@@ -99,7 +157,8 @@ Protocol and binary/JSON layout work is ported from
 [Legendary](https://github.com/derrod/legendary), by derrod and contributors,
 licensed GPL-3.0-or-later: `legendary/api/egs.py`, `models/manifest.py`,
 `models/json_manifest.py`, `models/chunk.py`, `downloader/mp/manager.py`,
-`downloader/mp/workers.py`, and `core.py` (`get_launch_parameters`). Madeira's
+`downloader/mp/workers.py`, `utils/savegame_helper.py`, `utils/rolling_hash.py`, and `core.py`
+(`get_launch_parameters`, `get_save_path`, `upload_save`, `download_saves`). Madeira's
 Swift port uses Apple's Foundation/URLSession and zlib, with no Python runtime
 or new package dependencies.
 

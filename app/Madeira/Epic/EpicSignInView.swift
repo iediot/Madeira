@@ -82,6 +82,7 @@ struct EpicSignInView: View {
             Section {
                 LabeledContent("Signed in as", value: name.isEmpty ? "Epic account" : name)
                 LabeledContent("Games", value: library.isLoading ? "Loading…" : "\(library.games.count)")
+                EpicCloudSettingRows()
                 Button("Sign out of Epic Games", role: .destructive) {
                     auth.signOut()
                     library.clear()
