@@ -4475,6 +4475,7 @@ struct LibraryHUD: View {
                         }
                     }
                 }
+                PreparingGameStatus()
                 // The starting screen's controls are one row of glyph-only buttons, so a
                 // short screen does not push them below the fold. The words stay as
                 // VoiceOver labels. A stopped Dock start can be closed; while a Dock start
@@ -5471,5 +5472,60 @@ enum UnityResolution {
         } catch {
             LogStore.shared.log("[unity-res] could not update user.reg: \(error.localizedDescription)", level: .error)
         }
+    }
+}
+
+/// "Preparing game": FEX translating a game's code into its cache on the first launch
+/// (MADEIRA_FEX_PRECOMPILE). The game process writes "done total module" to
+/// precompile-progress.txt about four times a second; Skip creates precompile-skip,
+/// which stops it there and starts the game (it is offered again next launch).
+struct PreparingGameStatus: View {
+    private static let folder = MadeiraDock.prefix.appendingPathComponent("drive_c/users/Public/madeira-fex-cache")
+    private static var progressFile: URL { folder.appendingPathComponent("precompile-progress.txt") }
+    private static var skipFile: URL { folder.appendingPathComponent("precompile-skip") }
+    @State private var first: (date: Date, done: Int)?
+    @State private var skipped = false
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            if let progress = Self.read(now: context.date), !skipped {
+                VStack(spacing: 8) {
+                    Text("Preparing game code").font(.headline)
+                    ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1))).tint(.white).frame(maxWidth: 320)
+                    Text(detail(progress, now: context.date)).font(.caption.monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center)
+                    Button("Skip") {
+                        skipped = true
+                        try? Data().write(to: Self.skipFile)
+                    }.frame(minHeight: 44)
+                }
+                .padding(16).frame(maxWidth: 380)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .onAppear { if first == nil { first = (context.date, progress.done) } }
+            }
+        }
+        .onAppear { try? FileManager.default.removeItem(at: Self.skipFile) }
+    }
+
+    private func detail(_ progress: (done: Int, total: Int), now: Date) -> String {
+        let percent = progress.total > 0 ? progress.done * 100 / progress.total : 0
+        var text = "\(percent)% · once per game, so later launches start faster"
+        if let first, progress.done > first.done, now.timeIntervalSince(first.date) >= 5 {
+            let rate = Double(progress.done - first.done) / now.timeIntervalSince(first.date)
+            let left = Int(Double(progress.total - progress.done) / rate)
+            text = "\(percent)% · about \(left >= 60 ? "\(left / 60) min" : "\(left) s") left"
+        }
+        return text
+    }
+
+    /// The current pass, or nil when none is running (no file, finished, or not written lately).
+    private static func read(now: Date) -> (done: Int, total: Int)? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: progressFile.path),
+              let modified = attributes[.modificationDate] as? Date, now.timeIntervalSince(modified) < 5,
+              let line = try? String(contentsOf: progressFile, encoding: .utf8) else { return nil }
+        let parts = line.split(separator: " ", maxSplits: 2)
+        guard parts.count >= 2, let done = Int(parts[0]), let total = Int(parts[1]), done < total,
+              !line.hasSuffix("done\n") else { return nil }
+        return (done, total)
     }
 }
