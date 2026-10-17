@@ -4358,7 +4358,7 @@ index 45ddd3a..d48c894 100644
  	MVKSmallVector<MVKSwapchainSignaler, 1> _availabilitySignalers;
  	MVKSwapchainSignaler _preSignaler = {};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index ef8ca60..7f15dcd 100644
+index ef8ca60..2228cc2 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 @@ -34,6 +34,8 @@
@@ -4567,11 +4567,12 @@ index ef8ca60..7f15dcd 100644
  
  	// Stencil usage is implied to be the same as usage, unless overridden in the pNext chain.
  	_usage = pCreateInfo->usage;
-@@ -1490,9 +1555,33 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1490,9 +1555,34 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  MVKImage::~MVKImage() {
  	mvkDestroyContainerContents(_memoryBindings);
  	mvkDestroyContainerContents(_planes);
-+	_device->getStoreElisionTracker().forgetImage(_madeiraStoreElisionID);
++	// Swapchain images can be torn down with _device already null (Detroit, Oct 17).
++	if (_madeiraStoreElisionID && _device) { _device->getStoreElisionTracker().forgetImage(_madeiraStoreElisionID); }
      releaseIOSurface();
  }
  
@@ -4601,7 +4602,7 @@ index ef8ca60..7f15dcd 100644
  
  #pragma mark -
  #pragma mark MVKSwapchainImage
-@@ -1590,6 +1679,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1590,6 +1680,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			}
  			signal(signaler.semaphore, signaler.semaphoreSignalToken, mtlCmdBuff);
  			signal(signaler.fence);
@@ -4609,7 +4610,7 @@ index ef8ca60..7f15dcd 100644
  			[mtlCmdBuff commit];
  		}
  
-@@ -1632,13 +1722,17 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1632,13 +1723,17 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  // If not headless, retrieve the MTLTexture directly from the CAMetalDrawable.
  id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
@@ -4628,7 +4629,7 @@ index ef8ca60..7f15dcd 100644
  	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
  
  	// According to Apple, it is more performant to call MTLDrawable present from within a
-@@ -1656,8 +1750,22 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1656,8 +1751,22 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  		if (presentInfo.presentMode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
  			mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
  		}
@@ -4651,7 +4652,7 @@ index ef8ca60..7f15dcd 100644
  		} else {
  			[mtlDrwbl present];
  		}
-@@ -1760,6 +1868,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1760,6 +1869,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  // Releases the CAMetalDrawable underlying this image.
  void MVKPresentableSwapchainImage::releaseMetalDrawable() {
@@ -4659,7 +4660,7 @@ index ef8ca60..7f15dcd 100644
      [_mtlDrawable release];
  	_mtlDrawable = nil;
  }
-@@ -1800,7 +1909,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1800,7 +1910,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			mtlTexDesc.usage = MTLTextureUsageRenderTarget;
  			mtlTexDesc.storageMode = MTLStorageModePrivate;
  
@@ -4672,7 +4673,7 @@ index ef8ca60..7f15dcd 100644
  		}
  	}
  }
-@@ -1808,6 +1921,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1808,6 +1922,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  void MVKPresentableSwapchainImage::destroy() {
  	releaseMetalDrawable();
@@ -4684,7 +4685,7 @@ index ef8ca60..7f15dcd 100644
  	[_mtlTextureHeadless release];
  	_mtlTextureHeadless = nil;
  	MVKSwapchainImage::destroy();
-@@ -1929,6 +2047,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1929,6 +2048,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
      if ( !mtlTexture ) { return; }
  
      getDevice()->getLiveResources().add(mtlTexture);
@@ -4692,7 +4693,7 @@ index ef8ca60..7f15dcd 100644
      _mtlTexture = mtlTexture;
  
      propagateDebugName();
-@@ -2189,6 +2308,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2189,6 +2309,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  void MVKImageViewPlane::releaseMTLTexture() {
  	if (id<MTLTexture> tex = _mtlTexture) {
