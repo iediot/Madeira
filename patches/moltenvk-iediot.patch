@@ -2858,7 +2858,7 @@ index 534a414..38482e6 100644
  	uint32_t _visibilityBufferCount = 0;
  	int _capturePipeFileDesc = -1;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 9772757..7a865fd 100644
+index 9772757..96d7e84 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -25,6 +25,11 @@
@@ -2963,15 +2963,18 @@ index 9772757..7a865fd 100644
  		[_buffer release];
  		for (auto& groups : _fences)
  			for (auto& fence : groups)
-@@ -4363,6 +4406,24 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4363,6 +4406,27 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	bool ignoreFurtherPipelines = false;
      VkResult rslt = VK_SUCCESS;
      MVKPipelineCache* mvkPLC = (MVKPipelineCache*)pipelineCache;
 +	static std::mutex burstLock;
 +	static uint64_t lastCall = 0;
 +	static uint32_t rollingCount = 0;
++	// Opt-in (=1): Detroit creates pipelines one call at a time in quick runs during
++	// gameplay too, so "8 within 50 ms" read play as a loading screen and its render
++	// thread waited 100-340 ms per compile, the stutter async exists to remove (Oct 18).
 +	const char* burstMode = getenv("MVK_MADEIRA_ASYNC_LOAD_BURST");
-+	bool burstEnabled = !(burstMode && burstMode[0] == '0');
++	bool burstEnabled = burstMode && burstMode[0] == '1';
 +	const char* thresholdValue = getenv("MVK_MADEIRA_ASYNC_LOAD_BURST_N");
 +	uint32_t threshold = thresholdValue ? std::max(1u, (uint32_t)strtoul(thresholdValue, nullptr, 10)) : 8;
 +	const char* windowValue = getenv("MVK_MADEIRA_ASYNC_LOAD_WINDOW_MS");
@@ -2988,7 +2991,7 @@ index 9772757..7a865fd 100644
  
  	@autoreleasepool {
  		for (uint32_t plIdx = 0; plIdx < count; plIdx++) {
-@@ -4400,6 +4461,29 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4400,6 +4464,29 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  			}
  		}
  	}
@@ -3018,7 +3021,7 @@ index 9772757..7a865fd 100644
  
      return rslt;
  }
-@@ -4797,6 +4881,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4797,6 +4884,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		}
  		if (mvkBlitEnc.mtlBlitEncoder) { [mvkBlitEnc.mtlBlitEncoder endEncoding]; }
  		if (mvkBlitEnc.mtlCmdBuffer) {
@@ -3026,7 +3029,7 @@ index 9772757..7a865fd 100644
  			[mvkBlitEnc.mtlCmdBuffer commit];
  			[mvkBlitEnc.mtlCmdBuffer waitUntilCompleted];
  		}
-@@ -4881,7 +4966,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4881,7 +4969,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  MVKVisibilityBuffer MVKDevice::getVisibilityBuffer() {
  	std::lock_guard<std::mutex> guard(_vizLock);
  	if (_visibilityBuffers.empty())
@@ -3035,7 +3038,7 @@ index 9772757..7a865fd 100644
  	MVKVisibilityBuffer res = std::move(_visibilityBuffers.back());
  	_visibilityBuffers.pop_back();
  	return res;
-@@ -4917,6 +5002,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -4917,6 +5005,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  		if ( !_dummyBlitMTLBuffer ) {
  			@autoreleasepool {
  				_dummyBlitMTLBuffer = [_physicalDevice->_mtlDevice newBufferWithLength: 1 options: MTLResourceStorageModePrivate];
@@ -3045,7 +3048,7 @@ index 9772757..7a865fd 100644
  			}
  		}
  	}
-@@ -5130,6 +5218,1619 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5130,6 +5221,1636 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  }
  
@@ -4248,15 +4251,24 @@ index 9772757..7a865fd 100644
 +				if (shard.pages.empty()) { appendPage(shard, index); }
 +			}
 +			if (!shard.archive) { return finishMiss(nil); }
++			writer = [shard.archive retain];
++		}
++		{
++			std::lock_guard<std::mutex> addLock(shard.writeLock);
 +			NSError* addError = nil;
-+			if (!add(shard.archive, descriptor, &addError)) {
++			if (!add(writer, descriptor, &addError)) {
 +				if (_errors.fetch_add(1) < 8) { fprintf(stderr, "[mvk-archive] add failed: %s\n", addError.localizedDescription.UTF8String); }
++				[writer release];
 +				return finishMiss(nil);
 +			}
-+			++shard.dirty;
-+			shard.pendingIndex.emplace_back(descriptorHash);
-+			writer = [shard.archive retain];
-+			if (shard.pageAdded + shard.dirty >= _pageAdditions && !shard.queued) { shard.queued = true; queueFlush = true; }
++		}
++		{
++			std::lock_guard<std::mutex> lock(shard.lock);
++			if (shard.archive == writer) {   // else a full-page save swapped it meanwhile; this one is saved with it
++				++shard.dirty;
++				shard.pendingIndex.emplace_back(descriptorHash);
++				if (shard.pageAdded + shard.dirty >= _pageAdditions && !shard.queued) { shard.queued = true; queueFlush = true; }
++			}
 +		}
 +		NSError* error = nil;
 +		descriptor.binaryArchives = @[writer];
@@ -4303,6 +4315,9 @@ index 9772757..7a865fd 100644
 +		std::mutex lock;
 +		std::mutex operationLock;
 +		unsigned pageAdded = 0;   // pipelines already saved into the current writer page
++		// add() and serializeToURL on one archive must not overlap; held for those only, so
++		// lookups (shard.lock) never wait behind an ~11 ms add or a save.
++		std::mutex writeLock;
 +		std::vector<NSURL*> pages;
 +		std::vector<FrozenPage> frozen;
 +		id<MTLBinaryArchive> archive = nil;
@@ -4504,6 +4519,7 @@ index 9772757..7a865fd 100644
 +			std::lock_guard<std::mutex> lock(shard.lock);
 +			if (!shard.archive || !shard.dirty) { shard.queued = false; return; }
 +			if (shard.pageAdded + shard.dirty < _pageAdditions) {
++				std::lock_guard<std::mutex> saveLock(shard.writeLock);
 +				// Not full: save the writer page in place and keep adding to it. Starting a
 +				// page on every save (each timed save) took Detroit from 447 to 769 open
 +				// pages in one run. Under the lock: add() must not run during serialize, and
@@ -4539,7 +4555,11 @@ index 9772757..7a865fd 100644
 +		NSURL* temp = [NSURL fileURLWithPath:[url.path stringByAppendingString:@".tmp"]];
 +		NSError* error = nil;
 +		uint64_t start = mvkTimeNow();
-+		bool ok = [archive serializeToURL:temp error:&error];
++		bool ok;
++		{
++			std::lock_guard<std::mutex> saveLock(shard.writeLock);   // adds already handed this archive finish first
++			ok = [archive serializeToURL:temp error:&error];
++		}
 +		// Rename on the same filesystem leaves the last good archive intact on failure.
 +		if (ok) { ok = rename(temp.path.fileSystemRepresentation, url.path.fileSystemRepresentation) == 0; }
 +		fprintf(stderr, "[mvk-archive] serialize shard=%u additions=%u elapsed=%.1fms unlocked=1 hits=%llu misses=%llu ok=%d file=%s error=%s\n", index, additions, (mvkTimeNow() - start) / 1e6, (unsigned long long)_hits.load(), (unsigned long long)_misses.load(), ok, url.path.UTF8String, error ? error.localizedDescription.UTF8String : (ok ? "none" : strerror(errno)));
@@ -4665,7 +4685,7 @@ index 9772757..7a865fd 100644
  MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) : _enabledExtensions(this) {
  
  	// If the physical device is lost, bail.
-@@ -5140,6 +6841,44 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5140,6 +6861,44 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	}
  
  	initPhysicalDevice(physicalDevice, pCreateInfo);
@@ -4710,7 +4730,7 @@ index 9772757..7a865fd 100644
  	initPerformanceTracking();
  	enableExtensions(pCreateInfo);
  	enableFeatures(pCreateInfo);
-@@ -5210,6 +6949,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5210,6 +6969,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  	MVKLogInfo("Created VkDevice to run on GPU %s with the following %d Vulkan extensions enabled:%s",
  			   getName(), _enabledExtensions.getEnabledCount(), _enabledExtensions.enabledNamesString("\n\t", true).c_str());
@@ -4718,7 +4738,7 @@ index 9772757..7a865fd 100644
  }
  
  // Perf stats that last the duration of the app process.
-@@ -5223,7 +6963,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5223,7 +6983,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  void MVKDevice::initConfiguration() {
  	bool needsLiveTrackingForCopy = _physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.needsArgumentBufferEncoders;
  	bool needsLiveTrackingForEncode = !hasResidencySet() && (getMVKConfig().liveCheckAllResources || _enabledDescriptorIndexingFeatures.descriptorBindingPartiallyBound);
@@ -4731,7 +4751,7 @@ index 9772757..7a865fd 100644
  }
  
  void MVKDevice::initPhysicalDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo* pCreateInfo) {
-@@ -5448,6 +7192,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5448,6 +7212,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  
  // Create the command queues
  void MVKDevice::initQueues(const VkDeviceCreateInfo* pCreateInfo) {
@@ -4740,7 +4760,7 @@ index 9772757..7a865fd 100644
  #if MVK_XCODE_16
  	if (_physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.residencySets) {
  		MTLResidencySetDescriptor *setDescriptor;
-@@ -5532,6 +7278,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5532,6 +7298,10 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  }
  
  MVKDevice::~MVKDevice() {
@@ -4751,7 +4771,7 @@ index 9772757..7a865fd 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5556,6 +7306,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+@@ -5556,6 +7326,9 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
  	[_residencySet release];
  #endif
  	[_defaultMTLSamplerState release];
