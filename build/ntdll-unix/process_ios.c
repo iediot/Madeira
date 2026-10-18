@@ -1345,21 +1345,30 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
      * would re-init both static PA copies and exhaust the slots. Chromium
      * tolerates a failed crashpad spawn (continues without crash upload). */
     {
-        static const char helper[] = "steamwebhelper.exe";
+        /* Rockstar's SocialClubHelper.exe is the same CEF browser host and needs
+         * the same treatment: one glued 32GB PA pool fits, a second process's
+         * would not. */
+        static const char *const helpers[] = { "steamwebhelper.exe", "socialclubhelper.exe" };
         static const char typesw[] = "--type=";
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
-        int hl = sizeof(helper) - 1, k, j;
+        int hl, k, j;
+        unsigned hi;
         int is_helper = 0;
-        for (k = 0; k + hl <= ip_len && !is_helper; k++)
+        for (hi = 0; hi < ARRAY_SIZE(helpers) && !is_helper; hi++)
         {
-            for (j = 0; j < hl; j++)
+            const char *helper = helpers[hi];
+            hl = (int)strlen( helper );
+            for (k = 0; k + hl <= ip_len && !is_helper; k++)
             {
-                WCHAR c = ip[k + j];
-                if (c >= 'A' && c <= 'Z') c += 32;
-                if (c != (WCHAR)helper[j]) break;
+                for (j = 0; j < hl; j++)
+                {
+                    WCHAR c = ip[k + j];
+                    if (c >= 'A' && c <= 'Z') c += 32;
+                    if (c != (WCHAR)helper[j]) break;
+                }
+                if (j == hl) is_helper = 1;
             }
-            if (j == hl) is_helper = 1;
         }
         if (is_helper)
         {

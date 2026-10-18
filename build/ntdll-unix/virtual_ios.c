@@ -1413,7 +1413,7 @@ static void ios_pool_owner_search( const uint64_t *wanted, unsigned nwanted )
  * so the margin should be large; if [soft-pool] COLLISION appears, this design
  * needs the full own-and-broker-the-window treatment before it can be trusted. */
 #define IOS_SOFT_MAX 8
-static struct { uint64_t base, size, committed; unsigned commits, collisions; unsigned cage; } ios_soft[IOS_SOFT_MAX];
+static struct { uint64_t base, size, committed; unsigned commits, collisions; unsigned cage; uint64_t granted; } ios_soft[IOS_SOFT_MAX];
 static unsigned ios_soft_n;
 
 /* ml433 (#72): the V8/cppgc cage holdback.
@@ -1992,6 +1992,8 @@ static size_t    ios_jumbo_hold_keep;
 
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags );
 
+static void ios_cefpool_holdback_init( void );
+
 void ios_jumbo_holdback_init( void )
 {
     static int done;
@@ -2005,6 +2007,7 @@ void ios_jumbo_holdback_init( void )
     if (done) return;
     done = 1;
 
+    ios_cefpool_holdback_init();
     want = (size_t)(madeira_cfg_int( "jumbo-mb", 0 ) * 1024ll * 1024ll);   /* ml1095: madeira.cfg jumbo-mb = N */
     if (!want) return;                       /* opt-in: absent or 0 => off */
 
@@ -2074,6 +2077,38 @@ void ios_jumbo_holdback_init( void )
                  "large guest reservation\n",
                  (unsigned long long)ios_jumbo_hold_base, want >> 20 );
     }
+}
+
+/* Chromium's glued core pools in a 63GB map (no extended-VA entitlement).
+ *
+ * PartitionAlloc reserves regular+BRP as ONE 32GB block aligned to 32GB, and on
+ * a 63GB map the only such base is 0x800000000 -- whose second half runs into
+ * FEX's thread furniture. PA only ever commits upward from each pool's start,
+ * so hold the first CEF_POOL_HEAD of the regular pool and CEF_POOL_BRP_HEAD of
+ * the BRP pool at boot, hand PA the whole 32GB with those heads as real views,
+ * and record it soft so commits past a head still materialise. Opt-in per
+ * session (MADEIRA_CEF_POOL=1): the hold costs every other game 5GB of VA. */
+#define CEF_POOL_BASE      0x800000000ULL
+#define CEF_POOL_SIZE      0x800000000ULL
+#define CEF_POOL_HEAD      0x100000000ULL   /* 4GB */
+#define CEF_POOL_BRP_HEAD  0x40000000ULL    /* 1GB */
+static int ios_cefpool_held;   /* bit 0 regular head held, bit 1 BRP head held */
+
+static void ios_cefpool_holdback_init( void )
+{
+    const char *e = getenv( "MADEIRA_CEF_POOL" );
+    void *got;
+
+    if (!e || e[0] != '1') return;
+    got = anon_mmap_tryfixed( (void *)CEF_POOL_BASE, CEF_POOL_HEAD, PROT_NONE, MAP_NORESERVE );
+    if (got != MAP_FAILED) ios_cefpool_held |= 1;
+    got = anon_mmap_tryfixed( (void *)(CEF_POOL_BASE + CEF_POOL_SIZE / 2), CEF_POOL_BRP_HEAD,
+                              PROT_NONE, MAP_NORESERVE );
+    if (got != MAP_FAILED) ios_cefpool_held |= 2;
+    dprintf( 2, "[cef-pool] holdback regular head 0x%llx+%lluMB %s, BRP head 0x%llx+%lluMB %s\n",
+             CEF_POOL_BASE, CEF_POOL_HEAD >> 20, (ios_cefpool_held & 1) ? "HELD" : "FAILED (occupied)",
+             CEF_POOL_BASE + CEF_POOL_SIZE / 2, CEF_POOL_BRP_HEAD >> 20,
+             (ios_cefpool_held & 2) ? "HELD" : "FAILED (occupied)" );
 }
 
 /* Returns the held base if this request can be served from it, else 0. The
@@ -3778,6 +3813,38 @@ int ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
  * slot, not to the new memory. Every allocate/free cycle at a new address also left an entry behind, so the table
  * filled after 4096 of them. The pool backing itself stays charged to the process until it exits. Called with
  * virtual_mutex held; takes ios_pool_lock like ios_jit_retire_image. */
+/* A PE image was just mapped over [base, base+len): an anon-RWX alias still recorded anywhere in
+ * that range belongs to memory that is gone. Aliases are kept per guest address in one table for
+ * all the pseudo-processes, and only the owner's MEM_RELEASE (of the alias's start) or its pool
+ * slot's reuse removed one; a helper that exited (RockstarService, an earlier Launcher.exe) left
+ * them behind. The Rockstar Games Launcher's setupapi.dll was later mapped over such a range, its
+ * IAT/metadata sync was skipped as "owned by anon JIT alias" (ml632), the pool copy kept a zero
+ * __os_arm64x_check_call slot and the launcher called address 0 ("Retrieving D3D11 device info").
+ * Takes ios_pool_lock. */
+static void ios_jit_anon_alias_retire_overlap( void *base, size_t len )
+{
+    uintptr_t lo = (uintptr_t)base, hi = lo + len;
+    int i, retired = 0;
+
+    if (!ios_jit_anon_alias_count || !len) return;
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_anon_alias_count; i++)
+    {
+        uintptr_t b = ios_jit_anon_aliases[i].user_va, e = ios_jit_anon_aliases[i].user_va_end;
+        if (!b || b >= hi || e <= lo) continue;
+        ios_jit_anon_aliases[i].user_va_end = 0;     /* readers match on user_va and the end: close the range first */
+        __sync_synchronize();
+        ios_mono_alias_retire( b );
+        ios_jit_anon_aliases[i].user_va = 0;
+        ios_jit_anon_alias_live--;
+        retired++;
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+    if (retired)
+        dprintf( 2, "[jit-alias] %d stale anon alias(es) under the image mapped at %p+0x%lx retired\n",
+                 retired, base, (unsigned long)len );
+}
+
 static void ios_jit_anon_alias_retire_range( void *base, size_t len )
 {
     uintptr_t lo = (uintptr_t)base, hi = lo + len;
@@ -13579,6 +13646,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             /* Record mapping for the entire image */
             ios_jit_add_mapping(image_base, (char *)jit_rx_base + offset, image_size);
+            ios_jit_anon_alias_retire_overlap( image_base, image_size );
 
             ERR("iOS JIT: copied image %p+0x%lx → pool %p (offset 0x%lx, used 0x%lx/0x%lx)\n",
                 image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
@@ -23766,6 +23834,39 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         ios_bigres_report( "hinted jumbo retry exhausted" );
                     }
                 }
+                /* Chromium's 32GB glued pools: the held heads at 0x800000000. */
+                if (st2 && (ios_cefpool_held & 1) && *size_ptr == CEF_POOL_SIZE
+                    && ios_soft_n < IOS_SOFT_MAX)
+                {
+                    void *h = (void *)CEF_POOL_BASE;
+                    SIZE_T hs = CEF_POOL_HEAD;
+
+                    munmap( h, CEF_POOL_HEAD );
+                    st2 = allocate_virtual_memory( &h, &hs, MEM_RESERVE, protect, 0, 0, 0, 0 );
+                    if (!st2 && (ios_cefpool_held & 2))
+                    {
+                        void *b = (void *)(CEF_POOL_BASE + CEF_POOL_SIZE / 2);
+                        SIZE_T bs = CEF_POOL_BRP_HEAD;
+                        munmap( b, CEF_POOL_BRP_HEAD );
+                        if (allocate_virtual_memory( &b, &bs, MEM_RESERVE, protect, 0, 0, 0, 0 ))
+                            dprintf( 2, "[cef-pool] BRP head reserve failed; BRP commits go soft\n" );
+                    }
+                    if (!st2)
+                    {
+                        ios_cefpool_held = 0;
+                        memset( &ios_soft[ios_soft_n], 0, sizeof(ios_soft[0]) );
+                        ios_soft[ios_soft_n].base = CEF_POOL_BASE;
+                        ios_soft[ios_soft_n].size = CEF_POOL_SIZE;
+                        ios_soft[ios_soft_n].granted = CEF_POOL_BASE;
+                        ios_soft_n++;
+                        pick = (void *)CEF_POOL_BASE;
+                        sz = CEF_POOL_SIZE;
+                        dprintf( 2, "[cef-pool] GRANTED 0x%llx+32GB to Chromium's glued pools "
+                                    "(regular and BRP heads real, rest soft)\n", CEF_POOL_BASE );
+                    }
+                    else
+                        dprintf( 2, "[cef-pool] regular head reserve failed (0x%x)\n", (unsigned)st2 );
+                }
                 if (!st2)
                 {
                     *ret = pick;
@@ -23819,6 +23920,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         ios_soft[ios_soft_n].committed = 0;
                         ios_soft[ios_soft_n].commits = 0;
                         ios_soft[ios_soft_n].collisions = 0;
+                        ios_soft[ios_soft_n].cage = 0;
+                        ios_soft[ios_soft_n].granted = (uint64_t)(uintptr_t)(off ? slot + off - align_unit : slot);
                         ios_soft_n++;
                         *ret = (void *)(uintptr_t)(off ? slot + off - align_unit : slot);
                         st = STATUS_SUCCESS;
@@ -25483,6 +25586,39 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
 #ifdef WINE_IOS
+    /* A soft pool released whole at the base it was granted at: drop it, with
+     * any real head views inside it. Chromium frees a pool it cannot use and
+     * treats a refused free as fatal (SocialClubHelper died on exactly that). */
+    if (type == MEM_RELEASE && !size && base)
+    {
+        unsigned i;
+        for (i = 0; i < ios_soft_n; i++)
+        {
+            uint64_t sb, heads[2];
+            struct file_view *hv;
+            unsigned h;
+
+            if (ios_soft[i].cage || !ios_soft[i].granted
+                || ios_soft[i].granted != (uint64_t)(uintptr_t)base) continue;
+            sb = ios_soft[i].base;
+            /* only the heads the grant itself reserved; other allocations may
+             * live in the soft middle and are not ours to free */
+            heads[0] = sb;
+            heads[1] = sb == CEF_POOL_BASE ? sb + ios_soft[i].size / 2 : 0;
+            for (h = 0; h < 2; h++)
+                if (heads[h] && (hv = find_view( (void *)(uintptr_t)heads[h], 0 ))
+                    && hv->base == (void *)(uintptr_t)heads[h] && is_view_valloc( hv ))
+                    free_pages( hv, hv->base, hv->size );
+            dprintf( 2, "[soft-pool] released 0x%llx+%lluMB (granted %p, %lluMB had materialised)\n",
+                     (unsigned long long)sb, (unsigned long long)(ios_soft[i].size >> 20), base,
+                     (unsigned long long)(ios_soft[i].committed >> 20) );
+            *addr_ptr = base;
+            *size_ptr = (SIZE_T)ios_soft[i].size;
+            ios_soft[i] = ios_soft[--ios_soft_n];
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            return STATUS_SUCCESS;
+        }
+    }
     /* Madeira: a thin reservation's tail holds nothing; see ios_thin_reserve. */
     if (ios_thin_live_n && type == MEM_DECOMMIT && base && ios_thin_decommit_fixup( base, &size ))
     {
