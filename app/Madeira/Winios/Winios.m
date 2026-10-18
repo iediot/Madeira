@@ -2018,6 +2018,15 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
  * cursor (no cursor on iOS — these are no-ops)
  * ============================================================ */
 
+/* Upstream's [swap-win] diagnostics (willfaust/madeira #285): driver_ios.c logs a
+ * swapchain window's style, position and activation when the app says the HWND
+ * presents through a swapchain. That app half was not ported; no window is
+ * registered, so the driver logs nothing. Defined so the weak references link. */
+int winios_swapchain_hwnd(void *hwnd) { (void)hwnd; return 0; }
+int winios_swapchain_take(int slot, int kind, unsigned int *seq) {
+    (void)slot; (void)kind; if (seq) *seq = 0; return 0;
+}
+
 void winios_pSetCursor(HWND hwnd, HCURSOR cursor) {
     /* iOS has no mouse cursor. Games that hide/show the cursor for
      * mouselook etc. just get nothing — fine for touch-driven input. */

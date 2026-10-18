@@ -1898,7 +1898,18 @@ static void ios_xprobe_main( void )
         thread_act_array_t th = NULL; mach_msg_type_number_t nth = 0, k;
         uint64_t now; double dt_ms, sum_thr_ms = 0; int nrows = 0, i, j;
 #define XP_MS(ticks) ((double)(ticks) * tb.numer / tb.denom / 1e6)
-        usleep( 250000 );
+        {
+            /* Audit 2026-10-18: every 2 s by default (it walks every thread's counters and
+             * writes two log lines per sample, in every session); MADEIRA_XP_FAST=1 or
+             * MADEIRA_PERF=1 restores the 250 ms cadence for profiling. */
+            static useconds_t xp_us;
+            if (!xp_us)
+            {
+                const char *f = getenv( "MADEIRA_XP_FAST" ), *p = getenv( "MADEIRA_PERF" );
+                xp_us = ((f && *f == '1') || (p && *p == '1')) ? 250000 : 2000000;
+            }
+            usleep( xp_us );
+        }
         now = mach_absolute_time();
         dt_ms = XP_MS( now - t_prev );
         gen++;

@@ -6843,10 +6843,12 @@ dispatch_guest_fault:
                     }
                     uint64_t state_rip_pre = fex_state_pre ?
                         ((uint64_t*)fex_state_pre)[0x18 / 8] : 0;
-                    int interesting_rip = (state_rip_pre >= 0x140079000 &&
-                                           state_rip_pre <  0x14007b000) ||
-                                          (state_rip_pre >= 0x1400e0000 &&
-                                           state_rip_pre <  0x1400e1000);
+                    /* Audit 2026-10-18: this used to also dump on every fault inside
+                     * Thumper's DXGI dispatch range (0x140079000.., 0x1400e0000..), with
+                     * no cap -- any game whose exe has code there got a full register dump
+                     * per fault. The first three dumps stay. */
+                    int interesting_rip = 0;
+                    (void)state_rip_pre;
                     if (cnt <= 3 || interesting_rip)
                     {
                         uintptr_t teb_out = teb_out_pre;

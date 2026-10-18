@@ -4327,7 +4327,12 @@ static void ios_trace_image_patch( void *requested, size_t length, unsigned int 
     unsigned int exec_bits = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
                              PAGE_EXECUTE_WRITECOPY;
 
-    enabled = getenv( "MADEIRA_IMAGE_PATCH_TRACE" );
+    {
+        /* read once: this runs after every NtProtectVirtualMemory */
+        static int trace = -1;
+        if (trace < 0) { enabled = getenv( "MADEIRA_IMAGE_PATCH_TRACE" ); trace = enabled && !strcmp( enabled, "1" ); }
+        enabled = trace ? "1" : NULL;
+    }
     if (!enabled || strcmp( enabled, "1" ) || status || !length || length > 16 ||
         start > UINTPTR_MAX - length || !(prot & read_bits) || !(prot & exec_bits) || (prot & PAGE_GUARD) ||
         __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 64) goto out;

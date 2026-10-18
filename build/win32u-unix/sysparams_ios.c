@@ -4401,6 +4401,17 @@ static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const 
                 found = (mw == want_w && mh == want_h);
         }
 
+        /* Any other size within the same bounds: the virtual monitor is scaled to
+         * the view, so it can take a size no real panel has. Deadlock's fullscreen
+         * asked for 1208x756 (its own pick from the list), got BADMODE, and was
+         * left black and not covering the screen. MADEIRA_ANY_MODE=0: list only. */
+        if (!found && want_w >= 320 && want_h >= 200 &&
+            (INT64)want_w * want_h <= 4 * (INT64)ios_screen_def_w * ios_screen_def_h)
+        {
+            const char *any = getenv( "MADEIRA_ANY_MODE" );
+            if (!(any && any[0] == '0')) found = TRUE;
+        }
+
         if (!found) ret = DISP_CHANGE_BADMODE, why = "mode is not in the virtual mode list";
         else
         {

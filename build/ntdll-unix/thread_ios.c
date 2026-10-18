@@ -2119,6 +2119,16 @@ NTSTATUS WINAPI NtOpenThread( HANDLE *handle, ACCESS_MASK access,
 }
 
 
+#ifdef WINE_IOS
+/* MADEIRA_SUSPEND_TRACE, read once: Suspend/Resume/GetContext are hot for GCs and profilers. */
+static const char *ios_suspend_trace_env(void)
+{
+    static int cached = -1;
+    if (cached < 0) { const char *e = getenv( "MADEIRA_SUSPEND_TRACE" ); cached = e && e[0] == '1'; }
+    return cached ? "1" : NULL;
+}
+#endif
+
 /******************************************************************************
  *              NtSuspendThread   (NTDLL.@)
  */
@@ -2152,7 +2162,7 @@ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
      * server_select observes the count; an early ResumeThread is not lost. */
     if (!ret && self) server_select(NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL);
     {
-        const char *e = getenv("MADEIRA_SUSPEND_TRACE");
+        const char *e = ios_suspend_trace_env();
         if (e && e[0] == '1')
             ERR("[wow-suspend-api] suspend by=%04x handle=%p status=%08x previous=%u\n",
                 (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, handle, ret, previous);
@@ -2181,7 +2191,7 @@ NTSTATUS WINAPI NtResumeThread( HANDLE handle, ULONG *count )
     SERVER_END_REQ;
 #ifdef WINE_IOS
     {
-        const char *e = getenv("MADEIRA_SUSPEND_TRACE");
+        const char *e = ios_suspend_trace_env();
         if (e && e[0] == '1')
             ERR("[wow-suspend-api] resume by=%04x handle=%p status=%08x previous=%u\n",
                 (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, handle, ret, previous);
@@ -2480,7 +2490,7 @@ NTSTATUS get_thread_context( HANDLE handle, void *context, BOOL *self, USHORT ma
     {
         static LONG serial;
         LONG n = InterlockedIncrement(&serial);
-        const char *e = getenv("MADEIRA_SUSPEND_TRACE");
+        const char *e = ios_suspend_trace_env();
         const I386_CONTEXT *wow = context;
         if (!ret && (flags & SERVER_CTX_CONTROL) &&
             (!count || !wow->Eip || !wow->Esp)) ret = STATUS_UNSUCCESSFUL;

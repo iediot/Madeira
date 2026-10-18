@@ -1263,11 +1263,26 @@ static void *wine_process_thread(void *arg) {
             if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
             aerr = nil;
+            /* The device reads the mix in passes of its I/O buffer, ~21 ms (941 frames
+             * at 44.1 kHz) by default. A game whose WASAPI buffer is 30 ms (SDL's
+             * default: Deadlock) can keep at most 20 ms ahead of it, so every pass ran
+             * short and the sound crackled. 5 ms passes fit any such buffer.
+             * env.MADEIRA_AUDIO_IO_MS = 1..40 (default 5); 0 leaves iOS's default. */
+            {
+                const char *io = getenv("MADEIRA_AUDIO_IO_MS");
+                int ms = io ? atoi(io) : 5;
+                if (!(io && io[0] == '0') && ms >= 1 && ms <= 40) {
+                    [session setPreferredIOBufferDuration:ms / 1000.0 error:&aerr];
+                    if (aerr) LOG("AVAudioSession setPreferredIOBufferDuration(%d ms) failed: %{public}s",
+                                  ms, aerr.localizedDescription.UTF8String);
+                    aerr = nil;
+                }
+            }
             [session setActive:YES error:&aerr];
             if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
-            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
-                     session.sampleRate, session.outputLatency * 1000.0);
+            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms io=%.1fms",
+                     session.sampleRate, session.outputLatency * 1000.0, session.IOBufferDuration * 1000.0);
 
             /* A phone call (even a missed one) interrupts the session and iOS
              * stops the RemoteIO unit; nothing restarted it, so the game stayed

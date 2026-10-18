@@ -507,6 +507,50 @@ extern void winios_cursor_show( int show ) __attribute__((weak));
 
 static int winios_desktop_mode(void);
 
+/* Mouse-look by clipping. SDL's relative mode (Deadlock, Source 2) leaves the
+ * cursor "shown" and instead clips it to a couple of pixels at the window centre,
+ * reading the motion as raw input. The app only locked the pointer and sent
+ * relative motion for a HIDDEN cursor, so such a game got absolute positions and
+ * its camera stopped turning at the screen edge. A clip this small is reported as
+ * a hidden cursor; the real visibility comes back when the clip goes.
+ * MADEIRA_CLIP_MOUSELOOK=0 turns this off. */
+static int ios_mouselook_clip;
+static int ios_cursor_shown_real = 1;
+
+static int ios_clip_mouselook_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv( "MADEIRA_CLIP_MOUSELOOK" ); v = !(e && e[0] == '0'); }
+    return v;
+}
+
+static BOOL winios_drv_clip_cursor( const RECT *clip, BOOL reset )
+{
+    /* A game marked env.MADEIRA_MOUSE_RELATIVE=1 confines the cursor to its window
+     * for mouse-look (SDL3's relative mode: Deadlock clips to {0,0,w,h} in play and
+     * releases the clip in its menus) and never hides it; any clip counts there. */
+    const char *rel = getenv( "MADEIRA_MOUSE_RELATIVE" );
+    int look = ios_clip_mouselook_enabled() && clip && !reset &&
+               ((clip->right - clip->left <= 16 && clip->bottom - clip->top <= 16) ||
+                (rel && rel[0] == '1'));
+    static int logged;
+
+    if (logged < 24)
+    {
+        logged++;
+        if (clip) dprintf( 2, "[clip-cursor] {%d,%d,%d,%d} reset=%d -> mouse-look %s\n", (int)clip->left, (int)clip->top,
+                           (int)clip->right, (int)clip->bottom, reset, look ? "ON" : "off" );
+        else dprintf( 2, "[clip-cursor] released reset=%d\n", reset );
+    }
+    if (look != ios_mouselook_clip)
+    {
+        ios_mouselook_clip = look;
+        if (winios_direct_cursor_show && (winios_desktop_mode() ? winios_cursor_reports_on() : winios_direct_cursor_on()))
+            winios_direct_cursor_show( look ? 0 : ios_cursor_shown_real );
+    }
+    return TRUE;
+}
+
 /* pSetCursor: extract the cursor image as straight-alpha BGRA and forward
  * to the app-side compositor cursor layer. win32u calls this on every
  * cursor CHANGE (WM_SETCURSOR → NtUserSetCursor), so resize arrows,
@@ -533,14 +577,26 @@ static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
         cursor_show = winios_direct_cursor_show;
     }
     if (!cursor_set) return;
+    ios_cursor_shown_real = cursor != 0;
+    {
+        static int set_logged;
+        static HCURSOR set_last = (HCURSOR)-1;
+        if (cursor != set_last && set_logged < 40)
+        {
+            set_logged++;
+            dprintf( 2, "[set-cursor] %s (handle %p, hwnd %p, mouse-look clip %d)\n",
+                     cursor ? "shown" : "HIDDEN", cursor, hwnd, ios_mouselook_clip );
+        }
+        set_last = cursor;
+    }
     if (winios_desktop_mode() && winios_cursor_reports_on() && winios_direct_cursor_show)
-        winios_direct_cursor_show( cursor != 0 );   /* desktop session: visibility only, see winios_cursor_reports_on */
+        winios_direct_cursor_show( cursor != 0 && !ios_mouselook_clip );   /* desktop session: visibility only, see winios_cursor_reports_on */
     if (!cursor)
     {
         if (cursor_show) cursor_show( 0 );
         return;
     }
-    if (cursor_show) cursor_show( 1 );
+    if (cursor_show) cursor_show( !ios_mouselook_clip );
     if (cursor == last_cursor) return;
 
     if (!NtUserGetIconInfo( cursor, &info, NULL, NULL, NULL, 0 )) return;
@@ -2146,6 +2202,8 @@ static void load_display_driver(void)
         else if (winios_pSetCursor)      winios_user_driver.pSetCursor           = winios_pSetCursor;
         if (!winios_desktop_mode() && winios_direct_cursor_pos)
             winios_user_driver.pSetCursorPos = winios_drv_set_cursor_pos;
+        if (winios_direct_cursor_show)
+            winios_user_driver.pClipCursor = winios_drv_clip_cursor;
         if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
         /* window-pos wrapper dereferences window_rects on this side and

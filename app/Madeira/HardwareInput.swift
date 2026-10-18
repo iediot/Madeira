@@ -513,6 +513,19 @@ final class HardwareInput: ObservableObject {
     /// while the program hides its cursor (see `AutoLock`).
     static let autoLockEnabled = lockEnabled && flag("MADEIRA_POINTER_AUTOLOCK", defaultOn: true)
 
+    /// env.MADEIRA_MOUSE_RELATIVE = 1 (a game's own line): the pointer stays locked
+    /// for the whole game session and Wine gets plain relative motion even while
+    /// the game shows a cursor. For games that read raw mouse deltas with their
+    /// cursor still visible and never hide or clip it (Deadlock, SDL): the
+    /// clamped virtual cursor and an unlocked iOS pointer both stop at the screen
+    /// edge, and the camera with them. Raw deltas from relative motion never stop;
+    /// the game's own cursor still moves (and is drawn) in its menus. Read per use:
+    /// the app exports a game's env lines for each launch.
+    static var relativeMouse: Bool {
+        guard let v = getenv("MADEIRA_MOUSE_RELATIVE") else { return false }
+        return v.pointee == 49  // '1'
+    }
+
     /// Only `0` disables a default-on switch; only `1` enables a default-off one.
     private static func flag(_ name: String, defaultOn: Bool) -> Bool {
         guard let value = MadeiraConfig.get("env.\(name)") ?? ProcessInfo.processInfo.environment[name]
@@ -1314,7 +1327,8 @@ final class HardwareInput: ObservableObject {
     private func updateRoute() {
         var r = PointerPolicy.route(focused: mouseFocused, hover: hoverSeen, locked: pointerLocked,
                                     cursorShown: cursorShownForRoute, absoluteAllowed: Self.absoluteEnabled)
-        if mouseFocused && pointerLocked && lockedForSession && cursorShownForRoute && Self.absoluteEnabled {
+        if mouseFocused && pointerLocked && lockedForSession && cursorShownForRoute && Self.absoluteEnabled
+            && !Self.relativeMouse {
             r = .virtualAbsolute
         }
         if r != currentRoute {
@@ -1329,7 +1343,7 @@ final class HardwareInput: ObservableObject {
                 if r != .absolute { lastAbsolute = nil }
                 motionLock.lock(); route = r; carry.reset(); motionLock.unlock()
             }
-            if diagnostics { log("pointer route: \(r.rawValue)") }
+            log("pointer route: \(r.rawValue) (locked \(pointerLocked), cursor shown \(cursorShownForRoute))")
         }
         updateTracking()
     }
@@ -1366,6 +1380,7 @@ final class HardwareInput: ObservableObject {
         let now = CACurrentMediaTime()
         lastReportAt = now
         if cursorState.image_serial != before.image_serial { DirectCursorOverlay.shared.loadImage() }
+        adoptProgramWarp(before: before)
         if before.reports == 0 || cursorState.shown != before.shown {
             cursorHiddenSince = cursorState.shown != 0 ? 0 : now
             if cursorState.shown != before.shown {
@@ -1377,6 +1392,25 @@ final class HardwareInput: ObservableObject {
             updateAutoLock()
             renderCursor()
         }
+    }
+
+    /// A locked, visible cursor integrates deltas into a position clamped to the
+    /// screen (postVirtualMotion). Games that turn the camera with the mouse warp
+    /// the cursor back to the centre (SetCursorPos) every frame; that warp has to
+    /// become the new origin, or the position sticks at the edge and the camera
+    /// stops turning (Deadlock, and the "can't look all the way round" games).
+    /// Our own moves echo back within a few pixels of lastAbsolute; a report far
+    /// from it is the program's warp.
+    private func adoptProgramWarp(before: winios_direct_cursor_state) {
+        guard currentRoute == .virtualAbsolute, let last = lastAbsolute,
+              cursorState.x != before.x || cursorState.y != before.y,
+              abs(cursorState.x - Int32(last.x)) > 32 || abs(cursorState.y - Int32(last.y)) > 32 else { return }
+        motionLock.lock()
+        virtualX = Double(cursorState.x); virtualY = Double(cursorState.y)
+        carry.reset()
+        motionLock.unlock()
+        lastAbsolute = (cursorState.x, cursorState.y)
+        if diagnostics { log("program warp adopted at \(cursorState.x),\(cursorState.y)") }
     }
 
     private func renderCursor() {
@@ -1645,7 +1679,7 @@ final class HardwareInput: ObservableObject {
     private func updateSessionLock() {
         let want = sessionActive && appActive && !sessionMenuOpen
             && !LibraryModel.shared.blocksGameplayTouch
-            && InputSettings.shared.keepPointerInGame && !sessionLockSuppressed
+            && (InputSettings.shared.keepPointerInGame || Self.relativeMouse) && !sessionLockSuppressed
             // Any connected mouse or trackpad: waiting for the GCMouse path to be
             // seen first left the pointer free for minutes after a game started.
             && mouseConnected && Self.pointerLockAvailable
@@ -1807,7 +1841,23 @@ enum PointerLock {
         grantObserver = NotificationCenter.default.addObserver(
             forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { _ in
             logGrant(why: "changed")
+            relockIfRevoked(attempt: 0)
         }
+    }
+
+    /// iPadOS drops the lock by itself when Escape is pressed (Deadlock's menu key:
+    /// every Esc press was followed by granted=no, and the system pointer showed up
+    /// beside the game's cursor until the lock came back seconds later). While
+    /// Madeira still wants the lock, ask again at once, a few times.
+    private static func relockIfRevoked(attempt: Int) {
+        guard HardwareInput.shared.pointerLocked, attempt < 5,
+              keyWindow()?.windowScene?.pointerLockState?.isLocked == false else { return }
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .compactMap { $0.rootViewController }
+            .forEach { $0.setNeedsUpdateOfPrefersPointerLocked() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { relockIfRevoked(attempt: attempt + 1) }
     }
 }
 
