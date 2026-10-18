@@ -1151,6 +1151,67 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
     if (!process_attr) process_attr = &empty_attr;
 
+#ifdef WINE_IOS
+    /* Madeira: MADEIRA_SPAWN_NOOP = <name>;<name>;... starts "cmd.exe /c exit 0" instead
+     * of a program whose image path contains one of the names (case-insensitive), so its
+     * caller sees it start and succeed. For installers' 32-bit helpers, which cannot run
+     * here (see the vulkandriverquery note below): the Rockstar Games Launcher installer
+     * runs vc_redist.x86/x64.exe (32-bit WiX bundles), they crash, and it stops with
+     * "encountered an error"; the runtime they install is Wine's builtin anyway. Empty by
+     * default. */
+    {
+        static WCHAR noop_nt[64], noop_image[64], noop_cmd[64];
+        static RTL_USER_PROCESS_PARAMETERS noop_params_storage;
+        const char *list = getenv( "MADEIRA_SPAWN_NOOP" );
+        const WCHAR *ip = params->ImagePathName.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR), matched = 0;
+
+        while (list && *list && !matched)
+        {
+            const char *end = strchr( list, ';' );
+            int bl = end ? (int)(end - list) : (int)strlen( list ), k, j;
+
+            for (k = 0; bl > 0 && k + bl <= ip_len && !matched; k++)
+            {
+                for (j = 0; j < bl; j++)
+                {
+                    WCHAR c = ip[k + j], w = (WCHAR)(unsigned char)list[j];
+                    if (c >= 'A' && c <= 'Z') c += 32;
+                    if (w >= 'A' && w <= 'Z') w += 32;
+                    if (c != w) break;
+                }
+                matched = j == bl;
+            }
+            list = end ? end + 1 : NULL;
+        }
+        if (matched)
+        {
+            static const char nt[] = "\\??\\C:\\windows\\system32\\cmd.exe";
+            static const char image[] = "C:\\windows\\system32\\cmd.exe";
+            static const char cmd[] = "cmd.exe /c exit 0";
+            RTL_USER_PROCESS_PARAMETERS *noop_params = &noop_params_storage;
+            unsigned n;
+
+            for (n = 0; n < sizeof(nt); n++) noop_nt[n] = (unsigned char)nt[n];
+            for (n = 0; n < sizeof(image); n++) noop_image[n] = (unsigned char)image[n];
+            for (n = 0; n < sizeof(cmd); n++) noop_cmd[n] = (unsigned char)cmd[n];
+            dprintf( 2, "[proc-noop] MADEIRA_SPAWN_NOOP: %s runs as \"cmd.exe /c exit 0\"\n",
+                     debugstr_us( &params->ImagePathName ) );
+            *noop_params = *params;
+            noop_params->ImagePathName.Buffer = noop_image;
+            noop_params->ImagePathName.Length = (sizeof(image) - 1) * sizeof(WCHAR);
+            noop_params->ImagePathName.MaximumLength = sizeof(image) * sizeof(WCHAR);
+            noop_params->CommandLine.Buffer = noop_cmd;
+            noop_params->CommandLine.Length = (sizeof(cmd) - 1) * sizeof(WCHAR);
+            noop_params->CommandLine.MaximumLength = sizeof(cmd) * sizeof(WCHAR);
+            params = noop_params;
+            path.Buffer = noop_nt;
+            path.Length = (sizeof(nt) - 1) * sizeof(WCHAR);
+            machine = 0;
+        }
+    }
+#endif
+
     TRACE( "%s image %s cmdline %s parent %p machine %x\n", debugstr_us( &path ),
            debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ), parent, machine );
 #ifdef WINE_IOS

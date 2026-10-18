@@ -4956,10 +4956,18 @@ index 45ddd3a..d48c894 100644
  	MVKSmallVector<MVKSwapchainSignaler, 1> _availabilitySignalers;
  	MVKSwapchainSignaler _preSignaler = {};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-index ef8ca60..2228cc2 100644
+index ef8ca60..8ab1556 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
-@@ -34,6 +34,8 @@
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "MVKImage.h"
++#include "MVKMadeiraFrameGen.h"
+ #include "MVKQueue.h"
+ #include "MVKSwapchain.h"
+ #include "MVKSurface.h"
+@@ -34,6 +35,8 @@
  using namespace std;
  using namespace SPIRV_CROSS_NAMESPACE;
  
@@ -4968,7 +4976,7 @@ index ef8ca60..2228cc2 100644
  static id<MTLTexture> mvkGetRootMTLTexture(id<MTLTexture> tex) {
      while (tex.parentTexture && tex.parentTexture != tex) {
        tex = tex.parentTexture;
-@@ -78,6 +80,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -78,6 +81,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
          }
  
          id<MTLTexture> tex;
@@ -4977,7 +4985,7 @@ index ef8ca60..2228cc2 100644
          // Use imported texture if we are binding to a VkDeviceMemory that was created with an import operation
          if (dvcMem && (dvcMem->_externalMemoryHandleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) && dvcMem->_mtlTexture) {
              tex = dvcMem->_mtlTexture;
-@@ -101,6 +105,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -101,6 +106,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              tex = [_heapAllocation.heap
                             newTextureWithDescriptor: mtlTexDesc
                             offset: _heapAllocation.offset];
@@ -4986,7 +4994,7 @@ index ef8ca60..2228cc2 100644
              if (_image->_isAliasable) { [_mtlTexture makeAliasable]; }
          } else if (_image->_isAliasable && dvcMem && dvcMem->isDedicatedAllocation() &&
              !mvkContains(dvcMem->_imageMemoryBindings, memoryBinding)) {
-@@ -111,12 +117,22 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -111,12 +118,22 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              tex = [dvcMem->_imageMemoryBindings[0]->_image->getMTLTexture(_planeIndex, mtlTexDesc.pixelFormat) retain];
          } else {
              tex = [_image->getMTLDevice() newTextureWithDescriptor: mtlTexDesc];
@@ -5009,7 +5017,7 @@ index ef8ca60..2228cc2 100644
  
          [mtlTexDesc release];                                            // temp release
          propagateDebugName();
-@@ -137,6 +153,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -137,6 +154,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
          if ( !mtlTex ) {
              mtlTex = [baseTexture newTextureViewWithPixelFormat: mtlPixFmt];    // retained
              _image->_device->getLiveResources().add(mtlTex);
@@ -5017,7 +5025,7 @@ index ef8ca60..2228cc2 100644
              _mtlTextureViews[mtlPixFmt] = mtlTex;
          }
      }
-@@ -147,13 +164,22 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -147,13 +165,22 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
      MVKDevice* dev = _image->_device;
      MVKLiveResourceSet& live = dev->getLiveResources();
      if (id<MTLTexture> tex = _mtlTexture) {
@@ -5040,7 +5048,7 @@ index ef8ca60..2228cc2 100644
          live.remove(elem.second);
          [elem.second release];
      }
-@@ -414,6 +440,9 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -414,6 +441,9 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
  					  memBind->isMemoryHostCoherent() &&
  					  barrier.newLayout == VK_IMAGE_LAYOUT_GENERAL &&
  					  mvkIsAnyFlagEnabled(barrier.dstAccessMask, (VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT)));
@@ -5050,7 +5058,7 @@ index ef8ca60..2228cc2 100644
  	MVKDeviceMemory* dvcMem = memBind->getDeviceMemory();
  	const MVKMappedMemoryRange& mappedRange = dvcMem ? dvcMem->getMappedRange() : MVKMappedMemoryRange();
  
-@@ -496,6 +525,21 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -496,6 +526,21 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
  // Memory may have been mapped before image was bound, and needs to be loaded into the MTLTexture.
  VkResult MVKImageMemoryBinding::bindDeviceMemory(MVKDeviceMemory* mvkMem, VkDeviceSize memOffset) {
      if (_deviceMemory) { MVKDeviceMemory::removeImageMemoryBinding(&_deviceMemory, this); }
@@ -5072,7 +5080,7 @@ index ef8ca60..2228cc2 100644
      MVKResource::bindDeviceMemory(mvkMem, memOffset);
  
      if (!_deviceMemory) { return VK_SUCCESS; }
-@@ -509,7 +553,6 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -509,7 +554,6 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              _mtlTexelBufferOffset = getDeviceMemoryOffset();
          } else {
              // Create our own buffer for this.
@@ -5080,7 +5088,7 @@ index ef8ca60..2228cc2 100644
              if (_deviceMemory->_mtlHeap && _image->getMTLStorageMode() == _deviceMemory->_mtlStorageMode) {
                  _mtlTexelBuffer = [_deviceMemory->_mtlHeap newBufferWithLength: _byteCount options: _deviceMemory->getMTLResourceOptions() offset: getDeviceMemoryOffset()];
                  if (_image->_isAliasable) { [_mtlTexelBuffer makeAliasable]; }
-@@ -519,6 +562,13 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -519,6 +563,13 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
              if (!_mtlTexelBuffer) {
                  return reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "Could not create an MTLBuffer for an image that requires a buffer backing store. Images that can be used for atomic accesses must have a texel buffer backing them.");
              }
@@ -5094,7 +5102,7 @@ index ef8ca60..2228cc2 100644
              _device->makeResident(_mtlTexelBuffer);
              _device->getLiveResources().add(_mtlTexelBuffer);
              _mtlTexelBufferOffset = 0;
-@@ -592,6 +642,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -592,6 +643,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
  // Pulls content from the MTLTexture into memory at the specified memory range.
  // Pulls from all subresources that overlap the specified range and are in an updatable layout state.
  VkResult MVKImageMemoryBinding::pullFromDevice(VkDeviceSize offset, VkDeviceSize size) {
@@ -5102,7 +5110,7 @@ index ef8ca60..2228cc2 100644
      if (shouldFlushHostMemory()) {
          for(uint8_t planeIndex = beginPlaneIndex(); planeIndex < endPlaneIndex(); planeIndex++) {
              for (auto& subRez : _image->_planes[planeIndex]->_subresources) {
-@@ -627,6 +678,11 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+@@ -627,6 +679,11 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
  	if (_ownsTexelBuffer) {
  		_device->removeResidency(_mtlTexelBuffer);
  		_device->getLiveResources().remove(_mtlTexelBuffer);
@@ -5114,7 +5122,7 @@ index ef8ca60..2228cc2 100644
  		[_mtlTexelBuffer release];
  	}
  }
-@@ -727,6 +783,10 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -727,6 +784,10 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  // Host-copy content between images by allocating a temporary memory buffer, copying into it from the
  // source image, and then copying from the memory buffer into the destination image, all using the CPU.
  VkResult MVKImage::copyImageToImage(const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
@@ -5125,7 +5133,7 @@ index ef8ca60..2228cc2 100644
  	for (uint32_t imgRgnIdx = 0; imgRgnIdx < pCopyImageToImageInfo->regionCount; imgRgnIdx++) {
  		auto& imgRgn = pCopyImageToImageInfo->pRegions[imgRgnIdx];
  
-@@ -793,6 +853,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -793,6 +854,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  }
  
  VkResult MVKImage::copyImageToMemory(const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
@@ -5133,7 +5141,7 @@ index ef8ca60..2228cc2 100644
  #if MVK_MACOS
  	// On macOS, if the device doesn't have unified memory, and the texture is using managed memory, we need
  	// to sync the managed memory from the GPU, so the texture content is accessible to be copied by the CPU.
-@@ -816,6 +877,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -816,6 +878,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  			}
  
  			[mtlBlitEnc endEncoding];
@@ -5141,7 +5149,7 @@ index ef8ca60..2228cc2 100644
  			[mtlCmdBuff commit];
  			[mtlCmdBuff waitUntilCompleted];
  		}
-@@ -826,6 +888,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -826,6 +889,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  }
  
  VkResult MVKImage::copyMemoryToImage(const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
@@ -5149,7 +5157,7 @@ index ef8ca60..2228cc2 100644
  	return copyContent(pCopyMemoryToImageInfo);
  }
  
-@@ -1040,6 +1103,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1040,6 +1104,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  	releaseIOSurface();
      _planes[planeIndex]->releaseMTLTexture();
  	_planes[planeIndex]->_mtlTexture = [mtlTexture retain];		// retained
@@ -5157,7 +5165,7 @@ index ef8ca60..2228cc2 100644
  
  	if (_planes[planeIndex]->_mtlTexture.storageMode != MTLStorageModeMemoryless) {
  		_device->makeResident(_planes[planeIndex]->_mtlTexture);
-@@ -1184,6 +1248,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1184,6 +1249,7 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  
  MVKImage::MVKImage(MVKDevice* device, const VkImageCreateInfo* pCreateInfo) : MVKVulkanAPIDeviceObject(device) {
  	_ioSurface = nil;
@@ -5165,7 +5173,7 @@ index ef8ca60..2228cc2 100644
  
  	// Stencil usage is implied to be the same as usage, unless overridden in the pNext chain.
  	_usage = pCreateInfo->usage;
-@@ -1490,9 +1555,34 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+@@ -1490,9 +1556,34 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
  MVKImage::~MVKImage() {
  	mvkDestroyContainerContents(_memoryBindings);
  	mvkDestroyContainerContents(_planes);
@@ -5200,7 +5208,7 @@ index ef8ca60..2228cc2 100644
  
  #pragma mark -
  #pragma mark MVKSwapchainImage
-@@ -1590,6 +1680,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1590,6 +1681,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			}
  			signal(signaler.semaphore, signaler.semaphoreSignalToken, mtlCmdBuff);
  			signal(signaler.fence);
@@ -5208,7 +5216,7 @@ index ef8ca60..2228cc2 100644
  			[mtlCmdBuff commit];
  		}
  
-@@ -1632,13 +1723,17 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1632,13 +1724,17 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  // If not headless, retrieve the MTLTexture directly from the CAMetalDrawable.
  id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
@@ -5227,10 +5235,23 @@ index ef8ca60..2228cc2 100644
  	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
  
  	// According to Apple, it is more performant to call MTLDrawable present from within a
-@@ -1656,8 +1751,22 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1647,6 +1743,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 	// Attach present handler before presenting to avoid race condition.
+ 	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
+ 	MVKSwapchainSignaler signaler = getPresentationSignaler();
++	// Madeira: frame generation encodes an in-between frame into its own drawable,
++	// presented first; the real frame then follows half a game frame later.
++	double fgHalfFrame = 0;
++	id<CAMetalDrawable> fgExtra = mvkMadeiraFrameGenEnabled() && !_mtlTextureHeadless ?
++		MVKMadeiraFrameGen::shared().encode(mtlCmdBuff, mtlDrwbl, &fgHalfFrame) : nil;
+ 	[mtlCmdBuff addScheduledHandler: ^(id<MTLCommandBuffer> mcb) {
+ 
+ 		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
+@@ -1656,8 +1757,26 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  		if (presentInfo.presentMode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
  			mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
  		}
+-		if (presentInfo.desiredPresentTime) {
 +		// Madeira: MVK_MADEIRA_FPS_CAP=N holds each frame on screen for at least 1/N s.
 +		// The swapchain then runs out of free drawables, so the game's CPU and GPU
 +		// work waits too: less heat, no throttling later. 40 needs a 120 Hz panel
@@ -5243,14 +5264,18 @@ index ef8ca60..2228cc2 100644
 +			fprintf(stderr, "[mvk-fps-cap] presents held >= 1/%ld s\n", cap);
 +			return 1.0 / cap - 0.0005;
 +		}();
- 		if (presentInfo.desiredPresentTime) {
++		if (fgExtra) {
++			[fgExtra present];
++			[mtlDrwbl presentAtTime: CACurrentMediaTime() + fgHalfFrame];
++			[fgExtra release];
++		} else if (presentInfo.desiredPresentTime) {
  			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
 +		} else if (minFrameSeconds > 0) {
 +			[mtlDrwbl presentAfterMinimumDuration: minFrameSeconds];
  		} else {
  			[mtlDrwbl present];
  		}
-@@ -1760,6 +1869,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1760,6 +1879,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  // Releases the CAMetalDrawable underlying this image.
  void MVKPresentableSwapchainImage::releaseMetalDrawable() {
@@ -5258,7 +5283,7 @@ index ef8ca60..2228cc2 100644
      [_mtlDrawable release];
  	_mtlDrawable = nil;
  }
-@@ -1800,7 +1910,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1800,7 +1920,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  			mtlTexDesc.usage = MTLTextureUsageRenderTarget;
  			mtlTexDesc.storageMode = MTLStorageModePrivate;
  
@@ -5271,7 +5296,7 @@ index ef8ca60..2228cc2 100644
  		}
  	}
  }
-@@ -1808,6 +1922,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1808,6 +1932,11 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  void MVKPresentableSwapchainImage::destroy() {
  	releaseMetalDrawable();
@@ -5283,7 +5308,7 @@ index ef8ca60..2228cc2 100644
  	[_mtlTextureHeadless release];
  	_mtlTextureHeadless = nil;
  	MVKSwapchainImage::destroy();
-@@ -1929,6 +2048,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -1929,6 +2058,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
      if ( !mtlTexture ) { return; }
  
      getDevice()->getLiveResources().add(mtlTexture);
@@ -5291,7 +5316,7 @@ index ef8ca60..2228cc2 100644
      _mtlTexture = mtlTexture;
  
      propagateDebugName();
-@@ -2189,6 +2309,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+@@ -2189,6 +2319,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
  
  void MVKImageViewPlane::releaseMTLTexture() {
  	if (id<MTLTexture> tex = _mtlTexture) {
@@ -5496,6 +5521,304 @@ index 0000000..6d31f83
 +			++_stats.evictions;
 +		}
 +	}
++};
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraFrameGen.h b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraFrameGen.h
+new file mode 100644
+index 0000000..d5f246f
+--- /dev/null
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraFrameGen.h
+@@ -0,0 +1,292 @@
++/*
++ * MVKMadeiraFrameGen.h
++ *
++ * Madeira: experimental frame generation for Vulkan games (MVK_MADEIRA_FRAMEGEN=1, off by
++ * default), ported from DXMT's MADEIRA_FRAMEGEN (dxmt/src/winemetal/unix/winemetal_unix.c).
++ * At each present it:
++ *   1. copies the swapchain drawable into a history texture (the layer is made
++ *      framebufferOnly = NO while it is on),
++ *   2. estimates motion between the previous and this frame on the GPU (block matching
++ *      on 1/8-size luma; the game gives MoltenVK no motion vectors),
++ *   3. runs MetalFX's frame interpolator (MTLFXFrameInterpolator, iOS 26) on the two
++ *      frames, that motion field and a flat depth, into a second drawable,
++ *   4. presents the generated frame at once and the real one half a frame later.
++ * The panel shows twice the game's rate (Detroit: 30 -> 60) for half a frame of latency
++ * and ~3-6 ms of GPU time; edges and the HUD can show artifacts. Tuning, as DXMT's:
++ * MVK_MADEIRA_FRAMEGEN_RADIUS (search radius in 1/8-size pixels, default 6),
++ * MVK_MADEIRA_FRAMEGEN_MVSCALE (default 1), MVK_MADEIRA_FRAMEGEN_MVSIGN (-1 flips).
++ * MetalFX is reached by name, so MoltenVK does not link it.
++ */
++
++#pragma once
++
++#import <Metal/Metal.h>
++#import <QuartzCore/QuartzCore.h>
++#import <MetalFX/MetalFX.h>
++#include <dlfcn.h>
++#include <mach/mach_time.h>
++#include <mutex>
++#include <cstdio>
++#include <cstdlib>
++
++static inline bool mvkMadeiraFrameGenEnabled() {
++	static const bool on = [] {
++		const char* e = getenv("MVK_MADEIRA_FRAMEGEN");
++		bool v = e && *e && *e != '0';
++		if (v) { fprintf(stderr, "[mvk-framegen] ON (MVK_MADEIRA_FRAMEGEN): MetalFX frame interpolation between game frames\n"); }
++		return v;
++	}();
++	return on;
++}
++
++class MVKMadeiraFrameGen {
++public:
++	static MVKMadeiraFrameGen& shared() { static MVKMadeiraFrameGen fg; return fg; }
++
++	/** Encodes the generated frame into cb. Returns a retained extra drawable to present
++	 *  before the real one, with *halfFrame set to half the game's frame time, or nil. */
++	id<CAMetalDrawable> encode(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable, double* halfFrame) {
++		std::lock_guard<std::mutex> guard(_lock);
++		@autoreleasepool { return encodeLocked(cb, drawable, halfFrame); }
++	}
++
++private:
++	static float envf(const char* name, float dflt) {
++		const char* e = getenv(name);
++		return (e && *e) ? (float)atof(e) : dflt;
++	}
++
++	static id<MTLTexture> tex(id<MTLDevice> dev, MTLPixelFormat f, NSUInteger w, NSUInteger h, MTLTextureUsage u) {
++		MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
++		d.usage = u;
++		d.storageMode = MTLStorageModePrivate;
++		return [dev newTextureWithDescriptor:d];
++	}
++
++	void release() {
++		for (int i = 0; i < 2; i++) { [_hist[i] release]; _hist[i] = nil; [_luma[i] release]; _luma[i] = nil; }
++		[_flow release]; [_motion release]; [_depth release]; [_out release];
++		_flow = _motion = _depth = _out = nil;
++		[_interp release]; _interp = nil;
++		_havePrev = false;
++	}
++
++	bool setup(id<MTLDevice> dev, id<MTLTexture> src) {
++		if (_dead) { return false; }
++		if (!_kLuma) {
++			NSError* err = nil;
++			id<MTLLibrary> lib = [dev newLibraryWithSource:@(kMSL) options:nil error:&err];
++			if (!lib) { return fail("shader compile failed"); }
++			id<MTLFunction> f1 = [lib newFunctionWithName:@"fg_luma"], f2 = [lib newFunctionWithName:@"fg_flow"],
++							f3 = [lib newFunctionWithName:@"fg_motion"];
++			_kLuma = [dev newComputePipelineStateWithFunction:f1 error:&err];
++			_kFlow = [dev newComputePipelineStateWithFunction:f2 error:&err];
++			_kMotion = [dev newComputePipelineStateWithFunction:f3 error:&err];
++			[f1 release]; [f2 release]; [f3 release]; [lib release];
++			if (!_kLuma || !_kFlow || !_kMotion) { return fail("pipeline creation failed"); }
++		}
++		if (_interp && _w == src.width && _h == src.height && _fmt == src.pixelFormat) { return true; }
++
++		release();
++		_w = src.width; _h = src.height; _fmt = src.pixelFormat;
++		if (@available(iOS 26.0, macOS 26.0, *)) {
++			dlopen("/System/Library/Frameworks/MetalFX.framework/MetalFX", RTLD_LAZY);
++			Class descClass = NSClassFromString(@"MTLFXFrameInterpolatorDescriptor");
++			if (!descClass || ![descClass supportsDevice:dev]) { return fail("MetalFX frame interpolation is not supported on this GPU"); }
++			MTLFXFrameInterpolatorDescriptor* desc = [[descClass alloc] init];
++			desc.colorTextureFormat = _fmt;
++			desc.outputTextureFormat = _fmt;
++			desc.depthTextureFormat = MTLPixelFormatDepth32Float;
++			desc.motionTextureFormat = MTLPixelFormatRG16Float;
++			desc.inputWidth = _w;  desc.inputHeight = _h;
++			desc.outputWidth = _w; desc.outputHeight = _h;
++			id<MTLFXFrameInterpolator> fi = [desc newFrameInterpolatorWithDevice:dev];
++			if (!fi) { desc.uiTextureFormat = _fmt; fi = [desc newFrameInterpolatorWithDevice:dev]; }
++			[desc release];
++			if (!fi) { return fail("no interpolator for this size and format"); }
++			_interp = fi;
++			NSUInteger lw = (_w + 7) / 8, lh = (_h + 7) / 8;
++			for (int i = 0; i < 2; i++) {
++				_hist[i] = tex(dev, _fmt, _w, _h, fi.colorTextureUsage | MTLTextureUsageShaderRead);
++				_luma[i] = tex(dev, MTLPixelFormatR16Float, lw, lh, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
++			}
++			_flow = tex(dev, MTLPixelFormatRG16Float, lw, lh, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
++			_motion = tex(dev, MTLPixelFormatRG16Float, _w, _h, fi.motionTextureUsage | MTLTextureUsageShaderWrite);
++			_depth = tex(dev, MTLPixelFormatDepth32Float, _w, _h, fi.depthTextureUsage | MTLTextureUsageRenderTarget);
++			_out = tex(dev, _fmt, _w, _h, fi.outputTextureUsage | MTLTextureUsageShaderRead);
++			if (!_hist[0] || !_hist[1] || !_luma[0] || !_luma[1] || !_flow || !_motion || !_depth || !_out) {
++				release();
++				return fail("texture allocation failed");
++			}
++			fprintf(stderr, "[mvk-framegen] interpolator ready: %lux%lu fmt %lu, motion search on %lux%lu\n",
++					(unsigned long)_w, (unsigned long)_h, (unsigned long)_fmt, (unsigned long)lw, (unsigned long)lh);
++			return true;
++		}
++		return fail("needs iOS 26");
++	}
++
++	bool fail(const char* why) {
++		fprintf(stderr, "[mvk-framegen] %s -- off\n", why);
++		_dead = true;
++		return false;
++	}
++
++	void dispatch(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p, NSUInteger w, NSUInteger h) {
++		[enc setComputePipelineState:p];
++		[enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++	}
++
++	id<CAMetalDrawable> encodeLocked(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable, double* halfFrame) {
++		static mach_timebase_info_data_t tb;
++		id<MTLTexture> src = drawable.texture;
++		id<MTLDevice> dev = src.device;
++		uint64_t now = mach_absolute_time();
++		if (!tb.denom) { mach_timebase_info(&tb); }
++		if (_lastAbs) {
++			double d = (double)(now - _lastAbs) * tb.numer / tb.denom / 1e9;
++			if (d < 1.0 / 120.0) { d = 1.0 / 120.0; }
++			if (d > 1.0 / 15.0) { d = 1.0 / 15.0; _havePrev = false; }   // a stall: no stale history
++			_dt = _dt > 0 ? _dt * 0.8 + d * 0.2 : d;
++		}
++		_lastAbs = now;
++		if (!src || src.framebufferOnly || !setup(dev, src)) { return nil; }
++
++		int ni = _cur ^ 1;
++		bool havePrev = _havePrev;
++		{
++			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++			[blit copyFromTexture:src toTexture:_hist[ni]];
++			[blit endEncoding];
++		}
++		{
++			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++			[enc setTexture:_hist[ni] atIndex:0];
++			[enc setTexture:_luma[ni] atIndex:1];
++			dispatch(enc, _kLuma, _luma[ni].width, _luma[ni].height);
++			if (havePrev) {
++				int radius = std::max(1, std::min(16, (int)envf("MVK_MADEIRA_FRAMEGEN_RADIUS", 6.0f)));
++				float scale = 8.0f * envf("MVK_MADEIRA_FRAMEGEN_MVSIGN", 1.0f);
++				[enc setTexture:_luma[ni] atIndex:0];
++				[enc setTexture:_luma[_cur] atIndex:1];
++				[enc setTexture:_flow atIndex:2];
++				[enc setBytes:&radius length:sizeof radius atIndex:0];
++				dispatch(enc, _kFlow, _flow.width, _flow.height);
++				[enc setTexture:_flow atIndex:0];
++				[enc setTexture:_motion atIndex:1];
++				[enc setBytes:&scale length:sizeof scale atIndex:0];
++				dispatch(enc, _kMotion, _w, _h);
++			}
++			[enc endEncoding];
++		}
++		if (!havePrev) {   // first frame (or after a stall): flat depth once, no generated frame
++			MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++			rp.depthAttachment.texture = _depth;
++			rp.depthAttachment.loadAction = MTLLoadActionClear;
++			rp.depthAttachment.storeAction = MTLStoreActionStore;
++			rp.depthAttachment.clearDepth = 0.5;
++			[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
++			_cur = ni;
++			_havePrev = true;
++			return nil;
++		}
++
++		id<CAMetalDrawable> extra = nil;
++		if (@available(iOS 26.0, macOS 26.0, *)) {
++			id<MTLFXFrameInterpolator> fi = (id<MTLFXFrameInterpolator>)_interp;
++			float mvs = envf("MVK_MADEIRA_FRAMEGEN_MVSCALE", 1.0f);
++			fi.colorTexture = _hist[ni];
++			fi.prevColorTexture = _hist[_cur];
++			fi.depthTexture = _depth;
++			fi.motionTexture = _motion;
++			fi.outputTexture = _out;
++			fi.motionVectorScaleX = mvs;
++			fi.motionVectorScaleY = mvs;
++			fi.deltaTime = (float)_dt;
++			fi.nearPlane = 0.1f;
++			fi.farPlane = 1000.0f;
++			fi.fieldOfView = 60.0f;
++			fi.aspectRatio = (float)_w / (float)_h;
++			fi.jitterOffsetX = 0; fi.jitterOffsetY = 0;
++			fi.shouldResetHistory = _generated == 0;
++			[fi encodeToCommandBuffer:cb];
++			extra = [((CAMetalLayer*)drawable.layer).nextDrawable retain];
++		}
++		_cur = ni;
++		_frames++;
++		if (!extra || extra.texture.width != _w || extra.texture.height != _h) {
++			[extra release];
++			_noDrawable++;
++			return nil;   // the caller presents the real frame as usual
++		}
++		{
++			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++			[blit copyFromTexture:_out toTexture:extra.texture];
++			[blit endEncoding];
++		}
++		_generated++;
++		if (_generated == 1 || (_generated % 600) == 0) {
++			fprintf(stderr, "[mvk-framegen] %llu generated / %llu frames (no drawable %llu), game frame %.1f ms\n",
++					_generated, _frames, _noDrawable, _dt * 1000.0);
++		}
++		*halfFrame = _dt * 0.5;
++		return extra;
++	}
++
++	static constexpr const char* kMSL =
++		"#include <metal_stdlib>\n"
++		"using namespace metal;\n"
++		"kernel void fg_luma(texture2d<float, access::sample> src [[texture(0)]],\n"
++		"                    texture2d<float, access::write> dst [[texture(1)]],\n"
++		"                    uint2 gid [[thread_position_in_grid]]) {\n"
++		"  if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
++		"  constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);\n"
++		"  float2 inv = 1.0 / float2(dst.get_width(), dst.get_height());\n"
++		"  float2 uv = (float2(gid) + 0.5) * inv, q = inv * 0.25;\n"
++		"  float3 c = src.sample(s, uv + float2(-q.x, -q.y)).rgb + src.sample(s, uv + float2(q.x, -q.y)).rgb\n"
++		"           + src.sample(s, uv + float2(-q.x, q.y)).rgb + src.sample(s, uv + float2(q.x, q.y)).rgb;\n"
++		"  dst.write(float4(dot(c * 0.25, float3(0.299, 0.587, 0.114)), 0, 0, 1), gid);\n"
++		"}\n"
++		"kernel void fg_flow(texture2d<float, access::read> cur [[texture(0)]],\n"
++		"                    texture2d<float, access::read> prev [[texture(1)]],\n"
++		"                    texture2d<float, access::write> flow [[texture(2)]],\n"
++		"                    constant int &radius [[buffer(0)]],\n"
++		"                    uint2 gid [[thread_position_in_grid]]) {\n"
++		"  int W = cur.get_width(), H = cur.get_height();\n"
++		"  if ((int)gid.x >= W || (int)gid.y >= H) return;\n"
++		"  int2 p = int2(gid), hi = int2(W - 1, H - 1);\n"
++		"  float best = 1e9; int2 bd = int2(0);\n"
++		"  for (int dy = -radius; dy <= radius; dy++)\n"
++		"    for (int dx = -radius; dx <= radius; dx++) {\n"
++		"      float sad = 0.002 * float(abs(dx) + abs(dy));\n"
++		"      for (int py = -2; py <= 2; py++)\n"
++		"        for (int px = -2; px <= 2; px++) {\n"
++		"          int2 a = clamp(p + int2(px, py), int2(0), hi);\n"
++		"          int2 b = clamp(p + int2(px + dx, py + dy), int2(0), hi);\n"
++		"          sad += fabs(cur.read(uint2(a)).r - prev.read(uint2(b)).r);\n"
++		"        }\n"
++		"      if (sad < best) { best = sad; bd = int2(dx, dy); }\n"
++		"    }\n"
++		"  flow.write(float4(float2(bd), 0, 0), gid);\n"
++		"}\n"
++		"kernel void fg_motion(texture2d<float, access::sample> flow [[texture(0)]],\n"
++		"                      texture2d<float, access::write> motion [[texture(1)]],\n"
++		"                      constant float &scale [[buffer(0)]],\n"
++		"                      uint2 gid [[thread_position_in_grid]]) {\n"
++		"  if (gid.x >= motion.get_width() || gid.y >= motion.get_height()) return;\n"
++		"  constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);\n"
++		"  float2 uv = (float2(gid) + 0.5) / float2(motion.get_width(), motion.get_height());\n"
++		"  motion.write(float4(flow.sample(s, uv).rg * scale, 0, 0), gid);\n"
++		"}\n";
++
++	std::mutex _lock;
++	NSUInteger _w = 0, _h = 0;
++	MTLPixelFormat _fmt = MTLPixelFormatInvalid;
++	id _interp = nil;   // id<MTLFXFrameInterpolator>
++	id<MTLTexture> _hist[2] = {nil, nil}, _luma[2] = {nil, nil}, _flow = nil, _motion = nil, _depth = nil, _out = nil;
++	id<MTLComputePipelineState> _kLuma = nil, _kFlow = nil, _kMotion = nil;
++	int _cur = 0;
++	bool _havePrev = false, _dead = false;
++	uint64_t _lastAbs = 0;
++	double _dt = 0;
++	unsigned long long _frames = 0, _generated = 0, _noDrawable = 0;
 +};
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraJobQueue.h b/MoltenVK/MoltenVK/GPUObjects/MVKMadeiraJobQueue.h
 new file mode 100644
@@ -8737,6 +9060,26 @@ index 3aa44a4..220e9a2 100644
  	return [_mtlLibrary retain];
  }
  
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+index 4c90866..02f8dd5 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+@@ -18,6 +18,7 @@
+ 
+ #include "MVKSurface.h"
+ #include "MVKSwapchain.h"
++#include "MVKMadeiraFrameGen.h"
+ #include "MVKImage.h"
+ #include "MVKQueue.h"
+ #include "MVKFoundation.h"
+@@ -512,6 +513,7 @@ static CALayerContentsGravity getCALayerContentsGravity(VkSwapchainPresentScalin
+ 																			  VK_IMAGE_USAGE_SAMPLED_BIT |
+ 																			  VK_IMAGE_USAGE_STORAGE_BIT)) &&
+ 								!mvkAreAllFlagsEnabled(pCreateInfo->flags, VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR);
++	if (mvkMadeiraFrameGenEnabled()) { mtlLayer.framebufferOnly = NO; }   // frame generation copies the drawable
+ 
+ 	if (pCreateInfo->compositeAlpha != VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+ 		mtlLayer.opaque = pCreateInfo->compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
 index b15fe5e..4a06751 100644
 --- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
