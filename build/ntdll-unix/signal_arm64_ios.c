@@ -3410,6 +3410,24 @@ static void *ios_mach_exception_thread( void *arg )
                         case 0x79400000: /* LDRH Wt */
                             if (rt != 31) state.__x[rt] = *(uint16_t *)ea;
                             emulated = 1; break;
+                        /* unsigned-offset sign-extending loads, base x18 (wow64.dll's
+                         * `ldrsw x8,[x18,#0x180c]` on a new 32-bit thread: Bad North,
+                         * 2026-10-19, c0000005 at teb+0x180c) */
+                        case 0xb9800000: /* LDRSW Xt */
+                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int32_t *)ea;
+                            emulated = 1; break;
+                        case 0x39800000: /* LDRSB Xt */
+                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int8_t *)ea;
+                            emulated = 1; break;
+                        case 0x39c00000: /* LDRSB Wt */
+                            if (rt != 31) state.__x[rt] = (uint32_t)(int32_t)*(int8_t *)ea;
+                            emulated = 1; break;
+                        case 0x79800000: /* LDRSH Xt */
+                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int16_t *)ea;
+                            emulated = 1; break;
+                        case 0x79c00000: /* LDRSH Wt */
+                            if (rt != 31) state.__x[rt] = (uint32_t)(int32_t)*(int16_t *)ea;
+                            emulated = 1; break;
                         /* unsigned-offset immediate stores, base x18 */
                         case 0xf9000000: /* STR Xt */
                             *(uint64_t *)ea = (rt == 31) ? 0 : state.__x[rt];
@@ -9224,7 +9242,15 @@ dispatch:
          * ~35 s and this guard killed a healthy game. A real storm refaults the
          * same instruction back to back on one thread, so the slot is chosen by
          * thread and any other fault on that thread restarts the run. */
-        static struct { uint64_t thread, key; uint32_t n; } redeliv[16];
+        /* 2026-10-19: AND BY RATE. A game whose own code throws the same managed
+         * exception every frame (Bad North: NullReferenceException in
+         * AgentStateRoot.Update, 4,069 in its log, harmless on Windows) faults the
+         * same instruction with nothing else faulting in between, so the run kept
+         * growing at 60 per second and this guard killed it after ~33 s. A storm
+         * refaults thousands of times a second; a run that took longer than 2 s to
+         * reach 2000 (under 1000 a second) restarts instead of terminating. Bad North
+         * throws one per unit per frame: 2000 in ~6 s (~330 a second). */
+        static struct { uint64_t thread, key; uint32_t n; uint64_t t0; } redeliv[16];
         static volatile int ios_redeliv_terminating;
         uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
         int rslot = (int)(((uint64_t)thread * 0x9E3779B97F4A7C15ull) >> 60);
@@ -9233,6 +9259,19 @@ dispatch:
             redeliv[rslot].thread = (uint64_t)thread;
             redeliv[rslot].key = rkey;
             redeliv[rslot].n = 1;
+            redeliv[rslot].t0 = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+        }
+        else if (redeliv[rslot].n + 1 >= 2000 &&
+                 clock_gettime_nsec_np( CLOCK_UPTIME_RAW ) - redeliv[rslot].t0 > 2000000000ull)
+        {
+            static unsigned slow_n;
+            if (slow_n++ < 8)
+                dprintf( 2, "[redeliv] 2000 identical deliveries pc=0x%llx addr=0x%llx took %llu s: a fault the guest "
+                            "handles every frame, not a storm -- counting again\n",
+                         (unsigned long long)pc, (unsigned long long)fault_addr,
+                         (unsigned long long)((clock_gettime_nsec_np( CLOCK_UPTIME_RAW ) - redeliv[rslot].t0) / 1000000000ull) );
+            redeliv[rslot].n = 1;
+            redeliv[rslot].t0 = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
         }
         else if (++redeliv[rslot].n == 256)
             dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",

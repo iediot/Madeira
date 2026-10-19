@@ -535,6 +535,38 @@ struct LibraryEntry: Codable, Identifiable {
     /// controls below: as wide as the screen is in portrait, square or 4:3.
     static let portraitShapes = ["square", "square@50", "4:3", "4:3@50"]
 
+    struct ResolutionRow { let name: String, w: Int, h: Int, tag: String }
+    /// The Resolution picker's rows: grouped by shape (Native, 16:9, 4:3, Square), each
+    /// group largest first.
+    static func resolutionRows(groups: [ResolutionChoices.Group]) -> [ResolutionRow] {
+        func size(_ v: String) -> (Int, Int) {
+            let p = pixelSize(v).split(separator: "x").compactMap { Int($0) }
+            return p.count == 2 ? (p[0], p[1]) : (0, 0)
+        }
+        var rows: [ResolutionRow] = []
+        for percent in screenScales {
+            let v = percent == 100 ? "native" : "\(percent)%", (w, h) = size(v)
+            rows.append(ResolutionRow(name: "Native", w: w, h: h, tag: v))
+        }
+        for v in portraitShapes {
+            let (w, h) = size(v)
+            rows.append(ResolutionRow(name: v.hasPrefix("square") ? "Square" : "4:3", w: w, h: h, tag: v))
+        }
+        for group in groups.dropFirst() {
+            let name = group.title.split(separator: " ").first.map(String.init) ?? ""
+            for c in group.choices where !rows.contains(where: { $0.tag == c.value }) {
+                rows.append(ResolutionRow(name: name, w: c.w, h: c.h, tag: c.value))
+            }
+        }
+        let order = ["Native", "16:9", "4:3", "Square"]
+        return rows.enumerated().sorted { a, b in
+            let ga = order.firstIndex(of: a.element.name) ?? order.count, gb = order.firstIndex(of: b.element.name) ?? order.count
+            if ga != gb { return ga < gb }
+            let pa = a.element.w * a.element.h, pb = b.element.w * b.element.h
+            return pa != pb ? pa > pb : a.offset < b.offset
+        }.map(\.element)
+    }
+
     /// "native" or "NN%" as this screen's landscape pixels scaled (each side rounded
     /// to an even number, so the shape stays within a fraction of a percent);
     /// "square" / "4:3" (optionally "@NN" percent) as that shape on the screen's
@@ -3691,19 +3723,17 @@ struct LibraryDetail: View {
                     let groups = ResolutionChoices.groups()
                     let metalFX = ResolutionChoices.metalFX(in: groups)
                     Picker("Resolution", selection: $entry.resolution) {
-                        // Shares of this screen's own pixels, in its own shape: the game fills it.
-                        ForEach(LibraryEntry.screenScales, id: \.self) { percent in
-                            let value = percent == 100 ? "native" : "\(percent)%"
-                            Text((percent == 100 ? "Native" : "\(percent)%") + " · " + LibraryEntry.pixelSize(value).replacingOccurrences(of: "x", with: "×")).tag(value)
-                        }
-                        // For portrait play: the game at the top, the controls below it.
-                        ForEach(LibraryEntry.portraitShapes, id: \.self) { value in
-                            let parts = value.split(separator: "@")
-                            Text((parts[0] == "square" ? "Square" : "4:3") + (parts.count == 2 ? " \(parts[1])%" : "") + " · "
-                                 + LibraryEntry.pixelSize(value).replacingOccurrences(of: "x", with: "×")).tag(value)
+                        // One list, grouped by shape and largest first within each: this screen's
+                        // own shape, 16:9, 4:3 (the portrait 4:3 shapes with the standard sizes),
+                        // then square. Standard sizes are for games whose own resolution menu only
+                        // knows standard shapes (Bad North's setup died on the screen's 2.16:1).
+                        let standard = groups.dropFirst().flatMap { $0.choices }
+                        ForEach(LibraryEntry.resolutionRows(groups: groups), id: \.tag) { row in
+                            Text(verbatim: "\(row.name) · \(row.w)×\(row.h)").tag(row.tag)   // verbatim: no "2,796" grouping
                         }
                         // A fixed size from before (or the Desktop's), kept so the picker is never blank.
-                        if entry.resolution != "native" && !entry.resolution.hasSuffix("%") && !LibraryEntry.portraitShapes.contains(entry.resolution) {
+                        if entry.resolution != "native" && !entry.resolution.hasSuffix("%") && !LibraryEntry.portraitShapes.contains(entry.resolution)
+                            && !standard.contains(where: { $0.value == entry.resolution }) {
                             Text(entry.resolution.replacingOccurrences(of: "x", with: "×")).tag(entry.resolution)
                         }
                         // The screen's shape at 480 lines, which MetalFX 1.5× brings to 720.

@@ -4157,7 +4157,30 @@ static BOOL ios_mode_at_index( UINT index, int *w, int *h )
     }
     {
         const char *standard = getenv( "MADEIRA_STANDARD_MODES" );  /* 1: also list the standard PC modes */
-        if (!standard || strcmp( standard, "1" )) return FALSE;
+        if (!standard || strcmp( standard, "1" ))
+        {
+            /* The standard PC modes that FIT the session default, after the
+             * screen-shaped ones. The aspect rungs above are the screen's height
+             * at 16:9 etc., which on a 2.16:1 iPhone is 1144x646 -- not an exact
+             * 16:9 mode. Bad North keeps only exact standard modes, found none,
+             * and its GameSetup died on the empty resolution list (dead menus).
+             * Fitting both sides keeps them below index 0's size, so a program
+             * that takes the largest mode still gets the screen's shape.
+             * MADEIRA_FIT_STANDARD_MODES=0 leaves them out. */
+            const char *fit = getenv( "MADEIRA_FIT_STANDARD_MODES" );
+            if (fit && !strcmp( fit, "0" )) return FALSE;
+            for (i = ARRAY_SIZE(ios_standard_modes); i-- > 0;)   /* largest first */
+            {
+                int mw = ios_standard_modes[i].w, mh = ios_standard_modes[i].h;
+
+                if (mw > cw || mh > ch || (mw == sw && mh == sh)) continue;
+                if (++n != index) continue;
+                *w = mw;
+                *h = mh;
+                return TRUE;
+            }
+            return FALSE;
+        }
     }
 
     for (i = 0; i < ARRAY_SIZE(ios_standard_modes); i++)
