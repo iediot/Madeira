@@ -7895,6 +7895,21 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 
     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
 
+    /* Subnautica (Mono) died jumping to 0x3600000070A12829: a Mono code address
+     * with its bytes shifted one place. If a context set carries such a PC, say
+     * who set it. Also the first cross-thread PC rewrites, to see if Mono
+     * redirects threads at all. */
+    if (flags & CONTEXT_CONTROL)
+    {
+        static int ctl_n, bad_n;
+        int bad = (context->Pc >> 47) != 0;
+        if ((bad && bad_n++ < 16) || (!self && ctl_n++ < 32))
+            dprintf( 2, "[set-ctx-pc] %s self=%d handle=%p pc=%p sp=%p lr=%p x0=%p x8=%p flags=%#x caller=%p\n",
+                     bad ? "NONCANONICAL" : "cross", self, handle, (void *)context->Pc, (void *)context->Sp,
+                     (void *)context->Lr, (void *)context->X[0], (void *)context->X[8], (unsigned)context->ContextFlags,
+                     __builtin_return_address(0) );
+    }
+
     /* iOS-Madeira diag: companion to [set-ctx] in signal_set_full_context —
      * catch cross-thread PC rewrites into the FEX tail carve that land on
      * data words (suspend/invalidate machinery redirecting threads). */
@@ -11010,6 +11025,78 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                                 ERR("  [guest-exact] ml885 block=%p rip=%p (bytes unreadable)\n", (void*)bb, (void*)xrip);
                         }
                         else ERR("  [guest-exact] ml885 block=%p unresolved: %s\n", (void*)bb, why);
+                        /* The fault is in the dispatcher (an indirect jmp/call/ret to a bad
+                         * target): the block that branched there is at lr-4. Name its x86. */
+                        if (!xrip && bb)
+                        {
+                            const char *why2 = "";
+                            uint64_t lrip = ios_native_rip_from_hostpc( bb, (uint64_t)REGn_sig(30, context) - 4, &why2 );
+                            uint8_t xb[16]; mach_vm_size_t g3 = 0;
+                            if (lrip && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)lrip, sizeof(xb),
+                                                                (mach_vm_address_t)xb, &g3 ) == KERN_SUCCESS && g3 == sizeof(xb))
+                            {
+                                ERR("  [guest-exact] via lr: rip=%p x86=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                    (void*)lrip, xb[0],xb[1],xb[2],xb[3],xb[4],xb[5],xb[6],xb[7],xb[8],xb[9],xb[10],xb[11],xb[12],xb[13],xb[14],xb[15]);
+                                /* An indirect call/jmp through memory ([base+disp], no SIB):
+                                 * dump the table around the slot it read, so one bad slot
+                                 * (a bad store) and a whole shifted block (a bad copy) can
+                                 * be told apart (Subnautica: call [rax-0x88]). */
+                                {
+                                    int k = 0, rexb = 0;
+                                    if ((xb[0] & 0xf0) == 0x40) { rexb = xb[0] & 1; k = 1; }
+                                    if (xb[k] == 0xff)
+                                    {
+                                        uint8_t m = xb[k + 1];
+                                        int mod = m >> 6, reg = (m >> 3) & 7, rm = m & 7;
+                                        if (reg >= 2 && reg <= 5 && (mod == 1 || mod == 2) && rm != 4)
+                                        {
+                                            int64_t disp = mod == 1 ? (int8_t)xb[k + 2]
+                                                                    : (int32_t)(xb[k + 2] | xb[k + 3] << 8 | xb[k + 4] << 16 | (uint32_t)xb[k + 5] << 24);
+                                            /* The frame's gregs are stale here (FEX keeps guest registers
+                                             * in host registers): read the base from its ARM64EC home. */
+                                            static const int sra[16] = { 8, 0, 1, 27, 23, 29, 25, 26, 2, 3, 4, 5, 19, 20, 21, 22 };
+                                            int hr = sra[rm | rexb << 3];
+                                            uint64_t basev = hr == 29 ? (uint64_t)FP_sig(context) : (uint64_t)REGn_sig(hr, context);
+                                            uint64_t ea = basev + disp, q[12];
+                                            ERR("  [slot] base=x%d=%p disp=%lld (stale frame value %p)\n", hr, (void*)basev,
+                                                (long long)disp, (void*)cs[1 + (rm | rexb << 3)]);
+                                            mach_vm_size_t g4 = 0;
+                                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ea - 48), sizeof(q),
+                                                                        (mach_vm_address_t)q, &g4 ) == KERN_SUCCESS && g4 == sizeof(q))
+                                            {
+                                                int j;
+                                                ERR("  [slot] ea=%p (slot = [6])\n", (void*)ea);
+                                                for (j = 0; j < 12; j += 4)
+                                                    ERR("  [slot]   %016llx %016llx %016llx %016llx\n",
+                                                        (unsigned long long)q[j], (unsigned long long)q[j+1],
+                                                        (unsigned long long)q[j+2], (unsigned long long)q[j+3]);
+                                            }
+                                            else ERR("  [slot] ea=%p unreadable\n", (void*)ea);
+                                        }
+                                    }
+                                    /* The host code FEX emitted for this exit (lr-64..lr+4). */
+                                    {
+                                        uint32_t hc[18]; mach_vm_size_t g6 = 0; int j;
+                                        uint64_t lr = (uint64_t)REGn_sig(30, context);
+                                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(lr - 64), sizeof(hc),
+                                                                    (mach_vm_address_t)hc, &g6 ) == KERN_SUCCESS && g6 == sizeof(hc))
+                                            for (j = 0; j < 18; j += 6)
+                                                ERR("  [slot-host] lr%+d: %08x %08x %08x %08x %08x %08x\n", j * 4 - 64,
+                                                    hc[j], hc[j+1], hc[j+2], hc[j+3], hc[j+4], hc[j+5]);
+                                    }
+                                    /* The target rotated back one byte, and what is there. */
+                                    {
+                                        uint64_t v = cs[0], r = (v << 8) | (v >> 56);
+                                        uint8_t tb[16]; mach_vm_size_t g5 = 0;
+                                        if ((v >> 47) && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)r, sizeof(tb),
+                                                                                 (mach_vm_address_t)tb, &g5 ) == KERN_SUCCESS && g5 == sizeof(tb))
+                                            ERR("  [slot] rol8(rip)=%p bytes=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                                (void*)r, tb[0],tb[1],tb[2],tb[3],tb[4],tb[5],tb[6],tb[7],tb[8],tb[9],tb[10],tb[11],tb[12],tb[13],tb[14],tb[15]);
+                                    }
+                                }
+                            }
+                            else ERR("  [guest-exact] via lr=%p: %s\n", (void*)REGn_sig(30, context), lrip ? "bytes unreadable" : why2);
+                        }
                     }
                     for (i = 0; i < 16; i += 4)
                         ERR("  [guest-state]   %s=%p %s=%p %s=%p %s=%p\n",

@@ -3194,6 +3194,16 @@ NTSTATUS WINAPI NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
     { extern void ios_tlswatch_rearm( const char * ); ios_tlswatch_rearm( "NtContinue" ); }
 #endif
 
+#ifdef WINE_IOS
+    if ((context->ContextFlags & CONTEXT_CONTROL & ~CONTEXT_ARM64) && (context->Pc >> 47))
+    {
+        static int bad_n;
+        if (bad_n++ < 16)
+            dprintf( 2, "[continue-pc] NONCANONICAL NtContinue pc=%p sp=%p lr=%p flags=%#x caller=%p\n",
+                     (void *)context->Pc, (void *)context->Sp, (void *)context->Lr,
+                     (unsigned)context->ContextFlags, __builtin_return_address(0) );
+    }
+#endif
     if ((UINT_PTR)args > 0xff)
         alertable = args->ContinueFlags & KCONTINUE_FLAG_TEST_ALERT;
     else

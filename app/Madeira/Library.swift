@@ -679,6 +679,10 @@ struct LibraryEntry: Codable, Identifiable {
     /// stand for, then its own config, which wins where both set a key.
     var gameConfigText: String? {
         var lines: [String] = []
+        // Built-in defaults first: madeira.cfg keeps any key it sets, and the
+        // pickers and this game's own lines below win over them.
+        let global = MadeiraConfig.all()
+        lines += builtInConfig.filter { global[$0.key] == nil }.map { "\($0.key) = \($0.value)" }
         if let metalFXUpscale { lines.append("metalfx-upscale = \(metalFXUpscale)") }
         if let config, !config.isEmpty { lines.append(config) }
         return lines.isEmpty ? nil : lines.joined(separator: "\n")
@@ -836,6 +840,57 @@ struct LibraryEntry: Codable, Identifiable {
         return FileManager.default.fileExists(atPath: exe.deletingLastPathComponent()
             .appendingPathComponent("UnityPlayer.dll").path)
     }
+    /// A Source 2 game (Deadlock, CS2, Dota 2): engine2.dll next to its program.
+    var isSource2Game: Bool {
+        guard let exe = Self.hostURL(ofWindowsPath: windowsPath) else { return false }
+        return FileManager.default.fileExists(atPath: exe.deletingLastPathComponent()
+            .appendingPathComponent("engine2.dll").path)
+    }
+
+    /// Settings every game gets without a config line: the switches that were
+    /// set by hand in madeira.cfg on both devices and in game after game. Each
+    /// is only a default: madeira.cfg and the game's own config still win.
+    var builtInConfig: [(key: String, value: String)] {
+        let bigDevice = ProcessInfo.processInfo.physicalMemory >= 12 << 30   // iPad M5: ~12.3 GB usable
+        var out: [(key: String, value: String)] = [
+            // Swap tier: cold guest memory goes to a file instead of counting toward the memory limit.
+            ("swap-mb", bigDevice ? "8192" : "4096"),
+            // Shader caches persist for 64-bit games too, so the second launch does not recompile.
+            ("env.DXMT_IOS_CACHE_DIR", "1"),
+            // DXGI lists Windows' full mode table, so fullscreen resolution lists are not empty.
+            ("env.DXMT_WSI_MODE_TABLE", "1"),
+            // DXMT fast paths that were 32-bit only (iPhone ran every 64-bit game with them).
+            ("env.DXMT_CLEAR_DISCARD_STORE", "1"),
+            ("env.DXMT_ZERO_BUFFER_POW2", "1"),
+            ("env.DXMT_RING_OVERSIZE_REUSE", "1"),
+            ("env.DXMT_WAIT_ON_ADDRESS", "1"),
+            // MoltenVK CPU fixes (Vulkan games), measured on the iPad with Detroit.
+            ("env.MVK_MADEIRA_SKIP_EMPTY_SUBMIT", "1"),
+            ("env.MVK_MADEIRA_BATCH_TEMP_RELEASE", "1"),
+            ("env.MVK_MADEIRA_LAZY_RESIDENCY", "1"),
+        ]
+        // Translated x86 code kept on disk (64-bit and auto-detected; Steam and Dock are excluded in FEX itself).
+        if bits != 32 { out.append(("env.MADEIRA_FEX_CODE_CACHE", "1")) }   // 0 = detected at launch (Epic/Steam imports)
+        if isUnityGame {
+            // Unity's unload-unused-assets pass tags each live object's vtable (bit 0) with the
+            // world stopped; a suspend that only snapshots lets a thread call through vtable+1
+            // (Subnautica, c0000005 right after loading). Really freeze suspended threads.
+            out.append(("env.MADEIRA_REAL_SUSPEND", "1"))
+        }
+        if isSource2Game {
+            // Source 2's lock-free job queue reads with plain loads: order every load
+            // (MSVC's volatile metadata dropped them; Deadlock crashed at rendersystemdx11+0x4aa5e).
+            out.append(("env.FEX_VOLATILEMETADATA", "0"))
+            // Its engine reserves ~7 GB in big blocks: back whole reservations from the swap file.
+            out.append(("env.MADEIRA_SWAP_COVERAGE", "broad"))
+            if bigDevice { out.append(("swap-mb", "12288")) }
+            // Less video memory reported, so it streams fewer textures (Deadlock hit the limit loading a match).
+            out.append(("vram-mb", "1536"))
+            out.append(("vram-trim-mb", "4096"))
+        }
+        return out
+    }
+
     /// "Fast semaphore waits" as it applies: this game's choice, else on for Unity games.
     var semaphoreFastPathEffective: Bool { semaphoreFastPath ?? isUnityGame }
 
