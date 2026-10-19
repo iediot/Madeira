@@ -234,6 +234,16 @@ static size_t ios_jit_hole_off, ios_jit_hole_end;
  * stay 0 and every helper below is the one-hole one. */
 static size_t ios_jit_hole2_off, ios_jit_hole2_end;
 
+/* Is pool offset `off` inside a split pool's hole (not pool memory: the main
+ * thread's stack, the app's placeholders, an early mapping)? For callers outside
+ * this file that turn a pool-range address into its RW alias (server_ios.c's
+ * reply path wrote a reply bound for the stack in the hole through the alias). */
+int ios_jit_pool_off_in_hole( size_t off )
+{
+    return (ios_jit_hole_end > ios_jit_hole_off && off >= ios_jit_hole_off && off < ios_jit_hole_end) ||
+           (ios_jit_hole2_end > ios_jit_hole2_off && off >= ios_jit_hole2_off && off < ios_jit_hole2_end);
+}
+
 /* madeira-bcd BIG-IMAGE SLOT (env MADEIRA_POOL_BIG_SLOT_MB = N, split pool only;
  * off by default). Ten processes each copy their own system DLLs into the pool
  * (GTA V Enhanced build 373, 2026-10-04 08:41: 326 images, 469 MB -- shell32
@@ -8413,6 +8423,9 @@ static int ios_place_proven_full( size_t size, uint64_t now )
            ios_place_proof_epoch == __atomic_load_n( &ios_va_release_epoch, __ATOMIC_RELAXED );
 }
 
+static unsigned long long ios_place_tag_bytes[256], ios_place_band_bytes[16];
+static int ios_place_census_done;
+
 static void *ios_ml1027_place( size_t size, int prot )
 {
     mach_vm_address_t raddr = 0x100000000ull;   /* below this is images/furniture */
@@ -8470,6 +8483,14 @@ static void *ios_ml1027_place( size_t size, int prot )
             { best_gap = gap; best_base = prev_end; gaps++; }
         }
         if (raddr + rsize > prev_end) prev_end = raddr + rsize;
+        /* Who holds the map: bytes per VM tag and per 32 GB band, printed once
+         * with the first NO GAP FITS (a 512 GB map came back "full" with only
+         * Madeira's few known reservations in it). */
+        if (!ios_place_census_done)
+        {
+            ios_place_tag_bytes[info.user_tag & 0xff] += rsize;
+            if (raddr < 0x8000000000ULL) ios_place_band_bytes[raddr >> 35] += rsize;
+        }
         /* ADVANCE. Without this, mach_vm_region_recurse keeps returning the SAME
          * region and the walk spins until the cap: the first version of this
          * function reported "200001 regions, highest_mapping_end=0x102d10000" on
@@ -8502,6 +8523,23 @@ static void *ios_ml1027_place( size_t size, int prot )
         ios_place_fresh_next = 0;
     }
 
+    if (!best_base && !truncated && !ios_place_census_done)
+    {
+        unsigned t, b;
+        ios_place_census_done = 1;
+        for (b = 0; b < 16; b++)
+            if (ios_place_band_bytes[b])
+                dprintf( 2, "[mmap-census] band %3u-%3u GB: %llu MB mapped\n", b * 32, b * 32 + 32,
+                         ios_place_band_bytes[b] >> 20 );
+        for (t = 0; t < 256; t++)
+            if (ios_place_tag_bytes[t] >= (64ULL << 20))
+                dprintf( 2, "[mmap-census] tag %3u: %llu MB\n", t, ios_place_tag_bytes[t] >> 20 );
+    }
+    else if (!ios_place_census_done)
+    {
+        memset( ios_place_tag_bytes, 0, sizeof(ios_place_tag_bytes) );
+        memset( ios_place_band_bytes, 0, sizeof(ios_place_band_bytes) );
+    }
     if (!best_base)
     {
         dprintf( 2, "[mmap-place] ml1027 NO GAP FITS size=0x%lx after %u regions "
@@ -19964,6 +20002,19 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             start = address_space_start;
             end = min( user_space_limit, host_addr_space_limit );
             if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
+            /* Our own reserved areas over the WHOLE user range first. The kernel's
+             * pick below cannot see them: Wine holds the free low address space as
+             * PROT_NONE reservations, so on a 512 GB map with Social Club's layout 2
+             * (floor 0x7100000000) an 8 GB V8 reserve found "no gap" anywhere while
+             * hundreds of GB below the floor were free in Wine's own map. */
+            if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
+            {
+                static unsigned long below_n;
+                if (++below_n <= 16 || !(below_n % 256))
+                    dprintf( 2, "[va-relax] #%lu 0x%lx bytes placed at %p from Wine's reserved areas "
+                                "after the clamped window was full\n", below_n, (unsigned long)size, ptr );
+                goto done;
+            }
         }
 
         for (;;)
@@ -29837,6 +29888,7 @@ void ios_reserve_fex_arena(void)
     unsigned i;
     unsigned long long arena_task_max = 0;
     unsigned long long arena_size_cap = 0;   /* ml995 */
+    int sc_row_only = 0;   /* #285: row 0 tried only for the Social Club arena */
 
     if (done) return;
     done = 1;
@@ -29983,7 +30035,14 @@ void ios_reserve_fex_arena(void)
         if (i == 0)   /* ml2114: the 32GB row is for Dock sessions; MADEIRA_FEX_ARENA_32G=0 skips it */
         {
             const char *dock = getenv( "MADEIRA_DOCK_SESSION" ), *big = getenv( "MADEIRA_FEX_ARENA_32G" );
-            if (!dock || dock[0] != '1' || (big && big[0] == '0')) continue;
+            /* madeira-bcd (#285): a Social Club layout places the arena itself in
+             * this row (ios_sc_pa_hold_arena below), Dock session or not; only the
+             * Dock's 32GB placement is skipped. */
+            if (!dock || dock[0] != '1' || (big && big[0] == '0'))
+            {
+                if (!ios_sc_layout()) continue;
+                sc_row_only = 1;
+            }
         }
         if (arena_size_cap && (unsigned long long)plan[i].size > arena_size_cap)
         {
@@ -30014,6 +30073,7 @@ void ios_reserve_fex_arena(void)
          * up and holds the 4 GB below it (ios_sc_pa_hold_arena); without it this
          * is never taken. */
         if (i == 0 && ios_sc_pa_hold_arena( &addr, &size )) goto sc_arena_placed;
+        if (i == 0 && sc_row_only) continue;
 
         /* ml802: 64KiB alignment mask. Wine's allocation granularity is 64KiB and
          * FEX asks with Alignment=0x10000; a base that is merely page-aligned

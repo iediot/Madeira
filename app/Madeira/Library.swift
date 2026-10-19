@@ -740,6 +740,15 @@ struct LibraryEntry: Codable, Identifiable {
         guard !parts.contains("..") else { return nil }
         return parts.reduce(hostDrive) { $0.appendingPathComponent($1) }
     }
+    /// Start services as it applies: this entry's choice, else on for programs that
+    /// register a Windows service (the Rockstar Games Launcher's setup and launcher:
+    /// RockstarService.exe install failed "RPC server unavailable" without the SCM).
+    var startServicesEffective: Bool {
+        if let startServices { return startServices }
+        let exe = (relativePath as NSString).lastPathComponent.lowercased()
+        return exe == "rockstar-games-launcher.exe"
+            || (exe == "launcher.exe" && relativePath.lowercased().contains("rockstar games/launcher"))
+    }
     /// ml1163: where startServices writes its batch file, one per entry.
     var servicesScriptPath: String { "C:\\madeira-games\\\(id.uuidString).bat" }
     /// ml1163: the services batch, CRLF. services.exe is STARTed; then a .bat is
@@ -747,7 +756,7 @@ struct LibraryEntry: Codable, Identifiable {
     /// its console closes straight away (the pattern of Steam's batch). nil
     /// unless startServices.
     var servicesScript: String? {
-        guard usesLaunchOptions, startServices == true else { return nil }
+        guard usesLaunchOptions, startServicesEffective else { return nil }
         func quoted(_ s: String) -> String { "\"\(s)\"" }
         // Text put into the batch keeps one line each (a line break in the arguments
         // or the title would start another command), and its '%' is doubled once per
@@ -912,7 +921,7 @@ struct LibraryEntry: Codable, Identifiable {
         pool-split = 1
         env.MADEIRA_SC_PA_POOLS = 2
         env.MADEIRA_LOCK_ORPHAN = stamped
-        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;VCRed\\vc_redist;.cr\\vc_redist;.be\\vc_redist
         env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
         env.WINEDLLOVERRIDES = video64=
         """
@@ -921,6 +930,11 @@ struct LibraryEntry: Codable, Identifiable {
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
         """
+        // The Rockstar Games Launcher started on its own runs RDR2 (and Social Club) in its
+        // own session, so it takes RDR2's list: upstream ran launcher + Social Club with it,
+        // and MADEIRA_RDR2_VA_HOLD's geometry gives the FEX arena 15 GB instead of 12 (12 GB
+        // filled with Social Club's threads in under a minute).
+        let exe = (exe == "launcher.exe" && path.contains("rockstar games/launcher")) ? "rdr2.exe" : exe
         switch exe {
         case "rdr2.exe", "playrdr2.exe":
             return socialClub + "\n" + bcd + "\n" + """
@@ -989,8 +1003,7 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_PAD_MODE = hid
             env.MADEIRA_EC_HOOK_TRACE = 0
             """ + "\n" + (steam ? steamLines : "env.SteamDeck = 1\nenv.MADEIRA_FASTSYNC_SEM = 1")
-        case "launcher.exe" where path.contains("rockstar games/launcher"),
-             "rockstarservice.exe", "socialclubhelper.exe":
+        case "rockstarservice.exe", "socialclubhelper.exe", "rockstar-games-launcher.exe":
             return socialClub + "\n" + bcd
         case "ghostoftsushima.exe":
             return bcd + "\n" + nvidia + "\n" + """
@@ -3766,12 +3779,12 @@ struct LibraryDetail: View {
                         TextField("Working folder (default: the program's folder)", text: Binding(get: { entry.workingDirectory ?? "" }, set: {
                             entry.workingDirectory = $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
                         })).autocorrectionDisabled().textInputAutocapitalization(.never).font(.body.monospaced())
-                        Toggle("Start Windows services first", isOn: Binding(get: { entry.startServices == true }, set: {
+                        Toggle("Start Windows services first", isOn: Binding(get: { entry.startServicesEffective }, set: {
                             entry.startServices = $0 ? true : nil
                         }))
                     } header: { Text("Launch") } footer: {
                         VStack(alignment: .leading, spacing: 4) {
-                            if !entry.runsInDesktop && (entry.isBatch || entry.startServices == true) {
+                            if !entry.runsInDesktop && (entry.isBatch || entry.startServicesEffective) {
                                 // Wine stops with its first process (the ml1163 open risk).
                                 Text("Started directly, Wine stops when its first program exits, so a batch file that starts the game and exits closes the game too. Start it in the Wine desktop instead.")
                                     .foregroundStyle(.orange)

@@ -684,7 +684,12 @@ static uintptr_t ios_reply_rw_alias( uintptr_t addr )
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
     size_t size = ios_jit_pool_size_global;
 
-    if (rx && rw && size && addr >= rx && addr - rx < size) return rw + (addr - rx);
+    extern int ios_jit_pool_off_in_hole( size_t off );
+
+    /* A split pool's hole is not pool memory (it holds the main thread's stack):
+     * write there directly. */
+    if (rx && rw && size && addr >= rx && addr - rx < size)
+        return ios_jit_pool_off_in_hole( addr - rx ) ? 0 : rw + (addr - rx);
     return ios_jit_anon_alias_lookup( addr );
 }
 
