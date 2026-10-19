@@ -779,7 +779,9 @@ struct LibraryEntry: Codable, Identifiable {
         if let startServices { return startServices }
         let exe = (relativePath as NSString).lastPathComponent.lowercased()
         return exe == "rockstar-games-launcher.exe"
-            || (exe == "launcher.exe" && relativePath.lowercased().contains("rockstar games/launcher"))
+            // Rockstar titles started on their own bring up the launcher and its service.
+            || relativePath.lowercased().contains("rockstar games/")
+            || ["rdr2.exe", "playrdr2.exe", "gta5_enhanced.exe", "playgtav.exe"].contains(exe)
     }
     /// ml1163: where startServices writes its batch file, one per entry.
     var servicesScriptPath: String { "C:\\madeira-games\\\(id.uuidString).bat" }
@@ -988,6 +990,8 @@ struct LibraryEntry: Codable, Identifiable {
             env.WINE_D3D_CONFIG = renderer=no3d
             env.FEX_VECTORTSOENABLED = 0
             env.MADEIRA_RDR2_VA_HOLD = 1
+            env.MADEIRA_COMMIT_LIMIT_MB = 10240
+            env.MADEIRA_TOTAL_PHYS_MB = 8192
             env.MADEIRA_SWAP_RESERVE_MAX_MB = 9216
             env.MADEIRA_THREAD_STACK_SPILL = 1
             env.MADEIRA_SMALL_STACK_EXES = RDR2.exe
