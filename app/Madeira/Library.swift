@@ -888,7 +888,133 @@ struct LibraryEntry: Codable, Identifiable {
             out.append(("vram-mb", "1536"))
             out.append(("vram-trim-mb", "4096"))
         }
+        out += MadeiraConfig.parsePairs(Self.knownGameConfig(exe: (relativePath as NSString).lastPathComponent.lowercased(),
+                                                             path: relativePath.lowercased(), steam: steamAppID != nil))
         return out
+    }
+
+    /// Upstream's tested per-game lists (willfaust/Madeira GameRecommendations.swift,
+    /// 2026-10-12..15), matched by program name. Diagnostic-only lines (caps logs,
+    /// band census, device stats, Metal HUD) are left out; the pickers they set
+    /// (NVIDIA, AVX) are their env lines here.
+    static func knownGameConfig(exe: String, path: String, steam: Bool) -> String {
+        // madeira-bcd's defaults, which upstream's lists were tested with.
+        let bcd = """
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """
+        // Social Club (Chromium in the Rockstar Games Launcher): layout 2 of the 512 GB map.
+        let socialClub = """
+        pool-low = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
+        env.WINEDLLOVERRIDES = video64=
+        """
+        let nvidia = """
+        env.DXMT_ENABLE_NVEXT = 1
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
+        """
+        switch exe {
+        case "rdr2.exe", "playrdr2.exe":
+            return socialClub + "\n" + bcd + "\n" + """
+            d3d12-shader-pack = 1
+            replay-split = 1
+            ring-share = 1
+            pool-mid = 1
+            vram-mb = 2304
+            swap-mb = 8192
+            swap-mode = 2
+            swap-min-mb = 1
+            swap-images = 1
+            pso-warm = 2
+            fence-chain = 6
+            avail-phys = 1
+            indirect-fast = 1
+            ind-probe = 0
+            fullscreen-window = 1
+            env.WINE_D3D_CONFIG = renderer=no3d
+            env.FEX_VECTORTSOENABLED = 0
+            env.MADEIRA_RDR2_VA_HOLD = 1
+            env.MADEIRA_SWAP_RESERVE_MAX_MB = 9216
+            env.MADEIRA_THREAD_STACK_SPILL = 1
+            env.MADEIRA_SMALL_STACK_EXES = RDR2.exe
+            env.MADEIRA_DXGI_BUDGET_EVENTS = 1
+            env.DXMT_WSI_MONITOR_IDENTITY = 1
+            env.DXMT_WSI_MODE_TABLE = 1
+            env.MADEIRA_EXECREQ_LEAVE = 1
+            env.MADEIRA_PIN_GRAPHICS_DLLS = 1
+            env.MADEIRA_PRELOAD_DLLS = xinput1_4.dll
+            env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+            env.MADEIRA_POOL_LOW_IMAGES = 1
+            env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+            env.MADEIRA_TOUCH_MOUSE = 1
+            env.MADEIRA_WOW_MIN_FREE_GB = 2
+            env.MADEIRA_X64_GRAPHICS_ENTRY = 1
+            env.MADEIRA_X64_IMAGE_NOCOPY = 1
+            env.MADEIRA_EC_HOOK_TRACE = 0
+            """ + (steam ? "\nenv.MADEIRA_DOCK_GAME_SCM = 1\nenv.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe" : "")
+        case "gta5_enhanced.exe", "playgtav.exe":
+            let steamLines = """
+            swap-mb = 3072
+            pso-warm = 2
+            env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye
+            env.MADEIRA_DOCK_GAME_SCM = 1
+            env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTA5_Enhanced.exe
+            env.MADEIRA_EXECREQ_LEAVE = 1
+            env.MADEIRA_PIN_GRAPHICS_DLLS = 1
+            env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+            env.MADEIRA_POOL_LOW_IMAGES = 1
+            env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+            env.MADEIRA_TOUCH_MOUSE = 1
+            env.MADEIRA_WOW_MIN_FREE_GB = 2
+            env.MADEIRA_X64_GRAPHICS_ENTRY = 1
+            env.MADEIRA_X64_IMAGE_NOCOPY = 1
+            """
+            return socialClub + "\n" + bcd + "\n" + nvidia + "\n" + """
+            d3d12-core-dll = 1
+            d3d12-msaa8 = 1
+            d3d12-tile-based = 0
+            d3d12-tiled-resources = 1
+            d3d12-typed-uav-load = 1
+            vram-mb = 4096
+            env.FEX_VECTORTSOENABLED = 0
+            env.MADEIRA_KMT_ADAPTER = 1
+            env.MADEIRA_PAD_MODE = hid
+            env.MADEIRA_EC_HOOK_TRACE = 0
+            """ + "\n" + (steam ? steamLines : "env.SteamDeck = 1\nenv.MADEIRA_FASTSYNC_SEM = 1")
+        case "launcher.exe" where path.contains("rockstar games/launcher"),
+             "rockstarservice.exe", "socialclubhelper.exe":
+            return socialClub + "\n" + bcd
+        case "ghostoftsushima.exe":
+            return bcd + "\n" + nvidia + "\n" + """
+            dxil-tess = 0
+            sampler-reduction = 3
+            ind-count = 6000
+            typed-view-align = 16
+            typed-view-shadow = 1
+            swap-mb = 4096
+            env.MADEIRA_PAD_MODE = hid
+            env.MADEIRA_EC_HOOK_TRACE = 0
+            env.MADEIRA_THREAD_STACK_SPILL = 1
+            env.MADEIRA_FEX_AVX = 1
+            """
+        case "gow.exe":
+            return bcd + "\n" + """
+            dxmt = d3d11.mipClampBC=2
+            swap-mb = 6144
+            swap-min-kb = 1024
+            env.MADEIRA_PAD_MODE = hid
+            """
+        default:
+            return ""
+        }
     }
 
     /// "Fast semaphore waits" as it applies: this game's choice, else on for Unity games.
@@ -1005,7 +1131,14 @@ struct LibraryEntry: Codable, Identifiable {
         madeira_set_vsync_locked(effectiveFPSMode)
         // This game's own lines; a launch without any unsets the previous game's.
         do {
-            let pairs = try MadeiraConfig.applyGame(gameConfigText)
+            let text = gameConfigText
+            let wantsSC2 = MadeiraConfig.parse(text ?? "")["env.MADEIRA_SC_PA_POOLS"]?.hasPrefix("2") == true
+            UserDefaults.standard.set(wantsSC2, forKey: StikJITHelper.scLayout2LastKey)
+            if wantsSC2 && StikJITHelper.earlyPoolWithoutLayout2 {
+                LogStore.shared.log("[sc-cef] this game needs the JIT pool placed for Social Club, but it was set up before the game was chosen. "
+                                    + "Quit Madeira and start this game again: the next launch places it.", level: .error)
+            }
+            let pairs = try MadeiraConfig.applyGame(text)
             if !pairs.isEmpty {
                 LogStore.shared.log("[game-cfg] " + pairs.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
             }

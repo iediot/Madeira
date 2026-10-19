@@ -153,6 +153,10 @@ enum StikJITHelper {
     /// land there, for libcef.dll's PartitionAlloc pools; ntdll takes the hold over.
     /// The alias holds no guest pointers, so its address is free (ml1037).
     static let scLayout2Alias: vm_address_t = 0x7900000000
+    /// UserDefaults: the last launched game asked for Social Club layout 2.
+    static let scLayout2LastKey = "madeira.scLayout2LastLaunch"
+    /// A pool was taken early (before the game was known) without layout 2's placement.
+    static var earlyPoolWithoutLayout2: Bool { preparedPool != nil && !scHoldTaken }
     private static let scLayout2Hold: vm_address_t = 0x7000000000
     private static let scLayout2HoldSize: vm_size_t = 0x100000000
     private static var scHoldTaken = false
@@ -1208,6 +1212,13 @@ enum StikJITHelper {
         // arrives while a preparation runs gets that preparation's result.
         if preparingPool != nil { preparingPool?.append(completion); return }
         guard MadeiraConfig.flag("MADEIRA_JIT_EARLY_POOL"), !poolTaken, isDebuggerAttached() else {
+            completion(.success(())); return
+        }
+        // Social Club layout 2 (#285) places the pool's RW alias for the game, so the pool
+        // must be taken at launch, when the game's config is known. The last launch
+        // decides (LibraryEntry.applyEnvironment records it).
+        if UserDefaults.standard.bool(forKey: scLayout2LastKey) {
+            LogStore.shared.log("[jit-early-pool] skipped: the last game launched (Rockstar / Social Club) needs the JIT pool placed at launch")
             completion(.success(())); return
         }
         preparingPool = [completion]

@@ -1692,10 +1692,9 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
      * would re-init both static PA copies and exhaust the slots. Chromium
      * tolerates a failed crashpad spawn (continues without crash upload). */
     {
-        /* Rockstar's SocialClubHelper.exe is the same CEF browser host and needs
-         * the same treatment: one glued 32GB PA pool fits, a second process's
-         * would not. */
-        static const char *const helpers[] = { "steamwebhelper.exe", "socialclubhelper.exe" };
+        /* SocialClubHelper.exe is not listed: #285's [sc-cef] path below runs its
+         * browser --single-process and refuses its --type= children itself. */
+        static const char *const helpers[] = { "steamwebhelper.exe" };
         static const char typesw[] = "--type=";
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);

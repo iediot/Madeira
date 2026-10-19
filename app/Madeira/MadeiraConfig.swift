@@ -84,6 +84,16 @@ enum MadeiraConfig {
         return out
     }
 
+    /// The key/value lines of `text` in order (repeats kept; the last one wins when applied).
+    static func parsePairs(_ text: String) -> [(key: String, value: String)] {
+        text.split(whereSeparator: { $0 == "\n" }).compactMap { raw in
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { return nil }
+            let k = line[..<eq].trimmingCharacters(in: .whitespaces)
+            return k.isEmpty ? nil : (k, line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces))
+        }
+    }
+
     /// The value for `key`, trimmed, or nil when unset. Falls back to the legacy
     /// file ONLY when madeira.cfg does not exist.
     static func get(_ key: String) -> String? {
