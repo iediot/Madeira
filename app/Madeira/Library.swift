@@ -738,10 +738,20 @@ struct LibraryEntry: Codable, Identifiable {
     /// Dock has Dock's own desktop and command (ContentView.startDock).
     var usesLaunchOptions: Bool { desktop != true && (steamAppID == nil || startsSteamGameDirectly) }
     /// ml1163: a game (not the Desktop entry) started inside the Wine desktop.
-    var runsInDesktop: Bool { usesLaunchOptions && launchMode == "desktop" }
+    var runsInDesktop: Bool { usesLaunchOptions && (launchMode == "desktop" || rockstarMinmodeTitle != nil) }
+    /// A Rockstar title's entry runs in a Wine desktop WITHOUT the shell (no taskbar, plain
+    /// background) at the entry's resolution: the launcher shows as a window there (it needs to:
+    /// with its Chromium panes hidden in game mode it never started the game), and the game's
+    /// full-screen window then covers the whole desktop.
+    var desktopName: String { rockstarMinmodeTitle != nil ? "madeira" : "shell" }
     /// The program's own arguments: Steam's launch configuration for "The game",
     /// else the entry's Launch arguments.
-    var programArguments: String { startsSteamGameDirectly ? (steamProgramArguments ?? "") : arguments }
+    var programArguments: String {
+        if let title = rockstarMinmodeTitle {
+            return ("-minmodeApp=\(title) " + arguments).trimmingCharacters(in: .whitespaces)
+        }
+        return startsSteamGameDirectly ? (steamProgramArguments ?? "") : arguments
+    }
     /// ml1163: the directory the program starts in (MADEIRA_WORKDIR): the chosen
     /// working folder, else Steam's for "The game", else the program's own folder.
     /// A desktop-mode game inherits explorer's directory and a .bat runs as
@@ -832,7 +842,7 @@ struct LibraryEntry: Codable, Identifiable {
         if servicesScript != nil { path = servicesScriptPath; extra = ""; batch = true }
         func withExtra(_ s: String) -> String { extra.isEmpty ? s : s + " " + extra }
         if runsInDesktop {
-            return ("explorer.exe", "/desktop=shell,\(pixelResolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : quoted(path)))
+            return ("explorer.exe", "/desktop=\(desktopName),\(pixelResolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : quoted(path)))
         }
         if batch { return ("C:\\windows\\system32\\cmd.exe", withExtra("/c \(quoted(path))")) }
         return (path, programArguments)   // upstream's direct launch, arguments verbatim
@@ -855,8 +865,21 @@ struct LibraryEntry: Codable, Identifiable {
     /// What a launch starts, relative to drive_c: "The game"'s program inside the
     /// install folder, else `relativePath`.
     var launchRelativePath: String {
+        if rockstarMinmodeTitle != nil { return "Program Files/Rockstar Games/Launcher/Launcher.exe" }
         guard startsSteamGameDirectly, let program = steamProgram, !program.isEmpty else { return relativePath }
         return relativePath + "/" + program
+    }
+    /// A Rockstar Games Launcher title started from its own entry: the launcher is started in
+    /// its minimal mode for it (Launcher.exe -minmodeApp=<id>), the way Steam and Epic copies
+    /// start RDR2. Started directly, RDR2.exe reserved its 8960 MB block in ordinary furniture
+    /// before the launcher ran, Social Club's browser then had 2.9 GB left and stopped with
+    /// Chromium's out-of-memory exit (0xe0000008, "the CEF browser crashed").
+    var rockstarMinmodeTitle: String? {
+        guard steamAppID == nil else { return nil }
+        let path = relativePath.lowercased()
+        guard path.hasPrefix("program files/rockstar games/") else { return nil }
+        if path.hasSuffix("/rdr2.exe") || path.hasSuffix("/playrdr2.exe") { return "rdr2" }
+        return nil
     }
     var launchWindowsPath: String { "C:\\" + launchRelativePath.replacingOccurrences(of: "/", with: "\\") }
     /// "The game"'s working folder as a Windows path, or nil for the program's own folder.
@@ -949,7 +972,11 @@ struct LibraryEntry: Codable, Identifiable {
         env.MADEIRA_JIT_DUMP = 0
         """
         // Social Club (Chromium in the Rockstar Games Launcher): layout 2 of the 512 GB map.
+        // No FEX code cache: Rockstar's anti-tamper decrypts the launcher's and the games' code
+        // just before it runs and re-encrypts it; with cached translations the launcher ran its
+        // still-encrypted bytes (Launcher.exe+0x258cf6, c0000096 privileged instruction).
         let socialClub = """
+        env.MADEIRA_FEX_CODE_CACHE = 0
         pool-low = 1
         pool-page-fit = 1
         pool-split = 1
@@ -1178,6 +1205,7 @@ struct LibraryEntry: Codable, Identifiable {
             else { unsetenv("MADEIRA_FASTSYNC_SEM") }
         }
         madeira_set_vsync_locked(effectiveFPSMode)
+        prepareRockstarSettings()
         // This game's own lines; a launch without any unsets the previous game's.
         do {
             let text = gameConfigText
@@ -1199,6 +1227,50 @@ struct LibraryEntry: Codable, Identifiable {
             fputs("[library] ml1163 start=\(runsInDesktop ? "desktop" : "direct") batch=\(isBatch ? 1 : 0) services=\(servicesScript != nil ? 1 : 0) cwd=\(launchDirectory)\n", stderr)
         }
         LogStore.shared.log("[display-shape] resolution=\(resolution) (\(pixelResolution)) mode=\(displayMode.rawValue)")
+    }
+
+    /// RDR2 picks Vulkan when it finds no settings file, and MoltenVK cannot make the
+    /// linear, mipmapped images it then asks for (vkCreateImage VK_ERROR_FEATURE_NOT_PRESENT
+    /// right before RDR2 read through the NULL result, in its first loading screen). A first
+    /// launch therefore gets a settings file that asks for DirectX 12 (madeira-d3d12, what
+    /// upstream's RDR2 list is tuned for), and a file RDR2 wrote with Vulkan is switched to it.
+    func prepareRockstarSettings() {
+        let exe = (relativePath as NSString).lastPathComponent.lowercased()
+        guard rockstarMinmodeTitle == "rdr2" || exe == "rdr2.exe"
+              || (exe == "launcher.exe" && relativePath.lowercased().contains("rockstar games/launcher")) else { return }
+        let dir = LibraryModel.drive.appendingPathComponent("users/mobile/Documents/Rockstar Games/Red Dead Redemption 2/Settings", isDirectory: true)
+        let file = dir.appendingPathComponent("system.xml")
+        if let text = try? String(contentsOf: file, encoding: .utf8) {
+            // RDR2 writes the whole file itself (version 37, the API under advancedGraphics)
+            // and chose Vulkan; turn that one setting to DirectX 12, leave the rest.
+            guard text.contains("kSettingAPI_Vulkan") else { return }
+            do {
+                try text.replacingOccurrences(of: "kSettingAPI_Vulkan", with: "kSettingAPI_DX12")
+                    .write(to: file, atomically: true, encoding: .utf8)
+                LogStore.shared.log("[rdr2] Settings/system.xml: API Vulkan -> DirectX 12 (MoltenVK cannot make the images RDR2's Vulkan path needs)")
+            } catch {
+                LogStore.shared.log("[rdr2] could not update Settings/system.xml: \(error.localizedDescription)", level: .error)
+            }
+            return
+        }
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <rage__fwuiSystemSettingsCollection>
+          <version value="37" />
+          <configSource>kSettingsConfig_Auto</configSource>
+          <advancedGraphics>
+            <API>kSettingAPI_DX12</API>
+          </advancedGraphics>
+        </rage__fwuiSystemSettingsCollection>
+
+        """
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try xml.write(to: file, atomically: true, encoding: .utf8)
+            LogStore.shared.log("[rdr2] wrote Settings/system.xml asking for DirectX 12 (no settings file yet)")
+        } catch {
+            LogStore.shared.log("[rdr2] could not write Settings/system.xml: \(error.localizedDescription)", level: .error)
+        }
     }
 
     /// What the bridge starts. Set on the main thread before the session begins.
@@ -1319,6 +1391,25 @@ final class LibraryModel: ObservableObject {
     private var laidOutAfterFirstPresent = false
     private struct Document: Codable { var version: Int; var entries: [LibraryEntry] }
     private var file: URL { Self.documents.appendingPathComponent("madeira-library.json") }
+    /// The library file's modification date when it was last read or written.
+    private var fileStamp: Date?
+
+    private static func stamp(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    /// The library is read once and every save writes the whole list, so a
+    /// change made to the file while Madeira ran (a config edited over USB)
+    /// was overwritten by the next save. The file is read again when it
+    /// changed since Madeira last read or wrote it.
+    func reloadIfChangedOnDisk() {
+        guard !readOnly, let now = Self.stamp(file), now != fileStamp,
+              let doc = try? JSONDecoder().decode(Document.self, from: Data(contentsOf: file)),
+              doc.version == 1 else { return }
+        entries = doc.entries
+        fileStamp = now
+        LogStore.shared.log("[library] reloaded: the file changed outside Madeira")
+    }
 
     private init() {
         refreshFlag()
@@ -1333,11 +1424,16 @@ final class LibraryModel: ObservableObject {
                 if model.current != nil { model.saveCurrentProfile() }
             }
         }
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { LibraryModel.shared.reloadIfChangedOnDisk() }
+        }
         if FileManager.default.fileExists(atPath: file.path) {
             do {
                 let doc = try JSONDecoder().decode(Document.self, from: Data(contentsOf: file))
                 guard doc.version == 1 else { throw LibraryError.message("This library uses a newer format.") }
                 entries = doc.entries
+                fileStamp = Self.stamp(file)
             } catch {
                 readOnly = true
                 self.error = "Library could not be opened. The original file was preserved. " + error.localizedDescription
@@ -1376,8 +1472,14 @@ final class LibraryModel: ObservableObject {
 
     func save(_ entry: LibraryEntry) {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
-        var next = entries
+        let before = entries.first(where: { $0.id == entry.id })
+        reloadIfChangedOnDisk()
         var entry = entry
+        // Config edited in the file since this entry was copied: a save that
+        // leaves the config as it was keeps the file's.
+        if let before, let disk = entries.first(where: { $0.id == entry.id }),
+           entry.config == before.config, disk.config != before.config { entry.config = disk.config }
+        var next = entries
         // A Steam game has one entry: a details page opened before its card first saved
         // one (refreshSteamMetadata) updates that entry.
         if let i = next.firstIndex(where: { $0.id == entry.id }) ??
@@ -1395,6 +1497,7 @@ final class LibraryModel: ObservableObject {
         persist(next)
     }
     func remove(_ id: UUID) {
+        reloadIfChangedOnDisk()
         persist(entries.filter { $0.id != id })
     }
     /// A Steam game's library entry, which holds its per-game settings
@@ -1422,6 +1525,7 @@ final class LibraryModel: ObservableObject {
     }
     /// A Steam game was uninstalled: its entry goes with its files.
     func removeSteam(appID: Int) {
+        reloadIfChangedOnDisk()
         guard entries.contains(where: { $0.steamAppID == appID }) else { return }
         persist(entries.filter { $0.steamAppID != appID })
     }
@@ -1432,6 +1536,7 @@ final class LibraryModel: ObservableObject {
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(Document(version: 1, entries: next)).write(to: file, options: .atomic)
             entries = next
+            fileStamp = Self.stamp(file)
             return true
         } catch { self.error = "Could not save the library: " + error.localizedDescription; return false }
     }

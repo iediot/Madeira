@@ -11798,10 +11798,20 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
 #ifdef WINE_IOS
     {
+        /* Keyed on the whole register state, not the PC alone: a fault that
+         * really makes no progress re-faults with identical registers on the
+         * same thread. FEX raises every guest int3/ud2 from one shared stub,
+         * so a PC-only key counted RDR2's anti-tamper breakpoints across all
+         * its threads, and the 5th one was skipped with x0=0xDEAD0001 instead
+         * of delivered: corrupt guest state, "Unknown error: FFFFFFFF". */
         static uintptr_t last_fault_pc = 0;
+        static uint64_t last_fault_key = 0;
         static int fault_repeat_count = 0;
         uintptr_t this_pc = PC_sig(context);
-        if (this_pc == last_fault_pc)
+        uint64_t this_key = (uint64_t)siginfo->si_addr ^ ((uint64_t)SP_sig(context) * 31);
+        for (int r = 0; r < 31; r++)
+            this_key = (this_key ^ (uint64_t)REGn_sig(r, context)) * 0x100000001b3ull;
+        if (this_pc == last_fault_pc && this_key == last_fault_key)
         {
             fault_repeat_count++;
             static unsigned long loop_storm;
@@ -11869,6 +11879,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         else
         {
             last_fault_pc = this_pc;
+            last_fault_key = this_key;
             fault_repeat_count = 1;
         }
     }

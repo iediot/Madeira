@@ -192,7 +192,39 @@ static void my_release_metal_device(macdrv_metal_device d) {
 // The layer an HWND presents to. Desktop mode: per-window layer in the
 // desktop compositor. Game mode: the fullscreen singleton. Shared by DXMT
 // (below) and the OpenGL presenter (Winios/WiniosGL.m).
+extern unsigned int winios_drv_window_style(void *hwnd);
+
+/* Game mode, env MADEIRA_GAME_BACKGROUND_CHILD_SWAPCHAINS=1 (the Rockstar titles' entry):
+ * a swapchain on a CHILD window (a launcher's Chromium pane: the Rockstar Games Launcher
+ * draws its pages into WS_CHILD windows) never takes the fullscreen game layer; it gets a
+ * layer nobody shows, so the launcher runs in the background and the game's own top-level
+ * window is what fills the screen. Without the variable every swapchain behaves as before. */
+static CAMetalLayer *madeira_background_layer_for_child(void *hwnd) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("MADEIRA_GAME_BACKGROUND_CHILD_SWAPCHAINS"); on = e && e[0] == '1'; }
+    if (!on) return nil;
+    if (!(winios_drv_window_style(hwnd) & 0x40000000u /* WS_CHILD */)) return nil;
+    static NSMutableDictionary<NSNumber *, CAMetalLayer *> *layers;
+    pthread_mutex_lock(&g_lock);
+    if (!layers) layers = [NSMutableDictionary new];
+    CAMetalLayer *l = layers[@((uintptr_t)hwnd)];
+    if (!l) {
+        l = [CAMetalLayer layer];
+        l.device = MTLCreateSystemDefaultDevice();
+        l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        l.drawableSize = CGSizeMake(64, 64);
+        layers[@((uintptr_t)hwnd)] = l;
+        fprintf(stderr, "[madeira-display] child swapchain hwnd=%p kept in the background: the game layer stays for a top-level window\n", hwnd);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return l;
+}
+
 CAMetalLayer *madeira_display_layer_for_hwnd(void *hwnd) {
+    if (!madeira_desktop_mode()) {
+        CAMetalLayer *bg = madeira_background_layer_for_child(hwnd);
+        if (bg) return bg;
+    }
     if (madeira_desktop_mode()) {
         CAMetalLayer *layer = winios_metal_layer_for_hwnd(hwnd);
         if (!layer)
@@ -219,7 +251,10 @@ static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_d
         fprintf(stderr, "[madeira-display] desktop metal view for hwnd=%p layer=%p\n", (void *)v, layer);
         fflush(stderr);
     }
-    winios_note_game_metal_hwnd((void *)v);
+    // A launcher pane kept in the background is not "the game window": it neither hides
+    // the overlay window it belongs to nor becomes the window touches map through.
+    if (madeira_desktop_mode() || layer != madeira_background_layer_for_child((void *)v))
+        winios_note_game_metal_hwnd((void *)v);
     return (macdrv_metal_view)CFBridgingRetain(layer);
 }
 

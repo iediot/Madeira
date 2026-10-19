@@ -1705,6 +1705,12 @@ static void *wine_process_thread(void *arg) {
                 is_i386_target ? " (i386: WoW64)" :
                 target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386 ? " (i386, but the bundle has no i386-windows)" : "");
         if (is_i386_target) use_arm64ec = NO;
+        /* Wine's own programs under C:\windows\system32 (cmd.exe running a .bat or the
+         * "Start Windows services" batch in game mode) are native ARM64 images: as an
+         * ARM64EC session's main exe they failed to load kernel32.dll (c000007b). They run
+         * the way explorer.exe does in desktop mode, on the aarch64 set, and the x64 game
+         * they start is a child process with its own machine. */
+        if (strncasecmp(madeira_exe, "C:\\windows\\system32\\", 20) == 0) use_arm64ec = NO;
         const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
         LOG("Target exe: %{public}s (bundle=%{public}s)", madeira_exe, bundle_subdir);
         dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", madeira_exe, bundle_subdir);

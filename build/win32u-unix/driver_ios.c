@@ -422,6 +422,13 @@ void winios_dump_window_tree(void)
 
 /* A top-level window's owning process id and style bits. Returns 0 for a
  * child window, the desktop window itself, or a window that is gone. */
+/* Any window's GWL_STYLE, child windows included (IOSDisplayShim.m: a game-mode swapchain on
+ * a WS_CHILD window, a launcher's Chromium pane, can be kept in the background). */
+unsigned int winios_drv_window_style( HWND hwnd )
+{
+    return hwnd ? (unsigned int)get_window_long( hwnd, GWL_STYLE ) : 0;
+}
+
 int winios_drv_census_owner( HWND hwnd, unsigned int *pid, unsigned int *style )
 {
     DWORD process = 0, bits;

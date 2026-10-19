@@ -2698,6 +2698,9 @@ struct ContentView: View {
         }
         let savedEntry = entry
         var entry = entry
+        // The file may have changed since the library screen read it (a config edited over USB).
+        library.reloadIfChangedOnDisk()
+        if let fresh = library.entries.first(where: { $0.id == entry.id }) { entry.config = fresh.config }
         if let epicArguments, let appName = entry.epicAppName {
             let command = entry.epicLaunchCommand ?? EpicInstaller.shared.installed[appName]?.launchCommand ?? ""
             entry.arguments = [command, entry.arguments, epicArguments].filter { !$0.isEmpty }.joined(separator: " ")
