@@ -53,6 +53,15 @@ void madeira_display_set_layer(CAMetalLayer *layer) {
     pthread_mutex_unlock(&g_lock);
 }
 
+// Winios.m (MADEIRA_METAL_HUD_MAIN): a desktop session presents into
+// per-window layers, so this layer's Metal HUD is turned off there.
+CAMetalLayer *madeira_display_layer(void) {
+    pthread_mutex_lock(&g_lock);
+    CAMetalLayer *layer = g_layer;
+    pthread_mutex_unlock(&g_lock);
+    return layer;
+}
+
 // --- The guest's virtual monitor ---------------------------------------
 //
 // The front end lays out the presented layer and maps touches in guest
@@ -165,6 +174,9 @@ extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
 extern void winios_note_game_metal_hwnd(void *hwnd);
 // Winios.m: a Vulkan surface presents to hwnd; match its layer scale to pixels.
 extern void winios_note_vulkan_hwnd(void *hwnd);
+// Both kinds of session: the driver logs what happens to a swapchain's window
+// ([swap-win] lines, Winios.m / driver_ios.c).
+extern void winios_note_swapchain_hwnd(void *hwnd);
 
 static macdrv_metal_device my_create_metal_device(void) {
     // DXMT also has a separate code path that creates its own MTLDevice;
@@ -200,6 +212,7 @@ CAMetalLayer *madeira_display_layer_for_hwnd(void *hwnd) {
 // (see my_get_win_data).
 static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_device d) {
     (void)d;
+    winios_note_swapchain_hwnd((void *)v);
     CAMetalLayer *layer = madeira_display_layer_for_hwnd((void *)v);
     if (!layer) return NULL;
     if (madeira_desktop_mode()) {
