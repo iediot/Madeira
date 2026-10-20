@@ -1,0 +1,796 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 2a1333fe..3728caf3 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -1348,10 +1348,114 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
+     return status;
+ }
+ 
++/* Madeira [at] anti-tamper trace (env MADEIRA_AT_TRACE=<program name>, e.g. RDR2.exe):
++ * every exception the named program gets, with the x64 instruction bytes that raised
++ * it, and where its handler resumes (how far past the instruction, and whether it set
++ * the trap flag). Anti-debug guards raise exceptions on purpose and check exactly this. */
++static PEB *at_peb;
++static int at_enabled;
++static struct { DWORD tid; DWORD code; ULONG64 rip; } at_last[1024];
++
++static int at_on(void)
++{
++    PEB *peb = NtCurrentTeb()->Peb;
++    if (peb != at_peb)
++    {
++        WCHAR buf[64];
++        UNICODE_STRING name, value;
++        int on = 0;
++
++        RtlInitUnicodeString( &name, L"MADEIRA_AT_TRACE" );
++        value.Buffer = buf;
++        value.Length = 0;
++        value.MaximumLength = sizeof(buf) - sizeof(WCHAR);
++        if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length &&
++            peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Buffer)
++        {
++            const UNICODE_STRING *img = &peb->ProcessParameters->ImagePathName;
++            USHORT n = img->Length / sizeof(WCHAR), w = value.Length / sizeof(WCHAR), i;
++            if (n >= w)
++            {
++                for (i = 0; i < w; i++)
++                    if (RtlDowncaseUnicodeChar( img->Buffer[n - w + i] ) != RtlDowncaseUnicodeChar( buf[i] )) break;
++                on = (i == w);
++            }
++        }
++        at_enabled = on;
++        at_peb = peb;
++    }
++    return at_enabled;
++}
++
++static int at_take( ULONG64 rip )
++{
++    static LONG counts[4096], total;
++    LONG n = InterlockedIncrement( &counts[(rip ^ (rip >> 12)) & 4095] );
++    if (n > 3 && n % 1000) return 0;
++    return InterlockedIncrement( &total ) <= 6000;
++}
++
++static void at_place( ULONG64 addr, char *out )
++{
++    ULONG_PTR base = (ULONG_PTR)NtCurrentTeb()->Peb->ImageBaseAddress;
++    IMAGE_NT_HEADERS *nt = base ? RtlImageNtHeader( (HMODULE)base ) : NULL;
++    void *mod = NULL;
++
++    if (nt && addr - base < nt->OptionalHeader.SizeOfImage) sprintf( out, "exe+%#I64x", addr - base );
++    else if (RtlPcToFileHeader( (void *)addr, &mod ) && mod) sprintf( out, "%p+%#I64x", mod, addr - (ULONG_PTR)mod );
++    else sprintf( out, "%#I64x", addr );
++}
++
++static void at_note_exception( const EXCEPTION_RECORD *rec, const CONTEXT *ctx )
++{
++    DWORD tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
++    void *mod = NULL;
++    char where[48], bytes[16 * 3 + 1] = "";
++    int i;
++
++    if (!at_on()) return;
++    at_last[(tid >> 2) & 1023].tid = tid;
++    at_last[(tid >> 2) & 1023].code = rec->ExceptionCode;
++    at_last[(tid >> 2) & 1023].rip = ctx->Rip;
++    if (!at_take( ctx->Rip )) return;
++    at_place( ctx->Rip, where );
++    if (RtlPcToFileHeader( (void *)ctx->Rip, &mod ) && mod)
++        for (i = 0; i < 12; i++) sprintf( bytes + 3 * i, "%02x ", ((const BYTE *)ctx->Rip)[i] );
++    ERR( "[at-exc] tid %04lx code %08lx at %s bytes %s eflags %#lx rsp %#I64x info %#I64x %#I64x\n", tid,
++         rec->ExceptionCode, where, bytes, ctx->EFlags, ctx->Rsp,
++         rec->NumberParameters > 0 ? (ULONG64)rec->ExceptionInformation[0] : 0,
++         rec->NumberParameters > 1 ? (ULONG64)rec->ExceptionInformation[1] : 0 );
++}
++
++static void at_note_continue( const CONTEXT *ctx )
++{
++    DWORD tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
++    char where[48], from[48];
++
++    if (!at_on()) return;
++    if (at_last[(tid >> 2) & 1023].tid == tid && at_last[(tid >> 2) & 1023].code)
++    {
++        ULONG64 rip = at_last[(tid >> 2) & 1023].rip;
++        DWORD code = at_last[(tid >> 2) & 1023].code;
++        at_last[(tid >> 2) & 1023].code = 0;
++        if (!at_take( rip ^ 0x5a5a5a5a5a5aull ) && !(ctx->EFlags & 0x100)) return;
++        at_place( rip, from );
++        at_place( ctx->Rip, where );
++        ERR( "[at-cont] tid %04lx after %08lx at %s resumes at %s (%+I64d bytes) eflags %#lx%s rsp %#I64x\n", tid, code,
++             from, where, (LONG64)(ctx->Rip - rip), ctx->EFlags, (ctx->EFlags & 0x100) ? " TRAP-FLAG" : "", ctx->Rsp );
++    }
++    else if (ctx->EFlags & 0x100 && at_take( ctx->Rip ^ 0x77ull ))
++    {
++        at_place( ctx->Rip, where );
++        ERR( "[at-cont] tid %04lx resumes at %s eflags %#lx TRAP-FLAG (no exception before)\n", tid, where, ctx->EFlags );
++    }
++}
++
+ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
++    at_note_continue( context );
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtContinue( &arm_ctx, alertable );
+ }
+@@ -1360,6 +1464,7 @@ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
++    at_note_continue( context );
+     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtContinueEx( &arm_ctx, args );
+ }
+@@ -3935,6 +4040,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD
+                  pResetToConsistentState, get_arm64ec_cpu_area()->InSimulation );
+     }
+     if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
++    at_note_exception( rec, &context->AMD64_Context );
+     {
+         static LONG rtcs_m;
+         if (rtcs_m < 40 && InterlockedIncrement( &rtcs_m ) <= 40)
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index e976d90d..d03cb52e 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -6620,9 +6620,44 @@ static void ios_js_read_note( HANDLE handle, int unix_fd, const void *buffer, UL
+ }
+ #endif
+ 
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++static NTSTATUS ios_at_impl_NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key );
++
++NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++{
++    NTSTATUS status = ios_at_impl_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
++    if (ios_at_on())
++        {
++            extern int ios_at_take( unsigned key );
++            extern void ios_at_where( char *out, size_t outlen );
++            ULONG got = (status == STATUS_SUCCESS || status == STATUS_END_OF_FILE) ? (ULONG)io->Information : 0;
++            if (status == STATUS_PENDING || (status != STATUS_SUCCESS) || got < length)
++            {
++                if (ios_at_take( 0x700 + (status == STATUS_PENDING ? 1 : status == STATUS_SUCCESS ? 2 : 3) ))
++                {
++                    char w[160], path[1024] = "?";
++                    int fd, needs_close;
++                    if (!server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL ))
++                    {
++                        if (fcntl( fd, F_GETPATH, path ) == -1) strcpy( path, "?" );
++                        if (needs_close) close( fd );
++                    }
++                    ios_at_where( w, sizeof(w) );
++                    ERR( "[at-read] NtReadFile(%p %s, offset %#llx, %#x bytes) -> %#x, %#x bytes from%s\n", handle, path,
++                         offset ? (unsigned long long)offset->QuadPart : ~0ull, (unsigned)length, (unsigned)status, (unsigned)got, w );
++                }
++            }
++        }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++#else
+ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                             IO_STATUS_BLOCK *io, void *buffer, ULONG length,
+                             LARGE_INTEGER *offset, ULONG *key )
++#endif
+ {
+     int result, unix_handle, needs_close;
+     unsigned int options;
+@@ -6885,9 +6920,44 @@ err:
+ /******************************************************************************
+  *              NtReadFileScatter   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++static NTSTATUS ios_at_impl_NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key );
++
++NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++{
++    NTSTATUS status = ios_at_impl_NtReadFileScatter( file, event, apc, apc_user, io, segments, length, offset, key );
++    if (ios_at_on())
++        {
++            extern int ios_at_take( unsigned key );
++            extern void ios_at_where( char *out, size_t outlen );
++            ULONG got = (status == STATUS_SUCCESS || status == STATUS_END_OF_FILE) ? (ULONG)io->Information : 0;
++            if (status == STATUS_PENDING || (status != STATUS_SUCCESS) || got < length)
++            {
++                if (ios_at_take( 0x700 + (status == STATUS_PENDING ? 1 : status == STATUS_SUCCESS ? 2 : 3) ))
++                {
++                    char w[160], path[1024] = "?";
++                    int fd, needs_close;
++                    if (!server_get_unix_fd( file, 0, &fd, &needs_close, NULL, NULL ))
++                    {
++                        if (fcntl( fd, F_GETPATH, path ) == -1) strcpy( path, "?" );
++                        if (needs_close) close( fd );
++                    }
++                    ios_at_where( w, sizeof(w) );
++                    ERR( "[at-read] NtReadFileScatter(%p %s, offset %#llx, %#x bytes) -> %#x, %#x bytes from%s\n", file, path,
++                         offset ? (unsigned long long)offset->QuadPart : ~0ull, (unsigned)length, (unsigned)status, (unsigned)got, w );
++                }
++            }
++        }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++#else
+ NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                    IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments,
+                                    ULONG length, LARGE_INTEGER *offset, ULONG *key )
++#endif
+ {
+     int result, unix_handle, needs_close;
+     unsigned int options, status;
+@@ -8355,8 +8425,37 @@ static void *put_object_type_info( OBJECT_TYPE_INFORMATION *p, struct object_typ
+ /**************************************************************************
+  *           NtQueryObject   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len );
++
++NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len )
++{
++    NTSTATUS status = ios_at_impl_NtQueryObject( handle, info_class, ptr, len, used_len );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x400 + info_class ))
++        {
++            char w[160], h[40];
++            ios_at_where( w, sizeof(w) );
++            ios_at_hex( h, status ? NULL : ptr, len, 16 );
++            ERR( "[at] QueryObject(%p, class %u, %u bytes) -> %#x data %s from%s\n",
++                 handle, (unsigned)info_class, (unsigned)len, (unsigned)status, h, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len )
++#else
+ NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class,
+                                void *ptr, ULONG len, ULONG *used_len )
++#endif
+ {
+     unsigned int status;
+ 
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 1380d70b..8b1fdec8 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2056,8 +2056,129 @@ NTSTATUS WINAPI NtQuerySemaphore( HANDLE handle, SEMAPHORE_INFORMATION_CLASS cla
+ /******************************************************************************
+  *              NtReleaseSemaphore (NTDLL.@)
+  */
++#ifdef WINE_IOS
++/* Madeira [wake-trace] (env MADEIRA_WAKE_TRACE=<seconds>): which thread wakes a thread
++ * that has been idle for at least that long, with the main program's code addresses on
++ * the waker's stack. RDR2 hands its "Unknown error FFFFFFFF" to a thread that sleeps
++ * until an error arrives; the waker is the code that raised it. A thread whose waits
++ * keep timing out stays idle across them. */
++struct ios_wt_slot { ULONG tid; LONG waiting; void *peb; ULONG_PTR obj[4]; ULONGLONG idle_since; int kind, nobj; };
++static struct ios_wt_slot ios_wt_tab[4096];
++static LONG ios_wt_lines;
++extern void ios_wake_trace_stack( void );
++
++static int ios_wt_seconds(void)
++{
++    static int secs = -1;
++    if (secs < 0)
++    {
++        const char *e = getenv( "MADEIRA_WAKE_TRACE" );
++        secs = e && atoi( e ) > 0 ? atoi( e ) : 0;
++    }
++    return secs;
++}
++
++static ULONGLONG ios_wt_now(void)
++{
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return (ULONGLONG)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++
++static const char *ios_wt_kind( int kind )
++{
++    switch (kind)
++    {
++    case 1: return "wait";
++    case 2: return "wait-multi";
++    case 3: return "wait-alert";
++    default: return "?";
++    }
++}
++
++static struct ios_wt_slot *ios_wt_self(void)
++{
++    ULONG tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
++    struct ios_wt_slot *slot = &ios_wt_tab[(tid >> 2) & 4095];
++    if (slot->tid != tid)
++    {
++        slot->tid = tid;
++        slot->idle_since = 0;
++    }
++    return slot;
++}
++
++static void ios_wt_enter( int kind, const ULONG_PTR *objs, int nobj )
++{
++    struct ios_wt_slot *slot;
++    int i;
++    if (!ios_wt_seconds() || !NtCurrentTeb()) return;
++    slot = ios_wt_self();
++    slot->peb = NtCurrentTeb()->Peb;
++    slot->nobj = !objs ? 0 : nobj < 4 ? nobj : 4;
++    for (i = 0; i < slot->nobj; i++) slot->obj[i] = objs[i];
++    slot->kind = kind;
++    if (!slot->idle_since) slot->idle_since = ios_wt_now();
++    __atomic_store_n( &slot->waiting, 1, __ATOMIC_RELEASE );
++}
++
++static void ios_wt_leave( unsigned int status )
++{
++    struct ios_wt_slot *slot;
++    ULONGLONG idle;
++    if (!ios_wt_seconds() || !NtCurrentTeb()) return;
++    slot = ios_wt_self();
++    __atomic_store_n( &slot->waiting, 0, __ATOMIC_RELEASE );
++    if (status == STATUS_TIMEOUT) return;   /* still idle */
++    {
++        ULONGLONG now = ios_wt_now(), since = slot->idle_since;
++        idle = since && since < now ? now - since : 0;
++    }
++    slot->idle_since = 0;
++    if (idle >= (ULONGLONG)ios_wt_seconds() * 1000000000ull &&
++        __sync_add_and_fetch( &ios_wt_lines, 1 ) <= 2000)
++        ERR( "[wake-trace] tid %04x woke after %.1f s idle (%s on %#lx) -> %#x\n",
++             slot->tid, idle / 1e9, ios_wt_kind( slot->kind ), (unsigned long)slot->obj[0], status );
++}
++
++/* A wake operation: report every thread idle long enough that it may wake. obj is a
++ * handle (matched within this process) or, for alerts, a thread id (tid != 0). */
++static void ios_wt_wake( const char *op, ULONG_PTR obj, ULONG tid )
++{
++    ULONGLONG now, min;
++    void *peb;
++    int i, hits = 0;
++    if (!ios_wt_seconds() || !NtCurrentTeb()) return;
++    now = ios_wt_now();
++    min = (ULONGLONG)ios_wt_seconds() * 1000000000ull;
++    peb = NtCurrentTeb()->Peb;
++    for (i = 0; i < 4096; i++)
++    {
++        struct ios_wt_slot *slot = &ios_wt_tab[i];
++        ULONGLONG since = slot->idle_since;
++        if (!__atomic_load_n( &slot->waiting, __ATOMIC_ACQUIRE ) || !since || since > now || now - since < min) continue;
++        if (tid) { if (slot->tid != tid) continue; }
++        else
++        {
++            int j, match = 0;
++            if (slot->peb != peb || slot->kind == 3) continue;
++            for (j = 0; j < slot->nobj; j++) if (slot->obj[j] == obj) match = 1;
++            if (!match) continue;
++        }
++        if (__sync_add_and_fetch( &ios_wt_lines, 1 ) > 2000) return;
++        ERR( "[wake-trace] tid %04lx %s(%#lx) wakes tid %04x idle %.1f s (%s)\n",
++             HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), op, (unsigned long)obj,
++             slot->tid, (now - since) / 1e9, ios_wt_kind( slot->kind ) );
++        if (!hits++) ios_wake_trace_stack();
++    }
++}
++#endif
++
+ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous )
+ {
++#ifdef WINE_IOS
++    ios_wt_wake( "ReleaseSemaphore", (ULONG_PTR)handle, 0 );
++#endif
+     unsigned int ret;
+ #ifdef WINE_IOS
+     unsigned int fast_status = STATUS_SUCCESS;
+@@ -2274,6 +2395,9 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
+ 
+     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+     __sync_fetch_and_add( &ios_xp_set_event, 1 );   /* ml1131 */
++#ifdef WINE_IOS
++    ios_wt_wake( "SetEvent", (ULONG_PTR)handle, 0 );
++#endif
+ 
+ #ifdef WINE_IOS
+     switch (madeira_fast_event_op( handle, 1, prev_state ))
+@@ -2311,6 +2435,9 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
+  */
+ NTSTATUS WINAPI NtSetEventBoostPriority( HANDLE handle )
+ {
++#ifdef WINE_IOS
++    ios_wt_wake( "SetEventBoostPriority", (ULONG_PTR)handle, 0 );
++#endif
+     return NtSetEvent( handle, NULL );
+ }
+ 
+@@ -2360,6 +2487,9 @@ NTSTATUS WINAPI NtClearEvent( HANDLE handle )
+  */
+ NTSTATUS WINAPI NtPulseEvent( HANDLE handle, LONG *prev_state )
+ {
++#ifdef WINE_IOS
++    ios_wt_wake( "PulseEvent", (ULONG_PTR)handle, 0 );
++#endif
+     unsigned int ret;
+ 
+     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+@@ -2806,8 +2936,35 @@ NTSTATUS WINAPI NtAssignProcessToJobObject( HANDLE job, HANDLE process )
+ /**********************************************************************
+  *           NtCreateDebugObject  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtCreateDebugObject( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG flags );
++
++NTSTATUS WINAPI NtCreateDebugObject( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG flags )
++{
++    NTSTATUS status = ios_at_impl_NtCreateDebugObject( handle, access, attr, flags );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x680 ))
++        {
++            char w[160];
++            ios_at_where( w, sizeof(w) );
++            ERR( "[at] CreateDebugObject(flags %#x) -> %#x from%s\n", (unsigned)flags, (unsigned)status, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtCreateDebugObject( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG flags )
++#else
+ NTSTATUS WINAPI NtCreateDebugObject( HANDLE *handle, ACCESS_MASK access,
+                                      OBJECT_ATTRIBUTES *attr, ULONG flags )
++#endif
+ {
+     unsigned int ret;
+     data_size_t len;
+@@ -3445,8 +3602,25 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
+ /******************************************************************
+  *		NtWaitForMultipleObjects (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_wait_multiple_impl( DWORD count, const HANDLE *handles, WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout );
++
+ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
+                                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    NTSTATUS status;
++    ios_wt_enter( 2, count <= MAXIMUM_WAIT_OBJECTS ? (const ULONG_PTR *)handles : NULL, count <= MAXIMUM_WAIT_OBJECTS ? (int)count : 0 );
++    status = ios_wait_multiple_impl( count, handles, type, alertable, timeout );
++    ios_wt_leave( status );
++    return status;
++}
++
++static NTSTATUS ios_wait_multiple_impl( DWORD count, const HANDLE *handles, WAIT_TYPE type,
++                                          BOOLEAN alertable, const LARGE_INTEGER *timeout )
++#else
++NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
++                                          BOOLEAN alertable, const LARGE_INTEGER *timeout )
++#endif
+ {
+     union select_op select_op;
+     UINT i, flags = SELECT_INTERRUPTIBLE;
+@@ -3524,7 +3698,22 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+ /******************************************************************
+  *		NtWaitForSingleObject (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_wait_single_impl( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout );
++
++NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    NTSTATUS status;
++    ios_wt_enter( 1, (const ULONG_PTR *)&handle, 1 );
++    status = ios_wait_single_impl( handle, alertable, timeout );
++    ios_wt_leave( status );
++    return status;
++}
++
++static NTSTATUS ios_wait_single_impl( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++#else
+ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++#endif
+ {
+     union select_op select_op;
+     UINT flags = SELECT_INTERRUPTIBLE;
+@@ -5224,6 +5413,9 @@ static double ios_ticks_per_us(void)
+ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
+ {
+     union tid_alert_entry *entry = get_tid_alert_entry( tid );
++#ifdef WINE_IOS
++    ios_wt_wake( "AlertThreadByThreadId", 0, HandleToULong( tid ) );
++#endif
+     __sync_fetch_and_add( &ios_alert_wakes, 1 );
+ 
+     TRACE( "%p\n", tid );
+@@ -5309,7 +5501,22 @@ static LONGLONG update_timeout( ULONGLONG end )
+ /***********************************************************************
+  *             NtWaitForAlertByThreadId (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_wait_alert_impl( const void *address, const LARGE_INTEGER *timeout );
++
+ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
++{
++    NTSTATUS status;
++    ios_wt_enter( 3, (const ULONG_PTR *)&address, 1 );
++    status = ios_wait_alert_impl( address, timeout );
++    ios_wt_leave( status );
++    return status;
++}
++
++static NTSTATUS ios_wait_alert_impl( const void *address, const LARGE_INTEGER *timeout )
++#else
++NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
++#endif
+ {
+     IOS_ECO_POLL();   /* ml1133 */
+     __sync_fetch_and_add( &ios_alert_waits, 1 );   /* ml1115 */
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index ee7d255b..fe662c2b 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -3309,8 +3309,37 @@ C_ASSERT( sizeof(struct process_info) <= sizeof(SYSTEM_PROCESS_INFORMATION) );
+ /******************************************************************************
+  *              NtQuerySystemInformation  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size );
++
++NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size )
++{
++    NTSTATUS status = ios_at_impl_NtQuerySystemInformation( class, info, size, ret_size );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x300 + class ))
++        {
++            char w[160], h[40];
++            ios_at_where( w, sizeof(w) );
++            ios_at_hex( h, status ? NULL : info, size, 16 );
++            ERR( "[at] QuerySystemInformation(class %u, %u bytes) -> %#x data %s from%s\n",
++                 (unsigned)class, (unsigned)size, (unsigned)status, h, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size )
++#else
+ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
+                                           void *info, ULONG size, ULONG *ret_size )
++#endif
+ {
+     unsigned int ret = STATUS_SUCCESS;
+     ULONG len = 0;
+diff --git a/dlls/user32/msgbox.c b/dlls/user32/msgbox.c
+index 009f3858..af1be4f5 100644
+--- a/dlls/user32/msgbox.c
++++ b/dlls/user32/msgbox.c
+@@ -21,6 +21,7 @@
+ 
+ #include <stdarg.h>
+ #include <string.h>
++#include <stdio.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -523,6 +524,170 @@ INT WINAPI MessageBoxIndirectW( LPMSGBOXPARAMSW msgbox )
+     UINT i;
+     struct ThreadWindows threadWindows;
+ 
++#ifdef __arm64ec__
++    /* Madeira: which code opens a message box (RDR2's "Unknown error FFFFFFFF" comes from one
++     * while the game keeps running): the thread and its caller chain as module+offset. */
++    {
++        void *frames[24];
++        USHORT n = RtlCaptureStackBackTrace( 0, ARRAY_SIZE(frames), frames, NULL );
++        ERR( "[msgbox] tid %04lx caption %s text %s style %#lx, %u frames\n", GetCurrentThreadId(),
++             debugstr_w(msgbox->lpszCaption), debugstr_w(msgbox->lpszText), msgbox->dwStyle, n );
++        for (i = 0; i < n; i++)
++        {
++            HMODULE mod = NULL;
++            WCHAR name[MAX_PATH] = L"?";
++            if (GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                    frames[i], &mod ))
++                GetModuleFileNameW( mod, name, ARRAY_SIZE(name) );
++            ERR( "[msgbox]   #%u %p %s+%#Ix\n", i, frames[i], debugstr_w(wcsrchr( name, '\\' ) ? wcsrchr( name, '\\' ) + 1 : name),
++                 mod ? (ULONG_PTR)frames[i] - (ULONG_PTR)mod : 0 );
++        }
++    }
++    /* MADEIRA_AT_DUMP=1: the program's whole image as it is in memory now (code that is
++     * encrypted on disk is decrypted here) and this thread's stack, written once to
++     * Documents for offline analysis: madeira-dump-image-<base>.bin (file offset = RVA,
++     * unreadable ranges left as zeros) and madeira-dump-stack-<sp>.bin (from sp up). */
++    {
++        static LONG dumped;
++        WCHAR flag[8], dir[MAX_PATH], path[MAX_PATH];
++
++        if (GetEnvironmentVariableW( L"MADEIRA_AT_DUMP", flag, ARRAY_SIZE(flag) ) && flag[0] != '0' &&
++            !InterlockedExchange( &dumped, 1 ) &&
++            ExpandEnvironmentStringsW( L"%USERPROFILE%\\Documents", dir, ARRAY_SIZE(dir) ))
++        {
++            BYTE *exe = (BYTE *)GetModuleHandleW( NULL );
++            const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( (HMODULE)exe );
++            ULONG_PTR sp = (ULONG_PTR)&flag & ~(ULONG_PTR)15, top = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++            HANDLE file;
++            DWORD written;
++
++            swprintf( path, ARRAY_SIZE(path), L"%s\\madeira-dump-image-%p.bin", dir, exe );
++            file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++            if (file != INVALID_HANDLE_VALUE && nt)
++            {
++                BYTE *p = exe, *end = exe + nt->OptionalHeader.SizeOfImage;
++                SIZE_T saved = 0;
++                while (p < end)
++                {
++                    MEMORY_BASIC_INFORMATION mbi;
++                    BYTE *next;
++                    if (!VirtualQuery( p, &mbi, sizeof(mbi) )) break;
++                    next = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
++                    if (next > end) next = end;
++                    if (mbi.State == MEM_COMMIT && mbi.Protect && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
++                    {
++                        LARGE_INTEGER pos;
++                        pos.QuadPart = p - exe;
++                        SetFilePointerEx( file, pos, NULL, FILE_BEGIN );
++                        if (WriteFile( file, p, next - p, &written, NULL )) saved += written;
++                    }
++                    p = next;
++                }
++                CloseHandle( file );
++                ERR( "[msgbox] dumped %Iu bytes of the image at %p to %s\n", saved, exe, debugstr_w(path) );
++            }
++            /* The memory the stack points at, two levels deep (the streamer's request table,
++             * the failing entry, its device object): madeira-dump-heap-<sp>.bin, records of
++             * { UINT64 address, UINT64 length, bytes }. */
++            swprintf( path, ARRAY_SIZE(path), L"%s\\madeira-dump-heap-%p.bin", dir, (void *)sp );
++            file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++            if (file != INVALID_HANDLE_VALUE && nt && top > sp)
++            {
++                static ULONG_PTR seen[16384];
++                ULONG_PTR img_lo = (ULONG_PTR)exe, img_hi = img_lo + nt->OptionalHeader.SizeOfImage;
++                ULONG_PTR level1[1024];
++                UINT n1 = 0, records = 0, level, i;
++                const ULONG_PTR *scan_from[2] = { (const ULONG_PTR *)sp, NULL };
++
++                for (level = 0; level < 2; level++)
++                {
++                    UINT count = level ? n1 : (UINT)((top - sp) / 8);
++                    for (i = 0; i < count && records < 8000; i++)
++                    {
++                        ULONG_PTR block = level ? level1[i] : 0, end = block + 0x800, q;
++                        if (level)
++                        {
++                            for (q = block; q + 8 <= end && records < 8000; q += 8)
++                            {
++                                ULONG_PTR v = *(const ULONG_PTR *)q, start = (v - 0x40) & ~(ULONG_PTR)15;
++                                MEMORY_BASIC_INFORMATION mbi;
++                                UINT64 hdr[2];
++                                UINT h;
++                                if (v < 0x10000 || (v >= img_lo && v < img_hi) || (v >= sp && v < top)) continue;
++                                h = (UINT)((start >> 6) * 2654435761u) & 16383;
++                                if (seen[h] == start) continue;
++                                if (!VirtualQuery( (void *)start, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT || !mbi.Protect ||
++                                    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++                                    start + 0x200 > (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) continue;
++                                seen[h] = start;
++                                hdr[0] = start; hdr[1] = 0x200;
++                                WriteFile( file, hdr, sizeof(hdr), &written, NULL );
++                                WriteFile( file, (void *)start, 0x200, &written, NULL );
++                                records++;
++                            }
++                            continue;
++                        }
++                        {
++                            ULONG_PTR v = scan_from[0][i], start = (v - 0x200) & ~(ULONG_PTR)15;
++                            MEMORY_BASIC_INFORMATION mbi;
++                            UINT64 hdr[2];
++                            UINT h;
++                            if (v < 0x10000 || (v >= img_lo && v < img_hi) || (v >= sp && v < top) || n1 >= ARRAY_SIZE(level1)) continue;
++                            h = (UINT)((start >> 6) * 2654435761u) & 16383;
++                            if (seen[h] == start) continue;
++                            if (!VirtualQuery( (void *)start, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT || !mbi.Protect ||
++                                (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++                                start < (ULONG_PTR)mbi.BaseAddress || start + 0x800 > (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) continue;
++                            seen[h] = start;
++                            level1[n1++] = start;
++                            hdr[0] = start; hdr[1] = 0x800;
++                            WriteFile( file, hdr, sizeof(hdr), &written, NULL );
++                            WriteFile( file, (void *)start, 0x800, &written, NULL );
++                            records++;
++                        }
++                    }
++                }
++                CloseHandle( file );
++                ERR( "[msgbox] dumped %u heap blocks (%u first-level) to %s\n", records, n1, debugstr_w(path) );
++            }
++            swprintf( path, ARRAY_SIZE(path), L"%s\\madeira-dump-stack-%p.bin", dir, (void *)sp );
++            file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++            if (file != INVALID_HANDLE_VALUE && top > sp)
++            {
++                WriteFile( file, (void *)sp, top - sp, &written, NULL );
++                CloseHandle( file );
++                ERR( "[msgbox] dumped %lu bytes of stack from %p to %s\n", written, (void *)sp, debugstr_w(path) );
++            }
++        }
++    }
++    /* The backtrace stops in the emulator's frames, so scan the stack itself for return
++     * addresses into the main program and dump the code around each one: the 64 bytes
++     * before it (the call) and 16 after, as the program has them in memory. */
++    {
++        const BYTE *exe = (const BYTE *)GetModuleHandleW( NULL );
++        const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( (HMODULE)exe );
++        ULONG_PTR here = (ULONG_PTR)&tmplate, top = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase, p;
++        SIZE_T size = nt ? nt->OptionalHeader.SizeOfImage : 0;
++        UINT hits = 0;
++
++        for (p = here & ~(ULONG_PTR)7; size && p + 8 <= top && hits < 16; p += 8)
++        {
++            ULONG_PTR v = *(const ULONG_PTR *)p, off = v - (ULONG_PTR)exe;
++            char hex[80 * 3 + 1];
++            MEMORY_BASIC_INFORMATION mbi;
++            UINT k;
++
++            if (off < 0x1000 || off >= size) continue;
++            if (!VirtualQuery( (void *)(v - 64), &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT ||
++                !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
++                continue;
++            for (k = 0; k < 80; k++) sprintf( hex + 3 * k, "%02x ", ((const BYTE *)v - 64)[k] );
++            ERR( "[msgbox]   [sp+%#Ix] exe+%#Ix code-64: %s\n", p - here, off, hex );
++            hits++;
++        }
++    }
++#endif
++
+     if (!(hRes = FindResourceExW(user32_module, (LPWSTR)RT_DIALOG, L"MSGBOX", msgbox->dwLanguageId)))
+     {
+         if (!msgbox->dwLanguageId ||
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 6e488592..298b636d 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -3138,6 +3138,17 @@ HWND WINAPI NtUserFindWindowEx( HWND parent, HWND child, UNICODE_STRING *class,
+     int i = 0, size = 128, title_len;
+     NTSTATUS status;
+ 
++#ifdef WINE_IOS
++    {
++        /* Madeira [at] (MADEIRA_AT_TRACE): anti-debug guards look for debugger windows */
++        extern int ios_at_on( void );
++        extern int ios_at_take( unsigned key );
++        if (ios_at_on() && ios_at_take( 0x6a0 ))
++            ERR( "[at] FindWindowEx(class %s, title %s)\n",
++                 class ? (IS_INTRESOURCE(class->Buffer) ? wine_dbg_sprintf( "#%u", LOWORD(class->Buffer) ) : debugstr_us( class )) : "NULL",
++                 title ? debugstr_us( title ) : "NULL" );
++    }
++#endif
+     /* empty class is not the same as NULL class */
+     if (class && !class->Length && !IS_INTRESOURCE(class->Buffer)) return 0;
+ 

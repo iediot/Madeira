@@ -20483,6 +20483,16 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         mad_swd_step(s->queue, 'A');
         mad_swap_apply_layer(s);
     }
+    {   /* The [perf] report's frame boundary (MADEIRA_PERF): DXMT's presenter marks each
+         * frame with this call, whose iOS side only ticks the frame clock, so D3D12 games
+         * report fps and frame times too instead of 0. */
+        static int perf = -1;
+        if (perf < 0) { char e[8]; perf = GetEnvironmentVariableA("MADEIRA_PERF", e, sizeof(e)) && e[0] != '0'; }
+        if (perf) {
+            uint64_t version; enum WMTColorSpace cs; struct WMTHDRMetadata hdr; struct WMTEDRValue edr;
+            WMTQueryDisplaySettingForLayer(s->layer, &version, &cs, &hdr, &edr);
+        }
+    }
     mad_swd_step(s->queue, 'D');
     { LONG64 td = mad_qpc();   /* ml1128 */
     drawable = MetalLayer_nextDrawable(s->layer);

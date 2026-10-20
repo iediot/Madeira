@@ -26621,6 +26621,74 @@ static ssize_t ios_kw_recvmsg( int fd, struct msghdr *hdr, int flags )
 
 
 /***********************************************************************
+ *           ios_finish_short_read
+ *
+ * A read() or pread() into a buffer Wine has committed writable can come back
+ * SHORT on iOS: the kernel copies up to the first 16 KB host page whose write
+ * permission is missing (stripped by the host-page/guest-page mismatch, the
+ * case bus_handler's [wr-strip] heals for user-mode stores) and returns the
+ * count so far instead of faulting. Windows never returns a short read before
+ * end of file, and RAGE's streamer treats one as fatal ("Unknown error
+ * FFFFFFFF" in RDR2). Re-grant write on such pages, the same rule [wr-strip]
+ * uses (Wine wants PROT_WRITE, the host page lacks it, not a JIT alias), and
+ * read the rest, until the full size, end of file or an error.
+ */
+static int ios_heal_stripped_range( void *addr, size_t size )
+{
+    char *p = (char *)((uintptr_t)addr & ~(uintptr_t)0x3fff), *end = (char *)addr + size;
+    int healed = 0;
+
+    for (; p < end; p += 0x4000)
+    {
+        char *probe = p < (char *)addr ? (char *)addr : p;
+        mach_vm_address_t a = (uintptr_t)p;
+        mach_vm_size_t s = 0;
+        vm_region_basic_info_data_64_t bi;
+        mach_msg_type_number_t c = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t o = MACH_PORT_NULL;
+        int want;
+
+        if (ios_kw_has_rw_alias( (uintptr_t)p, (uintptr_t)p + 0x4000 )) continue;
+        want = ios_page_expected_prot( probe );
+        if (want < 0 || !(want & PROT_WRITE)) continue;
+        if (mach_vm_region( mach_task_self(), &a, &s, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &c, &o ) != KERN_SUCCESS ||
+            a > (uintptr_t)p || (bi.protection & VM_PROT_WRITE))
+            continue;
+        if (!mprotect( p, 0x4000, want )) healed++;
+    }
+    return healed;
+}
+
+static ssize_t ios_finish_short_read( int fd, void *addr, size_t size, off_t offset, BOOL use_offset, ssize_t first )
+{
+    static LONG logged, logged_eof;
+    size_t total = first > 0 ? first : 0;
+    int healed = 0, rounds = 0;
+    ssize_t r = first;
+
+    while (total < size && rounds++ < 64)
+    {
+        healed += ios_heal_stripped_range( (char *)addr + total, size - total );
+        r = use_offset ? pread( fd, (char *)addr + total, size - total, offset + total )
+                       : read( fd, (char *)addr + total, size - total );
+        if (r == -1 && errno == EINTR) continue;
+        if (r <= 0) break;
+        total += r;
+    }
+    if (total != (size_t)(first > 0 ? first : 0))
+    {
+        if (__sync_add_and_fetch( &logged, 1 ) <= 200)
+            ERR( "[pread-short] fd %d offset %#llx size %#lx: first read %ld, completed to %#lx (%d host pages re-granted write, %d rounds)\n",
+                 fd, (unsigned long long)offset, (unsigned long)size, (long)first, (unsigned long)total, healed, rounds );
+    }
+    else if (__sync_add_and_fetch( &logged_eof, 1 ) <= 40)
+        ERR( "[pread-short] fd %d offset %#llx size %#lx: read %ld and no more (end of file or error %d)\n",
+             fd, (unsigned long long)offset, (unsigned long)size, (long)first, r == -1 ? errno : 0 );
+    if (!total && first == -1) return -1;
+    return total;
+}
+
+/***********************************************************************
  *           virtual_locked_read
  */
 ssize_t virtual_locked_read( int fd, void *addr, size_t size )
@@ -26632,6 +26700,7 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
 
     if (ios_kw_has_rw_alias( (uintptr_t)addr, (uintptr_t)addr + size )) return ios_kw_read( fd, addr, size, 0, FALSE );
     ret = read( fd, addr, size );
+    if (ret > 0 && (size_t)ret < size) return ios_finish_short_read( fd, addr, size, 0, FALSE, ret );
     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
@@ -26659,6 +26728,14 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
 
     if (ios_kw_has_rw_alias( (uintptr_t)addr, (uintptr_t)addr + size )) return ios_kw_read( fd, addr, size, offset, TRUE );
     ret = pread( fd, addr, size, offset );
+    if (ret > 0 && (size_t)ret < size) return ios_finish_short_read( fd, addr, size, offset, TRUE, ret );
+    if (ret == -1 && errno == EFAULT && !use_kernel_writewatch)
+    {
+        /* nothing copied: the very first host page may be the stripped one */
+        ssize_t healed = ios_finish_short_read( fd, addr, size, offset, TRUE, -1 );
+        if (healed > 0) return healed;
+        errno = EFAULT;
+    }
     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );

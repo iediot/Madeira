@@ -982,7 +982,8 @@ struct LibraryEntry: Codable, Identifiable {
         pool-split = 1
         env.MADEIRA_SC_PA_POOLS = 2
         env.MADEIRA_LOCK_ORPHAN = stamped
-        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;VCRed\\vc_redist;.cr\\vc_redist;.be\\vc_redist
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler
+        env.MADEIRA_SPAWN_NOOP = VCRed\\vc_redist;.cr\\vc_redist;.be\\vc_redist
         env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
         env.WINEDLLOVERRIDES = video64=
         """

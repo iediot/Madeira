@@ -1,0 +1,593 @@
+diff --git a/build/ntdll-unix/process_ios.c b/build/ntdll-unix/process_ios.c
+index 73ffb4ec..cd0aff99 100644
+--- a/build/ntdll-unix/process_ios.c
++++ b/build/ntdll-unix/process_ios.c
+@@ -3692,8 +3692,37 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
+ /**********************************************************************
+  *           NtQueryInformationProcess  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len );
++
++NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len )
++{
++    NTSTATUS status = ios_at_impl_NtQueryInformationProcess( handle, class, info, size, ret_len );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x100 + class ))
++        {
++            char w[160], h[40];
++            ios_at_where( w, sizeof(w) );
++            ios_at_hex( h, status ? NULL : info, size, 16 );
++            ERR( "[at] QueryInformationProcess(%s, class %u, %u bytes) -> %#x data %s from%s\n",
++                 handle == GetCurrentProcess() ? "self" : "other", (unsigned)class, (unsigned)size, (unsigned)status, h, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size, ULONG *ret_len )
++#else
+ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info,
+                                            ULONG size, ULONG *ret_len )
++#endif
+ {
+     unsigned int ret = STATUS_SUCCESS;
+     ULONG len = 0;
+@@ -4296,7 +4325,30 @@ NTSTATUS WINAPI NtWow64QueryInformationProcess64( HANDLE handle, PROCESSINFOCLAS
+ /**********************************************************************
+  *           NtSetInformationProcess  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size );
++
++NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size )
++{
++    NTSTATUS status = ios_at_impl_NtSetInformationProcess( handle, class, info, size );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x180 + class ))
++        {
++            char w[160], h[40];
++            ios_at_where( w, sizeof(w) );
++            ios_at_hex( h, info, size, 16 );
++            ERR( "[at] SetInformationProcess(%s, class %u, %u bytes %s) -> %#x from%s\n",
++                 handle == GetCurrentProcess() ? "self" : "other", (unsigned)class, (unsigned)size, h, (unsigned)status, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size )
++#else
+ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, void *info, ULONG size )
++#endif
+ {
+     unsigned int ret = STATUS_SUCCESS;
+ 
+@@ -4593,7 +4645,28 @@ NTSTATUS WINAPI NtGetNextProcess( HANDLE process, ACCESS_MASK access, ULONG attr
+ /**********************************************************************
+  *           NtDebugActiveProcess  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtDebugActiveProcess( HANDLE process, HANDLE debug );
++
++NTSTATUS WINAPI NtDebugActiveProcess( HANDLE process, HANDLE debug )
++{
++    NTSTATUS status = ios_at_impl_NtDebugActiveProcess( process, debug );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x690 ))
++        {
++            char w[160];
++            ios_at_where( w, sizeof(w) );
++            ERR( "[at] DebugActiveProcess(%p) -> %#x from%s\n", process, (unsigned)status, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtDebugActiveProcess( HANDLE process, HANDLE debug )
++#else
+ NTSTATUS WINAPI NtDebugActiveProcess( HANDLE process, HANDLE debug )
++#endif
+ {
+     unsigned int ret;
+ 
+diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
+index aca3b0c4..8940052c 100644
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -7983,6 +7983,25 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+ 
+     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
+ 
++    /* [single-step] A context with PSTATE.SS (x64 EFlags.TF, converted by the ARM64EC
++     * ntdll) asks for a single-step exception after the next instruction: anti-tamper
++     * code sets TF from an exception handler and treats a missing EXCEPTION_SINGLE_STEP
++     * as a debugger. Logged so a run shows whether a single step follows. */
++    if ((flags & CONTEXT_CONTROL) && (context->Cpsr & 0x200000))
++    {
++        static LONG ss_n;
++        if (__sync_add_and_fetch( &ss_n, 1 ) <= 200)
++            ERR( "[single-step] #%d set-context self=%d handle=%p pc=%p sp=%p cpsr=%#x\n", (int)ss_n, self, handle,
++                 (void *)context->Pc, (void *)context->Sp, (unsigned)context->Cpsr );
++    }
++    if (flags & CONTEXT_DEBUG_REGISTERS)
++    {
++        static LONG dr_n;
++        if (__sync_add_and_fetch( &dr_n, 1 ) <= 50)
++            ERR( "[debug-regs] #%d set-context self=%d handle=%p ctrl=%#x bcr0=%#x wcr0=%#x\n", (int)dr_n, self, handle,
++                 (unsigned)context->ContextFlags, (unsigned)context->Bcr[0], (unsigned)context->Wcr[0] );
++    }
++
+     /* Subnautica (Mono) died jumping to 0x3600000070A12829: a Mono code address
+      * with its bytes shifted one place. If a context set carries such a PC, say
+      * who set it. Also the first cross-thread PC rewrites, to see if Mono
+@@ -8145,7 +8164,36 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
+  *              NtGetContextThread  (NTDLL.@)
+  *              ZwGetContextThread  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtGetContextThread( HANDLE handle, CONTEXT *context );
++
+ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
++{
++    NTSTATUS status = ios_at_impl_NtGetContextThread( handle, context );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x480 + ((context->ContextFlags >> 1) & 0x3f) ))
++        {
++            char w[160];
++            ios_at_where( w, sizeof(w) );
++            ERR( "[at] GetContextThread(%p, flags %#x) -> %#x pc=%p cpsr=%#x bcr0=%#x bvr0=%p wcr0=%#x wvr0=%p from%s\n",
++                 handle, (unsigned)context->ContextFlags, (unsigned)status, (void *)context->Pc, (unsigned)context->Cpsr,
++                 (unsigned)context->Bcr[0], (void *)context->Bvr[0], (unsigned)context->Wcr[0], (void *)context->Wvr[0], w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtGetContextThread( HANDLE handle, CONTEXT *context )
++#else
++NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
++#endif
+ {
+     struct syscall_frame *frame = get_syscall_frame();
+     DWORD needed_flags = context->ContextFlags & ~CONTEXT_ARM64;
+@@ -16984,3 +17032,128 @@ next:
+     mach_port_deallocate(mach_task_self(), self);
+     fflush(stderr);
+ }
++
++#ifdef WINE_IOS
++/* [wake-trace] (sync.c): the main program's code addresses on this thread's stack, from
++ * the syscall frame's sp up, so a waker can be placed in the game's code. x64 and ARM64EC
++ * code share the thread's stack, so the x64 return addresses are in it. */
++void ios_wake_trace_stack( void )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    TEB *teb = NtCurrentTeb();
++    const IMAGE_DOS_HEADER *dos;
++    const IMAGE_NT_HEADERS64 *nt;
++    ULONG_PTR base, size, sp, top, p;
++    int hits = 0;
++
++    if (!frame || !teb || !teb->Peb || !(base = (ULONG_PTR)teb->Peb->ImageBaseAddress)) return;
++    dos = (const IMAGE_DOS_HEADER *)base;
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
++    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
++    size = nt->OptionalHeader.SizeOfImage;
++    sp = frame->sp & ~7ul;
++    top = (ULONG_PTR)teb->Tib.StackBase;
++    if (sp < (ULONG_PTR)teb->Tib.StackLimit || sp >= top) return;
++    if (top - sp > 0x20000) top = sp + 0x20000;
++    for (p = sp; p + 8 <= top && hits < 32; p += 8)
++    {
++        ULONG_PTR v = *(const ULONG_PTR *)p;
++        if (v - base >= size) continue;
++        ERR( "[wake-trace]   [sp+%#lx] exe+%#lx\n", (unsigned long)(p - sp), (unsigned long)(v - base) );
++        hits++;
++    }
++    if (!hits) ERR( "[wake-trace]   no main-program addresses in %#lx bytes of stack (sp %#lx)\n",
++                    (unsigned long)(top - sp), (unsigned long)sp );
++}
++#endif
++
++#ifdef WINE_IOS
++/* [at] anti-tamper trace (env MADEIRA_AT_TRACE=<program name>, e.g. RDR2.exe): the
++ * queries an anti-tamper or anti-debug guard makes about the process, its threads, the
++ * system and its own memory, from the named program only, each with what it was told
++ * and where in the program it asked from. Rate-limited per call type. */
++int ios_at_on( void )
++{
++    static void *cached_peb;
++    static int cached_on;
++    TEB *teb = NtCurrentTeb();
++    const char *want;
++    PEB *peb;
++
++    if (!teb || !(peb = teb->Peb)) return 0;
++    if (peb == __atomic_load_n( &cached_peb, __ATOMIC_ACQUIRE )) return cached_on;
++    want = getenv( "MADEIRA_AT_TRACE" );
++    cached_on = 0;
++    if (want && *want && peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Buffer)
++    {
++        const WCHAR *p = peb->ProcessParameters->ImagePathName.Buffer;
++        size_t n = peb->ProcessParameters->ImagePathName.Length / sizeof(WCHAR), w = strlen( want ), i;
++        if (n >= w)
++        {
++            for (i = 0; i < w; i++)
++            {
++                WCHAR c = p[n - w + i], d = (unsigned char)want[i];
++                if (c >= 'A' && c <= 'Z') c += 32;
++                if (d >= 'A' && d <= 'Z') d += 32;
++                if (c != d) break;
++            }
++            cached_on = (i == w);
++        }
++    }
++    if (cached_on)
++        ERR( "[at] tracing this process: BeingDebugged=%u NtGlobalFlag=%#x heap=%p\n", peb->BeingDebugged,
++             (unsigned)peb->NtGlobalFlag, peb->ProcessHeap );
++    __atomic_store_n( &cached_peb, peb, __ATOMIC_RELEASE );
++    return cached_on;
++}
++
++/* 1 = log this one: the first 40 of each key, then every 500th; 30000 lines in all */
++int ios_at_take( unsigned key )
++{
++    static LONG counts[1024], total;
++    LONG n = __sync_add_and_fetch( &counts[key % 1024], 1 );
++    if (n > 40 && n % 500) return 0;
++    return __sync_add_and_fetch( &total, 1 ) <= 30000;
++}
++
++/* where in the main program the call came from: its first 6 code addresses on the stack */
++void ios_at_where( char *out, size_t outlen )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    TEB *teb = NtCurrentTeb();
++    const IMAGE_DOS_HEADER *dos;
++    const IMAGE_NT_HEADERS64 *nt;
++    ULONG_PTR base, size, sp, top, p;
++    size_t off = 0;
++    int hits = 0;
++
++    out[0] = 0;
++    if (!frame || !teb || !teb->Peb || !(base = (ULONG_PTR)teb->Peb->ImageBaseAddress)) return;
++    dos = (const IMAGE_DOS_HEADER *)base;
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
++    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
++    size = nt->OptionalHeader.SizeOfImage;
++    sp = frame->sp & ~7ul;
++    top = (ULONG_PTR)teb->Tib.StackBase;
++    if (sp < (ULONG_PTR)teb->Tib.StackLimit || sp >= top) return;
++    if (top - sp > 0x4000) top = sp + 0x4000;
++    for (p = sp; p + 8 <= top && hits < 6 && off + 24 < outlen; p += 8)
++    {
++        ULONG_PTR v = *(const ULONG_PTR *)p;
++        if (v - base < 0x1000 || v - base >= size) continue;
++        off += snprintf( out + off, outlen - off, " exe+%#lx", (unsigned long)(v - base) );
++        hits++;
++    }
++}
++
++void ios_at_hex( char *out, const void *data, size_t len, size_t max )
++{
++    size_t i, off = 0;
++    out[0] = 0;
++    if (!data) return;
++    if (len > max) len = max;
++    for (i = 0; i < len; i++) off += sprintf( out + off, "%02x", ((const unsigned char *)data)[i] );
++}
++#endif
+diff --git a/build/ntdll-unix/thread_ios.c b/build/ntdll-unix/thread_ios.c
+index 010c5720..82113551 100644
+--- a/build/ntdll-unix/thread_ios.c
++++ b/build/ntdll-unix/thread_ios.c
+@@ -2777,8 +2777,37 @@ static BOOL is_process_wow64( const CLIENT_ID *id )
+ /******************************************************************************
+  *              NtQueryInformationThread  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len );
++
++NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len )
++{
++    NTSTATUS status = ios_at_impl_NtQueryInformationThread( handle, class, data, length, ret_len );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x200 + class ))
++        {
++            char w[160], h[40];
++            ios_at_where( w, sizeof(w) );
++            ios_at_hex( h, status ? NULL : data, length, 16 );
++            ERR( "[at] QueryInformationThread(%p, class %u, %u bytes) -> %#x data %s from%s\n",
++                 handle, (unsigned)class, (unsigned)length, (unsigned)status, h, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class, void *data, ULONG length, ULONG *ret_len )
++#else
+ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
+                                           void *data, ULONG length, ULONG *ret_len )
++#endif
+ {
+     unsigned int status;
+ 
+@@ -3087,8 +3116,31 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
+ /******************************************************************************
+  *              NtSetInformationThread  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtSetInformationThread( HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length );
++
++NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length )
++{
++    NTSTATUS status = ios_at_impl_NtSetInformationThread( handle, class, data, length );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x280 + class ))
++        {
++            char w[160], h[40];
++            ios_at_where( w, sizeof(w) );
++            ios_at_hex( h, data, length, 16 );
++            ERR( "[at] SetInformationThread(%p, class %u, %u bytes %s) -> %#x from%s\n",
++                 handle, (unsigned)class, (unsigned)length, h, (unsigned)status, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtSetInformationThread( HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length )
++#else
+ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
+                                         const void *data, ULONG length )
++#endif
+ {
+     unsigned int status;
+ 
+diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
+index 7fc4b728..6edb1fdf 100644
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -26620,6 +26620,75 @@ static ssize_t ios_kw_recvmsg( int fd, struct msghdr *hdr, int flags )
+ }
+ 
+ 
++/***********************************************************************
++ *           ios_finish_short_read
++ *
++ * A read() or pread() into a buffer Wine has committed writable can come back
++ * SHORT on iOS: the kernel copies up to the first 16 KB host page whose write
++ * permission is missing (stripped by the host-page/guest-page mismatch, the
++ * case bus_handler's [wr-strip] heals for user-mode stores) and returns the
++ * count so far instead of faulting. Windows never returns a short read before
++ * end of file, and RAGE's streamer treats one as fatal ("Unknown error
++ * FFFFFFFF" in RDR2). Re-grant write on such pages, the same rule [wr-strip]
++ * uses (Wine wants PROT_WRITE, the host page lacks it, not a JIT alias), and
++ * read the rest, until the full size, end of file or an error.
++ */
++static int ios_heal_stripped_range( void *addr, size_t size )
++{
++    char *p = (char *)((uintptr_t)addr & ~(uintptr_t)0x3fff), *end = (char *)addr + size;
++    int healed = 0;
++
++    for (; p < end; p += 0x4000)
++    {
++        char *probe = p < (char *)addr ? (char *)addr : p;
++        mach_vm_address_t a = (uintptr_t)p;
++        mach_vm_size_t s = 0;
++        vm_region_basic_info_data_64_t bi;
++        mach_msg_type_number_t c = VM_REGION_BASIC_INFO_COUNT_64;
++        mach_port_t o = MACH_PORT_NULL;
++        int want;
++
++        if (ios_kw_has_rw_alias( (uintptr_t)p, (uintptr_t)p + 0x4000 )) continue;
++        want = ios_page_expected_prot( probe );
++        if (want < 0 || !(want & PROT_WRITE)) continue;
++        if (mach_vm_region( mach_task_self(), &a, &s, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &c, &o ) != KERN_SUCCESS ||
++            a > (uintptr_t)p || (bi.protection & VM_PROT_WRITE))
++            continue;
++        if (!mprotect( p, 0x4000, want )) healed++;
++    }
++    return healed;
++}
++
++static ssize_t ios_finish_short_read( int fd, void *addr, size_t size, off_t offset, BOOL use_offset, ssize_t first )
++{
++    static LONG logged, logged_eof;
++    size_t total = first > 0 ? first : 0;
++    int healed = 0, rounds = 0;
++    ssize_t r = first;
++
++    while (total < size && rounds++ < 64)
++    {
++        healed += ios_heal_stripped_range( (char *)addr + total, size - total );
++        r = use_offset ? pread( fd, (char *)addr + total, size - total, offset + total )
++                       : read( fd, (char *)addr + total, size - total );
++        if (r == -1 && errno == EINTR) continue;
++        if (r <= 0) break;
++        total += r;
++    }
++    if (total != (size_t)(first > 0 ? first : 0))
++    {
++        if (__sync_add_and_fetch( &logged, 1 ) <= 200)
++            ERR( "[pread-short] fd %d offset %#llx size %#lx: first read %ld, completed to %#lx (%d host pages re-granted write, %d rounds)\n",
++                 fd, (unsigned long long)offset, (unsigned long)size, (long)first, (unsigned long)total, healed, rounds );
++    }
++    else if (__sync_add_and_fetch( &logged_eof, 1 ) <= 40)
++        ERR( "[pread-short] fd %d offset %#llx size %#lx: read %ld and no more (end of file or error %d)\n",
++             fd, (unsigned long long)offset, (unsigned long)size, (long)first, r == -1 ? errno : 0 );
++    if (!total && first == -1) return -1;
++    return total;
++}
++
++
+ /***********************************************************************
+  *           virtual_locked_read
+  */
+@@ -26632,6 +26701,7 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
+ 
+     if (ios_kw_has_rw_alias( (uintptr_t)addr, (uintptr_t)addr + size )) return ios_kw_read( fd, addr, size, 0, FALSE );
+     ret = read( fd, addr, size );
++    if (ret > 0 && (size_t)ret < size) return ios_finish_short_read( fd, addr, size, 0, FALSE, ret );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+@@ -26659,6 +26729,14 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
+ 
+     if (ios_kw_has_rw_alias( (uintptr_t)addr, (uintptr_t)addr + size )) return ios_kw_read( fd, addr, size, offset, TRUE );
+     ret = pread( fd, addr, size, offset );
++    if (ret > 0 && (size_t)ret < size) return ios_finish_short_read( fd, addr, size, offset, TRUE, ret );
++    if (ret == -1 && errno == EFAULT && !use_kernel_writewatch)
++    {
++        /* nothing copied: the very first host page may be the stripped one */
++        ssize_t healed = ios_finish_short_read( fd, addr, size, offset, TRUE, -1 );
++        if (healed > 0) return healed;
++        errno = EFAULT;
++    }
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+@@ -31810,8 +31888,39 @@ static void ios_ec_hook_report( int idx, const unsigned char *pe, const unsigned
+  *             NtProtectVirtualMemory   (NTDLL.@)
+  *             ZwProtectVirtualMemory   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG new_prot, ULONG *old_prot );
++
++NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG new_prot, ULONG *old_prot )
++{
++    NTSTATUS status = ios_at_impl_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++    if (ios_at_on())
++    {
++        {
++            ULONG_PTR base = (ULONG_PTR)NtCurrentTeb()->Peb->ImageBaseAddress, off = (ULONG_PTR)*addr_ptr - base;
++            if (off < 0x10000000 && ios_at_take( 0x600 + (new_prot & 0xff) ))
++            {
++                char w[160];
++                ios_at_where( w, sizeof(w) );
++                ERR( "[at] ProtectVirtualMemory(exe+%#lx, %#lx, new %#x) -> %#x old %#x from%s\n", (unsigned long)off,
++                     (unsigned long)*size_ptr, (unsigned)new_prot, (unsigned)status, old_prot ? (unsigned)*old_prot : 0, w );
++            }
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG new_prot, ULONG *old_prot )
++#else
+ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
+                                         ULONG new_prot, ULONG *old_prot )
++#endif
+ {
+     struct file_view *view;
+     sigset_t sigset;
+@@ -33037,9 +33146,46 @@ static unsigned int get_memory_image_info( HANDLE process, LPCVOID addr, MEMORY_
+  *             NtQueryVirtualMemory   (NTDLL.@)
+  *             ZwQueryVirtualMemory   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class, PVOID buffer, SIZE_T len, SIZE_T *res_len );
++
++NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class, PVOID buffer, SIZE_T len, SIZE_T *res_len )
++{
++    NTSTATUS status = ios_at_impl_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
++    if (ios_at_on())
++    {
++        {
++            ULONG_PTR base = (ULONG_PTR)NtCurrentTeb()->Peb->ImageBaseAddress, off = (ULONG_PTR)addr - base;
++            if (off < 0x10000000 && ios_at_take( 0x500 + info_class ))
++            {
++                char w[160];
++                ios_at_where( w, sizeof(w) );
++                if (!status && info_class == MemoryBasicInformation && len >= sizeof(MEMORY_BASIC_INFORMATION))
++                {
++                    const MEMORY_BASIC_INFORMATION *m = buffer;
++                    ERR( "[at] QueryVirtualMemory(exe+%#lx, basic) -> base exe+%#lx size %#lx state %#x protect %#x alloc-protect %#x type %#x from%s\n",
++                         (unsigned long)off, (unsigned long)((ULONG_PTR)m->BaseAddress - base), (unsigned long)m->RegionSize,
++                         (unsigned)m->State, (unsigned)m->Protect, (unsigned)m->AllocationProtect, (unsigned)m->Type, w );
++                }
++                else
++                {
++                    char h[40];
++                    ios_at_hex( h, status ? NULL : buffer, len, 16 );
++                    ERR( "[at] QueryVirtualMemory(exe+%#lx, class %u, %u bytes) -> %#x data %s from%s\n",
++                         (unsigned long)off, (unsigned)info_class, (unsigned)len, (unsigned)status, h, w );
++                }
++            }
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class, PVOID buffer, SIZE_T len, SIZE_T *res_len )
++#else
+ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
+                                       MEMORY_INFORMATION_CLASS info_class,
+                                       PVOID buffer, SIZE_T len, SIZE_T *res_len )
++#endif
+ {
+     NTSTATUS status;
+ 
+@@ -33997,8 +34143,30 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
+  *             NtReadVirtualMemory   (NTDLL.@)
+  *             ZwReadVirtualMemory   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtReadVirtualMemory( HANDLE process, const void *addr, void *buffer, SIZE_T size, SIZE_T *bytes_read );
++
++NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buffer, SIZE_T size, SIZE_T *bytes_read )
++{
++    NTSTATUS status = ios_at_impl_NtReadVirtualMemory( process, addr, buffer, size, bytes_read );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x580 ))
++        {
++            char w[160];
++            ios_at_where( w, sizeof(w) );
++            ERR( "[at] ReadVirtualMemory(%s, %p, %#lx) -> %#x from%s\n", process == GetCurrentProcess() ? "self" : "other",
++                 addr, (unsigned long)size, (unsigned)status, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtReadVirtualMemory( HANDLE process, const void *addr, void *buffer, SIZE_T size, SIZE_T *bytes_read )
++#else
+ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buffer,
+                                      SIZE_T size, SIZE_T *bytes_read )
++#endif
+ {
+     unsigned int status;
+ 
