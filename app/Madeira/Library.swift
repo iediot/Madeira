@@ -1024,9 +1024,10 @@ struct LibraryEntry: Codable, Identifiable {
         let exe = (exe == "launcher.exe" && path.contains("rockstar games/launcher")) ? "rdr2.exe" : exe
         switch exe {
         case "rdr2.exe", "playrdr2.exe":
+            // Per-command timing and hot-page reports are for captures, not normal play.
             return socialClub + "\n" + bcd + "\n" + """
             d3d12-shader-pack = 1
-            replay-split = 1
+            replay-split = 0
             ring-share = 1
             pool-mid = 1
             vram-mb = 4096
@@ -1062,6 +1063,7 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_X64_GRAPHICS_ENTRY = 1
             env.MADEIRA_X64_IMAGE_NOCOPY = 1
             env.MADEIRA_EC_HOOK_TRACE = 0
+            env.MADEIRA_PERF_CLASSIFY = 0
             """ + (steam ? "\nenv.MADEIRA_DOCK_GAME_SCM = 1\nenv.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe" : "")
         case "gta5_enhanced.exe", "playgtav.exe":
             let steamLines = """
