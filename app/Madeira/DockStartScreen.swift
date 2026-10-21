@@ -396,16 +396,14 @@ final class DockStartScreen: ObservableObject {
 }
 
 /// The started game's Steam artwork as the starting screen's backdrop: the wide
-/// library hero, else the cover (public store artwork by App ID, no account data).
+/// random store screenshot, falling back to cached artwork. Never plays video.
 struct SteamLaunchBackdrop: View {
     let appID: Int
     var body: some View {
         GeometryReader { geometry in
             ZStack {
                 Color.black
-                CachedArtworkImage(url: Self.hero(appID),
-                                   fallbacks: [SteamGamesRules.cover(appID)].compactMap { $0 },
-                                   steamAppID: appID, wide: true)
+                GameFootageBackdrop(steamAppID: appID)
                     .id(appID)
             }
             .frame(width: geometry.size.width, height: geometry.size.height).clipped()

@@ -28,6 +28,38 @@ struct StoreMovie: Identifiable {
     let thumbnail: URL?
     let url: URL
 }
+enum StoreBackdropItem: Equatable {
+    case image(URL)
+    case movie(URL, poster: URL?)
+    var imageURL: URL? {
+        switch self { case .image(let url): return url; case .movie(_, let poster): return poster }
+    }
+    var movieURL: URL? {
+        if case .movie(let url, _) = self { return url }
+        return nil
+    }
+}
+extension StoreGame {
+    /// Visit every item once before reshuffling; loading screens never get videos.
+    func shuffledBackdrops(allowsVideo: Bool, avoiding previous: StoreBackdropItem? = nil) -> [StoreBackdropItem] {
+        var items = screenshots.map { StoreBackdropItem.image($0.full) }
+        if allowsVideo {
+            items += movies.map { .movie($0.url, poster: $0.thumbnail ?? screenshots.first?.full) }
+        }
+        items = Array(items.enumerated().filter { index, item in !items.prefix(index).contains(item) }.map(\.element)).shuffled()
+        if items.count > 1, items.first == previous { items.swapAt(0, Int.random(in: 1..<items.count)) }
+        return items
+    }
+    /// Loading is screenshot-only; Home may select a trailer with an image
+    /// behind it while buffering, or if the platform cannot play that format.
+    func randomBackdrop(allowsVideo: Bool) -> (image: URL?, movie: StoreMovie?) {
+        let image = screenshots.randomElement()?.full
+        guard allowsVideo, let pick = (0..<(screenshots.count + movies.count)).randomElement(),
+              pick >= screenshots.count else { return (image, nil) }
+        let movie = movies[pick - screenshots.count]
+        return (image ?? movie.thumbnail, movie)
+    }
+}
 enum StoreAction: Equatable {
     case owned, get, buy
     static func decide(owned: Bool, isFree: Bool) -> Self { owned ? .owned : isFree ? .get : .buy }

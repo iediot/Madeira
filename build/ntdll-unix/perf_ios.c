@@ -1034,8 +1034,17 @@ static void *perf_classifier(void *arg)
         if (now >= report) { class_report(); report = now + 5000000000ull; }
         if (now >= top)
         {
-            class_report_top(); class_report_fex(); class_report_system(); class_report_game();
-            top = now + 30000000000ull;
+            uint64_t t0 = perf_now_ns(), t1, t2, t3, t4;
+            class_report_top(); t1 = perf_now_ns();
+            class_report_fex(); t2 = perf_now_ns();
+            class_report_system(); t3 = perf_now_ns();
+            class_report_game(); t4 = perf_now_ns();
+            /* Distinguish periodic diagnostic work from an actual game/PSO
+             * stall. Times include lock waits; no target thread is suspended. */
+            if (t4 - t0 >= 50000000ull)
+                dprintf(2, "[perf-classify-cost] report_ms=%.1f top_ms=%.1f fex_symbols_ms=%.1f system_symbols_ms=%.1f guest_ms=%.1f\n",
+                        (t4-t0)/1e6, (t1-t0)/1e6, (t2-t1)/1e6, (t3-t2)/1e6, (t4-t3)/1e6);
+            top = t4 + 30000000000ull;
         }
         if (now >= refresh)
         {

@@ -1413,12 +1413,48 @@ struct mad_heap {
     UINT count;
     struct mad_device *owner;
     D3D12_DESCRIPTOR_HEAP_DESC desc;           /* as created; answered by GetDesc */
+    volatile LONG64 table_version;
+    struct mad_heap *table_version_next;
 };
-/* A table built during replay is reusable only while no descriptor writer has
- * run. One process-wide version is deliberately conservative: descriptor
- * writes are rare beside draws, and it keeps CPU handles as plain pointers. */
-static volatile LONG64 g_descriptor_version = 1;
-static void mad_descriptor_write(void) { InterlockedIncrement64(&g_descriptor_version); }
+/* AIR tables depend on their bound shader-visible heaps, not staging/RTV/DSV
+ * writes or another process/device's heaps. The list owns no heap references:
+ * removal under its exclusive lock precedes heap destruction, while writers
+ * hold the shared lock through version updates. CPU handles stay plain pointers. */
+static SRWLOCK g_descriptor_heaps_lock = SRWLOCK_INIT;
+static struct mad_heap *g_descriptor_heaps;
+static void mad_descriptor_register(struct mad_heap *h) {
+    if (!h->shader_visible || !h->cpu) return;
+    h->table_version = 1;
+    AcquireSRWLockExclusive(&g_descriptor_heaps_lock);
+    h->table_version_next = g_descriptor_heaps;
+    g_descriptor_heaps = h;
+    ReleaseSRWLockExclusive(&g_descriptor_heaps_lock);
+}
+static void mad_descriptor_unregister(struct mad_heap *h) {
+    struct mad_heap **p;
+    if (!h->shader_visible || !h->cpu) return;
+    AcquireSRWLockExclusive(&g_descriptor_heaps_lock);
+    for (p = &g_descriptor_heaps; *p; p = &(*p)->table_version_next)
+        if (*p == h) { *p = h->table_version_next; break; }
+    ReleaseSRWLockExclusive(&g_descriptor_heaps_lock);
+}
+static void mad_descriptor_write(const void *dst, UINT count, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    struct mad_heap *h;
+    UINT64 first = (UINT64)(uintptr_t)dst, bytes = (UINT64)count * sizeof(struct mad_descriptor);
+    if (!dst || !count || (type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                          type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)) return;
+    AcquireSRWLockShared(&g_descriptor_heaps_lock);
+    for (h = g_descriptor_heaps; h; h = h->table_version_next) {
+        UINT64 base = (UINT64)(uintptr_t)h->cpu, size = (UINT64)h->count * sizeof(struct mad_descriptor);
+        /* Difference comparisons avoid wraparound at either range's end. */
+        if (type == h->type && (first >= base ? first - base < size : base - first < bytes))
+            InterlockedIncrement64(&h->table_version);
+    }
+    ReleaseSRWLockShared(&g_descriptor_heaps_lock);
+}
+static UINT64 mad_descriptor_version(const struct mad_heap *h) {
+    return h ? (UINT64)InterlockedCompareExchange64((volatile LONG64 *)&h->table_version, 0, 0) : 0;
+}
 
 /* An RTV or DSV handle addresses one slot in a heap's resource-pointer array. */
 /* ml925: a render-target / depth-stencil view. The resource pointer comes
@@ -2114,7 +2150,8 @@ struct mad_exec {
         const struct mad_pso *pso;
         const struct madeira_ir_air_range *air;
         UINT cb_bind, arg_bind, arg_qwords, nair, vis_mask;
-        UINT64 root_version, descriptor_version;
+        UINT64 root_version, srv_version, smp_version;
+        const struct mad_heap *srv, *smp;
         obj_handle_t cb_buf, arg_buf;
         UINT64 cb_off, arg_off;
     } air_cache[8];
@@ -7516,7 +7553,7 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                                    obj_handle_t *cb_buf, UINT64 *cb_off,
                                    obj_handle_t *arg_buf, UINT64 *arg_off) {
     UINT64 rv = e->root_version[root == e->croot ? 1 : 0];
-    UINT64 dv = (UINT64)InterlockedCompareExchange64(&g_descriptor_version, 0, 0);
+    UINT64 sv = mad_descriptor_version(e->srv), mv = mad_descriptor_version(e->smp);
     unsigned i;
     /* madeira-bcd: replay split "of which argument tables" */
     UINT64 t0 = g_replay_split > 0 ? mad_tick() : 0;
@@ -7527,7 +7564,8 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
         const typeof(e->air_cache[0]) *c = &e->air_cache[i];
         if (c->rs == rs && c->pso == pso && c->air == airv && c->cb_bind == cb_bind &&
             c->arg_bind == arg_bind && c->arg_qwords == arg_qwords && c->nair == nair &&
-            c->vis_mask == vis_mask && c->root_version == rv && c->descriptor_version == dv) {
+            c->vis_mask == vis_mask && c->root_version == rv && c->srv == e->srv && c->smp == e->smp &&
+            c->srv_version == sv && c->smp_version == mv) {
             *cb_buf = c->cb_buf; *cb_off = c->cb_off;
             *arg_buf = c->arg_buf; *arg_off = c->arg_off;
             InterlockedIncrement64(&g_air_cache_hits);
@@ -7542,7 +7580,8 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
         typeof(e->air_cache[0]) *c = &e->air_cache[e->air_cache_next++ & 7];
         c->rs = rs; c->pso = pso; c->air = airv; c->cb_bind = cb_bind; c->arg_bind = arg_bind;
         c->arg_qwords = arg_qwords; c->nair = nair; c->vis_mask = vis_mask;
-        c->root_version = rv; c->descriptor_version = dv;
+        c->root_version = rv; c->srv = e->srv; c->smp = e->smp;
+        c->srv_version = sv; c->smp_version = mv;
         c->cb_buf = *cb_buf; c->cb_off = *cb_off; c->arg_buf = *arg_buf; c->arg_off = *arg_off;
     }
     if (t0) mad_rs_step(RS_TABLES, &t0);
@@ -12638,7 +12677,7 @@ static void STDMETHODCALLTYPE device_CreateConstantBufferView(ID3D12Device *This
         const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     if (!e) return;
-    mad_descriptor_write();
+    mad_descriptor_write(e, 1, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateConstantBufferView");   /* madeira-bcd: desc-guard */
     if (!desc || !desc->BufferLocation) {   /* a null view: defined to read as zeros (ml1049) */
         struct mad_device *nd = (struct mad_device *)This;
@@ -12691,7 +12730,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     static int said_counter, said_kind;
     if (!e) return;
-    mad_descriptor_write();
+    mad_descriptor_write(e, 1, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateUnorderedAccessView");   /* madeira-bcd: desc-guard */
     if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
     if (counter && !said_counter++)
@@ -12814,7 +12853,7 @@ static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(ID3D12Device *This, U
         D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     (void)This;
     if (!n || !dst.ptr || !src.ptr) return;
-    mad_descriptor_write();
+    mad_descriptor_write((void *)dst.ptr, n, type);
     if (g_sd_state > 0) mad_dg_write((const void *)dst.ptr, n, "CopyDescriptorsSimple");   /* madeira-bcd: desc-guard */
     memmove((void *)dst.ptr, (const void *)src.ptr, (size_t)n * mad_descriptor_stride(type));
 }
@@ -12826,16 +12865,17 @@ static void STDMETHODCALLTYPE device_CopyDescriptors(ID3D12Device *This,
     UINT stride = mad_descriptor_stride(type);
     UINT di = 0, si = 0, dpos = 0, spos = 0;
     (void)This;
-    if (ndst && nsrc) mad_descriptor_write();
     /* Sizes may be NULL, meaning every range is one descriptor long. */
     while (di < ndst && si < nsrc) {
         UINT dlen = dst_sizes ? dst_sizes[di] : 1, slen = src_sizes ? src_sizes[si] : 1;
         UINT take = (dlen - dpos < slen - spos) ? dlen - dpos : slen - spos;
         if (take && dsts[di].ptr && srcs[si].ptr && g_sd_state > 0)   /* madeira-bcd: desc-guard */
             mad_dg_write((const char *)dsts[di].ptr + (size_t)dpos * stride, take, "CopyDescriptors");
-        if (take && dsts[di].ptr && srcs[si].ptr)
+        if (take && dsts[di].ptr && srcs[si].ptr) {
+            mad_descriptor_write((char *)dsts[di].ptr + (size_t)dpos * stride, take, type);
             memmove((char *)dsts[di].ptr + (size_t)dpos * stride,
                     (const char *)srcs[si].ptr + (size_t)spos * stride, (size_t)take * stride);
+        }
         dpos += take; spos += take;
         if (dpos >= dlen) { di++; dpos = 0; }
         if (spos >= slen) { si++; spos = 0; }
@@ -14077,6 +14117,7 @@ static ULONG STDMETHODCALLTYPE heap_Release(ID3D12DescriptorHeap *T) {
     struct mad_heap *h = (struct mad_heap *)T;
     LONG r = InterlockedDecrement(&h->refs);
     if (r == 0) { mad_pd_purge(T);   /* ml1143 */
+        mad_descriptor_unregister(h);
         /* The Metal buffer of a shader-visible heap is deliberately kept: a
          * command buffer already submitted may still read it. CPU-only
          * storage has no such reader. */
@@ -14987,6 +15028,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(ID3D12Device *This,
         if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd: desc-guard watches shader-visible heaps */
         if (g_sd_state > 0 && g_desc_guard) mad_dg_register(h);
     }
+    mad_descriptor_register(h);
     HRESULT hr = heap_QI((ID3D12DescriptorHeap *)h, riid, out);
     heap_Release((ID3D12DescriptorHeap *)h);
     return hr;
@@ -15061,7 +15103,7 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
     struct mad_resource *r = (struct mad_resource *)res;
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     if (!e) return;
-    mad_descriptor_write();
+    mad_descriptor_write(e, 1, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateShaderResourceView");   /* madeira-bcd: desc-guard */
     if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
     if (r->buffer) {
@@ -15276,7 +15318,7 @@ static void STDMETHODCALLTYPE device_CreateSampler(ID3D12Device *This,
     struct mad_device *d = (struct mad_device *)This;
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     if (!e) return;
-    mad_descriptor_write();
+    mad_descriptor_write(e, 1, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateSampler");   /* madeira-bcd: desc-guard */
 
     struct WMTSamplerInfo si;

@@ -4910,7 +4910,7 @@ struct LibraryHUD: View {
         if let appID = dockStart.appID { SteamGameArtwork(appID: appID) } else { LibraryArtwork(entry: entry) }
     }
     @ViewBuilder private func launchBackdrop(_ entry: LibraryEntry) -> some View {
-        if let appID = dockStart.appID { SteamLaunchBackdrop(appID: appID) } else { LibraryArtwork(entry: entry, backdrop: true) }
+        if let appID = dockStart.appID { SteamLaunchBackdrop(appID: appID) } else { GameFootageBackdrop(entry: entry) }
     }
 
     /// What the Dock start is doing (DockStartStatus), read once a second.
@@ -5421,17 +5421,25 @@ enum ArtworkCache {
     /// Longest side of a decoded card image, in pixels (a 132 pt card at 3x is ~400).
     static let maxPixel: CGFloat = 480
     private static let images = NSCache<NSURL, UIImage>()
+    private static let backdropImages: NSCache<NSURL, UIImage> = {
+        let cache = NSCache<NSURL, UIImage>()
+        cache.totalCostLimit = 64 * 1024 * 1024
+        cache.countLimit = 3
+        return cache
+    }()
     private static let blurred = NSCache<NSURL, UIImage>()
     private static let context = CIContext(options: [.useSoftwareRenderer: false])
 
     /// Memory first, then the disk copy kept across launches (a 480 px JPEG of a few
     /// tens of KB, so reading it here on the main thread costs well under a frame):
     /// covers are on screen at once when the app opens again, not half a second later.
-    static func cached(_ url: URL) -> UIImage? {
-        if let hit = images.object(forKey: url as NSURL) { return hit }
-        guard !url.isFileURL, let file = diskFile(url), let data = try? Data(contentsOf: file),
-              let image = UIImage(data: data) else { return nil }
-        images.setObject(image, forKey: url as NSURL)
+    static func cached(_ url: URL, pixels: Int = 480) -> UIImage? {
+        let cache = pixels == 480 ? images : backdropImages
+        let key = (pixels == 480 ? url : url.appendingPathComponent("__madeira_pixels_\(pixels)")) as NSURL
+        if let hit = cache.object(forKey: key) { return hit }
+        guard !url.isFileURL, let file = diskFile(url, pixels: pixels), let data = try? Data(contentsOf: file),
+              let image = pixels == 480 ? UIImage(data: data) : downsample(data, pixels: pixels) else { return nil }
+        cache.setObject(image, forKey: key, cost: Int(image.size.width * image.scale * image.size.height * image.scale * 4))
         return image
     }
 
@@ -5444,10 +5452,10 @@ enum ArtworkCache {
         return dir
     }()
 
-    private static func diskFile(_ url: URL) -> URL? {
+    private static func diskFile(_ url: URL, pixels: Int = 480) -> URL? {
         guard let dir = diskFolder else { return nil }
         let digest = SHA256.hash(data: Data(url.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined()
-        return dir.appendingPathComponent(digest + ".jpg")
+        return dir.appendingPathComponent(digest + (pixels == 480 ? "" : "-\(pixels)") + ".jpg")
     }
     static func cachedBlur(_ url: URL) -> UIImage? { blurred.object(forKey: url as NSURL) }
 
@@ -5476,8 +5484,13 @@ enum ArtworkCache {
     private static func noteMiss(_ url: URL) { missesLock.lock(); misses.insert(url); missesLock.unlock() }
 
     /// The image at `url` (a web or file URL), downsized; nil when it cannot be had.
-    static func image(_ url: URL) async -> UIImage? {
-        if let hit = cached(url) { return hit }
+    static func image(_ url: URL, pixels: Int = 480) async -> UIImage? {
+        // A large backdrop's disk read and decode must not hitch the UI thread.
+        if pixels == 480 {
+            if let hit = cached(url) { return hit }
+        } else if let hit = await Task.detached(priority: .utility, operation: { cached(url, pixels: pixels) }).value {
+            return hit
+        }
         if isMiss(url) { return nil }
         let data: Data
         if url.isFileURL {
@@ -5488,11 +5501,13 @@ enum ArtworkCache {
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { noteMiss(url); return nil }
             data = d
         }
-        let image = await Task.detached(priority: .utility) { downsample(data) }.value
+        let image = await Task.detached(priority: .utility) { downsample(data, pixels: pixels) }.value
         if let image {
-            images.setObject(image, forKey: url as NSURL)
+            let cache = pixels == 480 ? images : backdropImages
+            let key = (pixels == 480 ? url : url.appendingPathComponent("__madeira_pixels_\(pixels)")) as NSURL
+            cache.setObject(image, forKey: key, cost: Int(image.size.width * image.scale * image.size.height * image.scale * 4))
             // Keep the downsized copy for the next launch (web artwork only).
-            if !url.isFileURL, let file = diskFile(url) {
+            if !url.isFileURL, let file = diskFile(url, pixels: pixels) {
                 Task.detached(priority: .background) {
                     if let jpeg = image.jpegData(compressionQuality: 0.85) { try? jpeg.write(to: file, options: .atomic) }
                 }
@@ -5533,7 +5548,7 @@ enum ArtworkCache {
         return false
     }
 
-    private static func downsample(_ data: Data) -> UIImage? {
+    private static func downsample(_ data: Data, pixels: Int = 480) -> UIImage? {
         guard looksLikeImage(data),
               let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
               CGImageSourceGetType(source) != nil,
@@ -5544,7 +5559,7 @@ enum ArtworkCache {
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceShouldCacheImmediately: true,      // decode now, off the main thread
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            kCGImageSourceThumbnailMaxPixelSize: pixels,
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
         return UIImage(cgImage: cg)

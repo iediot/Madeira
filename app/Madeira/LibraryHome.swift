@@ -166,7 +166,7 @@ struct LibraryHero: View {
         }
         .frame(maxWidth: .infinity, minHeight: height, alignment: .topLeading)
         .background(alignment: .top) {
-            LibraryArtwork(entry: entry, backdrop: true)
+            GameFootageBackdrop(entry: entry, allowsVideo: true)
                 .frame(maxWidth: .infinity).frame(height: height)
                 .mask {
                     LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black.opacity(0.35), location: 0.1),
@@ -184,15 +184,8 @@ struct LibraryHero: View {
     private func info(wide: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(entry.title)
-                .font(wide ? .system(size: 46, weight: .bold) : .largeTitle.bold())
+                .font(.system(size: wide ? 30 : 25, weight: .bold))
                 .lineLimit(2).minimumScaleFactor(0.6)
-            HStack(spacing: 10) {
-                LibraryBadges(entry: entry).foregroundStyle(.secondary).fixedSize()
-                if let last = entry.lastPlayed {
-                    Text("Played \(last, format: .relative(presentation: .named))")
-                        .font(.footnote).foregroundStyle(.secondary).lineLimit(1)
-                }
-            }
             HStack(spacing: 10) {
                 Button(action: play) {
                     Label("Play", systemImage: "play.fill").font(.headline)
@@ -210,6 +203,10 @@ struct LibraryHero: View {
                 .controllerFocusable(cornerRadius: 25, activate: open)
             }
             .padding(.top, 6)
+            if let last = entry.lastPlayed {
+                Text("Played \(last, format: .relative(presentation: .named))")
+                    .font(.footnote).foregroundStyle(.secondary).lineLimit(1)
+            }
         }
     }
 }

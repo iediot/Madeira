@@ -338,9 +338,208 @@ struct StoreSafari: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
 }
 
+/// Store screenshots/trailers as decorative library media. This never changes
+/// the cover artwork or stores a random screenshot as a game's resolved cover.
+struct GameFootageBackdrop: View {
+    var entry: LibraryEntry? = nil
+    var steamAppID: Int? = nil
+    var allowsVideo = false
+
+    private var appID: Int? { steamAppID ?? entry?.steamAppID ?? entry?.steamID }
+    private var mediaKey: String {
+        if let epic = entry?.epicAppName { return "epic:\(epic)" }
+        if let appID { return "steam:\(appID)" }
+        return entry?.id.uuidString ?? "none"
+    }
+    var body: some View {
+        GameFootageContent(entry: entry, appID: appID, allowsVideo: allowsVideo)
+            .id(mediaKey + (allowsVideo ? ":hero" : ":loading"))
+            .allowsHitTesting(false).accessibilityHidden(true)
+    }
+}
+
+private struct GameFootageContent: View {
+    let entry: LibraryEntry?
+    let appID: Int?
+    let allowsVideo: Bool
+    private struct Slide: Identifiable {
+        let id = UUID()
+        let item: StoreBackdropItem
+        let image: UIImage?
+    }
+    @State private var slide: Slide?
+    @State private var fallback = false
+    @State private var advance = false
+    @State private var catalog: StoreGame?
+    @State private var deck: [StoreBackdropItem] = []
+    @State private var failures: [StoreBackdropItem] = []
+    @State private var remaining: Double = 10
+    @State private var visible = false
+    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject private var library = LibraryModel.shared
+    private var available: Bool { library.current == nil && library.startingJIT == nil }
+    private var active: Bool { visible && scenePhase == .active && available }
+    private struct PlaybackKey: Equatable {
+        let active: Bool
+        let slideID: UUID?
+        let ended: Bool
+    }
+
+    var body: some View {
+        ZStack {
+            // Neutral while fetching footage: never flash the old hero first.
+            Color.clear
+            if fallback, let entry {
+                LibraryArtwork(entry: entry, backdrop: true)
+            } else if fallback, let appID {
+                CachedArtworkImage(url: SteamCatalog.hero(appID), fallbacks: SteamCatalog.heroFallbacks(appID),
+                                   steamAppID: appID, wide: true)
+            }
+            if let slide {
+                GeometryReader { geo in
+                    ZStack {
+                        if let image = slide.image {
+                            Image(uiImage: image).resizable().scaledToFill()
+                                .frame(width: geo.size.width, height: geo.size.height).clipped()
+                        }
+                        if let url = slide.item.movieURL {
+                            FootageVideo(url: url, active: active, release: !available,
+                                         ended: { if self.slide?.id == slide.id { advance = true } })
+                        }
+                    }
+                }
+                .id(slide.id).transition(.opacity)
+            }
+        }
+        .clipped()
+        .onAppear { visible = true }
+        .onDisappear { visible = false }
+        .task {
+            let media: StoreGame?
+            if let name = entry?.epicAppName,
+               let game = EpicLibrary.shared.games.first(where: { $0.appName == name }) {
+                let found = (try? await EpicStore.shared.search(game.title)) ?? []
+                media = found.first { $0.matches(namespace: game.namespace, catalogItemID: game.catalogItemId, title: game.title) }?.presentation
+            } else if let appID {
+                media = try? await SteamStore.shared.details(appID)
+            } else { media = nil }
+            guard !Task.isCancelled else { return }
+            guard let media else { fallback = true; return }
+            catalog = media
+            if slide == nil { await nextSlide() }
+        }
+        // Environment values captured by a long-running task do not refresh on
+        // body updates. Key playback to current activity instead of polling a
+        // captured scenePhase (which could leave a screenshot paused forever).
+        .task(id: PlaybackKey(active: active, slideID: slide?.id, ended: advance)) {
+            guard active, allowsVideo, let slide else { return }
+            if slide.item.movieURL != nil {
+                if advance { await nextSlide() }
+                return // Trailers advance on completion, never the image timer.
+            }
+            while remaining > 0 {
+                do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+                guard !Task.isCancelled else { return }
+                remaining = max(0, remaining - 0.25)
+            }
+            await nextSlide()
+        }
+    }
+
+    @MainActor private func nextSlide() async {
+        guard let catalog else { return }
+        while !Task.isCancelled {
+            if deck.isEmpty {
+                deck = catalog.shuffledBackdrops(allowsVideo: allowsVideo, avoiding: slide?.item)
+                    .filter { !failures.contains($0) }
+            }
+            guard !deck.isEmpty else { fallback = slide == nil; return }
+            let item = deck.removeFirst()
+            let image: UIImage?
+            if let url = item.imageURL { image = await ArtworkCache.image(url, pixels: 2560) }
+            else { image = nil }
+            guard !Task.isCancelled else { return }
+            // Keep the previous frame until its replacement is decoded.
+            if image == nil && item.movieURL == nil {
+                failures.append(item)
+                continue
+            }
+            advance = false
+            remaining = 10
+            withAnimation(.easeInOut(duration: 1)) { slide = Slide(item: item, image: image) }
+            return
+        }
+    }
+}
+
+/// Muted, aspect-fill footage without playback controls or audio-session changes.
+/// Pause across brief backgrounding, preserving the timestamp; release for games.
+private struct FootageVideo: UIViewRepresentable {
+    let url: URL
+    let active: Bool
+    let release: Bool
+    let ended: () -> Void
+    final class Host: UIView {
+        override class var layerClass: AnyClass { AVPlayerLayer.self }
+        private var player: AVPlayer?
+        private var observation: NSKeyValueObservation?
+        private var statusObservation: NSKeyValueObservation?
+        private var endObserver: NSObjectProtocol?
+        private var onEnd: (() -> Void)?
+        private var playingURL: URL?
+        private var videoLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+        func update(url: URL, active: Bool, release: Bool, ended: @escaping () -> Void) {
+            onEnd = ended
+            if release { stop(); return }
+            if playingURL == url {
+                if active { player?.play() } else { player?.pause() }
+                return
+            }
+            guard active else { return }
+            stop()
+            playingURL = url
+            let queue = AVPlayer()
+            queue.isMuted = true
+            queue.preventsDisplaySleepDuringVideoPlayback = false
+            let item = AVPlayerItem(url: url)
+            // Use the store's full-quality stream, not the old 720p/2Mbps cap.
+            player = queue
+            videoLayer.videoGravity = .resizeAspectFill
+            videoLayer.opacity = 0
+            videoLayer.player = queue
+            observation = videoLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] _, _ in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.videoLayer.opacity = self.videoLayer.isReadyForDisplay ? 1 : 0
+                }
+            }
+            endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
+                object: item, queue: .main) { [weak self] _ in self?.onEnd?() }
+            statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+                if item.status == .failed { DispatchQueue.main.async { [weak self] in self?.onEnd?() } }
+            }
+            queue.replaceCurrentItem(with: item)
+            queue.play()
+        }
+        func stop() {
+            observation?.invalidate(); observation = nil
+            statusObservation?.invalidate(); statusObservation = nil
+            if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+            endObserver = nil
+            player?.pause()
+            player?.replaceCurrentItem(with: nil); player = nil
+            videoLayer.player = nil
+            videoLayer.opacity = 0
+            playingURL = nil
+        }
+    }
+    func makeUIView(context: Context) -> Host { Host() }
+    func updateUIView(_ view: Host, context: Context) { view.update(url: url, active: active, release: release, ended: ended) }
+    static func dismantleUIView(_ view: Host, coordinator: ()) { view.stop() }
+}
+
 /// Loaded only when the media section enters the view hierarchy; shared by all game
-/// pages (the existing ones put it in a Form row, so it is a plain scroll row: a paged
-/// TabView in a Form row was re-measured on every scroll and made the pages stutter).
+/// pages. A paged TabView in a Form row was re-measured on every scroll.
 struct StoreGameMedia: View {
     let appID: Int
     @State private var game: StoreGame?

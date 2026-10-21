@@ -629,7 +629,7 @@ rel = body_of(virt, 'static void ios_swap_release_range( void *base, size_t size
 check('if (!copy_back) msync( oa, olen, MS_KILLPAGES );\n            ios_swap_give( ooff, olen );' in rel,
       'ml1293: a released range drops its dirty pages before it is given back')
 resv = body_of(virt, 'static int ios_swap_punch_resv( char *lo, size_t len )\n{')
-check('msync( lo, len, MS_KILLPAGES );' in resv and resv.index('msync( lo, len, MS_KILLPAGES );') < resv.index('ios_swap_punch_timed('),
+check('msync( cursor, piece, MS_KILLPAGES );' in resv and resv.index('msync( cursor, piece, MS_KILLPAGES );') < resv.index('ios_swap_punch_timed('),
       'ml1293: a decommit drops its dirty pages before the punch')
 setprot = body_of(virt, 'static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size, ULONG protect )')
 check('ios_swap_release_range( base, size, 1 )' in setprot, 'set_protection still leaves the tier for EXEC/WRITECOPY/GUARD')

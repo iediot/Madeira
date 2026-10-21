@@ -20733,7 +20733,7 @@ static void ios_dc_census_take( const void *addr, size_t len, struct ios_dc_cens
 static int      ios_swap_fd = -1;
 static uint64_t ios_swap_cap, ios_swap_bump;
 /* resv: the extent maps a whole reservation (wide at reserve time, broad), so a
- * decommit inside it punches the file in place (ml1257). key: the size asked for
+ * decommit inside it replaces the file range before deferred cleanup. key: the size asked for
  * (reservation or commit), the churn filter's unit; born: ns when it was backed
  * (ml1258). img: an image section's (madeira-bcd swap-images, ios_swap_image_map). */
 static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; int img; } ios_swap_ext[16384];
@@ -20996,7 +20996,8 @@ static uint64_t ios_swap_now_ns( void )
  * new backing before it reads as zero. A full queue or a thread that could not
  * start falls back to the synchronous punch. MADEIRA_SWAP_PUNCH_DEFER=0 keeps
  * every punch synchronous. Punches of 100 ms or more are logged, the in-place
- * decommit punch (ios_swap_punch_resv, still synchronous) included. */
+ * fallback decommit punch included. Reservation decommits now rotate to fresh
+ * zero offsets first, making their old ranges safe to queue here too. */
 #define IOS_SWAP_PQ 1024
 static struct { uint64_t off, len; } ios_swap_pq[IOS_SWAP_PQ];
 static unsigned ios_swap_pq_head, ios_swap_pq_n;
@@ -21004,6 +21005,8 @@ static pthread_mutex_t ios_swap_pq_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ios_swap_pq_cond = PTHREAD_COND_INITIALIZER;
 static int ios_swap_pq_state;   /* 0 not started, 1 running, -1 off */
 static unsigned long long ios_swap_pq_done, ios_swap_punch_slow, ios_swap_punch_max_ms;
+static unsigned long long ios_swap_rotations, ios_swap_rotate_fallbacks;
+static unsigned long long ios_swap_rotate_merged;
 
 static int ios_swap_punch_timed( uint64_t off, uint64_t len, const char *why )
 {
@@ -21057,9 +21060,8 @@ static void *ios_swap_punch_thread( void *arg )
 }
 
 /* Called with virtual_mutex held (every ios_swap_give caller is). */
-static int ios_swap_punch_defer( uint64_t off, size_t len )
+static int ios_swap_punch_available( void )
 {
-    int queued = 0;
     if (!ios_swap_pq_state)
     {
         /* MADEIRA_SWAP_PUNCH_DEFER=0 keeps every swap file punch synchronous, under the virtual lock. */
@@ -21074,7 +21076,12 @@ static int ios_swap_punch_defer( uint64_t off, size_t len )
         dprintf( 2, "[swap] ml1291 deferred F_PUNCHHOLE %s\n",
                  ios_swap_pq_state > 0 ? "on" : (e && e[0] == '0') ? "off (MADEIRA_SWAP_PUNCH_DEFER=0)" : "off (no thread)" );
     }
-    if (ios_swap_pq_state < 0) return 0;
+    return ios_swap_pq_state > 0;
+}
+static int ios_swap_punch_defer( uint64_t off, size_t len )
+{
+    int queued = 0;
+    if (!ios_swap_punch_available()) return 0;
     pthread_mutex_lock( &ios_swap_pq_lock );
     if (ios_swap_pq_n < IOS_SWAP_PQ)
     {
@@ -21425,33 +21432,154 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
         dprintf( 2, "[swap] ml1077 released %p+0x%zx%s: %llu MB in %u extents, %llu releases, %llu unbacks\n",
                  base, size, copy_back ? " (copied back to anonymous)" : "", ios_swap_bytes >> 20, ios_swap_n, ios_swap_releases, ios_swap_unbacks );
 }
-/* ml1257: decommit inside a reservation extent. Punch the file range -- the
+/* Replace only the host-page interior being decommitted. ios_swap_take returns
+ * either never-used sparse offsets or offsets punched before being freed, so
+ * the replacement is zero without touching file pages under virtual_mutex.
+ * Keep both neighbours and the reservation metadata, including resv, so tiny
+ * recommits remain file-backed. Only AFTER a successful MAP_FIXED and metadata
+ * update may the old offset be queued: later writes now target a different
+ * file range and cannot be destroyed by the worker's delayed punch.
+ * No allocation, mapping or extent-table failure changes the old bookkeeping.
+ * The caller retains the synchronous zeroing path as a correctness fallback. */
+static int ios_swap_rotate_resv( unsigned i, char *lo, size_t len )
+{
+    char *hi = lo + len, *cursor;
+    __typeof__(ios_swap_ext[0]) replacement = ios_swap_ext[i];
+    uint64_t off, begin = ios_swap_now_ns(), t0, t1, t2, t3;
+    unsigned j, pieces = 0, edges = 0;
+    int room;
+    /* Validate every old piece before changing anything. A larger decommit
+     * replaces ALL of them with one contiguous file mapping, removing earlier
+     * fragmentation rather than permanently keeping a record per old piece. */
+    for (cursor = lo; cursor < hi; )
+    {
+        char *a, *b;
+        for (j = cursor == lo ? i : 0; j < ios_swap_n; j++)
+            if (ios_swap_ext[j].resv && cursor >= ios_swap_ext[j].va &&
+                cursor < ios_swap_ext[j].va + ios_swap_ext[j].len) break;
+        if (j == ios_swap_n) return 0;
+        a = ios_swap_ext[j].va; b = a + ios_swap_ext[j].len;
+        if (cursor == lo && lo > a) edges++;
+        if (hi < b) edges++;
+        pieces++;
+        cursor = b < hi ? b : hi;
+    }
+    if (!pieces || !ios_swap_punch_available() || ios_swap_n - pieces + edges + 1 > 16384) return 0;
+    /* Producers all hold virtual_mutex. Between this check and give, only the
+     * worker can change the queue (by removing entries), so give cannot fall
+     * back to a synchronous punch after we replace the mapping. */
+    pthread_mutex_lock( &ios_swap_pq_lock );
+    room = pieces <= IOS_SWAP_PQ - ios_swap_pq_n;
+    pthread_mutex_unlock( &ios_swap_pq_lock );
+    if (!room) return 0;
+    off = ios_swap_take( len );
+    if (off == (uint64_t)-1) return 0;
+    t0 = ios_swap_now_ns();
+    msync( lo, len, MS_KILLPAGES );
+    t1 = ios_swap_now_ns();
+    if (mmap( lo, len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED,
+              ios_swap_fd, (off_t)off ) == MAP_FAILED)
+    {
+        /* Not mapped or written: these offsets are still zero, no punch needed.
+         * Darwin leaves the previous mapping intact on a failed fixed mmap. */
+        ios_swap_free_add( off, len );
+        return 0;
+    }
+    t2 = ios_swap_now_ns();
+    for (j = pieces == 1 ? i : 0; j < ios_swap_n; )
+    {
+        char *a = ios_swap_ext[j].va, *b = a + ios_swap_ext[j].len;
+        char *oa = lo > a ? lo : a, *ob = hi < b ? hi : b;
+        if (oa >= ob) { j++; continue; }
+        ios_swap_give( ios_swap_ext[j].off + (oa - a), ob - oa );
+        if (oa == a && ob == b)
+        {
+            ios_swap_ext[j] = ios_swap_ext[--ios_swap_n];
+            if (pieces == 1) break;
+            continue;
+        }
+        if (oa == a) { ios_swap_ext[j].va = ob; ios_swap_ext[j].off += ob - a; ios_swap_ext[j].len = b - ob; }
+        else if (ob == b) ios_swap_ext[j].len = oa - a;
+        else
+        {
+            ios_swap_ext[ios_swap_n] = ios_swap_ext[j];
+            ios_swap_ext[ios_swap_n].va = ob;
+            ios_swap_ext[ios_swap_n].off += ob - a;
+            ios_swap_ext[ios_swap_n++].len = b - ob;
+            ios_swap_ext[j].len = oa - a;
+        }
+        j++;
+        if (pieces == 1) break;
+    }
+    replacement.va = lo; replacement.len = len; replacement.off = off;
+    ios_swap_ext[ios_swap_n++] = replacement;
+    ios_swap_rotate_merged += pieces - 1;
+    t3 = ios_swap_now_ns();
+    if (t3 - begin >= 20000000)
+    {
+        static unsigned slow;
+        if (++slow <= 32 || !(slow % 128))
+            dprintf( 2, "[swap] decommit cost total=%llu ms lookup=%llu discard=%llu mmap=%llu retire=%llu pieces=%u extents=%u\n",
+                     (unsigned long long)((t3-begin)/1000000), (unsigned long long)((t0-begin)/1000000), (unsigned long long)((t1-t0)/1000000),
+                     (unsigned long long)((t2-t1)/1000000), (unsigned long long)((t3-t2)/1000000), pieces, ios_swap_n );
+    }
+    if (++ios_swap_rotations <= 8 || (ios_swap_rotations % 1024) == 0)
+        dprintf( 2, "[swap] decommit rotate %p+0x%zx: fresh zero backing, old range retired (%llu rotations)\n",
+                 lo, len, ios_swap_rotations );
+    return 1;
+}
+/* ml1257 fallback: decommit inside a reservation extent. Punch the file range -- the
  * mapping stays, and a hole reads as zero -- instead of replacing it with
  * anonymous memory, which would leave every recommit anonymous. RW afterwards,
- * exactly like decommit_pages' anonymous mmap-over. 0 = not wholly inside one
- * reservation extent (or the punch failed): the caller releases as before.
+ * exactly like decommit_pages' anonymous mmap-over. A larger later decommit
+ * can span extents split by earlier rotations: validate coverage first, then
+ * process each piece without dropping it back to anonymous memory.
+ * 0 = not wholly reservation-backed (or punch failed): caller releases as before.
  * [lo, lo+len) is host-page aligned (decommit_pages' host interior). */
 static int ios_swap_punch_resv( char *lo, size_t len )
 {
-    unsigned i;
+    unsigned i, pass;
+    char *cursor, *end = lo + len;
     if (ios_swap_fd < 0 || !ios_swap_n) return 0;
     for (i = 0; i < ios_swap_n; i++)
-    {
-        char *a = ios_swap_ext[i].va;
-        if (!ios_swap_ext[i].resv || lo < a || lo + len > a + ios_swap_ext[i].len) continue;
-        msync( lo, len, MS_KILLPAGES );   /* ml1293: drop the dead dirty pages before the punch */
-        if (ios_swap_punch_timed( ios_swap_ext[i].off + (lo - a), len, "decommit" ))   /* ml1291: timed */
+        if (ios_swap_ext[i].resv && lo >= ios_swap_ext[i].va && lo < ios_swap_ext[i].va + ios_swap_ext[i].len)
         {
-            static int said;
-            if (said++ < 8) dprintf( 2, "[swap] ml1257 hole %p+0x%zx failed errno=%d: releasing instead\n", lo, len, errno );
-            return 0;
+            if (ios_swap_rotate_resv( i, lo, len )) return 1;
+            break;
         }
-        mprotect( lo, len, PROT_READ | PROT_WRITE );
-        if (++ios_swap_holes <= 8 || (ios_swap_holes % 1024) == 0)
-            dprintf( 2, "[swap] ml1257 decommit %p+0x%zx punched in place (%llu holes)\n", lo, len, ios_swap_holes );
-        return 1;
+    for (pass = 0; pass < 2; pass++)
+    {
+        for (cursor = lo; cursor < end; )
+        {
+            char *a, *b;
+            size_t piece;
+            for (i = 0; i < ios_swap_n; i++)
+                if (ios_swap_ext[i].resv && cursor >= ios_swap_ext[i].va &&
+                    cursor < ios_swap_ext[i].va + ios_swap_ext[i].len) break;
+            if (i == ios_swap_n) return 0;
+            a = ios_swap_ext[i].va;
+            b = a + ios_swap_ext[i].len;
+            piece = (end < b ? end : b) - cursor;
+            if (pass)
+            {
+                if (++ios_swap_rotate_fallbacks <= 8 || (ios_swap_rotate_fallbacks % 1024) == 0)
+                    dprintf( 2, "[swap] decommit rotate unavailable: synchronous fallback (%llu fallbacks)\n",
+                             ios_swap_rotate_fallbacks );
+                msync( cursor, piece, MS_KILLPAGES );
+                if (ios_swap_punch_timed( ios_swap_ext[i].off + (cursor - a), piece, "decommit" ))
+                {
+                    static int said;
+                    if (said++ < 8) dprintf( 2, "[swap] ml1257 hole %p+0x%zx failed errno=%d: releasing instead\n", cursor, piece, errno );
+                    return 0;
+                }
+                mprotect( cursor, piece, PROT_READ | PROT_WRITE );
+                if (++ios_swap_holes <= 8 || (ios_swap_holes % 1024) == 0)
+                    dprintf( 2, "[swap] ml1257 decommit %p+0x%zx punched in place (%llu holes)\n", cursor, piece, ios_swap_holes );
+            }
+            cursor += piece;
+        }
     }
-    return 0;
+    return 1;
 }
 static int ios_swap_overlaps( const void *base, size_t size )
 {
@@ -21475,6 +21603,8 @@ void ios_swap_stats_line( void )
              ios_swap_disk_refused, ios_swap_nchurny, ios_swap_churn_skips );
     dprintf( 2, "[swap] ml1291 punches: %llu deferred done, %u queued, %llu slow (>=100 ms), max %llu ms; ml1297 %llu ranges not reused after a failed punch\n",
              ios_swap_pq_done, ios_swap_pq_n, ios_swap_punch_slow, ios_swap_punch_max_ms, ios_swap_punch_leaks );
+    dprintf( 2, "[swap] decommit rotations %llu, synchronous fallbacks %llu, fragments merged %llu\n",
+             ios_swap_rotations, ios_swap_rotate_fallbacks, ios_swap_rotate_merged );
     if (ios_swap_img_backs || ios_swap_img_refused)   /* madeira-bcd swap-images */
         dprintf( 2, "[swap] swap-images: %llu MB of image sections in the file (peak %llu), %llu sections moved, %llu refused\n",
                  ios_swap_img_bytes >> 20, ios_swap_img_peak >> 20, ios_swap_img_backs, ios_swap_img_refused );
@@ -21521,6 +21651,9 @@ static void ios_swap_tick( int force )
     p = ios_swap_put( p, end, "/" );              p = ios_swap_put_u( p, end, ios_swap_cap >> 20 );
     p = ios_swap_put( p, end, "MB free=" );       p = ios_swap_put_u( p, end, ios_swap_nfree );
     p = ios_swap_put( p, end, " merges=" );       p = ios_swap_put_u( p, end, ios_swap_merges );
+    p = ios_swap_put( p, end, " rotate=" );       p = ios_swap_put_u( p, end, ios_swap_rotations );
+    p = ios_swap_put( p, end, " fallback=" );     p = ios_swap_put_u( p, end, ios_swap_rotate_fallbacks );
+    p = ios_swap_put( p, end, " compact=" );      p = ios_swap_put_u( p, end, ios_swap_rotate_merged );
     p = ios_swap_put( p, end, " | commit MB by reason:" );
     for (i = 0; i < IOS_SW_REASONS; i++)
     {
@@ -21946,7 +22079,7 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
         else if (host_start < host_end)
         {
             if (ios_swap_punch_resv( host_start, host_end - host_start ))   /* ml1257 */
-                dc_branch = "swap-hole";   /* no read-back: no file-page touches under the lock (ml1081) */
+                dc_branch = "swap-zero";   /* rotated backing or fallback hole; no file touches (ml1081) */
             else
             {
                 ios_swap_release_range( host_start, host_end - host_start, 0 );   /* ml1077 */
@@ -31464,6 +31597,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     SIZE_T size = *size_ptr;
 #ifdef WINE_IOS
     int sc_rehold = 0;
+    uint64_t vm_wait_start = 0;
 #endif
 
     TRACE("%p %p %08lx %x\n", process, addr, size, type );
@@ -31677,7 +31811,20 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         /* pool address but not a live tail carve — fall through unchanged */
     }
 
+#ifdef WINE_IOS
+    if (type == MEM_DECOMMIT) vm_wait_start = ios_swap_now_ns();
+#endif
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+#ifdef WINE_IOS
+    if (vm_wait_start)
+    {
+        uint64_t ms = (ios_swap_now_ns() - vm_wait_start) / 1000000;
+        static unsigned slow_waits;
+        if (ms >= 20 && (++slow_waits <= 32 || !(slow_waits % 128)))
+            dprintf( 2, "[swap] decommit VM-lock wait=%llu ms addr=%p size=%zu\n",
+                     (unsigned long long)ms, base, (size_t)size );
+    }
+#endif
 
 #ifdef WINE_IOS
     /* A soft pool released whole at the base it was granted at: drop it, with
