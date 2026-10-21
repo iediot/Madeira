@@ -553,44 +553,66 @@ static int mad_grow(void **arr, unsigned *cap, unsigned need, size_t elem) {
  * a/b: typed buffer = element count / first element; texture view = slices / 0. */
 #define MAD_VREC_TOMB (~(UINT64)0)
 static unsigned mad_vmap_slot(UINT64 id, unsigned cap) { return (unsigned)((id * 0x9E3779B97F4A7C15ull) >> 40) & (cap - 1); }
-static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) {
-    unsigned i;
-    if (!id || id == MAD_VREC_TOMB) return;
-    if (!d->vmap_cap || (d->vmap_used + 1) * 10 > d->vmap_cap * 6) {
-        unsigned ncap = d->vmap_cap ? d->vmap_cap : 1024, k;
-        struct mad_viewrec *n;
-        while ((d->vmap_live + 1) * 10 > ncap * 3) ncap *= 2;
-        n = calloc(ncap, sizeof *n);
-        if (!n) return;
-        for (k = 0; k < d->vmap_cap; k++) {
-            if (!d->vmap[k].id || d->vmap[k].id == MAD_VREC_TOMB) continue;
-            i = mad_vmap_slot(d->vmap[k].id, ncap);
-            while (n[i].id) i = (i + 1) & (ncap - 1);
-            n[i] = d->vmap[k];
-        }
-        free(d->vmap); d->vmap = n; d->vmap_cap = ncap; d->vmap_used = d->vmap_live;
+static int mad_vmap_grow_locked(struct mad_device *d, int force) {
+    unsigned ncap = d->vmap_cap ? d->vmap_cap : 1024, i, k, probe;
+    struct mad_viewrec *n;
+    if (force) {
+        if (ncap > ~0u / 2) return 0;
+        ncap *= 2;
     }
+    while ((UINT64)(d->vmap_live + 1) * 10 > (UINT64)ncap * 3) {
+        if (ncap > ~0u / 2) return 0;
+        ncap *= 2;
+    }
+    n = calloc(ncap, sizeof *n);
+    if (!n) return 0;
+    for (k = 0; k < d->vmap_cap; k++) {
+        if (!d->vmap[k].id || d->vmap[k].id == MAD_VREC_TOMB) continue;
+        i = mad_vmap_slot(d->vmap[k].id, ncap);
+        for (probe = 0; probe < ncap && n[i].id; probe++) i = (i + 1) & (ncap - 1);
+        if (probe == ncap) { free(n); return 0; }   /* never spin on a damaged map */
+        n[i] = d->vmap[k];
+    }
+    free(d->vmap); d->vmap = n; d->vmap_cap = ncap; d->vmap_used = d->vmap_live;
+    return 1;
+}
+static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) {
+    unsigned i, probe, tomb;
+    if (!id || id == MAD_VREC_TOMB) return;
+    if (!d->vmap_cap || (UINT64)(d->vmap_used + 1) * 10 > (UINT64)d->vmap_cap * 6) {
+        if (!mad_vmap_grow_locked(d, 0)) return;
+    }
+retry:
     i = mad_vmap_slot(id, d->vmap_cap);
-    while (d->vmap[i].id && d->vmap[i].id != id) i = (i + 1) & (d->vmap_cap - 1);
-    if (!d->vmap[i].id) { d->vmap_used++; d->vmap_live++; }
+    tomb = d->vmap_cap;
+    for (probe = 0; probe < d->vmap_cap; probe++) {
+        if (d->vmap[i].id == id) break;
+        if (d->vmap[i].id == MAD_VREC_TOMB) { if (tomb == d->vmap_cap) tomb = i; }
+        else if (!d->vmap[i].id) { if (tomb != d->vmap_cap) i = tomb; else { d->vmap_used++; d->vmap_live++; } break; }   /* a reused tombstone is counted below */
+        i = (i + 1) & (d->vmap_cap - 1);
+    }
+    if (probe == d->vmap_cap) {
+        if (tomb != d->vmap_cap) { i = tomb; d->vmap_live++; }
+        else { if (mad_vmap_grow_locked(d, 1)) goto retry; return; }   /* a full map must grow or fail */
+    } else if (d->vmap[i].id == MAD_VREC_TOMB) d->vmap_live++;
     d->vmap[i].id = id; d->vmap[i].a = a; d->vmap[i].b = b; d->vmap[i].flat = 0;
 }
 static void mad_vmap_del_locked(struct mad_device *d, UINT64 id) {
-    unsigned i;
+    unsigned i, probe;
     if (!d->vmap_cap || !id || id == MAD_VREC_TOMB) return;
     i = mad_vmap_slot(id, d->vmap_cap);
-    while (d->vmap[i].id) {
+    for (probe = 0; probe < d->vmap_cap && d->vmap[i].id; probe++) {
         if (d->vmap[i].id == id) { d->vmap[i].id = MAD_VREC_TOMB; d->vmap_live--; return; }
         i = (i + 1) & (d->vmap_cap - 1);
     }
 }
 static int mad_vmap_get(struct mad_device *d, UINT64 id, UINT32 *a, UINT32 *b) {
-    int hit = 0; unsigned i;
+    int hit = 0; unsigned i, probe;
     if (!id || id == MAD_VREC_TOMB) return 0;
     EnterCriticalSection(&d->view_lock);
     if (d->vmap_cap) {
         i = mad_vmap_slot(id, d->vmap_cap);
-        while (d->vmap[i].id) {
+        for (probe = 0; probe < d->vmap_cap && d->vmap[i].id; probe++) {
             if (d->vmap[i].id == id) { *a = d->vmap[i].a; *b = d->vmap[i].b; hit = 1; break; }
             i = (i + 1) & (d->vmap_cap - 1);
         }
@@ -1039,7 +1061,7 @@ static void mad_pso_time_report(const char *why) {
               why, g_pn_gfx, (double)g_pt_gfx * ms, g_pn_cs, (double)g_pt_cs * ms, (double)g_pt_conv * ms, g_pn_lib,
               (double)g_pt_lib * ms, g_pn_rs, (double)g_pt_rs * ms, g_pn_realize, (double)g_pt_realize * ms);
 }
-static LONG g_perf_ecl, g_perf_signals, g_perf_waits, g_perf_polls, g_perf_qwait_sleeps; static LONGLONG g_perf_wait_ticks, g_perf_sig_lat_ticks; static LONG g_perf_sig_lat_n;
+static LONG g_perf_ecl, g_perf_signals, g_perf_waits, g_perf_polls, g_perf_stale_polls, g_perf_qwait_sleeps; static LONGLONG g_perf_wait_ticks, g_perf_sig_lat_ticks; static LONG g_perf_sig_lat_n;
 #define MAD_SKIP(e_) (mad_skip_at(__LINE__), (e_)->skipped++)
 static void mad_pso_time_report(const char *why);
 static void mad_skip_report(void) {
@@ -1575,7 +1597,7 @@ struct mad_fence {
      * rather than a wait. A condition variable over the same critical section
      * is exactly that. */
     CONDITION_VARIABLE cv;
-    UINT64 value;
+    volatile LONG64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
     /* ml1109: t_reg = registration time. `waiters` is waiters_inline until more
@@ -1598,7 +1620,7 @@ static int mad_fence_grow(struct mad_fence *f) {
 }
 
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
-    f->value = v;
+    __atomic_store_n(&f->value, (LONG64)v, __ATOMIC_RELEASE);
     WakeAllConditionVariable(&f->cv);
     unsigned w = 0;
     for (unsigned i = 0; i < f->nwaiters; i++) {
@@ -1634,9 +1656,8 @@ static ULONG STDMETHODCALLTYPE fence_Release(ID3D12Fence *This) {
  * its own stack for return addresses inside the game executable (the x64 frames
  * sit on the same stack in ARM64EC) and tallies the nearest two, with the
  * thread's name, so the loop can be read in the executable. Diagnostic only. */
-static LONG g_gcv_calls;
 static struct { ULONG_PTR r0, r1; DWORD tid; LONG n; } g_gcv_site[16];
-static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
+static __attribute__((noinline)) void mad_gcv_sample(struct mad_fence *f, UINT64 v, LONG calls) {
     static ULONG_PTR exe_lo, exe_hi; static LONG samples;
     ULONG_PTR hit[2] = { 0, 0 }, *p, *end; unsigned nh = 0, i; NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
     volatile ULONG_PTR here = 0;
@@ -1656,18 +1677,18 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
         WCHAR *wn = NULL; char nm[64] = "?";
         if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &wn)) && wn) { WideCharToMultiByte(CP_UTF8, 0, wn, -1, nm, sizeof nm, NULL, NULL); LocalFree(wn); }
         d3d12_log("[gcv] ml1142 %ld calls; this thread %04lx '%s' polls %s at %llu (signalled %llu); exe callers (rva) by thread:\n",
-                  (long)g_gcv_calls, GetCurrentThreadId(), nm, f->name ? f->name : "fence", (unsigned long long)v, (unsigned long long)f->value);
+                  (long)calls, GetCurrentThreadId(), nm, f->name ? f->name : "fence", (unsigned long long)v,
+                  (unsigned long long)__atomic_load_n(&f->value, __ATOMIC_ACQUIRE));
         for (i = 0; i < 16 && g_gcv_site[i].n; i++)
             d3d12_log("[gcv]   %04lx  +0x%llx <- +0x%llx  x%ld\n", g_gcv_site[i].tid, (unsigned long long)g_gcv_site[i].r0, (unsigned long long)g_gcv_site[i].r1, (long)g_gcv_site[i].n);
     }
 }
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
-    InterlockedIncrement(&g_perf_polls);   /* ml1109 */
-    if ((InterlockedIncrement(&g_gcv_calls) & 0x3ffff) == 0) mad_gcv_sample(f, f->value);   /* ml1142 */
-    EnterCriticalSection(&f->lock);
-    UINT64 v = f->value;
-    LeaveCriticalSection(&f->lock);
+    UINT64 v = (UINT64)__atomic_load_n(&f->value, __ATOMIC_ACQUIRE);
+    LONG calls = InterlockedIncrement(&g_perf_polls);   /* ml1109; also drives the sparse ml1142 sample */
+    if ((UINT64)__atomic_load_n(&f->submitted, __ATOMIC_ACQUIRE) > v) InterlockedIncrement(&g_perf_stale_polls);
+    if ((calls & 0x3ffff) == 0) mad_gcv_sample(f, v, calls);   /* ml1142 */
     return v;
 }
 static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, UINT64 value, HANDLE event) {
@@ -6235,7 +6256,7 @@ static int g_flat_views = -1;   /* madeira.cfg sm5-flat-views (default 1) */
 static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, enum WMTTextureType want,
                                   UINT lvl0, UINT nlvl, UINT sl0, UINT nsl, enum WMTPixelFormat pf, UINT swz);
 static UINT64 mad_air_flat_view(struct mad_device *d, UINT64 id) {
-    unsigned i; UINT64 flat = 0; int xv = -1;
+    unsigned i, probe; UINT64 flat = 0; int xv = -1;
     struct mad_resource *r;
     UINT type, lvl0, nlvl, sl0, pf, swz;
     enum WMTTextureType want;
@@ -6243,7 +6264,7 @@ static UINT64 mad_air_flat_view(struct mad_device *d, UINT64 id) {
     EnterCriticalSection(&d->view_lock);
     if (d->vmap_cap) {
         i = mad_vmap_slot(id, d->vmap_cap);
-        while (d->vmap[i].id) {
+        for (probe = 0; probe < d->vmap_cap && d->vmap[i].id; probe++) {
             if (d->vmap[i].id == id) { flat = d->vmap[i].flat; break; }
             i = (i + 1) & (d->vmap_cap - 1);
         }
@@ -6273,7 +6294,7 @@ static UINT64 mad_air_flat_view(struct mad_device *d, UINT64 id) {
     EnterCriticalSection(&d->view_lock);
     if (d->vmap_cap) {
         i = mad_vmap_slot(id, d->vmap_cap);
-        while (d->vmap[i].id) {
+        for (probe = 0; probe < d->vmap_cap && d->vmap[i].id; probe++) {
             if (d->vmap[i].id == id) { d->vmap[i].flat = flat; break; }
             i = (i + 1) & (d->vmap_cap - 1);
         }
@@ -6336,7 +6357,6 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
     unsigned i, j;
 
     *direct_va = 0;
-    memset(desc, 0, sizeof *desc);
     if (!rs) { *why = "no root signature bound"; return 0; }
 
     for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
@@ -6413,6 +6433,7 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
              * needs a byte length for buffer bindings. Refuse rather than
              * invent a bound. */
             if (rg->type != MADEIRA_IR_AIR_CBV) { *why = "root SRV/UAV has no length for this binding"; return 0; }
+            memset(desc, 0, sizeof *desc);   /* capture logging also prints the unused descriptor */
             *direct_va = root[i];
             return 1;
         }
@@ -10389,14 +10410,16 @@ static void mad_perf_present(void) {
             if (g_perf_presents) mad_tr_report((double)g_perf_presents);   /* madeira-bcd gpu-traffic */
         }
         d3d12_log("[perf] ml1109 sync per frame: ExecuteCommandLists %.1f, Signal %.1f, fence waits %.1f (game blocked %.1f ms/frame = %.0f%% of wall), "
-                  "GetCompletedValue polls %.1f, Queue::Wait sleeps %.1f; GPU-done -> fence advanced %.2f ms avg over %ld\n",
+                  "GetCompletedValue polls %.1f (%.2f M/s, %.1f%% stale), Queue::Wait sleeps %.1f; GPU-done -> fence advanced %.2f ms avg over %ld\n",
                   g_perf_presents ? (double)g_perf_ecl / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_signals / g_perf_presents : 0.0,
                   g_perf_presents ? (double)g_perf_waits / g_perf_presents : 0.0,
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
-                  g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
+                  g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, (double)g_perf_polls / wall / 1000000.0,
+                  g_perf_polls ? 100.0 * g_perf_stale_polls / (double)g_perf_polls : 0.0,
+                  g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
-        g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
+        g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_stale_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
     mad_perf_unlock();
 }
@@ -10524,8 +10547,8 @@ static void mad_list_rings_rewind(struct mad_list *l) {
  * with two more threads queued behind that lock. D3D12's Signal is a GPU-timeline
  * operation: it returns at once and the fence advances when the GPU gets there.
  * A worker thread owns that: it waits on the device's shared event for the
- * batch's serial, retires the batch's command buffers (status checked), then
- * advances the fence. Jobs are FIFO, so fence values stay ordered. */
+ * batch's serial, publishes CPU query results, then advances the fence before
+ * diagnostic command-buffer retirement. Jobs are FIFO, so values stay ordered. */
 static DWORD WINAPI mad_fence_worker(void *arg) {
     struct mad_device *d = arg;
     for (;;) {
@@ -10572,13 +10595,16 @@ static DWORD WINAPI mad_fence_worker(void *arg) {
                           (long long)d->gpu_serial_committed, n ? line : " (none)");
             }
         }
-        {   /* ml1109: from "GPU reached the serial" to "fence advanced" = our retire overhead */
+        {   /* ml1109: publish completion before diagnostic retirement work */
             LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
-            for (k = 0; k < job.ncbs; k++) mad_cb_retire(d, job.cbs[k]);
+            /* Query resolves are CPU-published, so finish those before the game
+             * can observe the fence. The shared event already orders the GPU writes. */
+            for (k = 0; k < job.ncbs; k++) mad_vis_retire(d, job.cbs[k]);
             if (g_upload_guard) mad_ug_verify(d, job.serial);   /* madeira-bcd: before the game may reuse the data */
             ID3D12Fence_Signal(job.fence, job.value);
             QueryPerformanceCounter(&t1);
             InterlockedExchangeAdd64(&g_perf_sig_lat_ticks, t1.QuadPart - t0.QuadPart); InterlockedIncrement(&g_perf_sig_lat_n);
+            for (k = 0; k < job.ncbs; k++) mad_cb_retire(d, job.cbs[k]);
         }
         ID3D12Fence_Release(job.fence);
     }

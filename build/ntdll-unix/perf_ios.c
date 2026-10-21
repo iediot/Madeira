@@ -382,6 +382,7 @@ static void *perf_reporter( void *arg )
 #define CLASS_DYLIBS 2048
 #define CLASS_BUCKETS 1024
 #define CLASS_PCS 4096
+#define CLASS_SYSTEM_PCS 2048
 #define CLASS_GAME_PCS 2048
 #define CLASS_ROWS 8
 #define CLASS_TRAPS 16
@@ -419,15 +420,18 @@ struct class_game_bucket
     unsigned tid, hits;
 };
 static struct ios_perf_image class_pe[IOS_PERF_IMAGES];
+static struct ios_perf_fex_range class_fex_ranges[IOS_PERF_FEX_RANGES];
 static struct class_image class_dylibs[CLASS_DYLIBS];
 static struct { uintptr_t lo, hi; } class_traps[CLASS_TRAPS];
 static struct class_bucket class_buckets[CLASS_BUCKETS];
 static struct class_pc_bucket class_pcs[CLASS_PCS];
+static struct class_pc_bucket class_system_pcs[CLASS_SYSTEM_PCS];
 static struct class_game_bucket class_game_pcs[CLASS_GAME_PCS];
 static struct class_row class_rows[CLASS_ROWS];
 static struct perf_thread class_threads[PERF_THREADS];
 static enum perf_class class_pe_classes[IOS_PERF_IMAGES];
-static unsigned class_npe, class_ndylibs, class_ntraps, class_dropped, class_pc_dropped, class_game_dropped;
+static unsigned class_npe, class_nfex_ranges, class_ndylibs, class_ntraps, class_dropped;
+static unsigned class_pc_dropped, class_system_dropped, class_game_dropped;
 static uint32_t class_dyld_count = UINT32_MAX;
 extern void *ios_jit_rx_base_global;
 extern size_t ios_jit_pool_size_global;
@@ -549,6 +553,13 @@ static enum perf_class class_pc(uintptr_t pc, uintptr_t dispatcher, const char *
         *name = "jit-pool"; *offset = pc - (uintptr_t)ios_jit_rx_base_global;
         return C_GAME;
     }
+    for (i = 0; i < class_nfex_ranges; ++i)
+        if (pc >= class_fex_ranges[i].base &&
+            pc - class_fex_ranges[i].base < class_fex_ranges[i].size)
+        {
+            *name = "fex-code-buffer"; *offset = pc - class_fex_ranges[i].base;
+            return C_GAME;
+        }
     if (ios_fex_arena_base_unix && pc >= ios_fex_arena_base_unix && pc < ios_fex_arena_end_unix)
     {
         *name = "fex-arena"; *offset = pc - ios_fex_arena_base_unix;
@@ -677,6 +688,27 @@ static void class_pc_add(struct class_row *row, enum perf_class kind, uintptr_t 
         }
     }
     ++class_pc_dropped;
+}
+
+static void class_system_add(struct class_row *row, uintptr_t pc,
+                             const char *name, uintptr_t offset)
+{
+    unsigned i, h = (unsigned)(((pc >> 2) ^ row->id) * 2654435761u) % CLASS_SYSTEM_PCS;
+    for (i = 0; i < CLASS_SYSTEM_PCS; ++i, h = (h + 1) % CLASS_SYSTEM_PCS)
+    {
+        struct class_pc_bucket *b = &class_system_pcs[h];
+        if (!b->hits || (b->id == row->id && b->pc == pc))
+        {
+            if (!b->hits)
+            {
+                b->id = row->id; b->tid = row->tid; b->pc = pc; b->kind = C_SYSTEM; b->offset = offset;
+                snprintf(b->name, sizeof(b->name), "%s", name);
+            }
+            ++b->hits;
+            return;
+        }
+    }
+    ++class_system_dropped;
 }
 
 static void class_game_add(struct class_row *row, uintptr_t pc, uint64_t x28, uintptr_t teb)
@@ -875,6 +907,50 @@ static void class_report_fex(void)
     memset(class_pcs, 0, sizeof(class_pcs)); class_pc_dropped = 0;
 }
 
+static void class_report_system(void)
+{
+    static struct class_named_bucket named[CLASS_SYSTEM_PCS];
+    unsigned totals[CLASS_ROWS * 2] = {0};
+    uint64_t total_id[CLASS_ROWS * 2] = {0};
+    unsigned count = 0, ntotal = 0, i, rank;
+    memset(named, 0, sizeof(named));
+    for (i = 0; i < CLASS_SYSTEM_PCS; ++i)
+    {
+        struct class_pc_bucket *b = &class_system_pcs[i];
+        Dl_info di = {0};
+        char desc[192];
+        unsigned j;
+        if (!b->hits) continue;
+        if (dladdr((void *)b->pc, &di) && di.dli_sname)
+            snprintf(desc, sizeof(desc), "%s", di.dli_sname);
+        else if (dladdr((void *)b->pc, &di) && di.dli_fname)
+            snprintf(desc, sizeof(desc), "%s+0x%llx", class_basename(di.dli_fname),
+                     (unsigned long long)((b->pc - (uintptr_t)di.dli_fbase) & ~(uintptr_t)0xfff));
+        else snprintf(desc, sizeof(desc), "%s+0x%llx", b->name,
+                      (unsigned long long)(b->offset & ~(uintptr_t)0xfff));
+        class_named_add(named, CLASS_SYSTEM_PCS, &count, b->id, b->tid, desc, b->hits);
+        for (j = 0; j < ntotal && total_id[j] != b->id; ++j) ;
+        if (j == ntotal && ntotal < sizeof(totals)/sizeof(totals[0]))
+        { total_id[ntotal] = b->id; ++ntotal; }
+        if (j < ntotal) totals[j] += b->hits;
+    }
+    for (rank = 0; rank < 10; ++rank)
+    {
+        unsigned best = ~0u, j;
+        for (i = 0; i < count; ++i)
+            if (named[i].hits && (best == ~0u || named[i].hits > named[best].hits)) best = i;
+        if (best == ~0u) break;
+        for (j = 0; j < ntotal && total_id[j] != named[best].id; ++j) ;
+        dprintf(2, "[perf-classify-system] tid=%04x %s samples=%u pct=%.1f\n",
+                named[best].tid, named[best].name, named[best].hits,
+                j < ntotal && totals[j] ? 100.0 * named[best].hits / totals[j] : 0.0);
+        named[best].hits = 0;
+    }
+    if (class_system_dropped)
+        dprintf(2, "[perf-classify-system] pc-table-full dropped=%u\n", class_system_dropped);
+    memset(class_system_pcs, 0, sizeof(class_system_pcs)); class_system_dropped = 0;
+}
+
 static void class_report_game(void)
 {
     extern uint64_t ios_native_rip_from_hostpc(uint64_t, uint64_t, const char **);
@@ -958,7 +1034,7 @@ static void *perf_classifier(void *arg)
         if (now >= report) { class_report(); report = now + 5000000000ull; }
         if (now >= top)
         {
-            class_report_top(); class_report_fex(); class_report_game();
+            class_report_top(); class_report_fex(); class_report_system(); class_report_game();
             top = now + 30000000000ull;
         }
         if (now >= refresh)
@@ -968,6 +1044,7 @@ static void *perf_classifier(void *arg)
             if (selected) mach_port_deallocate(mach_task_self(), selected);
             selected = class_pick(++gen, &id, &tid, &teb, name);
             class_npe = ios_perf_image_snapshot(class_pe, IOS_PERF_IMAGES);
+            class_nfex_ranges = ios_perf_fex_range_snapshot(class_fex_ranges, IOS_PERF_FEX_RANGES);
             for (i = 0; i < class_npe; ++i) class_pe_classes[i] = class_pe_kind(class_pe[i].name);
             class_refresh_dyld();
             dispatcher = 0;
@@ -995,6 +1072,7 @@ static void *perf_classifier(void *arg)
                 ++r->samples; ++r->counts[kind];
                 class_bucket_add(r, kind, module, offset);
                 class_pc_add(r, kind, pc, module, offset);
+                if (kind == C_SYSTEM) class_system_add(r, pc, module, offset);
                 if (kind == C_GAME) class_game_add(r, pc, st.__x[28], teb);
                 n = THREAD_BASIC_INFO_COUNT;
                 if (thread_info(selected, THREAD_BASIC_INFO, (thread_info_t)&basic, &n)) ++r->state_failed;

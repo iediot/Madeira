@@ -20,3 +20,10 @@ What they log (env-gated):
 Finding: the box came from RAGE's streaming loop (exe+0x26043a8, check at
 exe+0x2604640): a device read returning a size other than the one requested is
 fatal with code -1.
+
+## Second round (2026-10-20)
+`wine-diagnostics-2.patch` / `ntdll-unix-diagnostics-2.patch`: the same tools plus [at-open] (every
+.rpf open with its handle, NtCreateFile/NtOpenFile) and [at-close] (NtClose and
+DuplicateObject(CLOSE_SOURCE) of an .rpf handle, with the module names on the closing stack,
+ios_at_where_mod). They found the real cause: wine/dlls/win32u/rawinput.c's shared device list
+closed handles in the wrong process (fixed there).

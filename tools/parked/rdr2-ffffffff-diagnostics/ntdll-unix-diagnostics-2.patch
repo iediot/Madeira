@@ -1,0 +1,297 @@
+diff --git a/build/ntdll-unix/server_ios.c b/build/ntdll-unix/server_ios.c
+index dcb65df9..48076652 100644
+--- a/build/ntdll-unix/server_ios.c
++++ b/build/ntdll-unix/server_ios.c
+@@ -3758,6 +3758,27 @@ static int remove_fd_from_cache( HANDLE handle )
+ 
+ 
+ #ifdef WINE_IOS
++/* [at-close] (MADEIRA_AT_TRACE): a close of a handle whose cached descriptor is a game
++ * data file (.rpf, or anything under Program Files), with the modules on the closing
++ * thread's stack. RDR2's streamer read a handle that had stopped being a file (0x37c,
++ * STATUS_OBJECT_TYPE_MISMATCH), so something in its process closes its archives.
++ * Caller holds fd_cache_mutex: peek the cache, take no lock. */
++void ios_at_note_close( HANDLE handle, const char *how )
++{
++    extern int ios_at_on( void );
++    extern void ios_at_where_mod( char *out, size_t outlen );
++    enum server_fd_type type;
++    char path[1024], where[512];
++    int fd = -1;
++
++    if (!ios_at_on()) return;
++    if (get_cached_fd( handle, &fd, &type, NULL, NULL ) || fd < 0 || type != FD_TYPE_FILE) return;
++    if (fcntl( fd, F_GETPATH, path ) == -1) return;
++    if (!strstr( path, ".rpf" ) && !strstr( path, ".RPF" )) return;
++    ios_at_where_mod( where, sizeof(where) );
++    ERR( "[at-close] %s(%p) fd %d %s by%s\n", how, handle, fd, path, where );
++}
++
+ /* madeira-bcd: get_handle_fd hands the descriptor over in its reply (build/wineserver/
+  * fd_ios.c). The server is a thread of this process and shares its descriptor table, so
+  * the copy it makes with F_DUPFD_CLOEXEC is what SCM_RIGHTS through the process socket
+@@ -5714,6 +5735,12 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+      * retrieve it again */
+     if (options & DUPLICATE_CLOSE_SOURCE)
+     {
++#ifdef WINE_IOS
++        {
++            extern void ios_at_note_close( HANDLE handle, const char *how );
++            ios_at_note_close( source, "DuplicateObject(CLOSE_SOURCE)" );
++        }
++#endif
+         fd = remove_fd_from_cache( source );
+         close_inproc_sync( source );
+     }
+@@ -5788,6 +5815,12 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
+ 
+     /* always remove the cached fd; if the server request fails we'll just
+      * retrieve it again */
++#ifdef WINE_IOS
++    {
++        extern void ios_at_note_close( HANDLE handle, const char *how );
++        ios_at_note_close( handle, "NtClose" );
++    }
++#endif
+     fd = remove_fd_from_cache( handle );
+     close_inproc_sync( handle );
+ 
+diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
+index aca3b0c4..8a1dcd40 100644
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -7983,6 +7983,25 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+ 
+     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
+ 
++    /* [single-step] A context with PSTATE.SS (x64 EFlags.TF, converted by the ARM64EC
++     * ntdll) asks for a single-step exception after the next instruction: anti-tamper
++     * code sets TF from an exception handler and treats a missing EXCEPTION_SINGLE_STEP
++     * as a debugger. Logged so a run shows whether a single step follows. */
++    if ((flags & CONTEXT_CONTROL) && (context->Cpsr & 0x200000))
++    {
++        static LONG ss_n;
++        if (__sync_add_and_fetch( &ss_n, 1 ) <= 200)
++            ERR( "[single-step] #%d set-context self=%d handle=%p pc=%p sp=%p cpsr=%#x\n", (int)ss_n, self, handle,
++                 (void *)context->Pc, (void *)context->Sp, (unsigned)context->Cpsr );
++    }
++    if (flags & CONTEXT_DEBUG_REGISTERS)
++    {
++        static LONG dr_n;
++        if (__sync_add_and_fetch( &dr_n, 1 ) <= 50)
++            ERR( "[debug-regs] #%d set-context self=%d handle=%p ctrl=%#x bcr0=%#x wcr0=%#x\n", (int)dr_n, self, handle,
++                 (unsigned)context->ContextFlags, (unsigned)context->Bcr[0], (unsigned)context->Wcr[0] );
++    }
++
+     /* Subnautica (Mono) died jumping to 0x3600000070A12829: a Mono code address
+      * with its bytes shifted one place. If a context set carries such a PC, say
+      * who set it. Also the first cross-thread PC rewrites, to see if Mono
+@@ -8145,7 +8164,36 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
+  *              NtGetContextThread  (NTDLL.@)
+  *              ZwGetContextThread  (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtGetContextThread( HANDLE handle, CONTEXT *context );
++
++NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
++{
++    NTSTATUS status = ios_at_impl_NtGetContextThread( handle, context );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x480 + ((context->ContextFlags >> 1) & 0x3f) ))
++        {
++            char w[160];
++            ios_at_where( w, sizeof(w) );
++            ERR( "[at] GetContextThread(%p, flags %#x) -> %#x pc=%p cpsr=%#x bcr0=%#x bvr0=%p wcr0=%#x wvr0=%p from%s\n",
++                 handle, (unsigned)context->ContextFlags, (unsigned)status, (void *)context->Pc, (unsigned)context->Cpsr,
++                 (unsigned)context->Bcr[0], (void *)context->Bvr[0], (unsigned)context->Wcr[0], (void *)context->Wvr[0], w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtGetContextThread( HANDLE handle, CONTEXT *context )
++#else
+ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
++#endif
+ {
+     struct syscall_frame *frame = get_syscall_frame();
+     DWORD needed_flags = context->ContextFlags & ~CONTEXT_ARM64;
+@@ -16984,3 +17032,171 @@ next:
+     mach_port_deallocate(mach_task_self(), self);
+     fflush(stderr);
+ }
++
++#ifdef WINE_IOS
++/* [wake-trace] (sync.c): the main program's code addresses on this thread's stack, from
++ * the syscall frame's sp up, so a waker can be placed in the game's code. x64 and ARM64EC
++ * code share the thread's stack, so the x64 return addresses are in it. */
++void ios_wake_trace_stack( void )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    TEB *teb = NtCurrentTeb();
++    const IMAGE_DOS_HEADER *dos;
++    const IMAGE_NT_HEADERS64 *nt;
++    ULONG_PTR base, size, sp, top, p;
++    int hits = 0;
++
++    if (!frame || !teb || !teb->Peb || !(base = (ULONG_PTR)teb->Peb->ImageBaseAddress)) return;
++    dos = (const IMAGE_DOS_HEADER *)base;
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
++    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
++    size = nt->OptionalHeader.SizeOfImage;
++    sp = frame->sp & ~7ul;
++    top = (ULONG_PTR)teb->Tib.StackBase;
++    if (sp < (ULONG_PTR)teb->Tib.StackLimit || sp >= top) return;
++    if (top - sp > 0x20000) top = sp + 0x20000;
++    for (p = sp; p + 8 <= top && hits < 32; p += 8)
++    {
++        ULONG_PTR v = *(const ULONG_PTR *)p;
++        if (v - base >= size) continue;
++        ERR( "[wake-trace]   [sp+%#lx] exe+%#lx\n", (unsigned long)(p - sp), (unsigned long)(v - base) );
++        hits++;
++    }
++    if (!hits) ERR( "[wake-trace]   no main-program addresses in %#lx bytes of stack (sp %#lx)\n",
++                    (unsigned long)(top - sp), (unsigned long)sp );
++}
++#endif
++
++#ifdef WINE_IOS
++/* [at] anti-tamper trace (env MADEIRA_AT_TRACE=<program name>, e.g. RDR2.exe): the
++ * queries an anti-tamper or anti-debug guard makes about the process, its threads, the
++ * system and its own memory, from the named program only, each with what it was told
++ * and where in the program it asked from. Rate-limited per call type. */
++int ios_at_on( void )
++{
++    static void *cached_peb;
++    static int cached_on;
++    TEB *teb = NtCurrentTeb();
++    const char *want;
++    PEB *peb;
++
++    if (!teb || !(peb = teb->Peb)) return 0;
++    if (peb == __atomic_load_n( &cached_peb, __ATOMIC_ACQUIRE )) return cached_on;
++    want = getenv( "MADEIRA_AT_TRACE" );
++    cached_on = 0;
++    if (want && *want && peb->ProcessParameters && peb->ProcessParameters->ImagePathName.Buffer)
++    {
++        const WCHAR *p = peb->ProcessParameters->ImagePathName.Buffer;
++        size_t n = peb->ProcessParameters->ImagePathName.Length / sizeof(WCHAR), w = strlen( want ), i;
++        if (n >= w)
++        {
++            for (i = 0; i < w; i++)
++            {
++                WCHAR c = p[n - w + i], d = (unsigned char)want[i];
++                if (c >= 'A' && c <= 'Z') c += 32;
++                if (d >= 'A' && d <= 'Z') d += 32;
++                if (c != d) break;
++            }
++            cached_on = (i == w);
++        }
++    }
++    if (cached_on)
++        ERR( "[at] tracing this process: BeingDebugged=%u NtGlobalFlag=%#x heap=%p\n", peb->BeingDebugged,
++             (unsigned)peb->NtGlobalFlag, peb->ProcessHeap );
++    __atomic_store_n( &cached_peb, peb, __ATOMIC_RELEASE );
++    return cached_on;
++}
++
++/* 1 = log this one: the first 40 of each key, then every 500th; 30000 lines in all */
++int ios_at_take( unsigned key )
++{
++    static LONG counts[1024], total;
++    LONG n = __sync_add_and_fetch( &counts[key % 1024], 1 );
++    if (n > 40 && n % 500) return 0;
++    return __sync_add_and_fetch( &total, 1 ) <= 30000;
++}
++
++/* where in the main program the call came from: its first 6 code addresses on the stack */
++void ios_at_where( char *out, size_t outlen )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    TEB *teb = NtCurrentTeb();
++    const IMAGE_DOS_HEADER *dos;
++    const IMAGE_NT_HEADERS64 *nt;
++    ULONG_PTR base, size, sp, top, p;
++    size_t off = 0;
++    int hits = 0;
++
++    out[0] = 0;
++    if (!frame || !teb || !teb->Peb || !(base = (ULONG_PTR)teb->Peb->ImageBaseAddress)) return;
++    dos = (const IMAGE_DOS_HEADER *)base;
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
++    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
++    size = nt->OptionalHeader.SizeOfImage;
++    sp = frame->sp & ~7ul;
++    top = (ULONG_PTR)teb->Tib.StackBase;
++    if (sp < (ULONG_PTR)teb->Tib.StackLimit || sp >= top) return;
++    if (top - sp > 0x4000) top = sp + 0x4000;
++    for (p = sp; p + 8 <= top && hits < 6 && off + 24 < outlen; p += 8)
++    {
++        ULONG_PTR v = *(const ULONG_PTR *)p;
++        if (v - base < 0x1000 || v - base >= size) continue;
++        off += snprintf( out + off, outlen - off, " exe+%#lx", (unsigned long)(v - base) );
++        hits++;
++    }
++}
++
++void ios_at_hex( char *out, const void *data, size_t len, size_t max )
++{
++    size_t i, off = 0;
++    out[0] = 0;
++    if (!data) return;
++    if (len > max) len = max;
++    for (i = 0; i < len; i++) off += sprintf( out + off, "%02x", ((const unsigned char *)data)[i] );
++}
++#endif
++
++#ifdef WINE_IOS
++/* [at-close]: the code addresses on this thread's stack, named by module (the PEB loader
++ * list, read without the loader lock: a diagnostic, racy against a concurrent unload). */
++void ios_at_where_mod( char *out, size_t outlen )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    TEB *teb = NtCurrentTeb();
++    ULONG_PTR sp, top, p, last = 0;
++    size_t off = 0;
++    int hits = 0;
++
++    out[0] = 0;
++    if (!frame || !teb || !teb->Peb || !teb->Peb->LdrData) return;
++    sp = frame->sp & ~7ul;
++    top = (ULONG_PTR)teb->Tib.StackBase;
++    if (sp < (ULONG_PTR)teb->Tib.StackLimit || sp >= top) return;
++    if (top - sp > 0x4000) top = sp + 0x4000;
++    for (p = sp; p + 8 <= top && hits < 10 && off + 80 < outlen; p += 8)
++    {
++        ULONG_PTR v = *(const ULONG_PTR *)p;
++        LIST_ENTRY *head = &teb->Peb->LdrData->InLoadOrderModuleList, *e;
++        int n = 0;
++        for (e = head->Flink; e && e != head && n < 512; e = e->Flink, n++)
++        {
++            LDR_DATA_TABLE_ENTRY *m = CONTAINING_RECORD( e, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
++            ULONG_PTR base = (ULONG_PTR)m->DllBase;
++            if (v - base >= 0x1000 && v - base < m->SizeOfImage)
++            {
++                char name[40];
++                int i, len = m->BaseDllName.Length / sizeof(WCHAR);
++                if (base == last) break;   /* one entry per module run */
++                for (i = 0; i < len && i < 39; i++) name[i] = (char)m->BaseDllName.Buffer[i];
++                name[i] = 0;
++                off += snprintf( out + off, outlen - off, " %s+%#lx", name, (unsigned long)(v - base) );
++                last = base;
++                hits++;
++                break;
++            }
++        }
++    }
++}
++#endif

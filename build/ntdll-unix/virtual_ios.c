@@ -549,6 +549,45 @@ static void ios_pool_tail_unreserve( volatile size_t *reserved, size_t mine, siz
  * freed-but-unreused range stays valid during the grace window. */
 static pthread_mutex_t ios_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static struct ios_perf_fex_range ios_perf_fex_ranges[IOS_PERF_FEX_RANGES];
+static unsigned ios_perf_fex_range_count;
+
+/* FEX names every allocation it owns. Keep only exact CodeBuffer ranges;
+ * any later named owner overlapping one retires the stale record. */
+void ios_perf_fex_range_publish(const char *name, const void *base, size_t size)
+{
+    uintptr_t lo = (uintptr_t)base, hi = lo + size;
+    unsigned i, n = 0;
+    int code = name && !strcmp(name, "FEXMemJIT");
+
+    if (!lo || !size || hi < lo) return;
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_perf_fex_range_count; ++i)
+    {
+        uintptr_t old_lo = ios_perf_fex_ranges[i].base;
+        uintptr_t old_hi = old_lo + ios_perf_fex_ranges[i].size;
+        if (lo < old_hi && old_lo < hi) continue;
+        ios_perf_fex_ranges[n++] = ios_perf_fex_ranges[i];
+    }
+    if (code && n < IOS_PERF_FEX_RANGES)
+    {
+        ios_perf_fex_ranges[n].base = lo;
+        ios_perf_fex_ranges[n++].size = size;
+    }
+    ios_perf_fex_range_count = n;
+    pthread_mutex_unlock( &ios_pool_lock );
+}
+
+unsigned ios_perf_fex_range_snapshot(struct ios_perf_fex_range *out, unsigned cap)
+{
+    unsigned n;
+    pthread_mutex_lock( &ios_pool_lock );
+    n = ios_perf_fex_range_count < cap ? ios_perf_fex_range_count : cap;
+    memcpy( out, ios_perf_fex_ranges, n * sizeof(*out) );
+    pthread_mutex_unlock( &ios_pool_lock );
+    return n;
+}
+
 /* All range publication and retirement share ios_pool_lock. Copy names too:
  * the original PE may already be unmapped, even while its pool copy survives. */
 unsigned ios_perf_image_snapshot(struct ios_perf_image *out, unsigned cap)
@@ -11513,6 +11552,30 @@ static NTSTATUS ios_stub_unix_call_ok(void *args) {
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS ios_fex_set_vma_name(void *args)
+{
+    struct ios_fex_vma_name
+    {
+        const void *addr;
+        size_t size;
+        const char *name;
+    } *p = args;
+    if (!p) return STATUS_INVALID_PARAMETER;
+    ios_perf_fex_range_publish( p->name, p->addr, p->size );
+    return STATUS_SUCCESS;
+}
+
+/* Matches FEXUnixLibFunctions. Only SetVMAName is meaningful on iOS. */
+static unixlib_entry_t ios_fex_unix_call_table[] =
+{
+    ios_stub_unix_call,
+    ios_stub_unix_call,
+    ios_stub_unix_call,
+    ios_fex_set_vma_name,
+    ios_stub_unix_call,
+    ios_stub_unix_call,
+};
+
 /* iOS-Madeira 2026-07-10: the unixlib "funcs" value handed back to the PE
  * side is a TABLE that __wine_unix_call_dispatcher indexes as
  * funcs[code](args) — storing a bare function there makes UNIX_CALL read
@@ -11936,6 +11999,10 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "dnsapi (libresolv)";
             funcs64 = (const void *)dnsapi_unix_call_funcs;
             funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;
+        } else if (match && (strstr(match, "arm64ecfex") || strstr(match, "wow64fex") ||
+                             strstr(match, "xtajit"))) {
+            libname = "FEX allocation registry";
+            funcs64 = funcs_wow64 = (const void *)ios_fex_unix_call_table;
         } else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.
              * Activating this causes user32 process_attach to crash until

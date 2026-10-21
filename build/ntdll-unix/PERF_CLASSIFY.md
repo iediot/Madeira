@@ -23,11 +23,11 @@ TEB ClientId.UniqueThread; `name` is the host thread name.
 
 | Class | PC ownership |
 | --- | --- |
-| game | JIT pool outside registered PE copies and the selected EC dispatcher |
+| game | Translated guest code in registered FEX CodeBuffers, including JIT-pool buffers, outside registered PE copies and the selected EC dispatcher |
 | dxmt | d3d11, d3d10core, dxgi, d3d9, d3d9-emulated, winemetal PE copies |
 | winePE | Other registered native PE copies |
 | wineUnix | Madeira's main Mach-O executable, corrected at report time when its symbol belongs to statically linked FEXCore |
-| fex | libarm64ecfex/libwow64fex/xtajit* PE copies, EC dispatcher, FEX arena, and symbol-identified FEXCore code in Madeira |
+| fex | libarm64ecfex/libwow64fex/xtajit* PE copies, dispatcher/compiler/lookup helpers, the non-CodeBuffer FEX arena, and symbol-identified FEXCore code in Madeira |
 | mvk/metal | MoltenVK, Metal, IOGPU, AGX Mach-O images |
 | system | Remaining Mach-O dylibs |
 | blocked | Cached kernel wait/trap function PC ranges |
@@ -59,6 +59,11 @@ lookup, compile, syscall and thunk, signal and fault, and other groups. These
 groups are report-time symbol-name heuristics; unsymbolized dispatcher pages
 are still recognized from their known allocation.
 
+`[perf-classify-system]` similarly lists the top ten system symbols per
+30-second window. Raw system PCs are kept in a separate fixed table and passed
+to `dladdr()` only at report time, so libsystem/libobjc waits, memcpy and other
+native work remain in `system` but are identifiable.
+
 `[perf-classify-game]` lists the top ten guest module + 4 KB offsets for JIT-pool
 samples. It records the sampled PC and x28 block pointer, then reuses the
 existing perf-stack host-PC-to-guest-RIP decoder and guest loader module map at
@@ -77,14 +82,13 @@ omitted.
 - Wait ranges are resolved once from libsystem_kernel with dlsym/dladdr, bounded
   by the next symbol and capped at 256 bytes. Missing/private symbols, longer
   wrappers and unlisted waits can be missed.
-- FEX `CodeBuffer` and `Dispatcher` both allocate executable memory through the
-  EC_CODE pool path in `NtAllocateVirtualMemoryEx`. The large `ios_fex_arena`
-  reservation primarily holds FEX state/lookup data, not translated instructions.
-  For ARM64EC, TEB+0x1788 -> CPUArea+0x40 gives DispatcherLoopTopEnterEC. FEX's
-  dispatcher occupies a 16 KB allocation (four FEX 4 KB pages); the pool aligns
-  it to 16 KB. This identifies its range without changing FEX or calling into
-  it from the sampler. This depends on the current FEX/EC layout. The WOW64
-  dispatcher is not identified this way and may count as game.
+- FEX publishes its existing `VirtualName` allocation records to the unix side.
+  Exact `FEXMemJIT` CodeBuffer ranges are snapshotted once per second and count
+  as game even when iOS 27 places them inside `ios_fex_arena`. Later named owners
+  retire overlapping stale CodeBuffer records. Dispatcher, CPU-backend, lookup
+  and other arena allocations remain FEX. For pool-hosted ARM64EC dispatchers,
+  TEB+0x1788 -> CPUArea+0x40 still identifies the four-page dispatcher without
+  calling into FEX from the sampler.
 - FEXCore and the iOS syscall/signal glue are static archives linked into the
   Madeira executable, not a framework. Image-range classification therefore
   initially sees that native code as wineUnix. The raw-PC report pass recognizes
@@ -99,8 +103,9 @@ omitted.
 - The existing `[perf-stack]` resolves guest RIP using x28's block metadata.
   The classifier reads only BlockBegin while sampling and walks the mutable
   block/RIP tables at report time.
-- Storage is fixed: 512 Wine threads/PE copies, 2048 Mach-O text ranges, 1024
-  top buckets, 4096 native PCs, 2048 guest PCs, and eight per-report target
+- Storage is fixed: 512 Wine threads/PE copies/FEX CodeBuffer ranges, 2048
+  Mach-O text ranges, 1024 top buckets, 4096 FEX/native PCs, 2048 system PCs,
+  2048 guest PCs, and eight per-report target
   rows. Overflowed tables are counted explicitly; a saturated table biases the
   top list toward PCs first seen in the interval. There are no explicit
   heap/VM allocations in the sampling loop, nor task_threads enumeration.

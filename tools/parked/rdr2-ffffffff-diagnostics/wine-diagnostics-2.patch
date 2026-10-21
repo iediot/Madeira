@@ -1,0 +1,379 @@
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index e976d90d..2b9f24ed 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -4851,10 +4851,32 @@ static void ios_iot_note( HANDLE h, const char *what, long long a, long long b,
+ }
+ #endif
+ 
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++static NTSTATUS ios_at_impl_NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size, ULONG attributes, ULONG sharing, ULONG disposition, ULONG options, void *ea_buffer, ULONG ea_length );
++
++NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size, ULONG attributes, ULONG sharing, ULONG disposition, ULONG options, void *ea_buffer, ULONG ea_length )
++{
++    NTSTATUS status = ios_at_impl_NtCreateFile( handle, access, attr, io, alloc_size, attributes, sharing, disposition, options, ea_buffer, ea_length );
++    if (ios_at_on())
++        {
++            if (!status && attr && attr->ObjectName && attr->ObjectName->Buffer)
++            {
++                const char *name = debugstr_us( attr->ObjectName );
++                if (strstr( name, ".rpf" ) || strstr( name, ".RPF" ))
++                    ERR( "[at-open] NtCreateFile(%s) -> handle %p\n", name, *handle );
++            }
++        }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size, ULONG attributes, ULONG sharing, ULONG disposition, ULONG options, void *ea_buffer, ULONG ea_length )
++#else
+ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
+                               IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size,
+                               ULONG attributes, ULONG sharing, ULONG disposition,
+                               ULONG options, void *ea_buffer, ULONG ea_length )
++#endif
+ {
+     OBJECT_ATTRIBUTES new_attr;
+     UNICODE_STRING nt_name;
+@@ -5051,8 +5073,30 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
+ /******************************************************************************
+  *              NtOpenFile   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++static NTSTATUS ios_at_impl_NtOpenFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG sharing, ULONG options );
++
++NTSTATUS WINAPI NtOpenFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG sharing, ULONG options )
++{
++    NTSTATUS status = ios_at_impl_NtOpenFile( handle, access, attr, io, sharing, options );
++    if (ios_at_on())
++        {
++            if (!status && attr && attr->ObjectName && attr->ObjectName->Buffer)
++            {
++                const char *name = debugstr_us( attr->ObjectName );
++                if (strstr( name, ".rpf" ) || strstr( name, ".RPF" ))
++                    ERR( "[at-open] NtOpenFile(%s) -> handle %p\n", name, *handle );
++            }
++        }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtOpenFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG sharing, ULONG options )
++#else
+ NTSTATUS WINAPI NtOpenFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
+                             IO_STATUS_BLOCK *io, ULONG sharing, ULONG options )
++#endif
+ {
+     return NtCreateFile( handle, access, attr, io, NULL, 0, sharing, FILE_OPEN, options, NULL, 0 );
+ }
+@@ -6620,9 +6664,44 @@ static void ios_js_read_note( HANDLE handle, int unix_fd, const void *buffer, UL
+ }
+ #endif
+ 
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++static NTSTATUS ios_at_impl_NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key );
++
++NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++{
++    NTSTATUS status = ios_at_impl_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
++    if (ios_at_on())
++        {
++            extern int ios_at_take( unsigned key );
++            extern void ios_at_where( char *out, size_t outlen );
++            ULONG got = (status == STATUS_SUCCESS || status == STATUS_END_OF_FILE) ? (ULONG)io->Information : 0;
++            if (status == STATUS_PENDING || (status != STATUS_SUCCESS) || got < length)
++            {
++                if (ios_at_take( 0x700 + (status == STATUS_PENDING ? 1 : status == STATUS_SUCCESS ? 2 : 3) ))
++                {
++                    char w[160], path[1024] = "?";
++                    int fd, needs_close;
++                    if (!server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL ))
++                    {
++                        if (fcntl( fd, F_GETPATH, path ) == -1) strcpy( path, "?" );
++                        if (needs_close) close( fd );
++                    }
++                    ios_at_where( w, sizeof(w) );
++                    ERR( "[at-read] NtReadFile(%p %s, offset %#llx, %#x bytes) -> %#x, %#x bytes from%s\n", handle, path,
++                         offset ? (unsigned long long)offset->QuadPart : ~0ull, (unsigned)length, (unsigned)status, (unsigned)got, w );
++                }
++            }
++        }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++#else
+ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                             IO_STATUS_BLOCK *io, void *buffer, ULONG length,
+                             LARGE_INTEGER *offset, ULONG *key )
++#endif
+ {
+     int result, unix_handle, needs_close;
+     unsigned int options;
+@@ -6885,9 +6964,44 @@ err:
+ /******************************************************************************
+  *              NtReadFileScatter   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++static NTSTATUS ios_at_impl_NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key );
++
++NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++{
++    NTSTATUS status = ios_at_impl_NtReadFileScatter( file, event, apc, apc_user, io, segments, length, offset, key );
++    if (ios_at_on())
++        {
++            extern int ios_at_take( unsigned key );
++            extern void ios_at_where( char *out, size_t outlen );
++            ULONG got = (status == STATUS_SUCCESS || status == STATUS_END_OF_FILE) ? (ULONG)io->Information : 0;
++            if (status == STATUS_PENDING || (status != STATUS_SUCCESS) || got < length)
++            {
++                if (ios_at_take( 0x700 + (status == STATUS_PENDING ? 1 : status == STATUS_SUCCESS ? 2 : 3) ))
++                {
++                    char w[160], path[1024] = "?";
++                    int fd, needs_close;
++                    if (!server_get_unix_fd( file, 0, &fd, &needs_close, NULL, NULL ))
++                    {
++                        if (fcntl( fd, F_GETPATH, path ) == -1) strcpy( path, "?" );
++                        if (needs_close) close( fd );
++                    }
++                    ios_at_where( w, sizeof(w) );
++                    ERR( "[at-read] NtReadFileScatter(%p %s, offset %#llx, %#x bytes) -> %#x, %#x bytes from%s\n", file, path,
++                         offset ? (unsigned long long)offset->QuadPart : ~0ull, (unsigned)length, (unsigned)status, (unsigned)got, w );
++                }
++            }
++        }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key )
++#else
+ NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                                    IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments,
+                                    ULONG length, LARGE_INTEGER *offset, ULONG *key )
++#endif
+ {
+     int result, unix_handle, needs_close;
+     unsigned int options, status;
+@@ -8355,8 +8469,37 @@ static void *put_object_type_info( OBJECT_TYPE_INFORMATION *p, struct object_typ
+ /**************************************************************************
+  *           NtQueryObject   (NTDLL.@)
+  */
++#ifdef WINE_IOS
++extern int ios_at_on( void );
++extern int ios_at_take( unsigned key );
++extern void ios_at_where( char *out, size_t outlen );
++extern void ios_at_hex( char *out, const void *data, size_t len, size_t max );
++#endif
++#ifdef WINE_IOS
++static NTSTATUS ios_at_impl_NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len );
++
++NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len )
++{
++    NTSTATUS status = ios_at_impl_NtQueryObject( handle, info_class, ptr, len, used_len );
++    if (ios_at_on())
++    {
++        if (ios_at_take( 0x400 + info_class ))
++        {
++            char w[160], h[40];
++            ios_at_where( w, sizeof(w) );
++            ios_at_hex( h, status ? NULL : ptr, len, 16 );
++            ERR( "[at] QueryObject(%p, class %u, %u bytes) -> %#x data %s from%s\n",
++                 handle, (unsigned)info_class, (unsigned)len, (unsigned)status, h, w );
++        }
++    }
++    return status;
++}
++
++static NTSTATUS ios_at_impl_NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class, void *ptr, ULONG len, ULONG *used_len )
++#else
+ NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_class,
+                                void *ptr, ULONG len, ULONG *used_len )
++#endif
+ {
+     unsigned int status;
+ 
+diff --git a/dlls/user32/msgbox.c b/dlls/user32/msgbox.c
+index 009f3858..af1be4f5 100644
+--- a/dlls/user32/msgbox.c
++++ b/dlls/user32/msgbox.c
+@@ -21,6 +21,7 @@
+ 
+ #include <stdarg.h>
+ #include <string.h>
++#include <stdio.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -523,6 +524,170 @@ INT WINAPI MessageBoxIndirectW( LPMSGBOXPARAMSW msgbox )
+     UINT i;
+     struct ThreadWindows threadWindows;
+ 
++#ifdef __arm64ec__
++    /* Madeira: which code opens a message box (RDR2's "Unknown error FFFFFFFF" comes from one
++     * while the game keeps running): the thread and its caller chain as module+offset. */
++    {
++        void *frames[24];
++        USHORT n = RtlCaptureStackBackTrace( 0, ARRAY_SIZE(frames), frames, NULL );
++        ERR( "[msgbox] tid %04lx caption %s text %s style %#lx, %u frames\n", GetCurrentThreadId(),
++             debugstr_w(msgbox->lpszCaption), debugstr_w(msgbox->lpszText), msgbox->dwStyle, n );
++        for (i = 0; i < n; i++)
++        {
++            HMODULE mod = NULL;
++            WCHAR name[MAX_PATH] = L"?";
++            if (GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                    frames[i], &mod ))
++                GetModuleFileNameW( mod, name, ARRAY_SIZE(name) );
++            ERR( "[msgbox]   #%u %p %s+%#Ix\n", i, frames[i], debugstr_w(wcsrchr( name, '\\' ) ? wcsrchr( name, '\\' ) + 1 : name),
++                 mod ? (ULONG_PTR)frames[i] - (ULONG_PTR)mod : 0 );
++        }
++    }
++    /* MADEIRA_AT_DUMP=1: the program's whole image as it is in memory now (code that is
++     * encrypted on disk is decrypted here) and this thread's stack, written once to
++     * Documents for offline analysis: madeira-dump-image-<base>.bin (file offset = RVA,
++     * unreadable ranges left as zeros) and madeira-dump-stack-<sp>.bin (from sp up). */
++    {
++        static LONG dumped;
++        WCHAR flag[8], dir[MAX_PATH], path[MAX_PATH];
++
++        if (GetEnvironmentVariableW( L"MADEIRA_AT_DUMP", flag, ARRAY_SIZE(flag) ) && flag[0] != '0' &&
++            !InterlockedExchange( &dumped, 1 ) &&
++            ExpandEnvironmentStringsW( L"%USERPROFILE%\\Documents", dir, ARRAY_SIZE(dir) ))
++        {
++            BYTE *exe = (BYTE *)GetModuleHandleW( NULL );
++            const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( (HMODULE)exe );
++            ULONG_PTR sp = (ULONG_PTR)&flag & ~(ULONG_PTR)15, top = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++            HANDLE file;
++            DWORD written;
++
++            swprintf( path, ARRAY_SIZE(path), L"%s\\madeira-dump-image-%p.bin", dir, exe );
++            file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++            if (file != INVALID_HANDLE_VALUE && nt)
++            {
++                BYTE *p = exe, *end = exe + nt->OptionalHeader.SizeOfImage;
++                SIZE_T saved = 0;
++                while (p < end)
++                {
++                    MEMORY_BASIC_INFORMATION mbi;
++                    BYTE *next;
++                    if (!VirtualQuery( p, &mbi, sizeof(mbi) )) break;
++                    next = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
++                    if (next > end) next = end;
++                    if (mbi.State == MEM_COMMIT && mbi.Protect && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
++                    {
++                        LARGE_INTEGER pos;
++                        pos.QuadPart = p - exe;
++                        SetFilePointerEx( file, pos, NULL, FILE_BEGIN );
++                        if (WriteFile( file, p, next - p, &written, NULL )) saved += written;
++                    }
++                    p = next;
++                }
++                CloseHandle( file );
++                ERR( "[msgbox] dumped %Iu bytes of the image at %p to %s\n", saved, exe, debugstr_w(path) );
++            }
++            /* The memory the stack points at, two levels deep (the streamer's request table,
++             * the failing entry, its device object): madeira-dump-heap-<sp>.bin, records of
++             * { UINT64 address, UINT64 length, bytes }. */
++            swprintf( path, ARRAY_SIZE(path), L"%s\\madeira-dump-heap-%p.bin", dir, (void *)sp );
++            file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++            if (file != INVALID_HANDLE_VALUE && nt && top > sp)
++            {
++                static ULONG_PTR seen[16384];
++                ULONG_PTR img_lo = (ULONG_PTR)exe, img_hi = img_lo + nt->OptionalHeader.SizeOfImage;
++                ULONG_PTR level1[1024];
++                UINT n1 = 0, records = 0, level, i;
++                const ULONG_PTR *scan_from[2] = { (const ULONG_PTR *)sp, NULL };
++
++                for (level = 0; level < 2; level++)
++                {
++                    UINT count = level ? n1 : (UINT)((top - sp) / 8);
++                    for (i = 0; i < count && records < 8000; i++)
++                    {
++                        ULONG_PTR block = level ? level1[i] : 0, end = block + 0x800, q;
++                        if (level)
++                        {
++                            for (q = block; q + 8 <= end && records < 8000; q += 8)
++                            {
++                                ULONG_PTR v = *(const ULONG_PTR *)q, start = (v - 0x40) & ~(ULONG_PTR)15;
++                                MEMORY_BASIC_INFORMATION mbi;
++                                UINT64 hdr[2];
++                                UINT h;
++                                if (v < 0x10000 || (v >= img_lo && v < img_hi) || (v >= sp && v < top)) continue;
++                                h = (UINT)((start >> 6) * 2654435761u) & 16383;
++                                if (seen[h] == start) continue;
++                                if (!VirtualQuery( (void *)start, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT || !mbi.Protect ||
++                                    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++                                    start + 0x200 > (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) continue;
++                                seen[h] = start;
++                                hdr[0] = start; hdr[1] = 0x200;
++                                WriteFile( file, hdr, sizeof(hdr), &written, NULL );
++                                WriteFile( file, (void *)start, 0x200, &written, NULL );
++                                records++;
++                            }
++                            continue;
++                        }
++                        {
++                            ULONG_PTR v = scan_from[0][i], start = (v - 0x200) & ~(ULONG_PTR)15;
++                            MEMORY_BASIC_INFORMATION mbi;
++                            UINT64 hdr[2];
++                            UINT h;
++                            if (v < 0x10000 || (v >= img_lo && v < img_hi) || (v >= sp && v < top) || n1 >= ARRAY_SIZE(level1)) continue;
++                            h = (UINT)((start >> 6) * 2654435761u) & 16383;
++                            if (seen[h] == start) continue;
++                            if (!VirtualQuery( (void *)start, &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT || !mbi.Protect ||
++                                (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++                                start < (ULONG_PTR)mbi.BaseAddress || start + 0x800 > (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize) continue;
++                            seen[h] = start;
++                            level1[n1++] = start;
++                            hdr[0] = start; hdr[1] = 0x800;
++                            WriteFile( file, hdr, sizeof(hdr), &written, NULL );
++                            WriteFile( file, (void *)start, 0x800, &written, NULL );
++                            records++;
++                        }
++                    }
++                }
++                CloseHandle( file );
++                ERR( "[msgbox] dumped %u heap blocks (%u first-level) to %s\n", records, n1, debugstr_w(path) );
++            }
++            swprintf( path, ARRAY_SIZE(path), L"%s\\madeira-dump-stack-%p.bin", dir, (void *)sp );
++            file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++            if (file != INVALID_HANDLE_VALUE && top > sp)
++            {
++                WriteFile( file, (void *)sp, top - sp, &written, NULL );
++                CloseHandle( file );
++                ERR( "[msgbox] dumped %lu bytes of stack from %p to %s\n", written, (void *)sp, debugstr_w(path) );
++            }
++        }
++    }
++    /* The backtrace stops in the emulator's frames, so scan the stack itself for return
++     * addresses into the main program and dump the code around each one: the 64 bytes
++     * before it (the call) and 16 after, as the program has them in memory. */
++    {
++        const BYTE *exe = (const BYTE *)GetModuleHandleW( NULL );
++        const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( (HMODULE)exe );
++        ULONG_PTR here = (ULONG_PTR)&tmplate, top = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase, p;
++        SIZE_T size = nt ? nt->OptionalHeader.SizeOfImage : 0;
++        UINT hits = 0;
++
++        for (p = here & ~(ULONG_PTR)7; size && p + 8 <= top && hits < 16; p += 8)
++        {
++            ULONG_PTR v = *(const ULONG_PTR *)p, off = v - (ULONG_PTR)exe;
++            char hex[80 * 3 + 1];
++            MEMORY_BASIC_INFORMATION mbi;
++            UINT k;
++
++            if (off < 0x1000 || off >= size) continue;
++            if (!VirtualQuery( (void *)(v - 64), &mbi, sizeof(mbi) ) || mbi.State != MEM_COMMIT ||
++                !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
++                continue;
++            for (k = 0; k < 80; k++) sprintf( hex + 3 * k, "%02x ", ((const BYTE *)v - 64)[k] );
++            ERR( "[msgbox]   [sp+%#Ix] exe+%#Ix code-64: %s\n", p - here, off, hex );
++            hits++;
++        }
++    }
++#endif
++
+     if (!(hRes = FindResourceExW(user32_module, (LPWSTR)RT_DIALOG, L"MSGBOX", msgbox->dwLanguageId)))
+     {
+         if (!msgbox->dwLanguageId ||

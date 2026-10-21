@@ -792,6 +792,24 @@ struct LibraryEntry: Codable, Identifiable {
             // Rockstar titles started on their own bring up the launcher and its service.
             || relativePath.lowercased().contains("rockstar games/")
             || ["rdr2.exe", "playrdr2.exe", "gta5_enhanced.exe", "playgtav.exe"].contains(exe)
+            // Their Steam copies (RDR2, GTA V, GTA V Enhanced): the entry is the install
+            // folder, and Valve's client starts the launcher, which needs its service too.
+            || [1174180, 271590, 3240220].contains(steamAppID ?? 0)
+    }
+    /// A Dock session for an entry that needs Windows services: a batch that starts
+    /// services.exe and then calls the session's one-time installs, if any, run before
+    /// the Steam host (MadeiraDock.launchArguments). Without it the Rockstar Games
+    /// Launcher a Steam copy brings up said "Failed to connect to the Rockstar Games
+    /// Library Service". nil when the entry needs none; throws when it cannot be written.
+    func dockServicesScript(installers: String?) throws -> String? {
+        guard startServicesEffective else { return installers }
+        let path = "C:\\madeira-games\\dock-services.bat"
+        guard let url = Self.hostURL(ofWindowsPath: path) else { return installers }
+        var text = "@echo off\r\nstart \"\" C:\\windows\\system32\\services.exe\r\n"
+        if let installers { text += "call \(installers)\r\n" }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try text.write(to: url, atomically: true, encoding: .utf8)
+        return path
     }
     /// ml1163: where startServices writes its batch file, one per entry.
     var servicesScriptPath: String { "C:\\madeira-games\\\(id.uuidString).bat" }
@@ -954,7 +972,14 @@ struct LibraryEntry: Codable, Identifiable {
             out.append(("vram-mb", "1536"))
             out.append(("vram-trim-mb", "4096"))
         }
-        out += MadeiraConfig.parsePairs(Self.knownGameConfig(exe: (relativePath as NSString).lastPathComponent.lowercased(),
+        // A Steam entry is its install folder: Rockstar's Steam copies are named by their
+        // program so they take the same list (RDR2 got none of it and could not start).
+        let rockstarProgram: String? = switch steamAppID {
+        case 1174180: "rdr2.exe"
+        case 271590, 3240220: "playgtav.exe"
+        default: nil
+        }
+        out += MadeiraConfig.parsePairs(Self.knownGameConfig(exe: rockstarProgram ?? (relativePath as NSString).lastPathComponent.lowercased(),
                                                              path: relativePath.lowercased(), steam: steamAppID != nil))
         return out
     }
@@ -1004,7 +1029,7 @@ struct LibraryEntry: Codable, Identifiable {
             replay-split = 1
             ring-share = 1
             pool-mid = 1
-            vram-mb = 2304
+            vram-mb = 4096
             swap-mb = 8192
             swap-mode = 2
             swap-min-mb = 1

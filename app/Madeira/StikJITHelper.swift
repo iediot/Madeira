@@ -382,8 +382,13 @@ enum StikJITHelper {
         // against ends at +117MB; ntdll hands the window to the first fixed map
         // of >=64MB that fits, and reads the size from WINE_IOS_EXE_WINDOW.
         let exeWinSize: vm_address_t = 0x8000000           // 128MB
+        // Something else already sits inside 0x140000000 (the system's malloc zone landed
+        // there before the image-load constructor ran): no fixed-base image can load there
+        // this launch whatever the pool does, so a pool overlapping it is not fatal, and
+        // refusing it threw away the only hole that fit (the app then died re-rolling).
+        var windowOccupied = false
         func overlapsExeWindow(_ base: vm_address_t, _ len: vm_address_t) -> Bool {
-            return base < exeWinBase + exeWinSize && base + len > exeWinBase
+            return !windowOccupied && base < exeWinBase + exeWinSize && base + len > exeWinBase
         }
         let skipWindow = (ProcessInfo.processInfo.environment["MADEIRA_NO_EXE_WINDOW"].map { $0 != "0" } ?? false)
         var windowHeld = false
@@ -403,6 +408,7 @@ enum StikJITHelper {
                     + "ntdll releases it on demand", level: .success)
             } else {
                 if krWin == KERN_SUCCESS { vm_deallocate(mach_task_self_, winAddr, vm_size_t(exeWinSize)) }
+                windowOccupied = true
                 LogStore.shared.log("ml1034: could NOT reserve the executable window (kr=\(krWin)) BEFORE "
                     + "RX - something else already holds 0x140000000; a non-relocatable image will be "
                     + "displaced and its absolute pointers will be stale", level: .error)

@@ -3567,7 +3567,14 @@ struct ContentView: View {
                 width = size[0]; height = size[1]
             }
             setenv("MADEIRA_EXE", "explorer.exe", 1)
-            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script,
+            // A game that needs Windows services (Rockstar's Steam copies) starts them before the host.
+            var prelude = DockInstallers.script
+            if let entry = profile, !DockInstallers.installsOnly {
+                do { prelude = try entry.dockServicesScript(installers: prelude) }
+                catch { logStore.log("[dock-services] could not write the services batch: \(error.localizedDescription)", level: .error) }
+                if prelude != DockInstallers.script { logStore.log("[dock-services] services.exe starts before the Steam host") }
+            }
+            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: prelude,
                                                                host: !DockInstallers.installsOnly), 1)
             setenv("MADEIRA_DESKTOP", "1", 1)
             setenv("MADEIRA_SCREEN_W", String(width), 1)

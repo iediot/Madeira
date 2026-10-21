@@ -77,9 +77,15 @@ int main(void) {
     assert(classify(0x200000) == C_OTHER);
     ios_fex_arena_base_unix = 0x300000;
     ios_fex_arena_end_unix = 0x400000;
+    class_nfex_ranges = 1;
+    class_fex_ranges[0] = (struct ios_perf_fex_range){ .base=0x320000, .size=0x10000 };
     assert(classify(0x300000) == C_FEX);
     assert(class_pc(0x301234, 0, &name, &offset) == C_FEX);
     assert(!strcmp(name, "fex-arena") && offset == 0x1234);
+    assert(class_pc(0x321234, 0, &name, &offset) == C_GAME);
+    assert(!strcmp(name, "fex-code-buffer") && offset == 0x1234);
+    assert(classify(0x32ffff) == C_GAME);
+    assert(classify(0x330000) == C_FEX);
     assert(classify(0x400000) == C_OTHER);
     class_ndylibs = 3;
     class_dylibs[0] = (struct class_image){ .lo=0x500000, .hi=0x510000, .base=0x500000, .kind=C_UNIX, .name="Madeira" };
