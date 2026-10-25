@@ -1622,6 +1622,12 @@ void main_loop(void)
             }
             if (!active_users) { ws_log("[wineserver-fd] LOOP EXIT: active_users=0 at iter=%d", ios_iter); break; }
 
+            {
+                /* a stall snapshot's request for wait targets (queue_ios.c); one load when idle */
+                extern void ios_wait_probe_service( void );
+                ios_wait_probe_service();
+            }
+
             ios_iter++;
             /* Heartbeat via ws_log (file-based, not stderr) */
             if (ios_iter % 50000 == 0)

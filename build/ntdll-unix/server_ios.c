@@ -1484,6 +1484,19 @@ void ios_xp_set_role( int role, uint64_t wtid )
 }
 struct ios_xp_pe { int64_t magic, qpf, pres_enq, pres_done, t_thr, n_ecl, t_ecl, n_sig, t_sig, n_wait, t_wait, t_prs,
                    t_flush, n_lat, t_lat, t_draw, t_cmt, t_pool, ecl_calls, t_ecl_caller; };
+
+/* Testable trigger policy, shared by synchronous and asynchronous presenters.
+ * A nonzero completion history prevents startup-only false triggers; counter
+ * reset/renderer replacement and time moving backwards must re-arm cleanly.
+ * Caller supplies monotonically sampled wall time, not cumulative CPU time. */
+static int ios_xp_stall_due(int enabled, int valid, int64_t done, int64_t previous,
+                            uint64_t now_ns, uint64_t *last_ns)
+{
+    if (!enabled || !valid || done <= 0 || done != previous) return 0;
+    if (*last_ns && now_ns >= *last_ns && now_ns - *last_ns < 1000000000ull) return 0;
+    *last_ns = now_ns;
+    return 1;
+}
 struct ios_xp_tcd { uint64_t instr, cyc, ut, st, nj; };
 struct ios_xp_tc { uint16_t len, r0; uint32_t r1; struct ios_xp_tcd c[4]; };
 struct ios_xp_prev { uint64_t tid; uint32_t gen; struct ios_xp_tcd c[2]; };
@@ -2000,12 +2013,16 @@ static void ios_xprobe_main( void )
             double pcy = (double)(ru.ri_pcycles - pru.ri_pcycles), cy = (double)(ru.ri_cycles - pru.ri_cycles);
             double ins = (double)(ru.ri_instructions - pru.ri_instructions);
             double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
+            double page_wait_ms = -1.0; /* unavailable in the build SDK (upstream #399) */
+#ifdef MADEIRA_HAVE_RUSAGE_PAGE_WAIT_TIME_MACH
+            page_wait_ms = XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach );
+#endif
             gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );
             snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
             n = snprintf( line, sizeof(line),
                           "[xp] %s +%.2f dt=%.0f cpu=%.0f (thr %.0f) P=%.0f E=%.0f run=%.0f pgw=%.1f GHz P=%.2f E=%.2f Minst=%.0f IPC=%.2f mJ=%.0f pin=%llu rdKB=%llu fpMB=%llu",
                           wall, XP_MS( now - t_start ) / 1000.0, dt_ms, cpu, sum_thr_ms, pms, ems,
-                          XP_MS( ru.ri_runnable_time - pru.ri_runnable_time ), XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach ),
+                          XP_MS( ru.ri_runnable_time - pru.ri_runnable_time ), page_wait_ms,
                           pms > 0 ? pcy / (pms * 1e6) : 0, ems > 0 ? (cy - pcy) / (ems * 1e6) : 0, ins / 1e6, cy > 0 ? ins / cy : 0,
                           (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6,
                           (unsigned long long)(ru.ri_pageins - pru.ri_pageins), (unsigned long long)((ru.ri_diskio_bytesread - pru.ri_diskio_bytesread) >> 10),
@@ -2020,6 +2037,46 @@ static void ios_xprobe_main( void )
                           (pe.t_draw - ppe.t_draw) * qf, (pe.t_cmt - ppe.t_cmt) * qf, (pe.t_pool - ppe.t_pool) * qf,
                           (long long)(pe.ecl_calls - ppe.ecl_calls), (pe.t_ecl_caller - ppe.t_ecl_caller) * qf );
             wine_log_write( "%s", line );
+            /* A 250ms zero-present window needs idle P/W thread PCs as well
+             * as hot threads. No suspension; one snapshot/second maximum.
+             * Loading/background also trigger: report facts, not a diagnosis. */
+            {
+                static uint64_t last_snapshot_ns;
+                const char *prof = getenv("MADEIRA_PERF");
+                uint64_t now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                int due = ios_xp_stall_due(prof && *prof == '1', qf != 0, pe.pres_done, ppe.pres_done,
+                                           now_ns, &last_snapshot_ns);
+                if (prof && *prof == '1')
+                {
+                    /* VM counters every pass, so a stall reports the window leading into it */
+                    extern void ios_perf_vm_tick(int);
+                    ios_perf_vm_tick(due);
+                }
+                if (due)
+                {
+                    extern void ios_perf_stall_snapshot(const uint64_t *, unsigned);
+                    uint64_t ids[16]; unsigned ni = 0, r;
+                    int selected[1024] = {0};
+                    pthread_mutex_lock(&ios_xp_role_lock);
+                    for (r = 0; r < (unsigned)ios_xp_nroles && ni < 8; r++) ids[ni++] = ios_xp_roles[r].tid;
+                    pthread_mutex_unlock(&ios_xp_role_lock);
+                    while (ni < 16)
+                    {
+                        int best = -1;
+                        for (i = 0; i < nrows; i++)
+                            if (!selected[i] && (best < 0 || rows[i].p_ms + rows[i].e_ms > rows[best].p_ms + rows[best].e_ms)) best = i;
+                        if (best < 0) break;
+                        selected[best] = 1;
+                        for (r = 0; r < ni && ids[r] != rows[best].tid; r++) ;
+                        if (r == ni) ids[ni++] = rows[best].tid;
+                    }
+                    wine_log_write("[stall-window] +%.2f dt_ms=%.1f no Metal-side D3D12 Presents completed; completed_total=%lld enqueued_delta=%lld ecl_delta=%lld selected=%u",
+                                   XP_MS(now-t_start)/1000.0, dt_ms,
+                                   (long long)pe.pres_done,
+                                   (long long)(pe.pres_enq-ppe.pres_enq), (long long)(pe.n_ecl-ppe.n_ecl), ni);
+                    ios_perf_stall_snapshot(ids, ni);
+                }
+            }
             /* threads: roles always, then the busiest; role + Windows TID : P ms / E ms : P GHz / E GHz : M instructions */
             {
                 int printed[1024] = {0}, shown = 0;
@@ -2961,16 +3018,203 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
 
 
 /***********************************************************************
+ *              ml585: IN-FLIGHT WAIT REGISTRY
+ *
+ * ml584 caught explorer's shell thread (Wine tid 0024 = Mach port 0xe903)
+ * blocked in NtWaitForSingleObject under rpcrt4 -> combase, cpu=0, at an
+ * IDENTICAL sp across two samples 20s apart, while its message queue piled
+ * up post=56 with QS_PAINT set. That is why the Start button never repaints
+ * AND why clicking it does nothing: one wedged thread, both symptoms.
+ *
+ * A sampler that logs on wait EXIT can never see this — the wait does not
+ * end. So publish the wait BEFORE entering it and clear it after. wineserver
+ * is a thread in this same Mach task, so it can walk this table directly and
+ * resolve the handles against the owning process's handle table (see
+ * ios_dump_stuck_waits in queue_ios.c) — no IPC, no extra syscalls.
+ *
+ * Cost on the healthy path: two stores and a clock read per wait. Bounded
+ * table, fixed slots, no allocation, no locks. A slot is only ever written
+ * by its owning thread; the reader tolerates torn reads by re-checking seq.
+ */
+#include "wait_registry_ios.h"
+struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
+struct ios_wait_probe_req ios_wait_probe;     /* perf_ios.c posts, queue_ios.c answers */
+static unsigned int ios_wait_untracked;       /* slot held by another live thread */
+
+/* v2 (RDR2 stall probe): the slot is indexed by Wine thread id so the server
+ * can find it, and server_select publishes every server wait itself, not
+ * only server_wait's. A wait inside a kernel APC (nested) keeps the outer
+ * one; see wait_registry_ios.h. */
+static void ios_wait_enter( struct ios_wait_token *tok, const union select_op *op, data_size_t size,
+                            UINT flags, timeout_t abs_timeout, const void *cookie, void *ret_pc )
+{
+    struct ios_wait_info in;
+    struct timespec ts;
+    int i, n = 0;
+
+    memset( &in, 0, sizeof(in) );
+    in.wine_tid = (unsigned int)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread;
+    in.wine_pid = (unsigned int)(uintptr_t)NtCurrentTeb()->ClientId.UniqueProcess;
+    pthread_threadid_np( NULL, &in.native_tid );
+    in.teb      = NtCurrentTeb();
+    in.flags    = flags;
+    in.timeout  = abs_timeout;
+    in.ret_pc   = ret_pc;
+    in.cookie   = (uint64_t)(uintptr_t)cookie;
+    in.frame    = (uint64_t)(uintptr_t)get_syscall_frame();
+    in.op       = op ? (int)op->op : -1;
+    if (op && size >= sizeof(op->wait) - sizeof(op->wait.handles))
+    {
+        switch (op->op)
+        {
+        case SELECT_WAIT:
+        case SELECT_WAIT_ALL:
+            n = (int)((size - offsetof(union select_op, wait.handles)) / sizeof(obj_handle_t));
+            if (n > IOS_WAITREG_HANDLES) n = IOS_WAITREG_HANDLES;
+            for (i = 0; i < n; i++) in.handles[i] = op->wait.handles[i];
+            break;
+        case SELECT_SIGNAL_AND_WAIT:
+            n = 1;
+            in.handles[0] = op->signal_and_wait.wait;
+            in.key = op->signal_and_wait.signal;
+            break;
+        case SELECT_KEYED_EVENT_WAIT:
+        case SELECT_KEYED_EVENT_RELEASE:
+            n = 1;
+            in.handles[0] = op->keyed_event.handle;
+            in.key = op->keyed_event.key;
+            break;
+        default:
+            break;
+        }
+    }
+    in.count = n;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    in.t0_ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    if (!ios_wait_publish( ios_wait_reg, &in, tok )) __atomic_add_fetch( &ios_wait_untracked, 1, __ATOMIC_RELAXED );
+}
+
+static inline void ios_wait_phase( struct ios_wait_token *tok, unsigned int phase, int request, int apc )
+{
+    if (!tok->slot) return;
+    __atomic_store_n( &tok->slot->phase, phase, __ATOMIC_RELAXED );
+    if (request) __atomic_add_fetch( &tok->slot->requests, 1, __ATOMIC_RELAXED );
+    if (apc) __atomic_add_fetch( &tok->slot->apcs, 1, __ATOMIC_RELAXED );
+}
+
+/* Render/Present/ECL role threads (ios_xp_set_role); appended only. */
+static int ios_xp_is_role_thread( uint64_t native_tid )
+{
+    int i, n = ios_xp_nroles;
+    for (i = 0; i < n && i < 32; i++) if (ios_xp_roles[i].tid == native_tid) return 1;
+    return 0;
+}
+
+/* Slow-wait completion: MADEIRA_PERF=1 only, for threads a stall snapshot
+ * selected in the last 5 s (>= 20 ms) and role threads (>= 100 ms). Says how
+ * the wait ended, who ended it and how long the wake-up took to come back:
+ * a long wait with a short wake_to_return means the signal itself was late;
+ * a long wake_to_return means the woken thread was slow to run again.
+ * Rate-capped; the fast path is one load and a clock read. */
+static void ios_wait_report_done( struct ios_wait_token *tok, unsigned int ret )
+{
+    static int profile = -1;
+    static unsigned int window, lines, dropped;
+    struct ios_wait_entry *e = tok->slot;
+    struct ios_wait_info in;
+    struct timespec ts;
+    uint64_t now, dur, wake_ns = 0;
+    unsigned int waker = 0, waker_pid = 0, sec;
+    int wake_status = 0, woke;
+    char tmo[48];
+    Dl_info info = {0};
+    uint64_t frame_pc = 0, frame_lr = 0;
+
+    if (profile < 0)
+    {
+        const char *pf = getenv( "MADEIRA_PERF" );
+        profile = pf && pf[0] == '1';
+    }
+    if (!profile || !e) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    ios_wait_copy_out( e, &in );     /* owner thread: no concurrent writer */
+    if (now < in.t0_ns) return;
+    dur = now - in.t0_ns;
+    if (dur < 20000000ull) return;
+    if (!(e->watch_until_ns >= now || (dur >= 100000000ull && ios_xp_is_role_thread( in.native_tid )))) return;
+
+    sec = (unsigned int)(now / 1000000000ull);
+    if (__atomic_exchange_n( &window, sec, __ATOMIC_RELAXED ) != sec) __atomic_store_n( &lines, 0, __ATOMIC_RELAXED );
+    if (__atomic_add_fetch( &lines, 1, __ATOMIC_RELAXED ) > 40) { __atomic_add_fetch( &dropped, 1, __ATOMIC_RELAXED ); return; }
+
+    woke = ios_wait_take_wake( e, in.cookie, in.t0_ns, &waker, &waker_pid, &wake_status, &wake_ns );
+    if (in.timeout == TIMEOUT_INFINITE) strcpy( tmo, "inf" );
+    else if (!in.timeout) strcpy( tmo, "poll" );
+    else if (in.timeout < 0)
+    {
+        LARGE_INTEGER qpc;
+        NtQueryPerformanceCounter( &qpc, NULL );
+        snprintf( tmo, sizeof(tmo), "deadline_left_ms=%.1f", (-in.timeout - qpc.QuadPart) / 10000.0 );
+    }
+    else
+    {
+        LARGE_INTEGER sys;
+        NtQuerySystemTime( &sys );
+        snprintf( tmo, sizeof(tmo), "abs_left_ms=%.1f", (in.timeout - sys.QuadPart) / 10000.0 );
+    }
+    if (in.frame)
+    {
+        extern void ios_syscall_frame_regs( const void *frame, uint64_t *fp, uint64_t *lr, uint64_t *sp, uint64_t *pc );
+        uint64_t fp, sp;
+        ios_syscall_frame_regs( (const void *)(uintptr_t)in.frame, &fp, &frame_lr, &sp, &frame_pc );
+    }
+    dladdr( in.ret_pc, &info );
+    fprintf( stderr, "[wait-done] wine_pid=%04x wine_tid=%04x native_tid=%llu ms=%.1f ret=%08x op=%d flags=%x "
+             "n=%d h=%x,%x,%x,%x key=%llx timeout=%s requests=%u apcs=%u depth=%u "
+             "waker=%s%04x waker_pid=%04x wake_status=%08x wake_to_return_ms=%.2f "
+             "caller=%s+%llx frame_pc=%llx frame_lr=%llx dropped=%u\n",
+             in.wine_pid, in.wine_tid, (unsigned long long)in.native_tid, dur / 1e6, ret, in.op, in.flags,
+             in.count, in.handles[0], in.handles[1], in.handles[2], in.handles[3], (unsigned long long)in.key, tmo,
+             e->requests, e->apcs, e->depth,
+             woke ? (waker ? "" : "server/") : "unrecorded/", waker, waker_pid, (unsigned int)wake_status,
+             woke && now >= wake_ns ? (now - wake_ns) / 1e6 : -1.0,
+             info.dli_sname ? info.dli_sname : "?",
+             (unsigned long long)((char *)in.ret_pc - (char *)(info.dli_saddr ? info.dli_saddr : info.dli_fbase)),
+             (unsigned long long)frame_pc, (unsigned long long)frame_lr, dropped );
+}
+
+static void ios_wait_leave( struct ios_wait_token *tok, unsigned int ret )
+{
+    if (!tok->slot) return;
+    ios_wait_report_done( tok, ret );
+    ios_wait_unpublish( tok );
+}
+
+/***********************************************************************
  *              server_select
  */
+static unsigned int server_select_tracked( const union select_op *select_op, data_size_t size, UINT flags,
+                                           timeout_t abs_timeout, struct context_data *context,
+                                           struct user_apc *user_apc, void *caller );
+
 unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
                             timeout_t abs_timeout, struct context_data *context, struct user_apc *user_apc )
+{
+    return server_select_tracked( select_op, size, flags, abs_timeout, context, user_apc,
+                                  __builtin_return_address(0) );
+}
+
+static unsigned int server_select_tracked( const union select_op *select_op, data_size_t size, UINT flags,
+                                           timeout_t abs_timeout, struct context_data *context,
+                                           struct user_apc *user_apc, void *caller )
 {
 #ifdef WINE_IOS
     { extern void ios_tls38_poll( const char * ); ios_tls38_poll( "wait" ); }
 #endif
     unsigned int ret;
     int cookie;
+    struct ios_wait_token wait_tok;
     obj_handle_t apc_handle = 0;
     BOOL suspend_context = !!context;
     union apc_result result;
@@ -2984,12 +3228,14 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
     } reply_data;
 
     memset( &result, 0, sizeof(result) );
+    ios_wait_enter( &wait_tok, select_op, size, flags, abs_timeout, &cookie, caller );
 
     do
     {
         pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
         for (;;)
         {
+            ios_wait_phase( &wait_tok, IOS_WAIT_PHASE_REQUEST, 1, 0 );
             SERVER_START_REQ( select )
             {
                 req->flags    = flags;
@@ -3015,6 +3261,7 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
             SERVER_END_REQ;
 
             if (ret != STATUS_KERNEL_APC) break;
+            ios_wait_phase( &wait_tok, IOS_WAIT_PHASE_APC, 0, 1 );
             invoke_system_apc( &reply_data.call, &result, FALSE );
 
             /* don't signal multiple times */
@@ -3024,9 +3271,11 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
         pthread_sigmask( SIG_SETMASK, &old_set, NULL );
         if (signaled) break;
 
+        ios_wait_phase( &wait_tok, IOS_WAIT_PHASE_PIPE, 0, 0 );
         ret = wait_select_reply( &cookie );
     }
     while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);
+    ios_wait_leave( &wait_tok, ret );
 
     if (ret == STATUS_USER_APC) *user_apc = reply_data.call.user;
     if (reply_size > sizeof(reply_data.call))
@@ -3042,85 +3291,6 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
 /***********************************************************************
  *              server_wait
  */
-/***********************************************************************
- *              ml585: IN-FLIGHT WAIT REGISTRY
- *
- * ml584 caught explorer's shell thread (Wine tid 0024 = Mach port 0xe903)
- * blocked in NtWaitForSingleObject under rpcrt4 -> combase, cpu=0, at an
- * IDENTICAL sp across two samples 20s apart, while its message queue piled
- * up post=56 with QS_PAINT set. That is why the Start button never repaints
- * AND why clicking it does nothing: one wedged thread, both symptoms.
- *
- * A sampler that logs on wait EXIT can never see this — the wait does not
- * end. So publish the wait BEFORE entering it and clear it after. wineserver
- * is a thread in this same Mach task, so it can walk this table directly and
- * resolve the handles against the owning process's handle table (see
- * ios_dump_stuck_waits in queue_ios.c) — no IPC, no extra syscalls.
- *
- * Cost on the healthy path: two stores and a clock read per wait. Bounded
- * table, fixed slots, no allocation, no locks. A slot is only ever written
- * by its owning thread; the reader tolerates torn reads by re-checking seq.
- */
-#define IOS_WAITREG_SLOTS 512
-struct ios_wait_entry
-{
-    volatile unsigned int  seq;        /* even = idle, odd = in a wait  */
-    void                  *teb;
-    unsigned int           wine_tid;
-    unsigned long long     t0_ns;      /* CLOCK_MONOTONIC at wait entry */
-    unsigned int           flags;      /* SELECT_* (alertable etc.)     */
-    long long              timeout;    /* abs_timeout as passed down    */
-    int                    op;
-    int                    count;
-    unsigned int           handles[8];
-    void                  *ret_pc;     /* caller of server_wait         */
-};
-struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
-
-static struct ios_wait_entry *ios_wait_slot(void)
-{
-    /* Stable per-thread slot: TEB pointer hashed. Collisions only cost
-     * fidelity of the report, never correctness — a colliding thread
-     * overwrites the entry and the stuck one is simply not reported. */
-    uintptr_t t = (uintptr_t)NtCurrentTeb();
-    return &ios_wait_reg[(t >> 16) % IOS_WAITREG_SLOTS];
-}
-
-static void ios_wait_enter( const union select_op *op, data_size_t size,
-                            UINT flags, timeout_t abs_timeout, void *ret_pc )
-{
-    struct ios_wait_entry *e = ios_wait_slot();
-    struct timespec ts;
-    int i, n = 0;
-
-    e->seq++;                       /* -> odd: entry is being written  */
-    __sync_synchronize();
-    e->teb      = NtCurrentTeb();
-    e->wine_tid = (unsigned int)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread;
-    e->flags    = flags;
-    e->timeout  = abs_timeout;
-    e->ret_pc   = ret_pc;
-    e->op       = op ? (int)op->op : -1;
-    if (op && size >= sizeof(op->wait) - sizeof(op->wait.handles))
-    {
-        n = (int)((size - offsetof(union select_op, wait.handles)) / sizeof(obj_handle_t));
-        if (n > 8) n = 8;
-        if (n < 0) n = 0;
-        for (i = 0; i < n; i++) e->handles[i] = op->wait.handles[i];
-    }
-    e->count = n;
-    clock_gettime( CLOCK_MONOTONIC, &ts );
-    e->t0_ns = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
-    __sync_synchronize();
-}
-
-static void ios_wait_leave(void)
-{
-    struct ios_wait_entry *e = ios_wait_slot();
-    __sync_synchronize();
-    e->seq++;                       /* -> even: no longer waiting */
-}
-
 unsigned int server_wait( const union select_op *select_op, data_size_t size, UINT flags,
                           const LARGE_INTEGER *timeout )
 {
@@ -3141,10 +3311,8 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
                       (uintptr_t)NtCurrentTeb() == ios_srv_game_teb;
         struct timespec t0, t1;
         if (is_game) clock_gettime( CLOCK_MONOTONIC, &t0 );
-        ios_wait_enter( select_op, size, flags, abs_timeout,
-                        __builtin_return_address(0) );
-        ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
-        ios_wait_leave();
+        ret = server_select_tracked( select_op, size, flags, abs_timeout, NULL, &apc,
+                                     __builtin_return_address(0) );
         if (is_game)
         {
             clock_gettime( CLOCK_MONOTONIC, &t1 );
@@ -4340,6 +4508,23 @@ void process_exit_wrapper( int status )
     }
     else
     {
+        /* madeira-orphan-exit: "no slot" is not proof of being the session.
+         * A thread of a child process that has already exited also has no
+         * slot -- its slot was cleared when the process went -- and on iOS
+         * such a thread is still running, because a pthread cannot be stopped
+         * from outside. Treating it as the session closed the session's
+         * master socket and ended every program in it. Compare the caller's
+         * PEB with the session's own; anything else exits only itself. */
+        extern void *ios_session_peb_get( void );
+        void *caller = ios_jit_current_peb();
+        void *session = ios_session_peb_get();
+        if (caller && session && caller != session)
+        {
+            wine_log_write( "[Wine ntdll/server] process_exit_wrapper(%d): orphaned thread "
+                            "of an exited process (peb=%p); exiting this thread only",
+                            status, caller );
+            pthread_exit( NULL );
+        }
         /* No slot: this is the session's initial process, the program the app
          * itself handed to __wine_main (WineProcessBridge.m). Its exit status
          * is how the app's library tells a crash from a normal quit, and this

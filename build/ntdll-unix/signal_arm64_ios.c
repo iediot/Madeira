@@ -272,6 +272,15 @@ struct syscall_frame
 
 C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
+/* Caller context of a syscall frame, for the wait probe (server_ios.c reads
+ * its own frame; perf_ios.c passes a copy read from another thread). */
+void ios_syscall_frame_regs( const void *frame, uint64_t *fp, uint64_t *lr, uint64_t *sp, uint64_t *pc )
+{
+    const struct syscall_frame *f = frame;
+    *fp = f->fp; *lr = f->lr; *sp = f->sp; *pc = f->pc;
+}
+const unsigned int ios_syscall_frame_size = sizeof(struct syscall_frame);
+
 #ifdef WINE_IOS
 /* Written by __wine_syscall_dispatcher at entry to capture the actual x18 value.
  * Read by the watchdog to verify whether x18 is TEB or 0. */
@@ -3070,7 +3079,10 @@ static void *ios_mach_exception_thread( void *arg )
             if (srcwatch_hit) handled = 1;
 
             /* 1. Redirect user_shared_data accesses (0x7FFE0000) */
-            if (!srcwatch_hit && fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
+            /* PR402: an emulated access has already updated the thread state.
+             * Do not then relocate data registers that merely contain a KUSER
+             * constant; that corrupts unrelated guest pointer arithmetic. */
+            if (!handled && !srcwatch_hit && fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
             {
                 for (int reg = 0; reg <= 28; reg++)
                 {

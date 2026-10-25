@@ -57,6 +57,74 @@ static _Atomic uint64_t perf_gpu_ns, perf_gpu_max_ns, perf_cmdbufs, perf_qdepth_
 static _Atomic uint64_t perf_limiter_ns;
 static _Atomic uint64_t perf_pass[3], perf_loads, perf_stores, perf_clears;
 static _Atomic int perf_panel_hz, perf_intent_hz, perf_vsync_mode;
+static _Atomic uint64_t perf_read_calls, perf_read_bytes, perf_read_ns, perf_read_max_ns;
+static _Atomic uint64_t perf_read_errors, perf_read_short;
+#define PERF_IO_ACTIVE 512
+struct perf_io_active {
+    _Atomic uint64_t seq, started, tid, size, offset;
+    _Atomic int fd, positioned;
+};
+static struct perf_io_active perf_io_active[PERF_IO_ACTIVE];
+static _Atomic unsigned perf_io_slots, perf_io_untracked;
+
+/* One bounded slot per native thread; no allocation or registry walk per read.
+ * An odd sequence is active. Readers validate the sequence around snapshots. */
+int ios_perf_read_enter(int fd, size_t size, int64_t offset, int positioned, uint64_t now)
+{
+    static _Thread_local int slot = -2;
+    if (slot == -2) {
+        unsigned n = atomic_fetch_add_explicit(&perf_io_slots, 1, memory_order_relaxed);
+        slot = n < PERF_IO_ACTIVE ? (int)n : -1;
+        if (slot >= 0) {
+            uint64_t tid = 0;
+            pthread_threadid_np(NULL, &tid);
+            atomic_store_explicit(&perf_io_active[slot].tid, tid, memory_order_relaxed);
+        }
+        else atomic_fetch_add_explicit(&perf_io_untracked, 1, memory_order_relaxed);
+    }
+    if (slot >= 0) {
+        struct perf_io_active *s = &perf_io_active[slot];
+        atomic_store_explicit(&s->fd, fd, memory_order_relaxed);
+        atomic_store_explicit(&s->size, size, memory_order_relaxed);
+        atomic_store_explicit(&s->offset, offset, memory_order_relaxed);
+        atomic_store_explicit(&s->positioned, positioned, memory_order_relaxed);
+        atomic_store_explicit(&s->started, now, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s->seq, 1, memory_order_release);
+    }
+    return slot;
+}
+
+void ios_perf_read_leave(int slot)
+{
+    if (slot >= 0) atomic_fetch_add_explicit(&perf_io_active[slot].seq, 1, memory_order_release);
+}
+
+static void perf_active_reads(void)
+{
+    unsigned count = atomic_load_explicit(&perf_io_slots, memory_order_relaxed), shown = 0;
+    uint64_t now = perf_now_ns();
+    if (count > PERF_IO_ACTIVE) count = PERF_IO_ACTIVE;
+    /* Positioned disk reads first, so idle launcher pipe reads do not hide them. */
+    for (int pass = 1; pass >= 0; pass--)
+    for (unsigned i = 0; i < count && shown < 32; i++) {
+        struct perf_io_active *s = &perf_io_active[i];
+        uint64_t seq = atomic_load_explicit(&s->seq, memory_order_acquire);
+        if (!(seq & 1)) continue;
+        uint64_t start = atomic_load_explicit(&s->started, memory_order_relaxed);
+        uint64_t tid = atomic_load_explicit(&s->tid, memory_order_relaxed);
+        uint64_t size = atomic_load_explicit(&s->size, memory_order_relaxed);
+        uint64_t offset = atomic_load_explicit(&s->offset, memory_order_relaxed);
+        int fd = atomic_load_explicit(&s->fd, memory_order_relaxed);
+        int positioned = atomic_load_explicit(&s->positioned, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        if (positioned != pass || start > now || now-start < 20000000ull ||
+            seq != atomic_load_explicit(&s->seq, memory_order_acquire)) continue;
+        dprintf(2, "[stall-io] native_tid=%llu op=%s fd=%d requested=%llu off=%llx active_ms=%.1f (in-flight; no result yet)\n",
+                (unsigned long long)tid, positioned ? "pread" : "read", fd,
+                (unsigned long long)size, (unsigned long long)offset, (now-start)/1e6);
+        shown++;
+    }
+}
 
 static void perf_max( _Atomic uint64_t *slot, uint64_t v )
 {
@@ -67,6 +135,16 @@ static void perf_max( _Atomic uint64_t *slot, uint64_t v )
 }
 
 /* ---- the hooks DXMT calls ---- */
+
+void ios_perf_read_done(size_t requested, ssize_t result, uint64_t elapsed)
+{
+    atomic_fetch_add_explicit(&perf_read_calls, 1, memory_order_relaxed);
+    if (result > 0) atomic_fetch_add_explicit(&perf_read_bytes, result, memory_order_relaxed);
+    if (result < 0) atomic_fetch_add_explicit(&perf_read_errors, 1, memory_order_relaxed);
+    else if ((size_t)result < requested) atomic_fetch_add_explicit(&perf_read_short, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&perf_read_ns, elapsed, memory_order_relaxed);
+    perf_max(&perf_read_max_ns, elapsed);
+}
 
 void ios_frame_game_tick( void )
 {
@@ -146,6 +224,437 @@ static int perf_read(uint64_t address, void *out, size_t size)
     vm_size_t got = 0;
     return address > 0x10000 && !vm_read_overwrite(mach_task_self(), address, size,
                                                   (vm_address_t)out, &got) && got == size;
+}
+
+/* Slow-path diagnostics only. No TLS/TEB guess on native Cocoa threads: use
+ * the existing registry and fault-safe reads. Zero means no Wine owner found.
+ * ClientId in the 64-bit TEB is {process, thread} at 0x40/0x48. */
+uint64_t ios_perf_caller_ids(void)
+{
+    extern int ios_thread_registry_count(void);
+    extern uintptr_t ios_thread_registry_teb(int);
+    extern thread_t ios_thread_registry_mach(int);
+    thread_t self = pthread_mach_thread_np(pthread_self());
+    unsigned i, count = ios_thread_registry_count();
+    uint64_t ids[2] = {0};
+    for (i = 0; i < count; i++)
+        if (ios_thread_registry_mach(i) == self)
+        {
+            uintptr_t teb = ios_thread_registry_teb(i);
+            if (teb && perf_read(teb + 0x40, ids, sizeof(ids)))
+                return ((uint64_t)(uint32_t)ids[0] << 32) | (uint32_t)ids[1];
+            break;
+        }
+    return 0;
+}
+
+/* ---- stall probe v3: wait targets, caller context, VM attribution ----
+ *
+ * v2 showed RDR2's render thread in wait_select_reply during ~0.7 s gaps and
+ * other game threads Mach-UNINTERRUPTIBLE with game PCs. v3 asks: what is the
+ * render thread waiting on, who ends that wait and when (server_ios.c
+ * [wait-done], queue_ios.c [stall-wait-srv]); and is an uninterruptible
+ * thread blocked on a page (decoded load/store address + kernel page state).
+ * Everything here runs on the XP probe thread at most once a second; reads go
+ * through perf_read (fault-safe) and no thread is suspended. */
+#include "wait_registry_ios.h"
+#include "arm64_mem_ea.h"
+#include <mach/mach_vm.h>
+#include <mach/vm_region.h>
+
+/* Guest module map per PEB (pseudo-processes share one address space, so a
+ * single global map would name another process's modules). Rebuilt at most
+ * every 20 s; at most 2 PEBs x 256 modules. */
+#define PERF_MOD_MAX 256
+static struct perf_modmap {
+    uint64_t peb, built_ns;
+    unsigned n;
+    struct { uint64_t base, size; char name[40]; } m[PERF_MOD_MAX];
+} perf_modmaps[2];
+
+static struct perf_modmap *perf_modmap_for(uint64_t teb)
+{
+    uint64_t peb = 0, ldr = 0, head, cur, now = perf_now_ns();
+    struct perf_modmap *map = NULL;
+    unsigned guard = 0, k;
+    if (!teb || !perf_read(teb + 0x60, &peb, 8) || !peb) return NULL;
+    for (k = 0; k < 2; k++) if (perf_modmaps[k].peb == peb) map = &perf_modmaps[k];
+    if (map && now - map->built_ns < 20000000000ull) return map;
+    if (!map) map = perf_modmaps[0].built_ns <= perf_modmaps[1].built_ns ? &perf_modmaps[0] : &perf_modmaps[1];
+    map->peb = peb; map->built_ns = now; map->n = 0;
+    if (!perf_read(peb + 0x18, &ldr, 8) || !ldr) return map;
+    head = ldr + 0x10;                        /* InLoadOrderModuleList */
+    if (!perf_read(head, &cur, 8)) return map;
+    while (cur && cur != head && guard++ < PERF_MOD_MAX && map->n < PERF_MOD_MAX)
+    {
+        /* LDR_DATA_TABLE_ENTRY (x64): DllBase +0x30, SizeOfImage +0x40, BaseDllName +0x58 */
+        uint64_t base = 0, next = 0, str[2] = {0};
+        uint32_t size = 0;
+        uint16_t wname[39];
+        if (!perf_read(cur + 0x30, &base, 8) || !perf_read(cur + 0x40, &size, 4)) break;
+        if (base && size && size < (1u << 30))
+        {
+            unsigned n = 0, j;
+            if (perf_read(cur + 0x58, str, 16))
+            {
+                n = (unsigned)(str[0] & 0xffff) / 2;
+                if (n > 39) n = 39;
+                if (!str[1] || !perf_read(str[1], wname, n * 2)) n = 0;
+            }
+            map->m[map->n].base = base; map->m[map->n].size = size;
+            for (j = 0; j < n; j++) map->m[map->n].name[j] = wname[j] < 0x80 ? (char)wname[j] : '?';
+            map->m[map->n].name[n] = 0;
+            map->n++;
+        }
+        if (!perf_read(cur, &next, 8)) break;
+        cur = next;
+    }
+    return map;
+}
+
+static const char *perf_module_name(const struct perf_modmap *map, uint64_t addr, uint64_t *rva)
+{
+    unsigned i;
+    if (map)
+        for (i = 0; i < map->n; i++)
+            if (addr >= map->m[i].base && addr - map->m[i].base < map->m[i].size)
+            { *rva = addr - map->m[i].base; return map->m[i].name; }
+    *rva = addr;
+    return NULL;
+}
+
+/* "module+rva", or the native symbol, or the raw address. */
+static void perf_addr_name(char *out, size_t size, const struct perf_modmap *map, uint64_t addr)
+{
+    uint64_t rva;
+    const char *mod = perf_module_name(map, addr, &rva);
+    Dl_info info = {0};
+    if (mod) snprintf(out, size, "%s+%llx", mod[0] ? mod : "module", (unsigned long long)rva);
+    else if (addr && dladdr((void *)addr, &info) && (info.dli_sname || info.dli_fname))
+        snprintf(out, size, "%s+%llx", info.dli_sname ? info.dli_sname : info.dli_fname,
+                 (unsigned long long)(addr - (uint64_t)(uintptr_t)(info.dli_saddr ? info.dli_saddr : info.dli_fbase)));
+    else snprintf(out, size, "%llx", (unsigned long long)addr);
+}
+
+/* Where a waiting thread came from: its syscall frame's pc/lr, the frame-
+ * pointer chain inside the thread's own stack bounds, then stack words that
+ * fall inside guest modules (x64 return addresses are not in the fp chain;
+ * these are CANDIDATES, not a proven call chain). */
+static void perf_wait_caller(const struct ios_wait_info *w, uint64_t native_tid)
+{
+    extern const unsigned int ios_syscall_frame_size;
+    extern void ios_syscall_frame_regs(const void *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+    static unsigned char frame[0x400];
+    uint64_t fp, lr, sp, pc, limit = 0, base = 0, words[256];
+    struct perf_modmap *map = perf_modmap_for((uint64_t)(uintptr_t)w->teb);
+    char line[1400], name[96];
+    int len, i, shown = 0;
+
+    if (!w->frame || ios_syscall_frame_size > sizeof(frame) ||
+        !perf_read(w->frame, frame, ios_syscall_frame_size)) return;
+    ios_syscall_frame_regs(frame, &fp, &lr, &sp, &pc);
+    perf_read((uint64_t)(uintptr_t)w->teb + 0x08, &base, 8);    /* NT_TIB StackBase  */
+    perf_read((uint64_t)(uintptr_t)w->teb + 0x10, &limit, 8);   /* NT_TIB StackLimit */
+    perf_addr_name(name, sizeof(name), map, pc);
+    len = snprintf(line, sizeof(line), "[stall-wait-stack] native_tid=%llu wine_tid=%04x pc=%s", (unsigned long long)native_tid, w->wine_tid, name);
+    perf_addr_name(name, sizeof(name), map, lr);
+    len += snprintf(line + len, sizeof(line) - len, " lr=%s fp-chain:", name);
+    for (i = 0; i < 12 && fp && !(fp & 7) && fp >= limit && fp + 16 <= base && len < (int)sizeof(line) - 120; i++)
+    {
+        uint64_t pair[2];
+        if (!perf_read(fp, pair, 16) || !pair[1]) break;
+        perf_addr_name(name, sizeof(name), map, pair[1]);
+        len += snprintf(line + len, sizeof(line) - len, " %s", name);
+        if (pair[0] <= fp) break;
+        fp = pair[0];
+    }
+    len += snprintf(line + len, sizeof(line) - len, " | guest-stack-candidates:");
+    if (sp >= limit && sp < base)
+    {
+        size_t bytes = base - sp < sizeof(words) ? base - sp : sizeof(words);
+        if (perf_read(sp, words, bytes & ~7ul))
+            for (i = 0; i < (int)(bytes / 8) && shown < 8 && len < (int)sizeof(line) - 100; i++)
+            {
+                uint64_t rva;
+                const char *mod = perf_module_name(map, words[i], &rva);
+                if (!mod) continue;
+                len += snprintf(line + len, sizeof(line) - len, " sp+%x:%s+%llx", i * 8, mod[0] ? mod : "module", (unsigned long long)rva);
+                shown++;
+            }
+    }
+    dprintf(2, "%s\n", line);
+}
+
+static const char *perf_wait_phase_name(unsigned p)
+{
+    return p == IOS_WAIT_PHASE_REQUEST ? "request" : p == IOS_WAIT_PHASE_PIPE ? "wait-pipe" :
+           p == IOS_WAIT_PHASE_APC ? "kernel-apc" : "?";
+}
+
+/* Print the selected threads' in-flight Wine waits, the other recent waits of
+ * the same processes, mark the selected ones for [wait-done], then ask the
+ * server thread to resolve the waited objects ([stall-wait-srv]). */
+void ios_perf_wait_report(const uint64_t *ids, unsigned nids)
+{
+    extern struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
+    extern struct ios_wait_probe_req ios_wait_probe;
+    extern void ios_wineserver_wake(void);
+    struct timespec ts;
+    uint64_t now;
+    unsigned i, j, probe[IOS_WAIT_PROBE_MAX], nprobe = 0, pids[16], npids = 0, others = 0, idle = 0;
+    struct ios_wait_info w;
+    unsigned depth;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    for (i = 0; i < IOS_WAITREG_SLOTS; i++)
+    {
+        if (!ios_wait_read(&ios_wait_reg[i], &w, &depth)) continue;
+        for (j = 0; j < nids && ids[j] != w.native_tid; j++) ;
+        if (j == nids) continue;
+        dprintf(2, "[stall-wait] native_tid=%llu wine_pid=%04x wine_tid=%04x age_ms=%.1f phase=%s depth=%u op=%d flags=%x "
+                   "n=%d h=%x,%x,%x,%x key=%llx timeout=%lld requests=%u apcs=%u\n",
+                (unsigned long long)w.native_tid, w.wine_pid, w.wine_tid, now > w.t0_ns ? (now - w.t0_ns) / 1e6 : 0.0,
+                perf_wait_phase_name(ios_wait_reg[i].phase), depth, w.op, w.flags, w.count,
+                w.handles[0], w.handles[1], w.handles[2], w.handles[3], (unsigned long long)w.key,
+                (long long)w.timeout, ios_wait_reg[i].requests, ios_wait_reg[i].apcs);
+        perf_wait_caller(&w, w.native_tid);
+        ios_wait_reg[i].watch_until_ns = now + 5000000000ull;
+        if (nprobe < IOS_WAIT_PROBE_MAX) probe[nprobe++] = w.wine_tid;
+        for (j = 0; j < npids && pids[j] != w.wine_pid; j++) ;
+        if (j == npids && npids < 16) pids[npids++] = w.wine_pid;
+    }
+    /* Selected threads that are not in a server wait are running, faulting or
+     * waiting elsewhere (fast-sync park, Mach semaphore, mutex). */
+    for (j = 0; j < nids; j++)
+    {
+        int found = 0;
+        for (i = 0; i < IOS_WAITREG_SLOTS && !found; i++)
+            found = ios_wait_read(&ios_wait_reg[i], &w, NULL) && w.native_tid == ids[j];
+        if (!found) idle++;
+    }
+    /* Other waits of the same processes that began in the last 2 s: the
+     * producers and consumers around the stalled thread. */
+    for (i = 0; i < IOS_WAITREG_SLOTS && others < 24; i++)
+    {
+        uint64_t age;
+        if (!ios_wait_read(&ios_wait_reg[i], &w, &depth) || now < w.t0_ns) continue;
+        age = now - w.t0_ns;
+        if (age < 20000000ull || age > 2000000000ull) continue;
+        for (j = 0; j < nids && ids[j] != w.native_tid; j++) ;
+        if (j < nids) continue;
+        for (j = 0; j < npids && pids[j] != w.wine_pid; j++) ;
+        if (j == npids) continue;
+        dprintf(2, "[stall-waits] wine_pid=%04x wine_tid=%04x native_tid=%llu age_ms=%.1f phase=%s op=%d n=%d h=%x,%x key=%llx timeout=%lld\n",
+                w.wine_pid, w.wine_tid, (unsigned long long)w.native_tid, age / 1e6,
+                perf_wait_phase_name(ios_wait_reg[i].phase), w.op, w.count, w.handles[0], w.handles[1],
+                (unsigned long long)w.key, (long long)w.timeout);
+        if (nprobe < IOS_WAIT_PROBE_MAX) probe[nprobe++] = w.wine_tid;
+        others++;
+    }
+    dprintf(2, "[stall-wait-summary] selected=%u in_server_wait=%u not_in_server_wait=%u recent_same_process_waits=%u resolve_requested=%u\n",
+            nids, nids - idle, idle, others, nprobe);
+    if (!nprobe) return;
+    for (i = 0; i < nprobe; i++) ios_wait_probe.tids[i] = probe[i];
+    ios_wait_probe.count = nprobe;
+    ios_wait_probe.posted_ns = now;
+    __atomic_add_fetch(&ios_wait_probe.gen, 1, __ATOMIC_RELEASE);
+    ios_wineserver_wake();
+}
+
+/* Task and host VM counters over the last XP window (~250 ms). Uninterruptible
+ * threads plus rising pageins/decompressions point at memory, not scheduling. */
+void ios_perf_vm_tick(int report)
+{
+    static int have;
+    static task_events_info_data_t last_ev;
+    static uint64_t last_decomp, last_ns;
+    static vm_statistics64_data_t last_host;
+    task_events_info_data_t ev;
+    task_vm_info_data_t vm;
+    vm_statistics64_data_t host;
+    mach_msg_type_number_t n = TASK_EVENTS_INFO_COUNT;
+    uint64_t now = perf_now_ns(), decomp = 0;
+    int ok_ev, ok_host;
+
+    ok_ev = task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ev, &n) == KERN_SUCCESS;
+    n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) == KERN_SUCCESS && n >= TASK_VM_INFO_REV5_COUNT)
+        decomp = vm.decompressions;
+    n = HOST_VM_INFO64_COUNT;
+    ok_host = host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&host, &n) == KERN_SUCCESS;
+    if (report && have && ok_ev && ok_host)
+        dprintf(2, "[stall-vm] window_ms=%.0f task: faults=%d pageins=%d cow=%d decompressions=%llu | host: pageins=%llu "
+                   "decompressions=%llu compressions=%llu swapins=%llu swapouts=%llu throttled_pages=%u free_pages=%u\n",
+                (now - last_ns) / 1e6, ev.faults - last_ev.faults, ev.pageins - last_ev.pageins,
+                ev.cow_faults - last_ev.cow_faults, (unsigned long long)(decomp - last_decomp),
+                (unsigned long long)(host.pageins - last_host.pageins),
+                (unsigned long long)(host.decompressions - last_host.decompressions),
+                (unsigned long long)(host.compressions - last_host.compressions),
+                (unsigned long long)(host.swapins - last_host.swapins),
+                (unsigned long long)(host.swapouts - last_host.swapouts),
+                host.throttled_count, host.free_count);
+    if (ok_ev && ok_host)
+    {
+        last_ev = ev; last_host = host; last_decomp = decomp; last_ns = now; have = 1;
+    }
+}
+
+/* For a thread not running with a PC in non-library code: decode the memory
+ * operand of the instruction at PC and ask the kernel about that page. */
+static void perf_fault_candidate(uint64_t native_tid, const arm_thread_state64_t *st, int run_state)
+{
+    extern int ios_swap_diag_classify(uint64_t addr, uint64_t *off, int *resv, int *img);
+    uint64_t regs[31], pc = arm_thread_state64_get_pc(*st), sp = arm_thread_state64_get_sp(*st), ea, off = 0;
+    uint32_t insn;
+    unsigned bytes, k;
+    integer_t disp = 0, refs = 0;
+    mach_vm_address_t raddr;
+    mach_vm_size_t rsize = 0;
+    vm_region_extended_info_data_t ext;
+    mach_msg_type_number_t n = VM_REGION_EXTENDED_INFO_COUNT;
+    mach_port_t obj = MACH_PORT_NULL;
+    int resv = 0, img = 0, swap, have_region;
+    Dl_info info;
+
+    if (dladdr((void *)pc, &info)) return;            /* inside a library: a syscall/kernel wait, not a load */
+    if (!perf_read(pc, &insn, 4)) return;
+    for (k = 0; k < 29; k++) regs[k] = st->__x[k];
+    regs[29] = arm_thread_state64_get_fp(*st);
+    regs[30] = arm_thread_state64_get_lr(*st);
+    if (!ios_arm64_mem_ea(insn, pc, regs, sp, &ea, &bytes))
+    {
+        dprintf(2, "[stall-fault] native_tid=%llu state=%d pc=%llx insn=%08x not a load/store (busy in code, or the sample moved)\n",
+                (unsigned long long)native_tid, run_state, (unsigned long long)pc, insn);
+        return;
+    }
+    mach_vm_page_query(mach_task_self(), ea & ~0xfffull, &disp, &refs);
+    raddr = ea;
+    have_region = mach_vm_region(mach_task_self(), &raddr, &rsize, VM_REGION_EXTENDED_INFO,
+                                 (vm_region_info_t)&ext, &n, &obj) == KERN_SUCCESS && raddr <= ea;
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    swap = ios_swap_diag_classify(ea, &off, &resv, &img);
+    dprintf(2, "[stall-fault] native_tid=%llu state=%d pc=%llx insn=%08x ea=%llx bytes=%u page=%s%s%s%s%s "
+               "region=%s tag=%d share=%d resident=%u swapped_out=%u external_pager=%u swap_file=%s off=%llx resv=%d img=%d\n",
+            (unsigned long long)native_tid, run_state, (unsigned long long)pc, insn, (unsigned long long)ea, bytes,
+            disp & VM_PAGE_QUERY_PAGE_PRESENT ? "present" : "absent",
+            disp & VM_PAGE_QUERY_PAGE_PAGED_OUT ? ",compressed/paged-out" : "",
+            disp & VM_PAGE_QUERY_PAGE_EXTERNAL ? ",file-backed" : "",
+            disp & VM_PAGE_QUERY_PAGE_COPIED ? ",copied" : "",
+            disp & VM_PAGE_QUERY_PAGE_DIRTY ? ",dirty" : "",
+            have_region ? "ok" : "none", have_region ? (int)ext.user_tag : -1, have_region ? (int)ext.share_mode : -1,
+            have_region ? ext.pages_resident : 0, have_region ? ext.pages_swapped_out : 0,
+            have_region ? ext.external_pager : 0, swap ? "yes" : "no", (unsigned long long)off, resv, img);
+}
+
+/* Capture live PCs during a zero-present interval, including idle role threads
+ * that the normal CPU-threshold stack sampler misses. No suspension, stack
+ * walk, target lock or guest memory dereference: these are PC/LR samples, not
+ * coherent call stacks. The caller caps cadence and selects at most 16 IDs. */
+void ios_perf_stall_snapshot(const uint64_t *ids, unsigned nids)
+{
+    extern int ios_thread_registry_count(void);
+    extern uintptr_t ios_thread_registry_teb(int);
+    extern thread_t ios_thread_registry_mach(int);
+    extern uint64_t ios_native_rip_from_hostpc(uint64_t, uint64_t, const char **);
+    extern void ios_swap_diag_report(void);
+    thread_act_array_t threads;
+    mach_msg_type_number_t count, i;
+    uint64_t start = perf_now_ns();
+    struct { thread_t port; uint64_t tid, pc; int state; } second[16];
+    unsigned nsecond = 0, s2;
+    perf_active_reads();
+    ios_swap_diag_report();
+    if (nids > 16) nids = 16;
+    if (task_threads(mach_task_self(), &threads, &count)) return;
+    for (i = 0; i < count; i++)
+    {
+        int keep = 0;
+        thread_identifier_info_data_t ident;
+        mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+        unsigned j;
+        if (!thread_info(threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &n))
+        for (j = 0; j < nids; j++) if (ident.thread_id == ids[j])
+        {
+            arm_thread_state64_t st;
+            thread_basic_info_data_t basic = {0};
+            uintptr_t teb = 0;
+            uint64_t owner[2] = {0}, rip = 0;
+            unsigned k, nr = ios_thread_registry_count();
+            const char *why = "not-resolved";
+            Dl_info pcinfo = {0}, lrinfo = {0};
+            n = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st, &n)) break;
+            n = THREAD_BASIC_INFO_COUNT;
+            thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&basic, &n);
+            for (k = 0; k < nr; k++) if (ios_thread_registry_mach(k) == threads[i])
+            { teb = ios_thread_registry_teb(k); break; }
+            if (teb) perf_read(teb + 0x40, owner, sizeof(owner));
+            uintptr_t pc = arm_thread_state64_get_pc(st), lr = arm_thread_state64_get_lr(st);
+            /* Only resolve an FEX block when x28 is readable; the resolver also
+             * validates its block metadata. Other PCs legitimately resolve 0. */
+            uint64_t block = 0;
+            if (teb && perf_read(st.__x[28], &block, sizeof(block)))
+                rip = ios_native_rip_from_hostpc(block, pc, &why);
+            dladdr((void *)pc, &pcinfo); dladdr((void *)lr, &lrinfo);
+            {
+                /* Mach run states: 1 running, 2 stopped, 3 waiting, 4 uninterruptible, 5 halted.
+                 * Cumulative user/system ms let consecutive snapshots show whether a
+                 * "waiting" thread is really burning kernel time (faults, decompression). */
+                thread_extended_info_data_t xi = {0};
+                mach_msg_type_number_t xn = THREAD_EXTENDED_INFO_COUNT;
+                thread_info(threads[i], THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xn);
+                dprintf(2, "[stall-thread] native_tid=%llu name=%s state=%s user_ms=%.1f sys_ms=%.1f pri=%d\n",
+                        (unsigned long long)ident.thread_id, xi.pth_name[0] ? xi.pth_name : "-",
+                        basic.run_state == 1 ? "running" : basic.run_state == 3 ? "waiting" :
+                        basic.run_state == 4 ? "uninterruptible" : basic.run_state == 2 ? "stopped" : "other",
+                        xi.pth_user_time / 1e6, xi.pth_system_time / 1e6, xi.pth_curpri);
+                if (basic.run_state != 1) perf_fault_candidate(ident.thread_id, &st, basic.run_state);
+                if (nsecond < 16) { second[nsecond].port = threads[i]; second[nsecond].tid = ident.thread_id;
+                                    second[nsecond].pc = pc; second[nsecond].state = basic.run_state; nsecond++; keep = 1; }
+            }
+            dprintf(2, "[stall-pc] native_tid=%llu wine_pid=%04x wine_tid=%04x state=%d suspend=%d pc=%llx %s+%llx lr=%llx %s+%llx guest_rip=%llx resolve=%s\n",
+                    (unsigned long long)ident.thread_id, (unsigned)owner[0], (unsigned)owner[1],
+                    basic.run_state, basic.suspend_count, (unsigned long long)pc,
+                    pcinfo.dli_sname ? pcinfo.dli_sname : pcinfo.dli_fname ? pcinfo.dli_fname : "?",
+                    (unsigned long long)(pc - (uintptr_t)(pcinfo.dli_saddr ? pcinfo.dli_saddr : pcinfo.dli_fbase)),
+                    (unsigned long long)lr,
+                    lrinfo.dli_sname ? lrinfo.dli_sname : lrinfo.dli_fname ? lrinfo.dli_fname : "?",
+                    (unsigned long long)(lr - (uintptr_t)(lrinfo.dli_saddr ? lrinfo.dli_saddr : lrinfo.dli_fbase)),
+                    (unsigned long long)rip, why ? why : "?");
+            break;
+        }
+        if (!keep) mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(*threads));
+    /* A second look 15 ms later: a state 4 that persists with the same PC is a
+     * long kernel wait (page-in, file I/O); a changed PC means it was moving. */
+    if (nsecond)
+    {
+        char line[1200];
+        int len = snprintf(line, sizeof(line), "[stall-pc2] after_ms=15");
+        usleep(15000);
+        for (s2 = 0; s2 < nsecond; s2++)
+        {
+            arm_thread_state64_t st;
+            thread_basic_info_data_t basic = {0};
+            mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+            uint64_t pc = 0;
+            if (!thread_get_state(second[s2].port, ARM_THREAD_STATE64, (thread_state_t)&st, &n))
+                pc = arm_thread_state64_get_pc(st);
+            n = THREAD_BASIC_INFO_COUNT;
+            thread_info(second[s2].port, THREAD_BASIC_INFO, (thread_info_t)&basic, &n);
+            if (len < (int)sizeof(line) - 80)
+                len += snprintf(line + len, sizeof(line) - len, " %llu:%d->%d:%s",
+                                (unsigned long long)second[s2].tid, second[s2].state, basic.run_state,
+                                pc == second[s2].pc ? "same-pc" : "moved");
+            mach_port_deallocate(mach_task_self(), second[s2].port);
+        }
+        dprintf(2, "%s\n", line);
+    }
+    ios_perf_wait_report(ids, nids);
+    dprintf(2, "[stall-pc-cost] ms=%.2f selected=%u (live PC samples; loading/background can also trigger; includes 15 ms second look)\n",
+            (perf_now_ns() - start) / 1e6, nids);
 }
 
 static void perf_hot_stack(thread_t port, uint64_t id, const char *name)
@@ -324,6 +833,16 @@ static void *perf_reporter( void *arg )
         }
         fps = frames / wall_s;
 
+        dprintf(2, "[perf-io] t=%.0fs scope=all-processes read_pread_calls=%llu MB=%.2f sum_ms=%.1f max_ms=%.1f errors=%llu short_or_eof=%llu untracked_threads=%u\n",
+                (now - t_start) / 1e9,
+                (unsigned long long)atomic_exchange_explicit(&perf_read_calls, 0, memory_order_relaxed),
+                atomic_exchange_explicit(&perf_read_bytes, 0, memory_order_relaxed) / 1048576.0,
+                atomic_exchange_explicit(&perf_read_ns, 0, memory_order_relaxed) / 1e6,
+                atomic_exchange_explicit(&perf_read_max_ns, 0, memory_order_relaxed) / 1e6,
+                (unsigned long long)atomic_exchange_explicit(&perf_read_errors, 0, memory_order_relaxed),
+                (unsigned long long)atomic_exchange_explicit(&perf_read_short, 0, memory_order_relaxed),
+                atomic_load_explicit(&perf_io_untracked, memory_order_relaxed));
+
         presents = atomic_exchange_explicit( &perf_presents, 0, memory_order_relaxed );
         skipped = atomic_exchange_explicit( &perf_presents_skipped, 0, memory_order_relaxed );
         cmdbufs = atomic_exchange_explicit( &perf_cmdbufs, 0, memory_order_relaxed );
@@ -347,7 +866,7 @@ static void *perf_reporter( void *arg )
             dprintf( 2, "[perf] t=%.0fs fps=%.1f frame avg=%.1f p50=%.1f p95=%.1f max=%.1f ms | "
                         "gpu=%.1f ms/frame (cb max %.1f, %llu cb, qdepth<=%llu) | drawable-wait=%.1f ms/frame (max %.1f) | "
                         "limiter=%.1f ms/frame | passes/frame render=%.1f compute=%.1f blit=%.1f loads=%.1f stores=%.1f clears=%.1f | "
-                        "presents=%llu skipped=%llu | panel=%dHz intent=%dHz vsync=%d | cpu=%.0f%% | footprint=%lluMB\n",
+                        "presents=%llu skipped=%llu | panel=%dHz intent=%dHz vsync=%d | cpu=%.0f%% | footprint=%lluMB scope=all-processes\n",
                      (now - t_start) / 1e9, fps, avg, p50, p95, mx,
                      gpu / 1e6 / per, gpu_max / 1e6, (unsigned long long)cmdbufs, (unsigned long long)qd,
                      dw / 1e6 / per, dw_max / 1e6, lim / 1e6 / per,
@@ -1124,6 +1643,7 @@ void ios_perf_init( void )
     /* winemetal's hooks default to 32-bit callers only; the profile wants every frame. */
     setenv( "MADEIRA_FRAME_STATS", "1", 0 );
     ios_frame_stats_on = 1;
+    dprintf(2, "[perf-hitch] diagnostics v3: v2 + in-flight Wine wait targets/wakers ([stall-wait*], [wait-done]), uninterruptible fault pages ([stall-fault], [stall-vm], [stall-swap]); no extra thread suspensions\n");
     if (!pthread_create( &t, NULL, perf_reporter, NULL )) pthread_detach( t );
     dprintf( 2, "[perf] profile on: a report every %us\n", perf_secs );
 }

@@ -30,7 +30,10 @@ static _Atomic int fail_build;
 static Token *token(int tag) { Token *t = [Token new]; t.tag = tag; return t; }
 static uint64_t madeira_avail_memory(uint64_t foot) { return (uint64_t)atomic_load(&headroom) << 20; }
 static int wmtr_enabled(void) { return atomic_load(&remote); }
-static long long madeira_cfg_int(const char *key, long long fallback) { return 2; }
+static int enable_warm = 1;
+static long long madeira_cfg_int(const char *key, long long fallback) {
+    return !strcmp(key,"pso-warm-native") ? enable_warm : 2;
+}
 static dispatch_semaphore_t gate;
 struct unixcall_mtldevice_newcomputepso {
     obj_handle_t device; struct WMTConstMemoryPointer info; obj_handle_t ret_error, ret_pso;
@@ -81,9 +84,19 @@ static void drain(unsigned target) {
     }
     assert(!"warm-up queue did not drain");
 }
-int main(void) { @autoreleasepool {
+int main(int argc, char **argv) { @autoreleasepool {
     gate = dispatch_semaphore_create(0);
     Token *device = token(5);
+    if (argc > 1) {
+        enable_warm = 0;
+        struct WMTRenderPipelineInfo r = {0};
+        struct madeira_warm_request q = {(obj_handle_t)device, (uint64_t)&r, 0};
+        assert(!madeira_warm_submit(&q,0));
+        assert(!madeira_warm_workers && !atomic_load(&madeira_warm_sent));
+        [device release];assert(!atomic_load(&live));dispatch_release(gate);
+        puts("PASS: pre-existing pso-warm=2 does not enable the experimental native warmer by default");
+        return 0;
+    }
     for (unsigned kind = 0; kind < 3; kind++) {
         Token *fn = token(23), *archive = token(77);
         obj_handle_t archives[] = {(obj_handle_t)archive};
@@ -138,3 +151,4 @@ with tempfile.TemporaryDirectory(prefix='madeira-warm-test-') as directory:
                     '-framework','Foundation','-framework','QuartzCore',
                     str(path/'test.m'),'-o',str(path/'test')],check=True)
     subprocess.run([str(path/'test')],check=True,timeout=20)
+    subprocess.run([str(path/'test'),'--disabled'],check=True,timeout=20)

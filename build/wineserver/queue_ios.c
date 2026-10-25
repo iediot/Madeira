@@ -4398,20 +4398,7 @@ void ios_dump_msg_queues(void)
  * that lasts minutes cannot flood the log it is being diagnosed in.
  * ============================================================ */
 
-#define IOS_WAITREG_SLOTS 512
-struct ios_wait_entry
-{
-    volatile unsigned int  seq;
-    void                  *teb;
-    unsigned int           wine_tid;
-    unsigned long long     t0_ns;
-    unsigned int           flags;
-    long long              timeout;
-    int                    op;
-    int                    count;
-    unsigned int           handles[8];
-    void                  *ret_pc;
-};
+#include "../ntdll-unix/wait_registry_ios.h"
 extern struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
 
 struct ios_stuck_find { unsigned int tid; struct thread *found; };
@@ -4453,20 +4440,15 @@ void ios_dump_stuck_waits(void)
 
     for (i = 0; i < IOS_WAITREG_SLOTS; i++)
     {
-        struct ios_wait_entry *e = &ios_wait_reg[i];
-        unsigned int s0 = e->seq, s1;
+        struct ios_wait_info w, *e = &w;
         struct ios_stuck_find f;
         unsigned long long age_ms;
         int h;
 
-        if (!(s0 & 1)) continue;            /* even => not in a wait */
+        if (!ios_wait_read( &ios_wait_reg[i], &w, NULL )) continue;   /* idle or torn */
         if (!e->t0_ns || now_ns < e->t0_ns) continue;
         age_ms = (now_ns - e->t0_ns) / 1000000ull;
         if (age_ms < (unsigned long long)thresh_s * 1000ull) continue;
-
-        __sync_synchronize();
-        s1 = e->seq;
-        if (s1 != s0) continue;             /* torn read: it moved, skip */
 
         reports++;
         fprintf( stderr, "[srv-stuck] tid=%04x teb=%p age=%llums op=%d flags=%08x "
@@ -4579,6 +4561,126 @@ void ios_dump_stuck_waits(void)
             }
             release_object( obj );
         }
+    }
+    fflush( stderr );
+}
+
+/* ============================================================
+ * Madeira wait probe: who a stalled thread waits on, and who woke it.
+ *
+ * RDR2's ~0.7 s gaps (docs/RDR2_LOG_231619_ANALYSIS.md) found its render
+ * thread blocked in wait_select_reply, i.e. in a server wait. A PC sample
+ * cannot say on WHAT, nor whether the wait ended late because the producer
+ * signalled late or because the wake-up reached the thread late.
+ *
+ * ios_wait_wakeup_hook: thread.c's send_thread_wakeup calls this just before
+ * it writes a wake-up reply; the waiter's [wait-done] line then reports the
+ * thread that ended its wait (0 = the server: timeout, timer, exit) and the
+ * wake-to-return delay. One clock read per wake-up.
+ *
+ * ios_wait_probe_service: a [stall-window] snapshot posts up to 16 Wine
+ * thread ids (perf_ios.c); the server loop answers on its next pass, under
+ * its own lock, from the server's own wait record: select opcode, timeout
+ * left, every waited object with type, name, waiter count, the event's
+ * lifetime set/reset history (who normally signals it) and its dump state.
+ * Reads only; no wait, object or timer is changed. Bounded by 16 threads x
+ * 8 objects per request and requests by the snapshot's 1/s cap.
+ * ============================================================ */
+extern struct ios_wait_probe_req ios_wait_probe;
+
+void ios_wait_wakeup_hook( unsigned int tid, client_ptr_t cookie, int signaled, unsigned int waker )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    ios_wait_note_wake( ios_wait_reg, tid, cookie, signaled, waker,
+                        current && current->process ? current->process->id : 0,
+                        (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec );
+}
+
+static void ios_wait_probe_object( unsigned int tid, int idx, struct object *obj )
+{
+    extern int ios_evt_brief( struct object *, unsigned int *, unsigned int *, unsigned int *, unsigned int * );
+    const WCHAR *name;
+    data_size_t len = 0;
+    unsigned int k, n_set, set_tid, n_reset, reset_tid, waiters = 0;
+    struct object *sync = get_obj_sync( obj );
+    struct list *entry;
+    char type[32], oname[96];
+
+    for (k = 0; k < obj->ops->type->name.len / sizeof(WCHAR) && k < sizeof(type) - 1; k++)
+        type[k] = (char)obj->ops->type->name.str[k];
+    type[k] = 0;
+    oname[0] = 0;
+    if ((name = get_object_name( obj, &len )) && len)
+    {
+        for (k = 0; k < len / sizeof(WCHAR) && k < sizeof(oname) - 1; k++)
+            oname[k] = name[k] < 0x80 ? (char)name[k] : '?';
+        oname[k] = 0;
+    }
+    if (sync) LIST_FOR_EACH( entry, &sync->wait_queue ) if (++waiters >= 1000) break;
+    fprintf( stderr, "[stall-wait-srv]   tid=%04x obj[%d]=%p type=%s name=%s waiters=%u",
+             tid, idx, obj, type, oname[0] ? oname : "-", waiters );
+    if (ios_evt_brief( obj, &n_set, &set_tid, &n_reset, &reset_tid ))
+        fprintf( stderr, " sets=%u last_set_tid=%04x resets=%u last_reset_tid=%04x",
+                 n_set, set_tid, n_reset, reset_tid );
+    fprintf( stderr, " state: " );
+    obj->ops->dump( obj, 0 );      /* prints its own newline */
+    if (sync) release_object( sync );
+}
+
+void ios_wait_probe_service( void )
+{
+    extern int ios_thread_wait_brief( struct thread *, int *, int *, long long *,
+                                      unsigned long long *, struct object **, int );
+    static unsigned int seen;
+    unsigned int gen = __atomic_load_n( &ios_wait_probe.gen, __ATOMIC_ACQUIRE );
+    unsigned int tids[IOS_WAIT_PROBE_MAX], n, i;
+    uint64_t posted, now_ns;
+    struct timespec now;
+
+    if (gen == seen) return;
+    seen = gen;
+    n = ios_wait_probe.count;
+    if (n > IOS_WAIT_PROBE_MAX) n = IOS_WAIT_PROBE_MAX;
+    for (i = 0; i < n; i++) tids[i] = ios_wait_probe.tids[i];
+    posted = ios_wait_probe.posted_ns;
+    if (__atomic_load_n( &ios_wait_probe.gen, __ATOMIC_ACQUIRE ) != gen) return;  /* rewritten: next pass */
+    clock_gettime( CLOCK_MONOTONIC, &now );
+    now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+
+    for (i = 0; i < n; i++)
+    {
+        struct ios_stuck_find f;
+        struct object *objs[IOS_WAITREG_HANDLES];
+        int select = 0, flags = 0, count, k;
+        long long remaining = -1;
+        unsigned long long key = 0;
+
+        f.tid = tids[i]; f.found = NULL;
+        if (tids[i]) enum_processes( ios_stuck_match, &f );
+        if (!f.found)
+        {
+            fprintf( stderr, "[stall-wait-srv] tid=%04x not found by the server\n", tids[i] );
+            continue;
+        }
+        count = ios_thread_wait_brief( f.found, &select, &flags, &remaining, &key, objs, IOS_WAITREG_HANDLES );
+        if (count < 0)
+        {
+            fprintf( stderr, "[stall-wait-srv] tid=%04x pid=%04x suspend=%d answered_after_ms=%.1f: no server wait "
+                     "(it ended before this pass, or the thread waits outside the server)\n",
+                     tids[i], f.found->process ? f.found->process->id : 0, f.found->suspend,
+                     now_ns > posted ? (now_ns - posted) / 1e6 : 0.0 );
+            continue;
+        }
+        {
+            char left[32] = "inf";
+            if (remaining >= 0) snprintf( left, sizeof(left), "%.1f", remaining / 10000.0 );
+            fprintf( stderr, "[stall-wait-srv] tid=%04x pid=%04x suspend=%d answered_after_ms=%.1f select=%d flags=%x "
+                     "objects=%d timeout_left_ms=%s key=%llx\n",
+                     tids[i], f.found->process ? f.found->process->id : 0, f.found->suspend,
+                     now_ns > posted ? (now_ns - posted) / 1e6 : 0.0, select, flags, count, left, key );
+        }
+        for (k = 0; k < count && k < IOS_WAITREG_HANDLES; k++) ios_wait_probe_object( tids[i], k, objs[k] );
     }
     fflush( stderr );
 }
