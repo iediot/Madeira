@@ -832,6 +832,7 @@ void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, void *hwnd);
 extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
 extern void winios_drv_close_windows(void);
+extern void winios_drv_post_text(unsigned int scalar, unsigned short vk, int shift);
 extern void winios_dump_window_tree(void);
 extern void ios_dump_all_thread_stacks(void);
 
@@ -839,6 +840,7 @@ extern void ios_dump_all_thread_stacks(void);
 #define WINIOS_EV_MOUSE 0
 #define WINIOS_EV_KEY   1
 #define WINIOS_EV_CLOSE 2   /* Quit game: WM_CLOSE to the top-level windows */
+#define WINIOS_EV_TEXT  3
 #define KEYEVENTF_KEYUP 0x0002
 typedef struct {
     unsigned int type;       /* WINIOS_EV_MOUSE / WINIOS_EV_KEY */
@@ -855,7 +857,43 @@ static struct {
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static int winios_ev_is_move_only(const winios_input_event_t *e) {
-    return e->type == WINIOS_EV_MOUSE && !(e->flags & ~(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
+    return e->type == WINIOS_EV_MOUSE && !(e->flags & ~(0x0001 | 0x8000));
+}
+
+static _Atomic unsigned int g_text_generation;
+/* One consumer owns delivery order across concurrent Wine event pumps. */
+static pthread_mutex_t g_input_drain_lock = PTHREAD_MUTEX_INITIALIZER;
+static double g_text_ready_at;
+static unsigned int g_text_paced_generation;
+
+int winios_try_post_text(unsigned int scalar, int vk, int shift, int interval_ms) {
+    if (interval_ms < 5) interval_ms = 5;
+    if (interval_ms > 100) interval_ms = 100;
+    int accepted = 0;
+    pthread_mutex_lock(&g_input_q.lock);
+    unsigned int used = (g_input_q.head + WINIOS_RING_SIZE - g_input_q.tail) % WINIOS_RING_SIZE;
+    /* Leave room for physical key/button releases while the game is busy. */
+    if (used < WINIOS_RING_SIZE - 16) {
+        g_input_q.buf[g_input_q.head] = (winios_input_event_t){
+            WINIOS_EV_TEXT, (int)scalar, vk, ((unsigned int)interval_ms << 8) | (shift != 0),
+            atomic_load(&g_text_generation)
+        };
+        g_input_q.head = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+        accepted = 1;
+    }
+    pthread_mutex_unlock(&g_input_q.lock);
+    return accepted;
+}
+
+void winios_cancel_text(void) {
+    atomic_fetch_add(&g_text_generation, 1);
+}
+
+static int winios_drain_text(const winios_input_event_t *e) {
+    if (e->type != WINIOS_EV_TEXT) return 0;
+    if (e->data == atomic_load(&g_text_generation))
+        winios_drv_post_text((unsigned int)e->x, (unsigned short)e->y, (e->flags & 1) != 0);
+    return 1;
 }
 
 static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
@@ -923,6 +961,72 @@ void winios_post_key(int vk, int down) {
     winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
 }
 
+/* Serial, nonblocking consumer: keys remain FIFO even with several Wine
+ * threads polling at once. Only the queue owner injects into wineserver. */
+static BOOL winios_drain_input(void) {
+    if (pthread_mutex_trylock(&g_input_drain_lock)) return FALSE;
+#ifdef __OBJC__
+    static const double kMinClick = 0.05;
+    static double button_down_at[3];
+#endif
+    BOOL drained = FALSE;
+    for (;;) {
+        winios_input_event_t e;
+        pthread_mutex_lock(&g_input_q.lock);
+        if (g_input_q.tail == g_input_q.head) {
+            pthread_mutex_unlock(&g_input_q.lock);
+            break;
+        }
+        e = g_input_q.buf[g_input_q.tail];
+        if (e.type == WINIOS_EV_TEXT && e.data == atomic_load(&g_text_generation)
+            && e.data == g_text_paced_generation && CACurrentMediaTime() < g_text_ready_at) {
+            pthread_mutex_unlock(&g_input_q.lock);
+            break; /* Never catch up a delayed queue as a burst of keystrokes. */
+        }
+        #ifdef __OBJC__
+        if (e.type == WINIOS_EV_MOUSE) {
+            int up = (e.flags & MOUSEEVENTF_LEFTUP) ? 0 : (e.flags & MOUSEEVENTF_RIGHTUP) ? 1
+                   : (e.flags & 0x0040 /* MIDDLEUP */) ? 2 : -1;
+            if (up >= 0 && CACurrentMediaTime() - button_down_at[up] < kMinClick) {
+                pthread_mutex_unlock(&g_input_q.lock);
+                break;
+            }
+            int down = (e.flags & MOUSEEVENTF_LEFTDOWN) ? 0 : (e.flags & MOUSEEVENTF_RIGHTDOWN) ? 1
+                     : (e.flags & 0x0020 /* MIDDLEDOWN */) ? 2 : -1;
+            if (down >= 0) button_down_at[down] = CACurrentMediaTime();
+        }
+        #endif
+        g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
+        pthread_mutex_unlock(&g_input_q.lock);
+
+        if (winios_drain_text(&e)) {
+            if (e.data == atomic_load(&g_text_generation)) {
+                g_text_paced_generation = e.data;
+                g_text_ready_at = CACurrentMediaTime() + (e.flags >> 8) / 1000.0;
+            }
+            drained = TRUE;
+            continue; /* Clipboard contents must not enter the input log. */
+        }
+#ifdef __OBJC__
+        if (madeira_get_diag_enabled()) {
+            fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags);
+            fflush(stderr);
+        }
+#endif
+        if (e.type == WINIOS_EV_KEY)
+            winios_drv_post_key((unsigned short)e.x, e.flags);
+#ifdef __OBJC__
+        else if (e.type == WINIOS_EV_CLOSE)
+            winios_drv_close_windows();
+#endif
+        else
+            winios_drv_post_mouse(e.x, e.y, e.flags, e.data, NULL);
+        drained = TRUE;
+    }
+    pthread_mutex_unlock(&g_input_drain_lock);
+    return drained;
+}
+
 BOOL winios_pProcessEvents(DWORD mask) {
     /* The restored born-minimized window's own thread brings it to the front
      * (see g_restore_foreground); other threads leave the request in place. */
@@ -952,48 +1056,7 @@ BOOL winios_pProcessEvents(DWORD mask) {
             winios_dump_window_tree();
         }
     }
-    /* A tap arrives as a button down and up posted together, so the game got
-     * both in one message pump with no time between them. Geometry Dash reads
-     * that as a press that never ends (the cube keeps jumping). Each mouse
-     * button now stays down for at least kMinClick: its up waits in the
-     * queue, with everything behind it, until that long after its down. */
-    static const double kMinClick = 0.05;
-    static double button_down_at[3];
-    BOOL drained = FALSE;
-    for (;;) {
-        winios_input_event_t e;
-        pthread_mutex_lock(&g_input_q.lock);
-        if (g_input_q.tail == g_input_q.head) {
-            pthread_mutex_unlock(&g_input_q.lock);
-            break;
-        }
-        e = g_input_q.buf[g_input_q.tail];
-        if (e.type == WINIOS_EV_MOUSE) {
-            int up = (e.flags & MOUSEEVENTF_LEFTUP) ? 0 : (e.flags & MOUSEEVENTF_RIGHTUP) ? 1
-                   : (e.flags & 0x0040 /* MIDDLEUP */) ? 2 : -1;
-            if (up >= 0 && CACurrentMediaTime() - button_down_at[up] < kMinClick) {
-                pthread_mutex_unlock(&g_input_q.lock);
-                break;
-            }
-            int down = (e.flags & MOUSEEVENTF_LEFTDOWN) ? 0 : (e.flags & MOUSEEVENTF_RIGHTDOWN) ? 1
-                     : (e.flags & 0x0020 /* MIDDLEDOWN */) ? 2 : -1;
-            if (down >= 0) button_down_at[down] = CACurrentMediaTime();
-        }
-        g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
-        pthread_mutex_unlock(&g_input_q.lock);
-
-        /* ml2111: one line (and an fflush) per input event: diagnostics only. */
-        if (madeira_get_diag_enabled())
-        { fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr); }
-        if (e.type == WINIOS_EV_KEY)
-            winios_drv_post_key((unsigned short)e.x, e.flags);
-        else if (e.type == WINIOS_EV_CLOSE)
-            winios_drv_close_windows();
-        else
-            winios_drv_post_mouse(e.x, e.y, e.flags, e.data, NULL);
-        drained = TRUE;
-    }
-    return drained;
+    return winios_drain_input();
 }
 
 /* ============================================================ *

@@ -384,6 +384,7 @@ struct SteamSettingsSection: View {
     let open: (SettingsSheet) -> Void
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var epic = EpicAuth.shared
+    @ObservedObject private var cloud = SteamCloudSetting.shared
     @State private var confirmSteamSignOut = false
     @State private var confirmEpicSignOut = false
 
@@ -397,6 +398,7 @@ struct SteamSettingsSection: View {
             if SteamSignIn.isEnabled {
                 account("Steam", name: signIn.accountName,
                         signIn: { open(.steamSignIn) }, signOut: { confirmSteamSignOut = true })
+                Toggle("Steam Cloud saves", isOn: $cloud.on)
             }
             // Epic Games (Epic/): the login is Epic's own page in the app; the account
             // then stays signed in, and its games join the library.

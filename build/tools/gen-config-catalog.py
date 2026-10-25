@@ -43,6 +43,10 @@ INT_READERS = {"madeira_cfg_int", "mad_cfg_int_pe"}
 # Titles, kinds and fixed choices for options with a dedicated Settings row.
 # "choices" are (value, label); the empty value means "remove the key".
 OVERLAY = {
+    "env.MADEIRA_PASTE_INTERVAL_MS": {"category": "Windows, display & input", "title": "Clipboard typing interval (ms)",
+                "kind": "int", "default": "10",
+                "note": "Default 10 ms between pasted characters. Range 5-100 ms; use a longer interval for games "
+                        "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
     "env.DXMT_WSI_MONITOR_IDENTITY": {"kind": "bool", "default": "1", "note": "DXGI outputs report user32's monitor handle, as on Windows, so Unity finds its fullscreen modes. On by default on every architecture; 0 restores DXMT's private sentinel monitor."},
     "swap-mb": { "note": "Moves game data to a file on this device's storage when memory runs short, up to this size. Off by default; read at launch.", "category": "Memory & JIT pool","title": "Swap tier size", "kind": "choice",
                 "choices": [("", "Off"), ("1024", "1 GB"), ("2048", "2 GB"), ("3072", "3 GB"), ("4096", "4 GB")]},
@@ -121,6 +125,18 @@ OVERLAY = {
                             ("0", "Off")],
                 "sources": ["app/Madeira/GamepadInput.swift", "app/Madeira/PadOutput.m"]},
     "env.MADEIRA_PROMOTE": {"title": "Hold the display at its maximum rate"},
+    "pool-pair": {"category": "Memory & JIT pool", "title": "Split JIT pool: prefer two runs above the window",
+                "kind": "bool", "default": "1",
+                "note": "With pool-split on: the pool takes two runs above the 0x140000000 executable window when "
+                        "together they are larger than the single run it would get -- whether that run lies below the "
+                        "window, where the pool cannot split (GTA V: 368 + 320 MB instead of 464 MB), or is the higher "
+                        "of two runs above it (The Adventures of Elliot: 240 + 288 MB instead of 288 MB). Falls back to "
+                        "the single run if the placement misses. On by default; 0 turns it off. Read at launch, the "
+                        "game's own file wins."},
+    "exe-window-mb": {"category": "Memory & JIT pool", "title": "Executable window size (MB)",
+                "kind": "int", "default": "128",
+                "note": "The address range at 0x140000000 kept for a game exe without relocations, which can only run there. Unset: 128 MB, or for a Madeira Dock launch the size of the largest such exe in the game's folder (The Adventures of Elliot: 473 MB -> 480). The JIT pool then starts above it and is that much smaller, so a large one also needs env.MADEIRA_X64_IMAGE_NOCOPY = 1 and pool-split = 1. A number sets it (129 to 960); 128 or less keeps 128 MB. Read at launch, the game's own file wins.",
+                "sources": ["app/Madeira/StikJITHelper.swift"]},
     # Mesa's opengl32 on D3D12 over Wine's stub (WineProcessBridge.m, build/mesa-d3d12).
     "env.MADEIRA_OPENGL": {"category": "Windows, display & input", "title": "OpenGL through Mesa on D3D12",
                 "kind": "bool", "default": "1",
