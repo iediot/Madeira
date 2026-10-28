@@ -8944,7 +8944,7 @@ tess_go:
      * cache and released by any thread once the cache is full (mad_pso_for_strides);
      * one is never left queued, so Metal holds it as soon as it was chosen. */
     if (c_pso.type == WMTRenderCommandSetPSO && !tv && c_pso.pso != e->pso->rps) mad_eb_flush_cur(EBF_VARIANT);
-    if (ml1302_held) ReleaseSRWLockShared(&dev->list_lock);   /* ml1302: the batch is encoded */
+    if (ml1302_held) { mad_eb_flush_cur(EBF_OTHER); ReleaseSRWLockShared(&dev->list_lock); }   /* ml1302: the batch is encoded */
     mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
 #undef MAD_APPEND
     e->draws++; e->pass_draws++;   /* ml1098 */
@@ -9848,7 +9848,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     tail->next.ptr = NULL;
 #undef MAD_APPEND
     MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&c_pso);
-    if (!ml1060_cskip) ReleaseSRWLockShared(&dev->list_lock);   /* ml1302: held until the batch is encoded, see exec_draw */
+    if (!ml1060_cskip) { mad_eb_flush_cur(EBF_OTHER); ReleaseSRWLockShared(&dev->list_lock); }   /* ml1302: held until the batch is encoded, see exec_draw */
     mad_use_commit(e);
     e->draws++;
     if (g_capture_on && g_cap_uav) mad_capture_dispatch_outputs(e, c);   /* madeira-bcd: contact sheets */

@@ -94,6 +94,10 @@ draw = draw[:draw.index("\n}\n")]
 check("exec_draw sends a pipeline-variant draw at once (another thread may evict and release the variant)",
       "if (c_pso.type == WMTRenderCommandSetPSO && !tv && c_pso.pso != e->pso->rps) mad_eb_flush_cur(EBF_VARIANT);" in draw
       and draw.index("mad_eb_flush_cur(EBF_VARIANT)") > draw.index("MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_pso);"))
+check("render borrowed resources reach Metal before their lifetime lock is released",
+      'if (ml1302_held) { mad_eb_flush_cur(EBF_OTHER); ReleaseSRWLockShared(&dev->list_lock); }' in src)
+check("compute borrowed resources reach Metal before their lifetime lock is released",
+      'if (!ml1060_cskip) { mad_eb_flush_cur(EBF_OTHER); ReleaseSRWLockShared(&dev->list_lock); }' in src)
 check("a thread's arena is freed at DLL_THREAD_DETACH",
       "if (reason == DLL_THREAD_DETACH) mad_es_thread_exit();" in src)
 
@@ -114,7 +118,7 @@ else:
     print("note: no dxmt sources; command-type coverage not checked")
 cat = (root / "app/Madeira/ConfigCatalog.generated.swift").read_text()
 check("catalog lists encode-batch, on by default",
-      re.search(r'key: "encode-batch".*kind: \.bool, defaultValue: "1"', cat) is not None)
+      re.search(r'key: "encode-batch".*kind: \.(?:bool|int), defaultValue: "1"', cat) is not None)
 
 harness = r'''
 #include <stdio.h>
@@ -331,7 +335,21 @@ int main(void) {
         mad_es_thread_exit();
         EXPECT(fake_tls[g_eb_tls] == NULL, "thread exit frees the arena");
     }
-    if (!bad) printf("ok\n");
+    { /* A resource declaration must leave the batch before its owner can free it. */
+    struct mad_eb *b = mad_es_begin();
+    struct wmtcmd_render_useresource r; memset(&r, 0, sizeof r);
+    r.type = WMTRenderCommandUseResource; r.resource = 0xabcdef;
+    unsigned before = ncalls;
+    MTLRenderCommandEncoder_encodeCommands(0x5151, (const struct wmtcmd_base *)&r);
+    EXPECT(ncalls == before, "borrowed resource declaration initially queued");
+    mad_eb_flush_cur(EBF_OTHER);
+    EXPECT(ncalls == before + 1, "borrowed resource submitted before simulated lifetime unlock");
+    before = ncalls;
+    mad_es_finish(b);
+    EXPECT(ncalls == before, "no borrowed declaration remains past lifetime unlock");
+    mad_es_thread_exit();
+}
+if (!bad) printf("ok\n");
     return bad;
 }
 '''
