@@ -205,6 +205,30 @@ assert(PointerPolicy.route(focused: true, hover: true, locked: true, cursorShown
 assert(PointerPolicy.route(focused: true, hover: true, locked: false, cursorShown: false, absoluteAllowed: true) == .relative)
 assert(PointerPolicy.route(focused: true, hover: false, locked: false, cursorShown: true, absoluteAllowed: true) == .relative)
 assert(PointerPolicy.route(focused: true, hover: true, locked: false, cursorShown: true, absoluteAllowed: false) == .relative)
+// A virtual desktop is not evidence that a game's cursor is visible.
+assert(PointerPolicy.cursorShown(desktop: true, directEnabled: true, reports: 0, shown: false))
+assert(PointerPolicy.cursorShown(desktop: true, directEnabled: true, reports: 1, shown: true))
+let hiddenDesktopCursor = PointerPolicy.cursorShown(desktop: true, directEnabled: true, reports: 1, shown: false)
+assert(!hiddenDesktopCursor)
+assert(PointerPolicy.route(focused: true, hover: true, locked: false, cursorShown: hiddenDesktopCursor, absoluteAllowed: true) == .relative)
+assert(!PointerPolicy.cursorShown(desktop: false, directEnabled: false, reports: 1, shown: true))
+// A direct game that hides the Windows cursor to draw its own keeps absolute motion when opted in.
+assert(!PointerPolicy.cursorShown(desktop: false, directEnabled: true, reports: 1, shown: false))
+assert(PointerPolicy.cursorShown(desktop: false, directEnabled: true, reports: 1, shown: false, hiddenAbsolute: true))
+assert(!PointerPolicy.cursorShown(desktop: false, directEnabled: true, reports: 1, shown: false, relative: true, hiddenAbsolute: true))
+assert(!PointerPolicy.cursorShown(desktop: false, directEnabled: false, reports: 1, shown: false, hiddenAbsolute: true))
+
+// The rollback keeps the desktop absolute even when its hidden-cursor
+// metadata says otherwise; direct-mode visibility remains unchanged.
+for enabled in [false, true] {
+    let shown = PointerPolicy.cursorShown(desktop: true, directEnabled: true,
+                                         reports: 1, shown: false, routingEnabled: enabled)
+    assert(shown == !enabled)
+    assert(PointerPolicy.route(focused: true, hover: true, locked: false,
+                               cursorShown: shown, absoluteAllowed: true) == (enabled ? .relative : .absolute))
+    assert(!PointerPolicy.cursorShown(desktop: false, directEnabled: true,
+                                      reports: 1, shown: false, routingEnabled: enabled))
+}
 
 // Automatic lock: only for a live program that hides its cursor under the pointer.
 func lockAction(locked: Bool = false, byUs: Bool = false, shown: Bool = false, hiddenFor: Double = 1,

@@ -45,7 +45,7 @@ INT_READERS = {"madeira_cfg_int", "mad_cfg_int_pe"}
 OVERLAY = {
     "env.MADEIRA_PASTE_INTERVAL_MS": {"category": "Windows, display & input", "title": "Clipboard typing interval (ms)",
                 "kind": "int", "default": "10",
-                "note": "Default 10 ms between pasted characters. Range 5-100 ms; use a longer interval for games "
+                "note": "Default 10 ms between pasted characters. Range 1-100 ms; use a longer interval for games "
                         "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
     "env.DXMT_WSI_MONITOR_IDENTITY": {"kind": "bool", "default": "1", "note": "DXGI outputs report user32's monitor handle, as on Windows, so Unity finds its fullscreen modes. On by default on every architecture; 0 restores DXMT's private sentinel monitor."},
     "swap-mb": { "note": "Moves game data to a file on this device's storage when memory runs short, up to this size. Off by default; read at launch.", "category": "Memory & JIT pool","title": "Swap tier size", "kind": "choice",
@@ -114,6 +114,22 @@ OVERLAY = {
                 "note": "1: with the HID controller on, player 1 also stays an XInput pad. Off by default, so a game "
                         "that reads both APIs does not see the same pad twice.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
+    "env.MADEIRA_PSO_ARCHIVE_INLINE": {"category": "Direct3D 12", "title": "Pipeline archive: compile once",
+                "kind": "bool", "default": "1",
+                "note": "With pso-archive on: 1 (default) compiles a pipeline the saved archive does not have once, into "
+                        "an open archive, and creates it from there. 0: created, then compiled again on one queue to be "
+                        "added (the first version; it kept about a quarter of a session's pipelines).",
+                "sources": ["dxmt/src/winemetal/unix/winemetal_unix.c"]},
+    "env.MADEIRA_PSO_ARCHIVE_MB": {"category": "Direct3D 12", "title": "Pipeline archive: size cap (MB)",
+                "kind": "int", "default": "1024",
+                "note": "With pso-archive on: the most a game's pipeline archive folder keeps across builds. Over it, the "
+                        "oldest chunks are deleted at launch down to three quarters; a session adds none once it is reached.",
+                "sources": ["dxmt/src/winemetal/unix/winemetal_unix.c"]},
+    "env.MADEIRA_PSO_ARCHIVE_PER_BUILD": {"category": "Direct3D 12", "title": "Pipeline archive: one per build",
+                "kind": "bool", "default": "0",
+                "note": "1: the archive folder sits in the build's shader cache directory and goes with it when a new build "
+                        "prunes it (the first version). Off: Madeira/PipelineArchive in LOCALAPPDATA, kept across builds.",
+                "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"]},
     # ml2106: game output to the physical pad (app/Madeira/PadOutput.m).
     "env.MADEIRA_PAD_OUTPUT": {"category": "Controllers", "title": "Rumble, adaptive triggers and lightbar to the pad",
                 "kind": "choice",

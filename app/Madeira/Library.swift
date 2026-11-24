@@ -1264,7 +1264,9 @@ struct LibraryEntry: Codable, Identifiable {
     /// upstream's RDR2 list is tuned for), and a file RDR2 wrote with Vulkan is switched to it.
     func prepareRockstarSettings() {
         let exe = (relativePath as NSString).lastPathComponent.lowercased()
-        guard rockstarMinmodeTitle == "rdr2" || exe == "rdr2.exe"
+        // The Steam copy's entry is its install folder (RDR2 1174180, started as PlayRDR2.exe):
+        // after a fresh install it had no settings file either and crashed the same way.
+        guard rockstarMinmodeTitle == "rdr2" || exe == "rdr2.exe" || steamAppID == 1174180
               || (exe == "launcher.exe" && relativePath.lowercased().contains("rockstar games/launcher")) else { return }
         let dir = LibraryModel.drive.appendingPathComponent("users/mobile/Documents/Rockstar Games/Red Dead Redemption 2/Settings", isDirectory: true)
         let file = dir.appendingPathComponent("system.xml")

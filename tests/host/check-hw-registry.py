@@ -216,11 +216,17 @@ int main( void )
               and "(CTX->HostFeatures.SupportsCRC << 20) |         // SSE4.2" in cpp
               and "(SupportsAVX() << 27) |                         // OSXSAVE" in cpp
               and "(SupportsAVX() << 28) |                         // AVX" in cpp
-              and "(SupportsAVX() << 5) |                   // AVX2 support" in cpp
+              and ("(SupportsAVX() << 5) |                   // AVX2 support" in cpp
+                   # MADEIRA_FEX_AVX=2 can hide AVX2; otherwise it still follows SupportsAVX
+                   or ("(SupportsAVX2() << 5) |                  // AVX2 support" in cpp
+                       and "return (SupportsAVX() && !HideAVX2) ? 1 : 0;" in
+                           (cpuid_cpp.parent / "CPUID.h").read_text()))
               and "if (CTX->HostFeatures.SupportsAVX) {\n    XCR0 |= XCR0_AVX;" in cpp)
         check("FEX: MADEIRA_FEX_AVX starting with '1' sets SupportsAVX, ARM64EC module only (what server_ios.c mirrors)",
               'getenv("MADEIRA_FEX_AVX")' in ios
-              and "Avx && Avx[0] == '1' && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64" in ios
+              # MADEIRA_FEX_AVX=2 (AVX without AVX2) was added beside '1'; '1' must still enable it.
+              and ("Avx && Avx[0] == '1' && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64" in ios
+                   or "Avx && (Avx[0] == '1' || (Avx[0] == '2' && Avx[1] == '\\0')) && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64" in ios)
               and "HostFeatures.SupportsAVX = true;" in ios)
         check("FEX: level/revision formulas and AMD64 for the ARM64EC module",
               "CpuInfo.ProcessorLevel = ((FamilyIdentifier >> 8) & 0xf) + ((FamilyIdentifier >> 20) & 0xff);" in cf
