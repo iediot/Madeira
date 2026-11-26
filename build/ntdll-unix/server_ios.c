@@ -1504,8 +1504,38 @@ static int ios_xp_stall_due(int enabled, int valid, int64_t done, int64_t previo
 }
 struct ios_xp_tcd { uint64_t instr, cyc, ut, st, nj; };
 struct ios_xp_tc { uint16_t len, r0; uint32_t r1; struct ios_xp_tcd c[4]; };
-struct ios_xp_prev { uint64_t tid; uint32_t gen; struct ios_xp_tcd c[2]; };
-struct ios_xp_row { uint64_t tid; uint32_t wtid; double p_ms, e_ms, p_ghz, e_ghz, minst; const char *role; };
+struct ios_xp_prev { uint64_t tid; uint32_t gen; struct ios_xp_tcd c[2]; long long yv[5]; };
+struct ios_xp_row { uint64_t tid; uint32_t wtid; double p_ms, e_ms, p_ghz, e_ghz, minst; const char *role;
+                    double rq_ms; uint32_t wpid; long long yv[5]; };   /* madeira-bcd yield-esc: runnable ms, yield deltas */
+
+/* madeira-bcd yield-esc: the per-thread yield counts kept by the unix sync.c
+ * (ios_ystat_tab; same layout and hash). Slots are never freed, so a probe ends at
+ * the first empty slot. Fills v[5] = yields, Sleep(0), short sleeps, escalations,
+ * escalated microseconds; 0 when the thread never yielded. */
+struct ios_ystat { volatile uint64_t tid; volatile long long yields, zero, shortsleep, esc, esc_us; };
+extern struct ios_ystat ios_ystat_tab[1024];
+extern volatile int ios_ystat_full;
+static int ios_xp_ystat( uint64_t tid, long long v[5] )
+{
+    unsigned int h = (unsigned int)((tid * 2654435761u) % 1024), i;
+    for (i = 0; i < 1024; i++, h = (h + 1) % 1024)
+    {
+        uint64_t cur = ios_ystat_tab[h].tid;
+        if (!cur) break;
+        if (cur != tid) continue;
+        v[0] = ios_ystat_tab[h].yields; v[1] = ios_ystat_tab[h].zero; v[2] = ios_ystat_tab[h].shortsleep;
+        v[3] = ios_ystat_tab[h].esc; v[4] = ios_ystat_tab[h].esc_us;
+        return 1;
+    }
+    memset( v, 0, 5 * sizeof(*v) );
+    return 0;
+}
+
+/* madeira-bcd present-pace: the window energy handed to madeira_d3d12's opt-in frame
+ * pacer. Written after the counter block it publishes (MadeiraCtl op 5) when that block
+ * is long enough and the pacer set seq non-zero (it is on); seq last, so a reader that
+ * sees a new seq sees its values. */
+struct ios_xp_pace_pub { int64_t seq, uj, dt_us; };
 static struct ios_xp_prev ios_xp_tab[2048];
 
 /* ml1131: [xp-api] REPORTER (measurement only). Once a second, from the xprobe
@@ -1639,6 +1669,146 @@ static void ios_spin_pc_sample( thread_t port, uint32_t wtid, uint64_t teb, doub
         n += snprintf( line + n, sizeof(line) - n, " ]" );
     }
     wine_log_write( "%s", line );
+}
+
+/* madeira-bcd sc-cpu / named spin-pc (2026-11-27): what Social Club's helper
+ * costs during play and where its renderer spends it.
+ * [sc-cpu] every ~30 s (once a SocialClubHelper.exe has started; env.MADEIRA_SC_CPU
+ * = 0 turns it off, and the thread-name table with it): the
+ * helper's CPU in ms per second (P/E split), its Chrome_InProcRendererThread's,
+ * and its three busiest threads -- the before/after line for [sc-hide] / [sc-park].
+ * env.MADEIRA_SPIN_PC_NAMES = "Name[,Name]": a thread with that name using at
+ * least 15 % of a core in an [xp-t] window is sampled whatever its instructions
+ * per cycle (the [spin-pc] gate wants >= 4; the renderer ran at ~1.3): three
+ * stops 2 ms apart, host PC/LR, guest RIP as module+RVA and the guest's last
+ * return addresses, as named [spin-pc] lines, at most 120 in a run. */
+extern volatile unsigned int ios_sc_helper_pid;
+extern int ios_thread_name_get( unsigned int tid, char *out, int cap );
+static struct { uint32_t wtid; double ms; } ios_scx_thr[64];
+static int ios_scx_nthr;
+static double ios_scx_p, ios_scx_e, ios_scx_render, ios_scx_window;
+static uint32_t ios_scx_render_tid;
+
+static int ios_scx_name_listed( const char *names, const char *name )
+{
+    size_t n = strlen( name );
+    const char *p = names;
+    if (!n) return 0;
+    while ((p = strstr( p, name )))
+    {
+        if ((p == names || p[-1] == ',' || p[-1] == ';' || p[-1] == ' ') &&
+            (!p[n] || p[n] == ',' || p[n] == ';' || p[n] == ' ')) return 1;
+        p += n;
+    }
+    return 0;
+}
+
+static void ios_scx_sample( thread_t port, uint32_t wtid, uint32_t wpid, uint64_t teb, const char *name,
+                            double ms, double window_ms, double ipc )
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    static int printed;
+    char line[1400];
+    int n, pass;
+
+    if (printed >= 120 || port == pthread_mach_thread_np( pthread_self() )) return;
+    printed++;
+    n = snprintf( line, sizeof(line), "[spin-pc] named \"%s\" tid=%04x pid=%04x %.0f of %.0f ms at %.1f instructions/cycle:",
+                  name, wtid, wpid, ms, window_ms, ipc );
+    for (pass = 0; pass < 3 && n < (int)sizeof(line) - 220; pass++)
+    {
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        uint64_t pc, lr, bb = 0, rip = 0, cr[12];
+        int have_cr, i;
+        const char *why = "";
+        char s1[120], s2[120], m[80];
+
+        if (pass) usleep( 2000 );
+        if (thread_suspend( port ) != KERN_SUCCESS) break;
+        if (thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+        {
+            thread_resume( port );
+            break;
+        }
+        pc = arm_thread_state64_get_pc( st ); lr = arm_thread_state64_get_lr( st );
+        if (ios_ts_read( st.__x[28], &bb, 8 ) && bb <= 0x10000) bb = 0;
+        have_cr = ios_ts_read( st.__x[17], cr, sizeof(cr) );
+        thread_resume( port );
+        if (bb) rip = ios_native_rip_from_hostpc( bb, pc, &why );
+        ios_ts_sym( pc, s1, sizeof(s1) ); ios_ts_sym( lr, s2, sizeof(s2) );
+        n += snprintf( line + n, sizeof(line) - n, " #%d pc=%s lr=%s", pass + 1, s1, s2 );
+        if (!rip) { n += snprintf( line + n, sizeof(line) - n, " native" ); continue; }
+        if (ios_spin_mod_for( teb, rip, m, sizeof(m) )) n += snprintf( line + n, sizeof(line) - n, " GUEST %s", m );
+        else n += snprintf( line + n, sizeof(line) - n, " GUEST rip=0x%llx", (unsigned long long)rip );
+        n += snprintf( line + n, sizeof(line) - n, " callret=[" );
+        for (i = 0; have_cr && i < 6 && cr[i * 2] && n < (int)sizeof(line) - 90; i++)
+        {
+            if (ios_spin_mod_for( teb, cr[i * 2], m, sizeof(m) )) n += snprintf( line + n, sizeof(line) - n, " %s", m );
+            else n += snprintf( line + n, sizeof(line) - n, " 0x%llx", (unsigned long long)cr[i * 2] );
+        }
+        n += snprintf( line + n, sizeof(line) - n, " ]" );
+    }
+    wine_log_write( "%s", line );
+}
+
+/* One [xp-t] row: account the helper's threads, sample named ones. */
+static void ios_sc_xp_row( thread_t port, uint32_t wtid, uint64_t teb, double p_ms, double e_ms,
+                           double cycles, double minst, double dt_ms )
+{
+    static const char *names;
+    static int names_read;
+    uint32_t wpid = 0, helper = __atomic_load_n( &ios_sc_helper_pid, __ATOMIC_RELAXED );
+    char name[40] = "";
+    int i, named;
+
+    static int cpu_on = -1;
+    if (!names_read) { names = getenv( "MADEIRA_SPIN_PC_NAMES" ); names_read = 1; }
+    if (cpu_on < 0) { const char *e = getenv( "MADEIRA_SC_CPU" ); cpu_on = !(e && e[0] == '0'); }
+    if (!cpu_on) helper = 0;
+    if (!teb || (!helper && !(names && *names))) return;
+    ios_ts_read( teb + 0x40, &wpid, 4 );
+    named = names && *names && p_ms + e_ms >= 0.15 * dt_ms && ios_thread_name_get( wtid, name, sizeof(name) ) &&
+            ios_scx_name_listed( names, name );
+    if (named) ios_scx_sample( port, wtid, wpid, teb, name, p_ms + e_ms, dt_ms, cycles > 0 ? minst * 1e6 / cycles : 0 );
+    if (!helper || wpid != helper) return;
+    ios_scx_p += p_ms; ios_scx_e += e_ms;
+    if (!name[0]) ios_thread_name_get( wtid, name, sizeof(name) );
+    if (!strcmp( name, "Chrome_InProcRendererThread" )) { ios_scx_render += p_ms + e_ms; ios_scx_render_tid = wtid; }
+    for (i = 0; i < ios_scx_nthr; i++) if (ios_scx_thr[i].wtid == wtid) break;
+    if (i == ios_scx_nthr && ios_scx_nthr < 64) { ios_scx_thr[i].wtid = wtid; ios_scx_thr[i].ms = 0; ios_scx_nthr++; }
+    if (i < ios_scx_nthr) ios_scx_thr[i].ms += p_ms + e_ms;
+}
+
+/* After each [xp-t] window: every ~30 s, one [sc-cpu] line. */
+static void ios_sc_xp_window( double dt_ms )
+{
+    uint32_t helper = __atomic_load_n( &ios_sc_helper_pid, __ATOMIC_RELAXED );
+    char line[600], name[40];
+    static int cpu_on = -1;
+    if (cpu_on < 0) { const char *e = getenv( "MADEIRA_SC_CPU" ); cpu_on = !(e && e[0] == '0'); }
+    if (!cpu_on) return;
+    int n, k, i, best;
+    double s;
+
+    if (!helper) return;
+    ios_scx_window += dt_ms;
+    if (ios_scx_window < 30000) return;
+    s = ios_scx_window / 1000.0;
+    n = snprintf( line, sizeof(line), "[sc-cpu] SocialClubHelper.exe pid %04x: %.0f ms CPU/s (P %.0f E %.0f) over %.0f s; "
+                  "Chrome_InProcRendererThread %04x %.0f ms/s; busiest:", helper, (ios_scx_p + ios_scx_e) / s,
+                  ios_scx_p / s, ios_scx_e / s, s, ios_scx_render_tid, ios_scx_render / s );
+    for (k = 0; k < 3; k++)
+    {
+        for (best = -1, i = 0; i < ios_scx_nthr; i++)
+            if (ios_scx_thr[i].ms > 0 && (best < 0 || ios_scx_thr[i].ms > ios_scx_thr[best].ms)) best = i;
+        if (best < 0) break;
+        if (!ios_thread_name_get( ios_scx_thr[best].wtid, name, sizeof(name) )) strcpy( name, "?" );
+        n += snprintf( line + n, sizeof(line) - n, " %04x %s %.0f", ios_scx_thr[best].wtid, name, ios_scx_thr[best].ms / s );
+        ios_scx_thr[best].ms = -1;
+    }
+    wine_log_write( "%s", line );
+    ios_scx_window = ios_scx_p = ios_scx_e = ios_scx_render = 0;
+    ios_scx_nthr = 0;
 }
 
 static void ios_xp_fallback_add( uint64_t teb, double ms )
@@ -1791,11 +1961,12 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     extern volatile long long ios_xp_wait_single, ios_xp_wait_multi, ios_xp_wait_zero, ios_xp_wait_zero_timeout;
     extern volatile long long ios_xp_yield, ios_xp_yield_slept, ios_xp_delay, ios_xp_delay_hist[6];
     extern volatile long long ios_alert_wakes, ios_alert_waits;
+    extern volatile long long ios_xp_yield_esc, ios_xp_yield_esc_us;   /* madeira-bcd yield-esc */
     static uint64_t *fex, *fex_prev; static struct ios_xp_nt_view *nt, *nt_prev;
-    static long long u_prev[18]; static int have_fex, have_nt, have_u, map_age = 1000, said_nf, said_alias_size;
+    static long long u_prev[20]; static int have_fex, have_nt, have_u, map_age = 1000, said_nf, said_alias_size;
     static double last_s;
     static uint64_t sorted[4096];
-    long long u[18]; double dt; char line[3000]; int n, i;
+    long long u[20]; double dt; char line[3000], esc[64] = ""; int n, i;
 
     if (!fex) { fex = calloc( IOS_XP_FEX_WORDS, 8 ); fex_prev = calloc( IOS_XP_FEX_WORDS, 8 ); nt = calloc( 1, sizeof(*nt) ); nt_prev = calloc( 1, sizeof(*nt) ); }
     if (!fex || !fex_prev || !nt || !nt_prev) return;
@@ -1842,6 +2013,7 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     u[5] = ios_xp_wait_zero; u[6] = ios_xp_wait_zero_timeout; u[7] = ios_xp_yield; u[8] = ios_xp_yield_slept; u[9] = ios_xp_delay;
     for (i = 0; i < 6; i++) u[10 + i] = ios_xp_delay_hist[i];
     u[16] = ios_alert_waits; u[17] = ios_alert_wakes;
+    u[18] = ios_xp_yield_esc; u[19] = ios_xp_yield_esc_us;
     {
         int got_fex = ios_xp_fex_addr && ios_ts_read( ios_xp_fex_addr, fex, IOS_XP_FEX_WORDS * 8 ) && fex[0] == 0x5845465058444d41ull;
         int got_nt = ios_xp_nt_addr && ios_ts_read( ios_xp_nt_addr, nt, sizeof(*nt) ) && nt->magic == 0x31544e5058444d41ull;
@@ -1872,14 +2044,18 @@ static void ios_xp_api_report( const char *wall, double wall_s )
                                XPR(nt->cs_wakes - nt_prev->cs_wakes),
                                XPR(nt->woa_waits - nt_prev->woa_waits), XPR(nt->woa_wake_single - nt_prev->woa_wake_single), XPR(nt->woa_wake_all - nt_prev->woa_wake_all) );
             }
+            if (have_u && u[18])   /* madeira-bcd yield-esc: only once a yield escalated */
+                snprintf( esc, sizeof(esc), ", escalated %.0f/s %.1f ms/s", XPR(u[18] - u_prev[18]), XPR(u[19] - u_prev[19]) / 1000.0 );
             if (have_u)
                 n += snprintf( line + n, sizeof(line) - n,
                                " | SetEvent %.0f/s ResetEvent %.0f/s Pulse %.0f/s | wait1 %.0f/s waitN %.0f/s polls %.0f/s (empty %.0f/s)"
-                               " | yield %.0f/s (slept %.0f/s) | delay %.0f/s [0 %.0f <1ms %.0f <5ms %.0f <20ms %.0f >=20ms %.0f inf %.0f] | alert wait %.0f/s wake %.0f/s",
+                               " | yield %.0f/s (slept %.0f/s%s) | delay %.0f/s [0 %.0f <1ms %.0f <5ms %.0f <20ms %.0f >=20ms %.0f inf %.0f] | alert wait %.0f/s wake %.0f/s%s",
                                XPR(u[0] - u_prev[0]), XPR(u[1] - u_prev[1]), XPR(u[2] - u_prev[2]), XPR(u[3] - u_prev[3]), XPR(u[4] - u_prev[4]),
-                               XPR(u[5] - u_prev[5]), XPR(u[6] - u_prev[6]), XPR(u[7] - u_prev[7]), XPR(u[8] - u_prev[8]), XPR(u[9] - u_prev[9]),
+                               XPR(u[5] - u_prev[5]), XPR(u[6] - u_prev[6]), XPR(u[7] - u_prev[7]), XPR(u[8] - u_prev[8]),
+                               esc, XPR(u[9] - u_prev[9]),
                                XPR(u[10] - u_prev[10]), XPR(u[11] - u_prev[11]), XPR(u[12] - u_prev[12]), XPR(u[13] - u_prev[13]), XPR(u[14] - u_prev[14]),
-                               XPR(u[15] - u_prev[15]), XPR(u[16] - u_prev[16]), XPR(u[17] - u_prev[17]) );
+                               XPR(u[15] - u_prev[15]), XPR(u[16] - u_prev[16]), XPR(u[17] - u_prev[17]),
+                               ios_ystat_full ? " | ystat table full" : "" );
             wine_log_write( "%s", line );
 
             /* top x64->EC call targets from the ring entries appended since the last report */
@@ -2007,6 +2183,23 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     }
 }
 
+/* madeira-bcd yield-esc: [xp-t] token suffix (runnable ms, yield counts) and the ranking */
+static int ios_xp_tok_extra( char *out, size_t cap, const struct ios_xp_row *r )
+{
+    int n = 0;
+    if (cap < 64) return 0;
+    if (r->rq_ms >= 0) n += snprintf( out + n, cap - n, ":r%.0f", r->rq_ms );
+    if (r->yv[0] > 0) n += snprintf( out + n, cap - n, "y%lld", r->yv[0] );
+    if (r->yv[1] > 0) n += snprintf( out + n, cap - n, "z%lld", r->yv[1] );
+    if (r->yv[2] > 0) n += snprintf( out + n, cap - n, "s%lld", r->yv[2] );
+    if (r->yv[3] > 0) n += snprintf( out + n, cap - n, "e%lld", r->yv[3] );
+    return n;
+}
+static double ios_xp_rank( const struct ios_xp_row *r )
+{
+    return r->p_ms + r->e_ms + (r->rq_ms > 0 ? r->rq_ms : 0);
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -2032,18 +2225,53 @@ static void ios_xprobe_main( void )
     {
         thread_act_array_t th = NULL; mach_msg_type_number_t nth = 0, k;
         uint64_t now; double dt_ms, sum_thr_ms = 0; int nrows = 0, i, j;
+        static uint16_t rq_cnt[4096];   /* madeira-bcd yield-esc: run-state samples per thread port */
+        unsigned int rq_slices = 0, rq_total = 0, s;
+        int have_th;
 #define XP_MS(ticks) ((double)(ticks) * tb.numer / tb.denom / 1e6)
+        /* madeira-bcd yield-esc: the thread list is taken at the window's START, and the
+         * window is slept in slices of ~125 ms; after each slice every thread's run state is
+         * read (thread_info, one call per thread, no suspension). TH_STATE_RUNNING is
+         * "runnable": on a core or waiting for one. Its share of the slices, times the window,
+         * is the thread's runnable time ([xp-t] r=); runnable minus CPU is time spent waiting
+         * for a core. A thread created during a window joins at the next one (its counters
+         * already needed two windows). MADEIRA_XP_RUNQ=0: as before, one sleep, then the
+         * thread list, no run-state reads, 14 threads in [xp-t]. */
         {
             /* Audit 2026-10-18: every 2 s by default (it walks every thread's counters and
              * writes two log lines per sample, in every session); MADEIRA_XP_FAST=1 or
              * MADEIRA_PERF=1 restores the 250 ms cadence for profiling. */
             static useconds_t xp_us;
+            static int runq = -1;
+            thread_t self = pthread_mach_thread_np( pthread_self() );
             if (!xp_us)
             {
                 const char *f = getenv( "MADEIRA_XP_FAST" ), *p = getenv( "MADEIRA_PERF" );
                 xp_us = ((f && *f == '1') || (p && *p == '1')) ? 250000 : 2000000;
             }
-            usleep( xp_us );
+            if (runq < 0) { const char *e = getenv( "MADEIRA_XP_RUNQ" ); runq = !(e && e[0] == '0'); }   /* [xp-t] run-state samples (r=); 0 = off */
+            if (!runq) usleep( xp_us );   /* the old order: sleep, then the thread list */
+            have_th = task_threads( mach_task_self(), &th, &nth ) == KERN_SUCCESS;
+            if (!have_th) { th = NULL; nth = 0; }
+            rq_slices = runq && nth ? (xp_us >= 250000 ? xp_us / 125000 : 1) : 0;
+            if (nth > 4096) rq_slices = 0;
+            if (rq_slices) memset( rq_cnt, 0, nth * sizeof(rq_cnt[0]) );
+            if (runq && !rq_slices) usleep( xp_us );
+            for (s = 0; s < rq_slices; s++)
+            {
+                usleep( xp_us / rq_slices );
+                for (k = 0; k < nth; k++)
+                {
+                    thread_basic_info_data_t bi; mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+                    if (th[k] == self) continue;
+                    if (thread_info( th[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic ) == KERN_SUCCESS &&
+                        bi.run_state == TH_STATE_RUNNING)
+                    {
+                        rq_cnt[k]++;
+                        rq_total++;
+                    }
+                }
+            }
         }
         now = mach_absolute_time();
         dt_ms = XP_MS( now - t_prev );
@@ -2051,7 +2279,7 @@ static void ios_xprobe_main( void )
         if (used > 1400) { memset( ios_xp_tab, 0, sizeof(ios_xp_tab) ); used = 0; wine_log_write( "[xp] ml1128 thread table reset (gen %u)", gen ); }
 
         /* per-thread counters */
-        if (task_threads( mach_task_self(), &th, &nth ) == KERN_SUCCESS)
+        if (have_th)
         {
             for (k = 0; k < nth; k++)
             {
@@ -2065,8 +2293,10 @@ static void ios_xprobe_main( void )
                     if (got > 0 && tc.len >= 1)
                     {
                         struct ios_xp_tcd cur[2]; int nl = tc.len > 2 ? 2 : tc.len;
+                        long long ycur[5];   /* madeira-bcd yield-esc */
                         memset( cur, 0, sizeof(cur) );
                         for (lv = 0; lv < nl; lv++) cur[lv] = tc.c[lv];
+                        ios_xp_ystat( idi.thread_id, ycur );
                         for (h = (int)(idi.thread_id * 2654435761u) & 2047, j = 0; j < 2048; j++, h = (h + 1) & 2047)
                             if (!ios_xp_tab[h].tid || ios_xp_tab[h].tid == idi.thread_id) { pv = &ios_xp_tab[h]; break; }
                         if (pv && pv->tid == idi.thread_id && pv->gen == gen - 1 && nrows < 1024)
@@ -2081,23 +2311,48 @@ static void ios_xprobe_main( void )
                                 uint64_t teb = pt_ ? ios_ts_teb( pt_ ) : 0; uint32_t w = 0;
                                 if (teb) ios_ts_read( teb + 0x48, &w, 4 );
                                 r->tid = idi.thread_id; r->wtid = w; r->p_ms = pt; r->e_ms = et;
+                                r->wpid = 0;   /* madeira-bcd yield-esc: process, runnable time, yield deltas */
+                                if (teb) ios_ts_read( teb + 0x40, &r->wpid, 4 );
+                                r->rq_ms = rq_slices ? dt_ms * rq_cnt[k] / rq_slices : -1;
+                                for (lv = 0; lv < 5; lv++) r->yv[lv] = ycur[lv] - pv->yv[lv];
                                 r->p_ghz = pt > 0 ? pcy / (pt * 1e6) : 0; r->e_ghz = et > 0 ? ecy / (et * 1e6) : 0;
                                 r->minst = (double)((cur[0].instr - pv->c[0].instr) + (cur[1].instr - pv->c[1].instr)) / 1e6;
                                 r->role = NULL;
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
                                 if (r->role && teb && (strchr( r->role, 'P' ) || strchr( r->role, 'E' ))) ios_xp_game_teb = teb;   /* ml1131 */
                                 if (teb && !ios_xp_nroles) ios_xp_fallback_add( teb, pt + et );   /* ml1131c */
+                                ios_sc_xp_row( th[k], w, teb, pt, et, pcy + ecy, r->minst, dt_ms );   /* madeira-bcd sc-cpu */
                                 {   /* madeira-bcd spin-pc: see ios_spin_pc_sample */
                                     static int spin_pc = -1;
                                     if (spin_pc < 0) { const char *e = getenv( "MADEIRA_SPIN_PC" ); spin_pc = e && e[0] == '1'; }
                                     if (spin_pc && pt + et >= 0.3 * dt_ms && pcy + ecy > 0 &&
                                         r->minst * 1e6 / (pcy + ecy) >= 4.0)
                                         ios_spin_pc_sample( th[k], w, teb, pt + et, dt_ms, r->minst * 1e6 / (pcy + ecy) );
+                                    /* madeira-bcd yield-esc: RDR2's job workers (log 1127-0105-wave1) each ran
+                                     * ~20 % of a core at ~4 IPC, under the gate above. One such thread per
+                                     * window (>= 12 % of a core at >= 3.5 IPC), 40 in all, names their loop. */
+                                    else if (spin_pc && pt + et >= 0.12 * dt_ms && pcy + ecy > 0 &&
+                                             r->minst * 1e6 / (pcy + ecy) >= 3.5)
+                                    {
+                                        static int worker_samples, workers_on = -1;
+                                        static uint32_t worker_gen;
+                                        if (workers_on < 0)
+                                        {   /* this gate only; 0 = the old [spin-pc] gate alone */
+                                            const char *e = getenv( "MADEIRA_SPIN_PC_WORKERS" );
+                                            workers_on = !(e && e[0] == '0');
+                                        }
+                                        if (workers_on && worker_samples < 40 && worker_gen != gen)
+                                        {
+                                            worker_samples++; worker_gen = gen;
+                                            ios_spin_pc_sample( th[k], w, teb, pt + et, dt_ms, r->minst * 1e6 / (pcy + ecy) );
+                                        }
+                                    }
                                 }
                                 sum_thr_ms += pt + et; nrows++;
                             }
                         }
-                        if (pv) { if (!pv->tid) used++; pv->tid = idi.thread_id; pv->gen = gen; pv->c[0] = cur[0]; pv->c[1] = cur[1]; }
+                        if (pv) { if (!pv->tid) used++; pv->tid = idi.thread_id; pv->gen = gen; pv->c[0] = cur[0]; pv->c[1] = cur[1];
+                                  memcpy( pv->yv, ycur, sizeof(ycur) ); }
                     }
                 }
                 mach_port_deallocate( mach_task_self(), th[k] );
@@ -2105,6 +2360,7 @@ static void ios_xprobe_main( void )
             vm_deallocate( mach_task_self(), (vm_address_t)th, nth * sizeof(*th) );
         }
         if (!(gen % 40)) ios_xp_fallback_pick();   /* ml1131c: every ~10 s */
+        ios_sc_xp_window( dt_ms );   /* madeira-bcd sc-cpu */
 
         /* process counters + PE counters */
         memset( &ru, 0, sizeof(ru) );
@@ -2144,6 +2400,19 @@ static void ios_xprobe_main( void )
                           (pe.t_draw - ppe.t_draw) * qf, (pe.t_cmt - ppe.t_cmt) * qf, (pe.t_pool - ppe.t_pool) * qf,
                           (long long)(pe.ecl_calls - ppe.ecl_calls), (pe.t_ecl_caller - ppe.t_ecl_caller) * qf );
             wine_log_write( "%s", line );
+            {   /* madeira-bcd present-pace: this window's process energy for madeira_d3d12's opt-in pacer */
+                uint64_t blk = ios_xp_pe_block, blen = ios_xp_pe_len;
+                struct ios_xp_pace_pub *pub = blk && blen >= sizeof(struct ios_xp_pe) + sizeof(struct ios_xp_pace_pub)
+                                              ? (struct ios_xp_pace_pub *)(uintptr_t)(blk + sizeof(struct ios_xp_pe)) : NULL;
+                /* only when the pacer asked for it (it sets seq non-zero when it is on): with the
+                 * pacer off nothing is written into madeira_d3d12's block */
+                if (pub && __atomic_load_n( &pub->seq, __ATOMIC_ACQUIRE ) && dt_ms > 0)
+                {
+                    __atomic_store_n( &pub->uj, (int64_t)((ru.ri_energy_nj - pru.ri_energy_nj) / 1000), __ATOMIC_RELAXED );
+                    __atomic_store_n( &pub->dt_us, (int64_t)(dt_ms * 1000.0), __ATOMIC_RELAXED );
+                    __atomic_add_fetch( &pub->seq, 1, __ATOMIC_RELEASE );
+                }
+            }
             /* A 250ms zero-present window needs idle P/W thread PCs as well
              * as hot threads. No suspension; one snapshot/second maximum.
              * Loading/background also trigger: report facts, not a diagnosis. */
@@ -2184,29 +2453,66 @@ static void ios_xprobe_main( void )
                     ios_perf_stall_snapshot(ids, ni);
                 }
             }
-            /* threads: roles always, then the busiest; role + Windows TID : P ms / E ms : P GHz / E GHz : M instructions */
+            /* threads: roles always, then the busiest; role + Windows TID : P ms / E ms : P GHz / E GHz : M instructions
+             * madeira-bcd yield-esc: then ":r" runnable ms (on a core or waiting for one; run-state
+             * samples, see the window loop) and the window's y (NtYieldExecution), z (Sleep(0)),
+             * s (timed sleeps < 5 ms) and e (escalated yields) counts when non-zero; up to 24
+             * threads, ranked by CPU + runnable time; the line ends with the average number of
+             * runnable threads and their split by Wine process. */
             {
                 int printed[1024] = {0}, shown = 0;
-                n = snprintf( line, sizeof(line), "[xp-t] %s", wall );
-                for (i = 0; i < nrows && n < (int)sizeof(line) - 48; i++)
+                char tl[2048];   /* wine_log_write keeps 1024 bytes: two lines when needed */
+                int tn = snprintf( tl, sizeof(tl), "[xp-t] %s", wall );
+                for (i = 0; i < nrows && tn < (int)sizeof(tl) - 96; i++)
                     if (rows[i].role) { printed[i] = 1; shown++;
-                        n += snprintf( line + n, sizeof(line) - n, " %s%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[i].role, rows[i].wtid,
-                                       rows[i].p_ms, rows[i].e_ms, rows[i].p_ghz, rows[i].e_ghz, rows[i].minst ); }
-                while (shown < 14 && n < (int)sizeof(line) - 48)
+                        tn += snprintf( tl + tn, sizeof(tl) - tn, " %s%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[i].role, rows[i].wtid,
+                                        rows[i].p_ms, rows[i].e_ms, rows[i].p_ghz, rows[i].e_ghz, rows[i].minst );
+                        tn += ios_xp_tok_extra( tl + tn, sizeof(tl) - tn, &rows[i] ); }
+                while (shown < (rq_slices ? 24 : 14) && tn < (int)sizeof(tl) - 96)
                 {
                     int best = -1;
                     for (i = 0; i < nrows; i++)
-                        if (!printed[i] && (best < 0 || rows[i].p_ms + rows[i].e_ms > rows[best].p_ms + rows[best].e_ms)) best = i;
-                    if (best < 0 || rows[best].p_ms + rows[best].e_ms < 2.0) break;
+                        if (!printed[i] && rows[i].p_ms + rows[i].e_ms >= 2.0 &&
+                            (best < 0 || ios_xp_rank( &rows[i] ) > ios_xp_rank( &rows[best] ))) best = i;
+                    if (best < 0) break;
                     printed[best] = 1; shown++;
                     if (rows[best].wtid)
-                        n += snprintf( line + n, sizeof(line) - n, " -%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[best].wtid,
-                                       rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
+                        tn += snprintf( tl + tn, sizeof(tl) - tn, " -%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[best].wtid,
+                                        rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
                     else
-                        n += snprintf( line + n, sizeof(line) - n, " m%llu:%.0f/%.0f:%.1f/%.1f:%.0f", (unsigned long long)rows[best].tid,
-                                       rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
+                        tn += snprintf( tl + tn, sizeof(tl) - tn, " m%llu:%.0f/%.0f:%.1f/%.1f:%.0f", (unsigned long long)rows[best].tid,
+                                        rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
+                    tn += ios_xp_tok_extra( tl + tn, sizeof(tl) - tn, &rows[best] );
                 }
-                wine_log_write( "%s", line );
+                if (rq_slices && tn < (int)sizeof(tl) - 160)
+                {
+                    uint32_t pids[8]; double prq[8]; int np = 0, q;
+                    for (i = 0; i < nrows; i++)
+                    {
+                        if (rows[i].rq_ms <= 0) continue;
+                        for (q = 0; q < np && pids[q] != rows[i].wpid; q++) ;
+                        if (q == np) { if (np == 8) continue; pids[np] = rows[i].wpid; prq[np++] = 0; }
+                        prq[q] += rows[i].rq_ms;
+                    }
+                    tn += snprintf( tl + tn, sizeof(tl) - tn, " | runnable %.1f of %u threads:",
+                                    (double)rq_total / rq_slices, (unsigned)nth );
+                    while (np && tn < (int)sizeof(tl) - 24)
+                    {
+                        int b = 0;
+                        for (q = 1; q < np; q++) if (prq[q] > prq[b]) b = q;
+                        tn += snprintf( tl + tn, sizeof(tl) - tn, " %04x=%.1f", pids[b], dt_ms > 0 ? prq[b] / dt_ms : 0 );
+                        pids[b] = pids[np - 1]; prq[b] = prq[np - 1]; np--;
+                    }
+                }
+                if (tn < 1000) wine_log_write( "%s", tl );
+                else
+                {   /* split at a token boundary; the second part carries the same time stamp */
+                    int cut = 1000;
+                    while (cut > 40 && tl[cut] != ' ') cut--;
+                    tl[cut] = 0;
+                    wine_log_write( "%s", tl );
+                    wine_log_write( "[xp-t] %s +%s", wall, tl + cut + 1 );
+                }
             }
             if (!(gen & 3)) ios_xp_api_report( wall, XP_MS( now - t_start ) / 1000.0 );   /* ml1131: ~1 s */
         }
@@ -5965,6 +6271,16 @@ NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES
 }
 
 
+/* madeira: build/ntdll-unix/regcache_ios.c, the client-side registry read cache
+ * (env.MADEIRA_REG_CACHE). A key handle it answered an open with is known only to
+ * it: closing one never reaches the server, and other uses first give it a real
+ * handle. Closing a root handle under which opens were cached drops them. */
+extern int ios_regcache_on;
+extern NTSTATUS ios_regcache_real( HANDLE *handle, const char *op );
+extern int ios_regcache_close( HANDLE handle, NTSTATUS *ret );
+extern void ios_regcache_close_done( void );
+extern void ios_regcache_forget( HANDLE handle );
+
 /******************************************************************************
  *           NtDuplicateObject
  */
@@ -5974,8 +6290,26 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
     sigset_t sigset;
     unsigned int ret;
     int fd = -1;
+    HANDLE rc_cached = 0;
+    int rc_root = 0;
 
     if (dest) *dest = 0;
+
+    if (ios_regcache_on > 0 && source_process == NtCurrentProcess())
+    {
+        HANDLE real = source;
+        if ((ret = ios_regcache_real( &real, NULL ))) return ret;
+        if (real != source)
+        {
+            rc_cached = source;
+            source = real;
+        }
+        else if (options & DUPLICATE_CLOSE_SOURCE)
+        {
+            NTSTATUS unused;
+            rc_root = ios_regcache_close( source, &unused ) == 2;
+        }
+    }
 
     if ((options & DUPLICATE_CLOSE_SOURCE) && source_process != NtCurrentProcess())
     {
@@ -6028,6 +6362,8 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
 
     if (fd != -1) close( fd );
+    if (rc_root) ios_regcache_close_done();
+    if (rc_cached && (options & DUPLICATE_CLOSE_SOURCE)) ios_regcache_forget( rc_cached );
     return ret;
 }
 
@@ -6038,6 +6374,10 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
 NTSTATUS WINAPI NtCompareObjects( HANDLE first, HANDLE second )
 {
     unsigned int status;
+
+    if (ios_regcache_on > 0 &&
+        ((status = ios_regcache_real( &first, NULL )) || (status = ios_regcache_real( &second, NULL ))))
+        return status;
 
     SERVER_START_REQ( compare_objects )
     {
@@ -6070,9 +6410,19 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     HANDLE port;
     unsigned int ret;
     int fd;
+    int rc_root = 0;
 
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
+
+    if (ios_regcache_on > 0)
+    {
+        switch (ios_regcache_close( handle, (NTSTATUS *)&ret ))
+        {
+        case 1: return ret;         /* a cached key handle */
+        case 2: rc_root = 1; break; /* a root of cached opens: ios_regcache_close_done below */
+        }
+    }
 
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
@@ -6091,6 +6441,7 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     SERVER_END_REQ;
 
     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+    if (rc_root) ios_regcache_close_done();
 
     if (fd != -1) close( fd );
 

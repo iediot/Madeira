@@ -1041,6 +1041,16 @@ struct LibraryEntry: Codable, Identifiable {
             // any thread still spinning. Not a suspend: Wine's suspend cannot hold a thread on iOS, and a
             // pseudo-process held inside a shared lock (malloc, the JIT pool, the futex table) would stop
             // the game too.
+            // The floor did not slow the renderer (~700 ms CPU per 2 s with it and without it, log
+            // 2026-11-27 01:05): the launcher hides the overlay but never tells the off-screen browser.
+            // From the same arming the helper's browsers get WasHidden(true) ([sc-hide]: Chromium stops
+            // the hidden pages' frames and painting; visible again if the helper shows its window or the
+            // game exits), and its threads park: a timed wait lasts 5 s unless what it waits on is
+            // signalled -- messages, pipe I/O and APCs still wake it at once, and such a wake or a
+            // SendMessage to it lifts the park for 5 s. The park needs the game's Presents moving; its
+            // watchdog ends it if they stop for 3 s ([sc-park] WATCHDOG). [sc-cpu] reports the helper's
+            // CPU every 30 s and named [spin-pc] lines sample its renderer thread. Off switches:
+            // env.MADEIRA_SC_HIDE = 0, env.MADEIRA_SC_PARK = 0, env.MADEIRA_SPIN_PC_NAMES = (empty).
             // Video budget by memory limit. 4096 MB was measured on the 12 GB iPad. The
             // iPhone 18 Pro (11.5 GB, 8 GB jetsam limit) ran 50-58 fps until RAGE's streamer
             // filled that budget: footprint 7.4 of 8.2 GB, 1.5 GB compressed, 47% page waits,
@@ -1065,11 +1075,23 @@ struct LibraryEntry: Codable, Identifiable {
             // The polled sound stream gets up to 40 ms more audio queued while it keeps running short
             // (ml1240; it delivered 65-75 % of real time in that log, heard as crackle).
             // Per-command timing and hot-page reports are for captures, not normal play.
+            // Yield escalation (sync.c yield-esc), RDR2.exe only: ~25 threads stayed runnable on 6 cores
+            // through clamped play, with 5,000-11,000 yields a second (mostly Sleep(0)) rising with the
+            // clock and six job workers at ~4 instructions per cycle (log 2026-11-27 01:05). After 32
+            // yields with no real wait between them a yield sleeps 20 us, doubling to 100 us; any real
+            // wait or 250 us of the thread's own CPU between yields resets it ([xp-t] y/z/e counts,
+            // [xp-api] "escalated"); madeira.cfg yield-esc-* tune it, env.MADEIRA_YIELD_ESCALATE = 0 turns it off.
             // rp-carry: RDR2 draws one pass over the same targets across several command lists of one
             // ExecuteCommandLists call, and each list boundary stored and reloaded those targets
             // (gpu-traffic "possible with rp-carry": 5 boundaries, 177-215 MB a frame at 1312x604, log
             // 2026-11-27 00:19). The pass stays open into the next list when only state comes between
             // (madeira_d3d12.c rp-carry): same draws in the same order, no graphics setting changed.
+            // Registry: RDR2's main thread opened, read and closed the same keys ~5,700 times a second
+            // for 30-60 s at a time while a menu was up ([srv-req] req87/92/21, logs 2026-11-26 20:17 and
+            // 2026-11-27 00:19), a wineserver round trip each. MADEIRA_REG_CACHE answers repeated opens and
+            // value reads in ntdll (build/ntdll-unix/regcache_ios.c); every registry write of every process
+            // invalidates it, so no read sees a value a finished write replaced. MADEIRA_REG_CENSUS names
+            // the keys every 30 s ([reg-census]) and counts the cache's answers ([reg-cache]).
             return socialClub + "\n" + bcd + "\n" + videoBudget + "\n" + """
             d3d12-shader-pack = 1
             replay-split = 0
@@ -1107,7 +1129,11 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_SC_CEF_LITE = 1
             env.MADEIRA_WAIT_FLOOR = SocialClubHelper.exe=50
             env.MADEIRA_WAIT_FLOOR_AFTER = RDR2.exe:180
+            env.MADEIRA_SC_HIDE = 1
+            env.MADEIRA_SC_PARK = 1
+            env.MADEIRA_SPIN_PC_NAMES = Chrome_InProcRendererThread
             env.MADEIRA_SPIN_PC = 1
+            env.MADEIRA_YIELD_ESCALATE = RDR2.exe
             env.MADEIRA_AUDIO_CUSHION_MS = 40
             env.MADEIRA_POOL_OTHER_BIG_GAME_MB = 64
             env.MADEIRA_POOL_LOW_IMAGES = 1
@@ -1119,6 +1145,8 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_X64_IMAGE_NOCOPY = 1
             env.MADEIRA_EC_HOOK_TRACE = 0
             env.MADEIRA_PERF_CLASSIFY = 0
+            env.MADEIRA_REG_CACHE = RDR2.exe
+            env.MADEIRA_REG_CENSUS = RDR2.exe
             """ + (steam ? "\nenv.MADEIRA_DOCK_GAME_SCM = 1\nenv.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe" : "")
         case "gta5_enhanced.exe", "playgtav.exe":
             let steamLines = """

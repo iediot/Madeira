@@ -98,6 +98,7 @@ harness = r'''
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>   /* usleep: the sc-park watchdog (process_ios.c) */
 typedef uint16_t WCHAR;
 typedef unsigned int NTSTATUS, ULONG;
 typedef long long LONGLONG;
@@ -106,9 +107,11 @@ typedef union { LONGLONG QuadPart; } LARGE_INTEGER;
 typedef struct { unsigned short Length, MaximumLength; WCHAR *Buffer; } UNICODE_STRING;
 typedef struct { UNICODE_STRING ImagePathName; } RTL_USER_PROCESS_PARAMETERS;
 typedef struct { RTL_USER_PROCESS_PARAMETERS *ProcessParameters; } PEB;
-typedef struct { PEB *Peb; } TEB;
 typedef struct { int dummy; } OBJECT_ATTRIBUTES;
 typedef struct { HANDLE UniqueProcess, UniqueThread; } CLIENT_ID;
+typedef struct { PEB *Peb; CLIENT_ID ClientId; } TEB;   /* ClientId: sc-park (process_ios.c) */
+#define HandleToULong(h) ((ULONG)(uintptr_t)(h))
+volatile uint64_t ios_xp_pe_block, ios_xp_pe_len;   /* server_ios.c: the sc-park watchdog reads it */
 typedef struct { NTSTATUS ExitStatus; } PROCESS_BASIC_INFORMATION;
 #define STATUS_PENDING 0x103
 #define STATUS_INVALID_CID 0xc000000b

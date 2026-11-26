@@ -78,3 +78,42 @@ Changes (audio_null_ios.c):
 - `[ios_audio] ml1240 slot=1 polled`: wrote %, presents/s, writer CPU % and
   padding at polls (a fill level near 30 ms with a high writer CPU % means a
   starved mixer; low writer CPU with wrote% ~ fps/30 means frame-locked audio).
+
+## Wave1 log (01:05): runnable oversubscription, yield spins, bursts
+
+Evidence: `~/MadeiraLogs/iphone18/1127-0105-wave1/madeira-log.txt` (RDR2 pid 0x44c,
+gameplay 01:00:20-01:03:50). Host analysis only.
+
+- Clamped windows: cpu 8.4-9.2 s per 2 s (P 2.1-2.6 s of 4, E 6.1-6.9 s of 8), `run`
+  48-57 s (~25 threads runnable), ~1 W, 40-50 presents, ~45 mJ per frame. The 1.5 W
+  windows (P 1.55-1.75 GHz) cost 55-87 mJ per frame. Collapse windows (01:02:02.8,
+  01:03:02.7) show cpu ~4.1 s with `run` still 23-30 s: runnable threads, idle cores.
+- Six RDR2 workers (0514, 0524, 0528, 052c, 0530, 0534) each ran ~410 ms per window
+  (P ~120 / E ~290) at ~2,800 M instructions, i.e. ~4.1 instructions per cycle: a wait
+  loop's signature (main thread 0450: ~1.1 IPC, render 04c0: ~2.7). Below the old
+  `[spin-pc]` gate (>= 30 % of a core), so never sampled.
+- `[xp-api]`: 5,100-10,900 yields/s, 3,400-8,200 of them Sleep(0), 400-2,000 Sleep(1);
+  Sleep(0) rises with the clock (more CPU, more spinning). The ml1063 adaptive yield
+  slept only 76-280 times/s in clamped windows: its streak resets after a 2 ms gap,
+  shorter than one sched_yield with 25 runnable threads.
+- SocialClubHelper's thread 034c (pid 0268, utility) used ~560 ms of E core per window.
+- Log: ~165 lines/s in play; FEX's per-event SIGBUS/SMC lines and `[decommit-zero]
+  branch=swap-zero` were most of it.
+
+Changes (all host-tested, none device-validated):
+- `[xp-t]`: run-state sampling per ~125 ms slice (`:r<ms>` runnable time per thread,
+  `| runnable N of M threads: <pid>=<avg>`), per-thread y/z/s/e yield counts, 24 threads;
+  `MADEIRA_XP_RUNQ=0` turns sampling off. Worker `[spin-pc]` gate: >= 12 % of a core at
+  >= 3.5 IPC, one per window, 40 in all.
+- Yield escalation (`env.MADEIRA_YIELD_ESCALATE = RDR2.exe` in the RDR2 profile):
+  after 32 yields with no real wait (and < 250 us of own CPU between them) a yield sleeps
+  20 us doubling to 100 us (cfg max 500); any real wait resets. `[xp-api] escalated N/s M ms/s`.
+- Present pacer (`present-cap-fps`, `present-pace-mw`, `present-pace-min-fps`): off by
+  default, in no profile. `[present-pace]` every ~5 s.
+- FEX per-event lines sampled in the unix `unixcall_wine_dbg_write` (`[fex-log]` counts;
+  `env.MADEIRA_FEX_LOG_ALL = 1` off); swap-zero `[decommit-zero]` lines rate-limited
+  (`env.MADEIRA_DECOMMIT_LOG_ALL = 1` off).
+- Off switches that restore the old behaviour exactly: `env.MADEIRA_YIELD_ESCALATE = 0`,
+  `env.MADEIRA_YIELD_STATS = 0`, `env.MADEIRA_XP_RUNQ = 0`, `env.MADEIRA_SPIN_PC_WORKERS = 0`,
+  `env.MADEIRA_FEX_LOG_ALL = 1`, `env.MADEIRA_DECOMMIT_LOG_ALL = 1`; the pacer is off unless
+  `present-cap-fps` / `present-pace-mw` are set.

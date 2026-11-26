@@ -1564,11 +1564,15 @@ static int ios_wf_parse_after( const char *spec, char *name, int name_size, long
     return 1;
 }
 
+static void ios_sc_quiet_init(void);   /* madeira-bcd sc-hide / sc-park, below */
+static int ios_sc_features;            /* 1 = WasHidden, 2 = park */
+
 static void ios_wf_init(void)
 {
     ios_wf_nrules = ios_wf_parse( getenv( "MADEIRA_WAIT_FLOOR" ) );
     ios_wf_parse_after( getenv( "MADEIRA_WAIT_FLOOR_AFTER" ), ios_wf_after_name,
                         sizeof(ios_wf_after_name), &ios_wf_after_ns );
+    ios_sc_quiet_init();
     if (ios_wf_nrules)
     {
         int i;
@@ -1578,13 +1582,17 @@ static void ios_wf_init(void)
                      ios_wf_after_name[0] ? "once " : "(always on)", ios_wf_after_name,
                      ios_wf_after_name[0] ? " has run its delay" : "" );
     }
-    __atomic_store_n( &ios_wf_state, ios_wf_nrules ? 1 : 0, __ATOMIC_RELEASE );
+    __atomic_store_n( &ios_wf_state, (ios_wf_nrules || ios_sc_features) ? 1 : 0, __ATOMIC_RELEASE );
 }
+
+volatile unsigned int ios_sc_helper_pid = 0;   /* madeira-bcd sc-cpu: the last SocialClubHelper.exe started */
 
 /* NtCreateUserProcess: the session started `image` as process `pid`. */
 static void ios_wait_floor_note_process( const WCHAR *image, int image_len, unsigned int pid )
 {
     pthread_once( &ios_wf_once, ios_wf_init );
+    if (ios_image_name_is( image, image_len, "socialclubhelper.exe" ))
+        __atomic_store_n( &ios_sc_helper_pid, pid, __ATOMIC_RELAXED );
     if (ios_wf_state <= 0 || !ios_wf_after_name[0]) return;
     if (!ios_image_name_is( image, image_len, ios_wf_after_name )) return;
     __atomic_store_n( &ios_wf_game_pid, pid, __ATOMIC_RELAXED );
@@ -1615,13 +1623,13 @@ static int ios_wf_thread_floor(void)
     return ios_wf_thread_ms;
 }
 
-/* Is the game (MADEIRA_WAIT_FLOOR_AFTER) past its delay and still there? */
-static int ios_wf_game_active( long long now )
+/* Is the game (MADEIRA_WAIT_FLOOR_AFTER) past `delay_ns` and still there? */
+static int ios_wf_game_active_after( long long now, long long delay_ns )
 {
     long long started = __atomic_load_n( &ios_wf_started_ns, __ATOMIC_ACQUIRE ), last;
 
     if (!ios_wf_after_name[0]) return 1;
-    if (!started || now - started < ios_wf_after_ns) return 0;
+    if (!started || now - started < delay_ns) return 0;
     last = __atomic_load_n( &ios_wf_check_ns, __ATOMIC_RELAXED );
     if (now - last >= 5000000000ll &&
         __atomic_compare_exchange_n( &ios_wf_check_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
@@ -1656,6 +1664,402 @@ static int ios_wf_game_active( long long now )
     return 1;
 }
 
+static int ios_wf_game_active( long long now )
+{
+    return ios_wf_game_active_after( now, ios_wf_after_ns );
+}
+
+/* madeira-bcd thread names (2026-11-27): Windows tid -> the name the thread gave
+ * itself (set_native_thread_name, thread_ios.c), for [sc-park] and the [sc-cpu] /
+ * named [spin-pc] lines (server_ios.c). Open addressing, never deleted; a reused
+ * tid takes the new name. Readers may see a name being rewritten: diagnostics only. */
+#define IOS_TNAME_SLOTS 1024
+static struct { volatile unsigned int tid; char name[40]; } ios_tname[IOS_TNAME_SLOTS];
+
+void ios_thread_name_note( unsigned int tid, const char *name )
+{
+    static int on = -1;
+    unsigned int h, j;
+    if (on < 0) { const char *e = getenv( "MADEIRA_SC_CPU" ); on = !(e && e[0] == '0'); }   /* off with [sc-cpu] */
+    if (!on || !tid || !name) return;
+    for (h = (tid * 2654435761u) % IOS_TNAME_SLOTS, j = 0; j < IOS_TNAME_SLOTS; j++, h = (h + 1) % IOS_TNAME_SLOTS)
+    {
+        unsigned int cur = __atomic_load_n( &ios_tname[h].tid, __ATOMIC_ACQUIRE );
+        if (!cur)
+        {
+            unsigned int expect = 0;
+            if (__atomic_compare_exchange_n( &ios_tname[h].tid, &expect, tid, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+                cur = tid;
+            else
+                cur = expect;   /* another thread took the slot first */
+        }
+        if (cur != tid) continue;
+        snprintf( ios_tname[h].name, sizeof(ios_tname[h].name), "%s", name );
+        return;
+    }
+}
+
+int ios_thread_name_get( unsigned int tid, char *out, int cap )
+{
+    unsigned int h, j, cur;
+    if (cap <= 0) return 0;
+    out[0] = 0;
+    for (h = (tid * 2654435761u) % IOS_TNAME_SLOTS, j = 0; j < IOS_TNAME_SLOTS; j++, h = (h + 1) % IOS_TNAME_SLOTS)
+    {
+        if (!(cur = __atomic_load_n( &ios_tname[h].tid, __ATOMIC_ACQUIRE ))) return 0;
+        if (cur != tid) continue;
+        memcpy( out, ios_tname[h].name, cap < (int)sizeof(ios_tname[h].name) ? cap : (int)sizeof(ios_tname[h].name) );
+        out[cap - 1] = 0;
+        return out[0] != 0;
+    }
+    return 0;
+}
+
+/* madeira-bcd sc-hide / sc-park (2026-11-27). Log 1127-0105-wave1: during play
+ * SocialClubHelper.exe's Chrome_InProcRendererThread was the busiest thread of
+ * the session (~700 ms CPU per 2 s), as busy with the 50 ms wait floor on as
+ * without it; the launcher hides the overlay but the off-screen browser is never
+ * told (the helper calls CefBrowserHost::WasHidden only when ITS window gets
+ * SIZE_MINIMIZED), so Chromium keeps running the page's animation frames.
+ *
+ * env.MADEIRA_SC_HIDE = 1: from the MADEIRA_WAIT_FLOOR_AFTER arming (default
+ * 180 s after the game starts) until the game is gone, every browser of the
+ * helper gets WasHidden(true): Chromium then stops animation frames, painting
+ * and throttles timers of the hidden pages. The [sc-hide] stub on the [sc-rph]
+ * renderer loop pump (virtual_ios.c, 2.4.0.302) makes the CEF calls and reads
+ * `want` here; it also counts the helper's own Show()/Hide() calls and OnPaint
+ * calls. When the helper shows its browser itself (Show(), e.g. the overlay
+ * opened) the pages are made visible again for MADEIRA_SC_HIDE_YIELD_S (120 s).
+ * When the game is gone they get WasHidden(false).
+ *
+ * env.MADEIRA_SC_PARK = 1 (or the number of seconds, 2..600; 1 = 5): from the
+ * same arming, once the pages are hidden (or 10 s later), every timed wait of
+ * 1 ms .. 5 s that a SocialClubHelper.exe thread enters (NtWaitForSingleObject,
+ * NtWaitForMultipleObjects, NtDelayExecution, NtRemoveIoCompletion(Ex),
+ * NtWaitForAlertByThreadId: the wait-floor hooks in sync.c) lasts 5 s. Not a
+ * suspend: the thread sits in the kernel wait it asked for, holding no lock,
+ * and still returns at once when that wait is satisfied -- a message sent to its
+ * window (the queue is signalled), pipe or socket I/O completing, an event set,
+ * an APC (system APCs from other processes included). Only timers stop: the
+ * helper's polling, Chromium's delayed tasks and frame timer. Infinite waits and
+ * zero-timeout polls are left alone. Fail-safes: a stretched wait that a signal
+ * ends (IPC, a message, an event: anything but the timeout) lifts the park for
+ * 5 s (env.MADEIRA_SC_PARK_LIFT = 0 turns that off), and so does a SendMessage
+ * to a helper window from another process (wineserver queue_ios.c counts it);
+ * the park needs the game's Presents moving and its watchdog ends it when they
+ * stop for 3 s ([sc-park] WATCHDOG, below). When the game is gone the park
+ * ends; a thread's current stretched wait ends within the 5 s.
+ * [sc-hide] / [sc-park] lines report each step, the first park of each thread
+ * and a 30 s summary (stretched waits, early wakes = waits ended by a signal).
+ * Each feature is off unless its variable is set; with none set nothing here runs. */
+struct ios_sc_vis
+{
+    volatile int want, applied, browsers, passes;   /* written by the guest stub: applied .. passes */
+    volatile int show_calls, hide_calls, pumps, paints;
+};
+struct ios_sc_vis ios_sc_vis = { 0 };
+void *ios_sc_vis_address(void) { return (void *)&ios_sc_vis; }
+
+volatile unsigned int madeira_sc_park_pid = 0;        /* read by the wineserver (queue_ios.c send_message) */
+volatile unsigned int madeira_sc_park_demands = 0;    /* bumped there */
+volatile unsigned int madeira_sc_park_demand_info[4] = { 0 };   /* msg, sender pid, receiver tid, hwnd */
+
+static long long ios_sc_after_ns, ios_sc_slice_ns, ios_sc_yield_ns;
+static int ios_sc_lift_on_signal;
+static __thread int ios_sc_thread_helper = -1;
+static __thread long long ios_sc_thread_last_slice;
+static __thread int ios_sc_thread_parked;
+static volatile long long ios_sc_poll_ns, ios_sc_active_since, ios_sc_demand_until, ios_sc_yield_until;
+static volatile long long ios_sc_want_since, ios_sc_report_ns, ios_sc_last_stretch_ns;
+static volatile int ios_sc_park_on, ios_sc_park_threads, ios_sc_park_lines;
+static volatile long long ios_sc_stretched, ios_sc_early, ios_sc_lifts;
+
+/* The park's watchdog (a host thread, started when the park first arms; it makes
+ * no Wine calls). It follows madeira_d3d12's completed-Present counter (the [xp]
+ * PE block, struct ios_xp_pe: magic, qpf, pres_enq, pres_done). The park is
+ * allowed only while that counter moved within the last 3 s. If it stops for
+ * more than 3 s while helper threads are parked (or one is still inside a
+ * stretched wait), [sc-park] WATCHDOG: the park is off until Presents have run
+ * again for 60 s. A game that presents some other way never gets parked. */
+extern volatile uint64_t ios_xp_pe_block, ios_xp_pe_len;   /* server_ios.c ml1128 */
+static volatile int ios_sc_presents_ok, ios_sc_watchdog_tripped, ios_sc_watchdog_started;
+
+static long long ios_sc_presents(void)
+{
+    const volatile int64_t *pe = (const volatile int64_t *)(uintptr_t)ios_xp_pe_block;
+    if (!pe || ios_xp_pe_len < 4 * sizeof(int64_t) || pe[0] != 0x3130305058444d4dLL) return -1;
+    return pe[3];
+}
+
+static long long ios_scw_last = -1, ios_scw_last_change, ios_scw_flowing_since;
+
+/* One watchdog step (every 250 ms). */
+static void ios_sc_watchdog_tick( long long now, long long p )
+{
+    if (p != ios_scw_last)
+    {
+        if (ios_scw_last >= 0 && p > ios_scw_last)
+        {
+            ios_scw_last_change = now;
+            if (!ios_scw_flowing_since) ios_scw_flowing_since = now;
+        }
+        ios_scw_last = p;
+    }
+    if (!ios_scw_last_change || now - ios_scw_last_change > 3000000000ll) ios_scw_flowing_since = 0;
+    __atomic_store_n( &ios_sc_presents_ok, p > 0 && ios_scw_last_change && now - ios_scw_last_change <= 3000000000ll,
+                      __ATOMIC_RELEASE );
+    if (!ios_sc_watchdog_tripped)
+    {
+        long long stretch = __atomic_load_n( &ios_sc_last_stretch_ns, __ATOMIC_RELAXED );
+        int parked = ios_sc_park_on || (stretch && now - stretch < ios_sc_slice_ns);
+        if (parked && ios_scw_last_change && now - ios_scw_last_change > 3000000000ll)
+        {
+            __atomic_store_n( &ios_sc_watchdog_tripped, 1, __ATOMIC_RELEASE );
+            dprintf( 2, "[sc-park] WATCHDOG: the game's Presents stopped %.1f s ago (count %lld) while "
+                        "%d SocialClubHelper.exe threads were parked: park off until Presents run again "
+                        "for 60 s; stretched waits end when signalled or within %lld s\n",
+                     (now - ios_scw_last_change) / 1e9, p, ios_sc_park_threads, ios_sc_slice_ns / 1000000000ll );
+        }
+    }
+    else if (ios_scw_flowing_since && now - ios_scw_flowing_since >= 60000000000ll)
+    {
+        __atomic_store_n( &ios_sc_watchdog_tripped, 0, __ATOMIC_RELEASE );
+        dprintf( 2, "[sc-park] watchdog: Presents ran again for 60 s (count %lld): the park may resume\n", p );
+    }
+}
+
+static void *ios_sc_watchdog_main( void *arg )
+{
+    (void)arg;
+    for (;;)
+    {
+        usleep( 250000 );
+        ios_sc_watchdog_tick( ios_wf_now_ns(), ios_sc_presents() );
+    }
+    return NULL;
+}
+
+static void ios_sc_watchdog_start(void)
+{
+    pthread_t t;
+    pthread_attr_t attr;
+    int expect = 0;
+
+    if (!__atomic_compare_exchange_n( &ios_sc_watchdog_started, &expect, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED ))
+        return;
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    if (pthread_create( &t, &attr, ios_sc_watchdog_main, NULL ))
+        dprintf( 2, "[sc-park] watchdog thread not started: the park stays off\n" );
+    else
+        dprintf( 2, "[sc-park] watchdog started: the park needs the game's Presents moving (3 s)\n" );
+    pthread_attr_destroy( &attr );
+}
+
+static void ios_sc_quiet_init(void)
+{
+    const char *h = getenv( "MADEIRA_SC_HIDE" ), *p = getenv( "MADEIRA_SC_PARK" ), *y = getenv( "MADEIRA_SC_HIDE_YIELD_S" );
+    const char *l = getenv( "MADEIRA_SC_PARK_LIFT" );
+    int park = p ? atoi( p ) : 0;
+
+    if (h && h[0] == '1') ios_sc_features |= 1;
+    if (park > 0)
+    {
+        ios_sc_features |= 2;
+        ios_sc_slice_ns = (long long)(park == 1 ? 5 : park > 600 ? 600 : park) * 1000000000ll;
+    }
+    ios_sc_lift_on_signal = !(l && l[0] == '0');
+    ios_sc_yield_ns = (long long)(y && atoi( y ) > 0 ? atoi( y ) : 120) * 1000000000ll;
+    ios_sc_after_ns = ios_wf_after_ns ? ios_wf_after_ns : 180 * 1000000000ll;
+    if (!ios_sc_features) return;
+    dprintf( 2, "[sc-park] %s%s%s for SocialClubHelper.exe %s%s (%lld s after it starts)\n",
+             (ios_sc_features & 1) ? "WasHidden on its browsers" : "",
+             ios_sc_features == 3 ? " and " : "",
+             (ios_sc_features & 2) ? "timed waits parked" : "",
+             ios_wf_after_name[0] ? "once " : "never: MADEIRA_WAIT_FLOOR_AFTER names no game",
+             ios_wf_after_name, ios_sc_after_ns / 1000000000ll );
+    if (ios_sc_features & 2)
+        dprintf( 2, "[sc-park] a parked thread's waits of 1 ms .. %lld s last %lld s unless signalled; %s\n",
+                 ios_sc_slice_ns / 1000000000ll, ios_sc_slice_ns / 1000000000ll,
+                 ios_sc_lift_on_signal ? "a wait ended by a signal (IPC, message, event) lifts the park for 5 s"
+                                       : "signals do not lift the park (MADEIRA_SC_PARK_LIFT=0)" );
+}
+
+static int ios_sc_is_helper_thread(void)
+{
+    const RTL_USER_PROCESS_PARAMETERS *pp;
+
+    if (ios_sc_thread_helper >= 0) return ios_sc_thread_helper;
+    if (!NtCurrentTeb() || !NtCurrentTeb()->Peb || !(pp = NtCurrentTeb()->Peb->ProcessParameters) ||
+        !pp->ImagePathName.Buffer)
+        return 0;
+    ios_sc_thread_helper = ios_image_name_is( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR),
+                                              "socialclubhelper.exe" );
+    return ios_sc_thread_helper;
+}
+
+/* At most every 250 ms, from any helper thread entering a timed wait. */
+static void ios_sc_poll( long long now )
+{
+    static int seen_show, seen_hide, logged_applied, warned, last_paints, last_pumps;
+    static unsigned int seen_demands, demand_lines;
+    static long long last_stretched, last_early;
+    long long last = __atomic_load_n( &ios_sc_poll_ns, __ATOMIC_RELAXED ), since;
+    unsigned int pid = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ), d;
+    int active, park, want;
+
+    if (now - last < 250000000ll ||
+        !__atomic_compare_exchange_n( &ios_sc_poll_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        return;
+
+    active = ios_wf_after_name[0] && ios_wf_game_active_after( now, ios_sc_after_ns );
+    since = __atomic_load_n( &ios_sc_active_since, __ATOMIC_RELAXED );
+    if (active && !since) __atomic_store_n( &ios_sc_active_since, since = now, __ATOMIC_RELAXED );
+    if (!active && since) __atomic_store_n( &ios_sc_active_since, since = 0, __ATOMIC_RELAXED );
+    __atomic_store_n( &madeira_sc_park_pid, ((ios_sc_features & 2) && active) ? pid : 0, __ATOMIC_RELEASE );
+
+    if ((d = __atomic_load_n( &madeira_sc_park_demands, __ATOMIC_ACQUIRE )) != seen_demands)
+    {
+        if (active) __atomic_store_n( &ios_sc_demand_until, now + 5000000000ll, __ATOMIC_RELAXED );
+        if (demand_lines < 24 || !(demand_lines % 64))
+            dprintf( 2, "[sc-park] SendMessage to the helper: msg 0x%04x hwnd %08x tid %04x from pid %04x "
+                        "(%u in all)%s\n", madeira_sc_park_demand_info[0], madeira_sc_park_demand_info[3],
+                     madeira_sc_park_demand_info[2], madeira_sc_park_demand_info[1], d,
+                     active ? ": park lifted for 5 s" : "" );
+        demand_lines++;
+        seen_demands = d;
+    }
+
+    if (ios_sc_features & 1)
+    {
+        int sc = ios_sc_vis.show_calls, hc = ios_sc_vis.hide_calls, applied = ios_sc_vis.applied;
+        if (sc != seen_show)
+        {
+            if (active && ios_sc_vis.want)
+                __atomic_store_n( &ios_sc_yield_until, now + ios_sc_yield_ns, __ATOMIC_RELAXED );
+            dprintf( 2, "[sc-hide] the helper called its browser window's Show() (%d calls)%s\n", sc,
+                     active ? "; its pages stay visible for MADEIRA_SC_HIDE_YIELD_S" : "" );
+            seen_show = sc;
+        }
+        if (hc != seen_hide)
+        {
+            dprintf( 2, "[sc-hide] the helper called its browser window's Hide() (%d calls)\n", hc );
+            seen_hide = hc;
+        }
+        want = active && now >= __atomic_load_n( &ios_sc_yield_until, __ATOMIC_RELAXED );
+        if (want != ios_sc_vis.want)
+        {
+            ios_sc_vis.want = want;
+            __atomic_store_n( &ios_sc_want_since, now, __ATOMIC_RELAXED );
+            warned = 0;
+            dprintf( 2, "[sc-hide] asking the renderer loop for WasHidden(%d) on the helper's browsers "
+                        "(OnPaint calls so far %d, pump runs %d)\n", want, ios_sc_vis.paints, ios_sc_vis.pumps );
+        }
+        if (applied != logged_applied)
+        {
+            dprintf( 2, "[sc-hide] WasHidden(%d) sent to %d browser(s) (pass %d, %.1f s after asking)\n",
+                     applied, ios_sc_vis.browsers, ios_sc_vis.passes,
+                     (now - __atomic_load_n( &ios_sc_want_since, __ATOMIC_RELAXED )) / 1e9 );
+            logged_applied = applied;
+        }
+        if (ios_sc_vis.want != applied && !warned &&
+            now - __atomic_load_n( &ios_sc_want_since, __ATOMIC_RELAXED ) > 15000000000ll)
+        {
+            warned = 1;
+            dprintf( 2, "[sc-hide] no WasHidden(%d) after 15 s: the renderer loop pump ran %d times in all "
+                        "(0: the [sc-hide] stub is not installed or the renderer loop never started)\n",
+                     ios_sc_vis.want, ios_sc_vis.pumps );
+        }
+    }
+
+    if ((ios_sc_features & 2) && active) ios_sc_watchdog_start();
+    /* signal / SendMessage lifts (ios_sc_demand_until) are checked by each wait, not here */
+    park = (ios_sc_features & 2) && active &&
+           __atomic_load_n( &ios_sc_presents_ok, __ATOMIC_ACQUIRE ) &&
+           !__atomic_load_n( &ios_sc_watchdog_tripped, __ATOMIC_ACQUIRE ) &&
+           (!(ios_sc_features & 1) || (ios_sc_vis.want == ios_sc_vis.applied) || now - since >= 10000000000ll);
+    if (park != ios_sc_park_on)
+    {
+        ios_sc_park_on = park;
+        if (park)
+            dprintf( 2, "[sc-park] ON: SocialClubHelper.exe (pid %04x) threads park in their next timed wait (%s)\n",
+                     pid, ios_wf_after_name );
+        else
+            dprintf( 2, "[sc-park] OFF: %s; stretched waits end when signalled or within %lld s\n",
+                     !active ? (since || !ios_wf_after_name[0] ? "the game is gone" : "the game is not running past its delay")
+                     : ios_sc_watchdog_tripped ? "WATCHDOG"
+                     : !ios_sc_presents_ok ? "the game's Presents are not moving"
+                     : "the helper's pages are not hidden yet", ios_sc_slice_ns / 1000000000ll );
+    }
+
+    last = __atomic_load_n( &ios_sc_report_ns, __ATOMIC_RELAXED );
+    if (!last) __atomic_store_n( &ios_sc_report_ns, now, __ATOMIC_RELAXED );
+    else if (now - last >= 30000000000ll && (active || park || ios_sc_park_threads))
+    {
+        long long st = ios_sc_stretched, ea = ios_sc_early;
+        __atomic_store_n( &ios_sc_report_ns, now, __ATOMIC_RELAXED );
+        dprintf( 2, "[sc-park] %lld s: park %s, %d threads parked so far, %lld waits stretched, %lld ended early "
+                    "by a signal (%lld lifts in all); %u SendMessages; WasHidden want %d applied %d; OnPaint +%d, "
+                    "pump runs +%d\n",
+                 (now - last) / 1000000000ll, park ? "on" : "off", ios_sc_park_threads, st - last_stretched,
+                 ea - last_early, (long long)ios_sc_lifts, d, ios_sc_vis.want, ios_sc_vis.applied,
+                 ios_sc_vis.paints - last_paints, ios_sc_vis.pumps - last_pumps );
+        last_stretched = st; last_early = ea;
+        last_paints = ios_sc_vis.paints; last_pumps = ios_sc_vis.pumps;
+    }
+    else if (now - last >= 30000000000ll) __atomic_store_n( &ios_sc_report_ns, now, __ATOMIC_RELAXED );
+}
+
+/* A helper thread's timed wait: NULL to go on with the wait floor, else the
+ * stretched timeout (in `store`). */
+static const LARGE_INTEGER *ios_sc_wait( const LARGE_INTEGER *timeout, LARGE_INTEGER *store )
+{
+    long long now = ios_wf_now_ns();
+
+    ios_sc_poll( now );
+    if (ios_sc_thread_last_slice && now - ios_sc_thread_last_slice < ios_sc_slice_ns / 10 * 9)
+    {
+        /* the last stretched wait of this thread ended early: something signalled it */
+        __atomic_add_fetch( &ios_sc_early, 1, __ATOMIC_RELAXED );
+        if (ios_sc_lift_on_signal)
+        {
+            long long n = __atomic_add_fetch( &ios_sc_lifts, 1, __ATOMIC_RELAXED );
+            __atomic_store_n( &ios_sc_demand_until, now + 5000000000ll, __ATOMIC_RELAXED );
+            if (n <= 24 || !(n % 256))
+            {
+                char name[40];
+                unsigned int tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+                dprintf( 2, "[sc-park] lifted for 5 s: tid %04x \"%s\" was woken by a signal (IPC, message or "
+                            "event) %.1f s into a stretched wait (lift %lld)\n", tid,
+                         ios_thread_name_get( tid, name, sizeof(name) ) ? name : "?",
+                         (now - ios_sc_thread_last_slice) / 1e9, n );
+            }
+        }
+    }
+    ios_sc_thread_last_slice = 0;
+    if (!ios_sc_park_on || -timeout->QuadPart >= ios_sc_slice_ns / 100 ||
+        now < __atomic_load_n( &ios_sc_demand_until, __ATOMIC_RELAXED ) ||
+        __atomic_load_n( &ios_sc_watchdog_tripped, __ATOMIC_ACQUIRE ) ||
+        !__atomic_load_n( &ios_sc_presents_ok, __ATOMIC_ACQUIRE ))
+        return NULL;
+    ios_sc_thread_last_slice = now;
+    __atomic_store_n( &ios_sc_last_stretch_ns, now, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &ios_sc_stretched, 1, __ATOMIC_RELAXED );
+    if (!ios_sc_thread_parked)
+    {
+        char name[40];
+        unsigned int tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+        ios_sc_thread_parked = 1;
+        __atomic_add_fetch( &ios_sc_park_threads, 1, __ATOMIC_RELAXED );
+        if (__atomic_add_fetch( &ios_sc_park_lines, 1, __ATOMIC_RELAXED ) <= 160)
+            dprintf( 2, "[sc-park] tid %04x \"%s\" parked: its %.1f ms wait now lasts %lld s unless signalled\n",
+                     tid, ios_thread_name_get( tid, name, sizeof(name) ) ? name : "?",
+                     -timeout->QuadPart / 10000.0, ios_sc_slice_ns / 1000000000ll );
+    }
+    store->QuadPart = -(ios_sc_slice_ns / 100);
+    return store;
+}
+
 const LARGE_INTEGER *ios_wait_floor( const LARGE_INTEGER *timeout, LARGE_INTEGER *store )
 {
     long long now, last, floor_100ns;
@@ -1665,6 +2069,11 @@ const LARGE_INTEGER *ios_wait_floor( const LARGE_INTEGER *timeout, LARGE_INTEGER
     if (!timeout || timeout->QuadPart > -10000) return timeout;
     if (__builtin_expect( ios_wf_state < 0, 0 )) pthread_once( &ios_wf_once, ios_wf_init );
     if (ios_wf_state <= 0) return timeout;
+    if (ios_sc_features && ios_sc_is_helper_thread())
+    {
+        const LARGE_INTEGER *parked = ios_sc_wait( timeout, store );   /* madeira-bcd sc-hide / sc-park */
+        if (parked) return parked;
+    }
     if (!(ms = ios_wf_thread_floor())) return timeout;
     floor_100ns = (long long)ms * 10000;
     if (-timeout->QuadPart >= floor_100ns) return timeout;

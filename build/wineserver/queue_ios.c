@@ -3226,6 +3226,22 @@ DECL_HANDLER(send_message)
 
     if (!(thread = get_thread_from_id( req->id ))) return;
 
+    {   /* madeira-bcd sc-park: a message another process waits on, sent to the parked
+         * SocialClubHelper.exe (ntdll process_ios.c lifts the park for 5 s) */
+        extern volatile unsigned int madeira_sc_park_pid, madeira_sc_park_demands, madeira_sc_park_demand_info[4];
+        unsigned int park_pid = __atomic_load_n( &madeira_sc_park_pid, __ATOMIC_ACQUIRE );
+        if (park_pid && thread->process->id == park_pid && current->process != thread->process &&
+            (req->type == MSG_ASCII || req->type == MSG_UNICODE || req->type == MSG_OTHER_PROCESS ||
+             req->type == MSG_CALLBACK))
+        {
+            madeira_sc_park_demand_info[0] = req->msg;
+            madeira_sc_park_demand_info[1] = current->process->id;
+            madeira_sc_park_demand_info[2] = thread->id;
+            madeira_sc_park_demand_info[3] = req->win;
+            __atomic_add_fetch( &madeira_sc_park_demands, 1, __ATOMIC_RELEASE );
+        }
+    }
+
     if (!(recv_queue = thread->queue))
     {
         set_error( STATUS_INVALID_PARAMETER );

@@ -16430,6 +16430,134 @@ static void ios_sc_render_handler_patch( char *base, SIZE_T total_size, const IM
              ipc_split ? "separate renderer IPC manager installed; renderer channels retained" : "IPC split disabled" );
 }
 
+/* madeira-bcd [sc-hide] (2026-11-27): hide the helper's off-screen pages while a
+ * game runs (env.MADEIRA_SC_HIDE = 1; policy and log lines in process_ios.c,
+ * ios_sc_poll). Social Club 2.4.0.302 only, on top of the [sc-rph] renderer
+ * loop: CEF 143.0.14 with CEF_API_VERSION_EXPERIMENTAL (cef_api_hash(999999) at
+ * 0x14006b322). The helper's own CefBrowserHostCToCpp vtable (0x1b05a8) shows the
+ * C layout used: slot 33 WasResized loads cef_browser_host_t+0x130, slot 34
+ * WasHidden (0x75e70) +0x138, slot 35 +0x140; GetBrowser +0x28. Its browser
+ * window object calls WasHidden(true) only from Hide() (0x2b0c0), which only its
+ * WndProc's WM_SIZE SIZE_MINIMIZED reaches; the launcher hiding the overlay never
+ * minimizes that window, so the pages stayed visible to Chromium.
+ *
+ * Bytes (source tests/host/sc-hide.S, linked at the RVAs below):
+ *   vis    the renderer loop pump's last CALL [cef_post_delayed_task] (inside
+ *          the [sc-rph] loop blob) becomes CALL vis: when the host's `want`
+ *          differs from `applied`, browsers 1..32 from
+ *          cef_browser_host_get_browser_by_identifier get was_hidden(want) on
+ *          their host (CEF posts it to its UI thread), every reference
+ *          released; then the original call as a tail jump.
+ *   show/hide  Show() / Hide() entry (40 53 48 83 ec 30) jump to counters.
+ *   paint  CefRenderHandlerCppToC on_paint (0xa11e0, the C callback CEF
+ *          calls for every software frame; 40 53 55 41 56) jumps to a counter.
+ * The counters and `want` live in the host (ios_sc_vis, process_ios.c); its
+ * address is written over the four 64-bit immediates. Every byte relied on is
+ * checked first and nothing is written on a mismatch. */
+#define IOS_SCH302_HIDE_BLOB      0x1a4680u   /* zero .text tail past the [sc-rph] blobs */
+#define IOS_SCH302_HIDE_SHOW_STUB 0x1a4720u
+#define IOS_SCH302_HIDE_HIDE_STUB 0x1a4740u
+#define IOS_SCH302_HIDE_PAINT_STUB 0x1a4760u
+#define IOS_SCH302_HIDE_ZERO      0x100u      /* tail bytes that must be zero */
+#define IOS_SCH302_PUMP_CALL      (IOS_SCH302_LOOP_INIT + 276)   /* FF 15 -> cef_post_delayed_task */
+#define IOS_SCH302_SHOW_FN        0x2ca60u
+#define IOS_SCH302_HIDE_FN        0x2b0c0u
+#define IOS_SCH302_ON_PAINT       0xa11e0u
+
+static const unsigned char ios_sch302_hide_blob[249] =
+{
+    0x51,0x52,0x41,0x50,0x53,0x56,0x57,0x48,0x83,0xec,0x38,0x48,0xbb,0xc0,0x5a,0xde,
+    0xc0,0x5a,0xde,0xc0,0x5a,0xf0,0xff,0x43,0x18,0x8b,0x33,0x3b,0x73,0x04,0x74,0x6e,
+    0xc7,0x43,0x08,0x00,0x00,0x00,0x00,0xc7,0x44,0x24,0x20,0x01,0x00,0x00,0x00,0x8b,
+    0x4c,0x24,0x20,0xff,0x15,0x6f,0x14,0x00,0x00,0x48,0x85,0xc0,0x74,0x3e,0x48,0x89,
+    0xc7,0x48,0x83,0x3f,0x38,0x72,0x2f,0x48,0x89,0xf9,0xff,0x57,0x30,0x48,0x85,0xc0,
+    0x74,0x24,0x48,0x89,0x44,0x24,0x28,0x48,0x81,0x38,0x40,0x01,0x00,0x00,0x72,0x0e,
+    0x48,0x89,0xc1,0x89,0xf2,0xff,0x90,0x38,0x01,0x00,0x00,0xff,0x43,0x08,0x48,0x8b,
+    0x4c,0x24,0x28,0xff,0x51,0x10,0x48,0x89,0xf9,0xff,0x57,0x10,0xff,0x44,0x24,0x20,
+    0x83,0x7c,0x24,0x20,0x20,0x76,0xa8,0x89,0x73,0x04,0xf0,0xff,0x43,0x0c,0x48,0x83,
+    0xc4,0x38,0x5f,0x5e,0x5b,0x41,0x58,0x5a,0x59,0xff,0x25,0xf1,0x13,0x00,0x00,0xcc,
+    0x50,0x48,0xb8,0xc0,0x5a,0xde,0xc0,0x5a,0xde,0xc0,0x5a,0xf0,0xff,0x40,0x10,0x58,
+    0x53,0x48,0x83,0xec,0x30,0xe9,0x2c,0x83,0xe8,0xff,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,
+    0x50,0x48,0xb8,0xc0,0x5a,0xde,0xc0,0x5a,0xde,0xc0,0x5a,0xf0,0xff,0x40,0x14,0x58,
+    0x53,0x48,0x83,0xec,0x30,0xe9,0x6c,0x69,0xe8,0xff,0xcc,0xcc,0xcc,0xcc,0xcc,0xcc,
+    0x50,0x48,0xb8,0xc0,0x5a,0xde,0xc0,0x5a,0xde,0xc0,0x5a,0xf0,0xff,0x40,0x1c,0x58,
+    0x53,0x55,0x41,0x56,0xe9,0x6c,0xca,0xef,0xff,
+};
+/* where the host address goes: vis, show, hide, paint */
+static const unsigned short ios_sch302_hide_imm[4] = { 0x0d, 0xa3, 0xc3, 0xe3 };
+static const unsigned char ios_sch302_window_entry[11] =   /* Show() and Hide(): push rbx; sub rsp,30h; mov rbx,rcx; xor ecx,ecx */
+    { 0x40,0x53,0x48,0x83,0xec,0x30,0x48,0x8b,0xd9,0x33,0xc9 };
+static const unsigned char ios_sch302_paint_entry[12] =    /* push rbx; push rbp; push r14; sub rsp,120h */
+    { 0x40,0x53,0x55,0x41,0x56,0x48,0x81,0xec,0x20,0x01,0x00,0x00 };
+static const unsigned char ios_sch302_pump_call[6] = { 0xff,0x15,0x26,0x16,0x00,0x00 };
+
+/* Why `base` cannot take the [sc-hide] stubs, or NULL. */
+static const char *ios_sc_hide_mismatch( const char *base, SIZE_T total_size, const IMAGE_NT_HEADERS *nt )
+{
+    unsigned int k;
+
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 || nt->FileHeader.TimeDateStamp != IOS_SCH302_STAMP ||
+        nt->OptionalHeader.SizeOfImage != IOS_SCH302_SIZE || total_size < IOS_SCH302_SIZE)
+        return "not Social Club 2.4.0.302 (the only build analysed for it)";
+    if (memcmp( base + IOS_SCH302_LOOP_INIT, ios_sch302_loop_thunk, sizeof(ios_sch302_loop_thunk) ))
+        return "the [sc-rph] renderer loop is not installed";
+    if (memcmp( base + IOS_SCH302_PUMP_CALL, ios_sch302_pump_call, sizeof(ios_sch302_pump_call) ))
+        return "renderer loop pump call differs";
+    if (memcmp( base + IOS_SCH302_SHOW_FN, ios_sch302_window_entry, sizeof(ios_sch302_window_entry) ) ||
+        memcmp( base + IOS_SCH302_HIDE_FN, ios_sch302_window_entry, sizeof(ios_sch302_window_entry) ))
+        return "browser window Show()/Hide() entry differs";
+    if (memcmp( base + IOS_SCH302_ON_PAINT, ios_sch302_paint_entry, sizeof(ios_sch302_paint_entry) ))
+        return "on_paint entry differs";
+    for (k = 0; k < IOS_SCH302_HIDE_ZERO; k++)
+        if (base[IOS_SCH302_HIDE_BLOB + k]) return ".text tail not zero";
+    return NULL;
+}
+
+static void ios_sc_hide_patch( char *base, SIZE_T total_size, const IMAGE_NT_HEADERS *nt,
+                               const UNICODE_STRING *nt_name )
+{
+    extern void *ios_sc_vis_address(void);   /* process_ios.c */
+    static int enabled = -1;
+    static const struct { unsigned int site, dest; unsigned char span, opcode; } hooks[] =
+    {
+        { IOS_SCH302_PUMP_CALL, IOS_SCH302_HIDE_BLOB, 6, 0xe8 },
+        { IOS_SCH302_SHOW_FN, IOS_SCH302_HIDE_SHOW_STUB, 6, 0xe9 },
+        { IOS_SCH302_HIDE_FN, IOS_SCH302_HIDE_HIDE_STUB, 6, 0xe9 },
+        { IOS_SCH302_ON_PAINT, IOS_SCH302_HIDE_PAINT_STUB, 5, 0xe9 },
+    };
+    ULONG64 host = (ULONG64)(ULONG_PTR)ios_sc_vis_address();
+    const char *why;
+    unsigned int k;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_SC_HIDE" );
+        enabled = e && e[0] == '1';
+    }
+    if (!enabled || !nt_name || !nt_name->Buffer ||
+        !ios_sc_path_is_helper( nt_name->Buffer, nt_name->Length / sizeof(WCHAR) )) return;
+    if ((why = ios_sc_hide_mismatch( base, total_size, nt )))
+    {
+        dprintf( 2, "[sc-hide] SocialClubHelper.exe at %p (TimeDateStamp 0x%08x) not patched: %s -- its pages "
+                    "are never told they are hidden (MADEIRA_SC_HIDE)\n", base,
+                 (unsigned int)nt->FileHeader.TimeDateStamp, why );
+        return;
+    }
+    memcpy( base + IOS_SCH302_HIDE_BLOB, ios_sch302_hide_blob, sizeof(ios_sch302_hide_blob) );
+    for (k = 0; k < ARRAY_SIZE(ios_sch302_hide_imm); k++)
+        memcpy( base + IOS_SCH302_HIDE_BLOB + ios_sch302_hide_imm[k], &host, sizeof(host) );
+    for (k = 0; k < ARRAY_SIZE(hooks); k++)
+    {
+        int32_t disp = (int32_t)(hooks[k].dest - hooks[k].site - 5);
+        base[hooks[k].site] = (char)hooks[k].opcode;
+        memcpy( base + hooks[k].site + 1, &disp, sizeof(disp) );
+        memset( base + hooks[k].site + 5, 0x90, hooks[k].span - 5 );
+    }
+    dprintf( 2, "[sc-hide] SocialClubHelper.exe at %p (2.4.0.302): WasHidden stub on the renderer loop pump "
+                "(guest 0x%llx), Show()/Hide()/OnPaint counters; host state %p (MADEIRA_SC_HIDE)\n",
+             base, (unsigned long long)(ULONG_PTR)(base + IOS_SCH302_HIDE_BLOB), (void *)(ULONG_PTR)host );
+}
+
 /* Does the calling pseudo-process have socialclub.dll mapped? The table is read
  * under the pool lock, the images' export names outside it (the caller holds
  * virtual_mutex, so none of this process's images can be unmapped meanwhile). */
@@ -23321,6 +23449,14 @@ static void ios_swap_image_flush( int ok )
     }
 }
 
+/* madeira-bcd log-volume: env.MADEIRA_DECOMMIT_LOG_ALL = 1 keeps every swap-zero [decommit-zero] line */
+static int ios_decommit_log_all(void)
+{
+    static int all = -1;
+    if (all < 0) { const char *e = getenv( "MADEIRA_DECOMMIT_LOG_ALL" ); all = e && e[0] == '1'; }
+    return all;
+}
+
 static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
@@ -23512,7 +23648,12 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
                         dprintf( 2, "[decommit-zero] #%lu base=%p size=0x%lx branch=swap-hole "
                                  "(zero by hole, not read back)\n", dc_n, base, (unsigned long)size );
                 }
-                else
+                else if (strcmp( dc_branch, "swap-zero" ) || dc_n <= 8 || (dc_n % 4096) == 0 || ios_decommit_log_all())
+                    /* madeira-bcd log-volume: swap-zero (a rotated backing or a punched hole,
+                     * ml1081/ml1257) is the ordinary decommit under swap-mode 2, not an
+                     * anomaly: RDR2 logged it on every decommit, 16,647 lines (~30 a second
+                     * in play, log 1127-0105-wave1). Rate-limited like swap-hole above;
+                     * env.MADEIRA_DECOMMIT_LOG_ALL = 1 logs every one, as before. */
                     dprintf( 2, "[decommit-zero] #%lu base=%p size=0x%lx branch=%s "
                              "(no read-back: this branch does not zero)\n",
                              dc_n, base, (unsigned long)size, dc_branch );
@@ -24780,6 +24921,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     }
     /* madeira-bcd: [sc-rph], before the protections and the JIT-pool copy. */
     ios_sc_render_handler_patch( ptr, total_size, nt, sec, nt_name );
+    ios_sc_hide_patch( ptr, total_size, nt, nt_name );   /* madeira-bcd [sc-hide], after [sc-rph] */
 
     /* madeira-bcd [x64-image]: decided before any protection is set, so both
      * the section pass and the eager copy loop below see the mark (see

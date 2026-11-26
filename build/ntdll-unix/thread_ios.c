@@ -3028,9 +3028,13 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
         if (nlen < 0) nlen = 0;
         nm[nlen] = 0;
         if (ios_terminate_is_self( handle ))
+        {
+            extern void ios_thread_name_note( unsigned int tid, const char *name );   /* process_ios.c */
             ERR( "[thr-name] ml810 tid=%04x teb=%p name=\"%s\"\n",
                  (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
                  NtCurrentTeb(), nm );
+            ios_thread_name_note( (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, nm );
+        }
         else
             ERR( "[thr-name] ml810 handle=%p (named by tid=%04x, NOT self) name=\"%s\"\n",
                  handle, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, nm );
