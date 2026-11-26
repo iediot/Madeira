@@ -3,6 +3,7 @@ import CryptoKit
 import UniformTypeIdentifiers
 import UIKit
 import Darwin
+import os
 import ImageIO
 import CoreImage
 import Combine
@@ -1024,13 +1025,21 @@ struct LibraryEntry: Codable, Identifiable {
         let exe = (exe == "launcher.exe" && path.contains("rockstar games/launcher")) ? "rdr2.exe" : exe
         switch exe {
         case "rdr2.exe", "playrdr2.exe":
+            // Video budget by memory limit. 4096 MB was measured on the 12 GB iPad. The
+            // iPhone 18 Pro (11.5 GB, 8 GB jetsam limit) ran 50-58 fps until RAGE's streamer
+            // filled that budget: footprint 7.4 of 8.2 GB, 1.5 GB compressed, 47% page waits,
+            // GPU idle, 1 fps (log 2026-11-26 10:39). RDR2 polls QueryVideoMemoryInfo, so a
+            // smaller base and an earlier ml1075 trim keep it out of the compressor.
+            // Keyed on the memory limit, not installed RAM: the 12 GB-limit iPad and the 8 GB-limit
+            // iPhone both report ~11.5 GB of physicalMemory. The app is small when this runs.
+            let roomyLimit = os_proc_available_memory() >= 10 << 30
+            let videoBudget = roomyLimit ? "vram-mb = 4096" : "vram-mb = 2048\nvram-trim-mb = 2560"
             // Per-command timing and hot-page reports are for captures, not normal play.
-            return socialClub + "\n" + bcd + "\n" + """
+            return socialClub + "\n" + bcd + "\n" + videoBudget + "\n" + """
             d3d12-shader-pack = 1
             replay-split = 0
             ring-share = 1
             pool-mid = 1
-            vram-mb = 4096
             swap-mb = 8192
             swap-mode = 2
             swap-min-mb = 1

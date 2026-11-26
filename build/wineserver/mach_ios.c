@@ -914,6 +914,51 @@ static int ios_ctx_fp_enabled(void)
     return enabled;
 }
 
+/* Where a halted thread's guest vector registers are, for ios_fill_thread_context(). */
+enum { IOS_CTX_FP_NONE, IOS_CTX_FP_LIVE, IOS_CTX_FP_SYSCALL_FRAME };
+
+/* A frame written by __wine_syscall_dispatcher, not __wine_unix_call_dispatcher. The Unix
+ * call dispatcher stores its return address as both lr and pc and saves only q8-q15; the
+ * syscall dispatcher stores the caller's lr (x9) and its return address (x30) and saves all
+ * vector registers, fpcr and fpsr. */
+static int ios_scf_is_syscall( const unsigned char *f )
+{
+    uint64_t lr = *(const uint64_t *)(f + IOS_SCF_LR), pc = *(const uint64_t *)(f + IOS_SCF_PC);
+    return pc && lr != pc;
+}
+
+/* Translated x64 code: the JIT pool outside an image copy, or the pool-low code region.
+ * The wineserver runs in the app's process, so these are the same lock-free classifiers
+ * the samplers in ntdll use. */
+static int ios_pc_is_x64_jit( uint64_t pc )
+{
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern int ios_jit_pool_image_pc( uintptr_t pc, uintptr_t *pe_addr_out );
+    extern int ios_jit_low_contains( uintptr_t a );
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+
+    if (ios_jit_low_contains( (uintptr_t)pc )) return 1;
+    return rx && pc >= rx && pc - rx < ios_jit_pool_size_global &&
+           !ios_jit_pool_image_pc( (uintptr_t)pc, NULL );
+}
+
+/* Selector mirrors is_inside_syscall(): kernel_stack <= sp <= syscall_frame. */
+static int ios_ctx_fp_source( struct thread *thread, uint64_t pc, uint64_t sp, uint64_t *frame_out )
+{
+    uint64_t frame = 0, kstack = 0;
+
+    if (thread->teb &&
+        ios_safe_read( (uint64_t)thread->teb + IOS_TEB_SYSCALL_FRAME_OFF, &frame, 8 ) &&
+        ios_safe_read( (uint64_t)thread->teb + IOS_TEB_KERNEL_STACK_OFF, &kstack, 8 ) &&
+        frame && kstack && !(frame & 7) && kstack < frame && sp >= kstack && sp <= frame)
+    {
+        *frame_out = frame;
+        return IOS_CTX_FP_SYSCALL_FRAME;
+    }
+    return ios_pc_is_x64_jit( pc ) ? IOS_CTX_FP_LIVE : IOS_CTX_FP_NONE;
+}
+
 int ios_fill_thread_context( struct thread *thread,
                              struct context_data *native,
                              struct context_data *wow )
@@ -951,49 +996,53 @@ int ios_fill_thread_context( struct thread *thread,
 
     /* The vector registers too: without them every cross-thread floating-point context
      * came back zeroed. FEX keeps guest XMM0-15 in V0-V15 under ARM64EC, the same mapping
-     * the ARM64EC ABI uses, so these are the guest's XMM registers. One engine moves
-     * code between threads this way: a thread loads it into XMM13, and the main thread
-     * reads its floating-point context into a CONTEXT in the image and jumps to the
-     * XMM13 slot. A thread blocked in a syscall is overridden below from the saved frame.
-     * MADEIRA_CTX_FP=0 restores the zeroed vector registers. */
+     * the ARM64EC ABI uses. One engine moves code between threads this way: a thread loads
+     * it into XMM13, and the main thread reads its floating-point context into a CONTEXT
+     * in the image and jumps to the XMM13 slot.
+     *
+     * Only report vector registers that are known to be the guest's (ios_ctx_fp_source):
+     *  - halted in translated x64 code (JIT pool outside an image copy, or pool-low): the
+     *    live V registers are the guest's XMM registers;
+     *  - halted inside a syscall: the dispatcher saved q0-q31, fpcr and fpsr at entry;
+     *  - anything else (inside a Unix call, which saves only q8-q15 and leaves q0-q7 and
+     *    fpcr/fpsr from an older syscall; FEX's dispatcher, compiler or signal code; ARM64EC
+     *    image code; libraries): leave FLOATING_POINT unset, as before the capture existed.
+     * Reporting live host vector state instead was measured to break a program that samples
+     * its threads' contexts constantly: it read another thread's registers as its own data
+     * and dereferenced a null pointer shortly after start; with the capture switched off it
+     * ran. MADEIRA_CTX_FP=0 turns the capture off entirely. */
     if (have_native && ios_ctx_fp_enabled())
     {
-        arm_neon_state64_t neon;
-        mach_msg_type_number_t ncount = ARM_NEON_STATE64_COUNT;
+        uint64_t fp_frame = 0;
+        int source = ios_ctx_fp_source( thread, arm.__pc, arm.__sp, &fp_frame );
 
-        if (!thread_get_state( port, ARM_NEON_STATE64, (thread_state_t)&neon, &ncount ))
+        if (source == IOS_CTX_FP_LIVE)
         {
-            unsigned int i;
-            for (i = 0; i < 32; i++)
-            {
-                native->fp.arm64_regs.q[i].low  = (uint64_t)neon.__v[i];
-                native->fp.arm64_regs.q[i].high = (uint64_t)(neon.__v[i] >> 64);
-            }
-            native->fp.arm64_regs.fpcr = neon.__fpcr;
-            native->fp.arm64_regs.fpsr = neon.__fpsr;
-            native->flags |= SERVER_CTX_FLOATING_POINT;
-        }
-    }
+            arm_neon_state64_t neon;
+            mach_msg_type_number_t ncount = ARM_NEON_STATE64_COUNT;
 
-    /* Inside a syscall the live vector registers belong to Unix code, which may have
-     * clobbered them; the dispatcher saved the guest's at entry. Same validation as the
-     * ml716 frame substitution below, but not behind its opt-in: only FP is replaced.
-     * A Unix call saves only q8-q15 in that frame, so inside one, q0-q7 are the values of
-     * the thread's last syscall. */
-    if (have_native && thread->teb && (native->flags & SERVER_CTX_FLOATING_POINT))
-    {
-        uint64_t frame = 0, kstack = 0;
-        uint64_t sp = native->ctl.arm64_regs.sp;
-        if (ios_safe_read( (uint64_t)thread->teb + IOS_TEB_SYSCALL_FRAME_OFF, &frame, 8 ) &&
-            ios_safe_read( (uint64_t)thread->teb + IOS_TEB_KERNEL_STACK_OFF, &kstack, 8 ) &&
-            frame && kstack && !(frame & 7) && kstack < frame && sp >= kstack && sp <= frame)
+            if (!thread_get_state( port, ARM_NEON_STATE64, (thread_state_t)&neon, &ncount ))
+            {
+                unsigned int i;
+                for (i = 0; i < 32; i++)
+                {
+                    native->fp.arm64_regs.q[i].low  = (uint64_t)neon.__v[i];
+                    native->fp.arm64_regs.q[i].high = (uint64_t)(neon.__v[i] >> 64);
+                }
+                native->fp.arm64_regs.fpcr = neon.__fpcr;
+                native->fp.arm64_regs.fpsr = neon.__fpsr;
+                native->flags |= SERVER_CTX_FLOATING_POINT;
+            }
+        }
+        else if (source == IOS_CTX_FP_SYSCALL_FRAME)
         {
             unsigned char f[IOS_SCF_SIZE];
-            if (ios_safe_read( frame, f, sizeof(f) ))
+            if (ios_safe_read( fp_frame, f, sizeof(f) ) && ios_scf_is_syscall( f ))
             {
                 memcpy( native->fp.arm64_regs.q, f + IOS_SCF_V, sizeof(native->fp.arm64_regs.q) );
                 native->fp.arm64_regs.fpcr = *(uint32_t *)(f + IOS_SCF_FPCR);
                 native->fp.arm64_regs.fpsr = *(uint32_t *)(f + IOS_SCF_FPSR);
+                native->flags |= SERVER_CTX_FLOATING_POINT;
             }
         }
     }

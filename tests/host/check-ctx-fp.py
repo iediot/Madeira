@@ -6,7 +6,8 @@ returned zeroed XMM registers. Persona 5 Royal reads another thread's floating-p
 a CONTEXT inside its image and jumps to the XMM13 slot, and executed zeros. Checks that the syscall
 frame offsets the capture reads match struct syscall_frame, that the syscall dispatcher saves every
 vector register there, that the capture is gated by MADEIRA_CTX_FP and runs while the thread is
-halted, and the switch itself: unset or 1 captures, 0 restores the zeroed registers, and the
+halted, that only vector registers known to be the guest's are reported (live in translated x64
+code, saved by a syscall -- not a Unix call -- frame, nothing elsewhere), and the switch itself: unset or 1 captures, 0 restores the zeroed registers, and the
 madeira.cfg line wins over the environment.
 """
 from pathlib import Path
@@ -53,10 +54,76 @@ neon = fill.index("thread_get_state( port, ARM_NEON_STATE64")
 assert fill.index("thread_suspend( port )") < fill.index("thread_get_state( port, ARM_THREAD_STATE64") < neon
 assert neon < fill.index("f + IOS_SCF_V") < fill.rindex("thread_resume( port );")
 assert "if (have_native && ios_ctx_fp_enabled())" in fill[:neon]
-assert "(native->flags & SERVER_CTX_FLOATING_POINT)" in fill[neon:fill.index("f + IOS_SCF_V")]
-assert "native->flags |= SERVER_CTX_FLOATING_POINT;" in fill
-print("PASS: the vector capture is gated by MADEIRA_CTX_FP, runs while the thread is halted, and the "
-      "frame override only replaces a capture that happened")
+assert "ios_ctx_fp_source( thread, arm.__pc, arm.__sp, &fp_frame )" in fill[:neon]
+assert "source == IOS_CTX_FP_LIVE" in fill[:neon]
+assert "ios_scf_is_syscall( f )" in fill[neon:fill.index("f + IOS_SCF_V")]
+assert fill.count("native->flags |= SERVER_CTX_FLOATING_POINT;") == 2
+print("PASS: the vector capture is gated by MADEIRA_CTX_FP, runs while the thread is halted, and "
+      "reports live registers only for translated code and frame registers only for a syscall frame")
+
+# The rule itself, compiled: which source vouches for the guest's vector registers.
+rule = "\n".join(function(src, n) for n in ("static int ios_scf_is_syscall(", "static int ios_pc_is_x64_jit(",
+                                         "static int ios_ctx_fp_source("))
+enum = re.search(r"enum \{ IOS_CTX_FP_NONE[^;]*;", src).group(0)
+defs = "".join(f"#define {k} {v}\n" for k, v in offs.items())
+defs += "".join(f"#define {k} {v}\n" for k, v in
+                re.findall(r"#define (IOS_TEB_(?:SYSCALL_FRAME|KERNEL_STACK)_OFF)\s+(0x[0-9a-fA-F]+)", src))
+harness = r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdio.h>
+struct thread { void *teb; };
+void *ios_jit_rx_base_global; size_t ios_jit_pool_size_global;
+static uintptr_t img_lo, img_hi, low_lo, low_hi;
+int ios_jit_pool_image_pc( uintptr_t pc, uintptr_t *pe ) { (void)pe; return pc >= img_lo && pc < img_hi; }
+int ios_jit_low_contains( uintptr_t a ) { return a >= low_lo && a < low_hi; }
+static int ios_safe_read( uint64_t a, void *out, size_t n ) { memcpy( out, (void *)(uintptr_t)a, n ); return 1; }
+""" + defs + enum + "\n" + rule + r"""
+#define CHECK(x) do { if (!(x)) { printf("failed line %d: %s\n", __LINE__, #x); return 1; } } while (0)
+static unsigned char teb[0x2000], f[IOS_SCF_SIZE];
+int main(void)
+{
+    struct thread t = { teb };
+    uint64_t fr = 0, kstack = 0x1000, frame = 0x8000;
+    ios_jit_rx_base_global = (void *)0x100000; ios_jit_pool_size_global = 0x100000;
+    img_lo = 0x180000; img_hi = 0x190000; low_lo = 0x50000; low_hi = 0x60000;
+    /* not in a syscall: live registers only in translated code */
+    CHECK(ios_ctx_fp_source( &t, 0x120000, 0x9000, &fr ) == IOS_CTX_FP_LIVE);
+    CHECK(ios_ctx_fp_source( &t, 0x058000, 0x9000, &fr ) == IOS_CTX_FP_LIVE);
+    CHECK(ios_ctx_fp_source( &t, 0x184000, 0x9000, &fr ) == IOS_CTX_FP_NONE);   /* image copy (EC, FEX module) */
+    CHECK(ios_ctx_fp_source( &t, 0x300000, 0x9000, &fr ) == IOS_CTX_FP_NONE);   /* host library */
+    CHECK(ios_ctx_fp_source( &t, 0x0ff000, 0x9000, &fr ) == IOS_CTX_FP_NONE);
+    /* inside a syscall frame: the frame, whatever the pc */
+    memcpy( teb + IOS_TEB_SYSCALL_FRAME_OFF, &frame, 8 ); memcpy( teb + IOS_TEB_KERNEL_STACK_OFF, &kstack, 8 );
+    CHECK(ios_ctx_fp_source( &t, 0x120000, 0x4000, &fr ) == IOS_CTX_FP_SYSCALL_FRAME && fr == frame);
+    CHECK(ios_ctx_fp_source( &t, 0x120000, 0x9000, &fr ) == IOS_CTX_FP_LIVE);
+    /* syscall dispatcher frame: lr = caller's x9, pc = x30; Unix call frame: both x30 */
+    *(uint64_t *)(f + IOS_SCF_LR) = 0x1111; *(uint64_t *)(f + IOS_SCF_PC) = 0x2222;
+    CHECK(ios_scf_is_syscall( f ));
+    *(uint64_t *)(f + IOS_SCF_LR) = 0x2222;
+    CHECK(!ios_scf_is_syscall( f ));
+    *(uint64_t *)(f + IOS_SCF_PC) = 0; *(uint64_t *)(f + IOS_SCF_LR) = 0x1;
+    CHECK(!ios_scf_is_syscall( f ));
+    return 0;
+}
+"""
+with tempfile.TemporaryDirectory() as t:
+    c = Path(t) / "rule.c"; c.write_text(harness); exe = Path(t) / "rule"
+    subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
+                    str(c), "-o", str(exe)], check=True)
+    run = subprocess.run([str(exe)], capture_output=True, text=True)
+    print(run.stdout, end=""); run.check_returncode()
+print("PASS: live vector registers only in translated x64 code, frame registers only from a syscall "
+      "frame (not a Unix call), nothing elsewhere")
+
+# The Unix call dispatcher really stores x30 as both lr and pc, which is what tells the frames apart.
+unix = sig[sig.index("__ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,"):]
+unix = unix[:unix.index("blr x16")]
+assert '"stp x30, x9, [x10, #0xf0]' in unix and '"stp x30, x9, [x10, #0x100]' in unix
+assert '"stp x9, x19, [x10, #0xf0]' in dispatcher and '"stp x30, x9, [x10, #0x100]' in dispatcher
+assert "stp q0," not in unix
+print("PASS: the Unix call dispatcher stores lr == pc and no q0-q7; the syscall dispatcher stores lr = x9")
 
 switch = function(src, "static int ios_ctx_fp_enabled(void)")
 harness = r"""

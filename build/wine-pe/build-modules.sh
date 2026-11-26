@@ -25,6 +25,9 @@
 #                                  api-ms-win-core-winrt-robuffer-l1-1-0, which the
 #                                  apiset schema sends to wintypes.dll; without it
 #                                  Unity stops with "Failed to load il2cpp"
+#   tbs                            Rockstar Games Launcher (Nov 2026 update)
+#                                  imports it; without it Launcher.exe stops
+#                                  with c0000135 and RDR2 never starts
 #   apphelp, ddraw, dxcore, gamingtcui, msi, sxs, wer, xinputuap
 #                                  the other apiset targets games import
 #                                  (GPU enumeration, error reporting, Xbox and
@@ -97,6 +100,7 @@ GAME_MODULES="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcrt20 msvcrt40 msvcirt
     xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_8 xaudio2_9
     x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6
     xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4
+    tbs
     d2d1 wmvcore winegstreamer netprofm"
 # shellcheck disable=SC2086 # the list is split on purpose
 [ $# -gt 0 ] || set -- apphelp cryptsp d3dx11_43 ddraw dxcore gamingtcui msi msvcp110 msvcr110 sxs wer wintypes xaudio2_7 xinputuap $GAME_MODULES
