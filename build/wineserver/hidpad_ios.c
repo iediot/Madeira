@@ -40,12 +40,26 @@
  * runs while some handle has a read pending. Each report is built from the
  * newest snapshot, so a slow reader gets the current state, not a backlog.
  *
+ * ON CHANGE (ml2108, env.MADEIRA_HIDPAD_ON_CHANGE = 1, off by default). An
+ * Xbox 360 pad reports when its state changes; this device's 4 ms clock woke
+ * every reader 250 times a second with the same bytes (dinput's and xinput's
+ * HID threads in each process: ~1.1k reads and ~0.9k get_async_result server
+ * requests a second in RDR2's process alone, logs 2026-11-27 00:19 and 01:05).
+ * With the switch on, a due report whose bytes equal the handle's last one is
+ * held and the read stays pending; any changed byte goes out on the same clock
+ * slot as without the switch, and the unchanged report is resent every
+ * env.MADEIRA_HIDPAD_KEEPALIVE_MS (default 200 ms). Decisions:
+ * build/hidpad/hidpad_pace.h. The generic/Xbox identity only: a DualSense
+ * report carries a counter and a sensor clock, so it streams as before.
+ * [hid-pad] ml2108 lines give ticks and reports per 30 s in both modes.
+ *
  * Nothing here runs unless the app exported MADEIRA_HIDPAD for this session
  * (env.MADEIRA_PAD_MODE = hid); in XInput mode the wineserver does exactly
  * what it did before.
  */
 
 #include "config.h"
+#include "../madeira_cfg.h"   /* env.MADEIRA_HIDPAD_ON_CHANGE: the server starts before the bridge exports env. lines (ml1236); before winbase.h, which poisons strncpy */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -67,6 +81,7 @@
 #include "request.h"
 
 #include "../hidpad/hidpad_reports.h"
+#include "../hidpad/hidpad_pace.h"
 #include "../hidpad/hidparse_ios.h"
 #include "../../app/Madeira/Winios/WiniosPadEffects.h"
 
@@ -78,6 +93,8 @@
 #define HIDPAD_TICK      (TICKS_PER_SEC / 250)    /* 4 ms, a wired DualSense's report rate */
 #define HIDPAD_MIN_GAP   (TICKS_PER_SEC / 1000)   /* a fresh sample goes out after 1 ms */
 #define HIDPAD_LOG_LIMIT 8
+#define HIDPAD_KEEPALIVE_MS 200                   /* ml2108: on-change mode's resend of an unchanged report */
+#define HIDPAD_STAT_PERIOD (30 * (timeout_t)TICKS_PER_SEC)
 
 struct hidpad_device
 {
@@ -94,6 +111,11 @@ struct hidpad_device
     unsigned int                  opens, reads, outputs, features, refused;
     /* ml2106: what the game's output reports asked for, for the log. */
     unsigned int                  out_rumble, out_audio, out_triggers, out_lightbar, out_leds, out_next;
+    /* ml2108: reports on change, and the [hid-pad] ml2108 counters (both modes). */
+    int                           on_change;
+    timeout_t                     keep_alive;
+    timeout_t                     stat_start;
+    unsigned int                  stat_ticks, stat_sent, stat_first, stat_changed, stat_keepalive, stat_held;
 };
 
 struct hidpad_file
@@ -106,6 +128,8 @@ struct hidpad_file
     timeout_t             last_report;    /* monotonic_time of this handle's last report, 0 = none */
     unsigned int          last_packet;    /* snapshot packet that report was built from */
     unsigned int          buffers;        /* IOCTL_[GS]ET_NUM_DEVICE_INPUT_BUFFERS */
+    unsigned int          last_len;       /* ml2108: bytes of that report kept in last_bytes, 0 = none */
+    unsigned char         last_bytes[HIDPAD_DUALSENSE_INPUT_LEN];
 };
 
 static void hidpad_device_dump( struct object *obj, int verbose );
@@ -230,6 +254,7 @@ static struct object *hidpad_device_open_file( struct object *obj, unsigned int 
     file->last_report = 0;
     file->last_packet = 0;
     file->buffers = 32;
+    file->last_len = 0;
     init_async_queue( &file->read_q );
     list_add_tail( &device->files, &file->entry );
     if (!(file->fd = alloc_pseudo_fd( &hidpad_file_fd_ops, &file->obj, options )))
@@ -285,32 +310,57 @@ static int hidpad_file_pending( struct hidpad_file *file )
     return async != NULL;
 }
 
-static int hidpad_report_due( const struct hidpad_file *file, const struct winios_hidpad *pad )
-{
-    timeout_t since = monotonic_time - file->last_report;
-
-    if (!file->last_report || since >= HIDPAD_TICK - HIDPAD_TICK / 8) return 1;
-    return pad->packet != file->last_packet && since >= HIDPAD_MIN_GAP;
-}
-
 /* Complete this handle's oldest pending read with a fresh report, if one is
  * due. One report per handle per call: hidclass hands each queue one report
- * per device report too. */
+ * per device report too. ml2108: with on_change, a due report equal to the
+ * handle's last one is held (hidpad_pace.h); only the generic/Xbox identity
+ * sets on_change, whose report builder keeps no state, so building a report
+ * that is then held changes nothing. */
 static void hidpad_file_deliver( struct hidpad_file *file )
 {
     struct hidpad_device *device = file->device;
     unsigned char report[HIDPAD_DUALSENSE_INPUT_LEN];
     struct winios_hidpad pad;
     struct async *async;
-    unsigned int len;
+    enum hidpad_send send;
+    unsigned int len = 0;
 
     if (!(async = find_pending_async( &file->read_q ))) return;
     winios_hidpad_get_state( &pad );
-    if (hidpad_report_due( file, &pad ))
+    if (!hidpad_pace_due( monotonic_time, file->last_report, file->last_packet, pad.packet,
+                          HIDPAD_TICK, HIDPAD_MIN_GAP ))
+        send = HIDPAD_SEND_NOT_DUE;
+    else if (!device->on_change)
+    {
+        send = HIDPAD_SEND_CLOCK;
+        len = hidpad_input_report( device->id, &pad, &device->state, monotonic_time / 10, report );
+    }
+    else
     {
         len = hidpad_input_report( device->id, &pad, &device->state, monotonic_time / 10, report );
+        send = hidpad_pace_send( 1, monotonic_time, file->last_report, file->last_packet, pad.packet,
+                                 file->last_bytes, file->last_len, report, len,
+                                 HIDPAD_TICK, HIDPAD_MIN_GAP, device->keep_alive );
+    }
+    switch (send)
+    {
+    case HIDPAD_SEND_HELD: device->stat_held++; break;
+    case HIDPAD_SEND_FIRST: device->stat_first++; break;
+    case HIDPAD_SEND_CHANGED: device->stat_changed++; break;
+    case HIDPAD_SEND_KEEPALIVE: device->stat_keepalive++; break;
+    default: break;
+    }
+    if (send >= HIDPAD_SEND_CLOCK)
+    {
         file->last_report = monotonic_time;
         file->last_packet = pad.packet;
+        if (len <= sizeof(file->last_bytes))
+        {
+            memcpy( file->last_bytes, report, len );
+            file->last_len = len;
+        }
+        else file->last_len = 0;
+        device->stat_sent++;
         if (!device->reads++)
             fprintf( stderr, "[hid-pad] ml2101 first input report: %u bytes, pad %s\n", len,
                      pad.connected ? "connected" : "at rest" );
@@ -326,19 +376,50 @@ static void hidpad_start_clock( struct hidpad_device *device )
     if (!device->clock) device->clock = add_timeout_user( -HIDPAD_TICK, hidpad_clock, device );
 }
 
+/* ml2108: one line per 30 s of clock: ticks, reports sent (reads completed
+ * by the clock and by new reads), and in on-change mode why. */
+static void hidpad_stat_log( struct hidpad_device *device, unsigned int handles, unsigned int waiting )
+{
+    timeout_t span = monotonic_time - device->stat_start;
+
+    if (!device->stat_start) { device->stat_start = monotonic_time; return; }
+    if (span < HIDPAD_STAT_PERIOD) return;
+    if (device->on_change)
+        fprintf( stderr, "[hid-pad] ml2108 %.1f s: %u clock ticks, %u reports sent (first %u, changed %u, "
+                 "keep-alive %u), %u held; on-change, keep-alive %u ms, %u handles, %u reads pending\n",
+                 span / (double)TICKS_PER_SEC, device->stat_ticks, device->stat_sent, device->stat_first,
+                 device->stat_changed, device->stat_keepalive, device->stat_held,
+                 (unsigned int)(device->keep_alive / (TICKS_PER_SEC / 1000)), handles, waiting );
+    else
+        fprintf( stderr, "[hid-pad] ml2108 %.1f s: %u clock ticks, %u reports sent; every tick (on-change off), "
+                 "%u handles, %u reads pending\n", span / (double)TICKS_PER_SEC, device->stat_ticks,
+                 device->stat_sent, handles, waiting );
+    device->stat_start = monotonic_time;
+    device->stat_ticks = device->stat_sent = device->stat_first = device->stat_changed = 0;
+    device->stat_keepalive = device->stat_held = 0;
+}
+
 /* The device clock: every 4 ms while any handle has a read pending. */
 static void hidpad_clock( void *private )
 {
     struct hidpad_device *device = private;
     struct hidpad_file *file, *next;
+    unsigned int handles = 0, waiting = 0;
     int pending = 0;
 
     device->clock = NULL;
+    device->stat_ticks++;
     LIST_FOR_EACH_ENTRY_SAFE( file, next, &device->files, struct hidpad_file, entry )
     {
+        int p;
+
         hidpad_file_deliver( file );
-        pending |= hidpad_file_pending( file );
+        p = hidpad_file_pending( file );
+        pending |= p;
+        waiting += p;
+        handles++;
     }
+    hidpad_stat_log( device, handles, waiting );
     if (pending) hidpad_start_clock( device );
 }
 
@@ -684,6 +765,28 @@ void madeira_hidpad_init( void )
     device->opens = device->reads = device->outputs = device->features = device->refused = 0;
     device->out_rumble = device->out_audio = device->out_triggers = device->out_lightbar = 0;
     device->out_leds = device->out_next = 0;
+    device->stat_start = 0;
+    device->stat_ticks = device->stat_sent = device->stat_first = device->stat_changed = 0;
+    device->stat_keepalive = device->stat_held = 0;
+    /* ml2108: reports on change, off by default (the game's lines win, then madeira.cfg, then the
+     * environment). The generic/Xbox identity only: a DualSense report changes every time. */
+    {
+        char onb[16], kab[16];
+        const char *on = madeira_cfg_get( "env.MADEIRA_HIDPAD_ON_CHANGE", onb, sizeof(onb) )   /* 1: a HID pad read completes only when the report changes, plus a keep-alive (generic/Xbox pad) */
+                         ? onb : getenv( "MADEIRA_HIDPAD_ON_CHANGE" );
+        const char *ka = madeira_cfg_get( "env.MADEIRA_HIDPAD_KEEPALIVE_MS", kab, sizeof(kab) )   /* ms between resends of an unchanged HID pad report with on-change (default 200, 4-1000) */
+                         ? kab : getenv( "MADEIRA_HIDPAD_KEEPALIVE_MS" );
+        long ms = ka && *ka ? strtol( ka, NULL, 10 ) : HIDPAD_KEEPALIVE_MS;
+
+        if (ms < 4 || ms > 1000) ms = HIDPAD_KEEPALIVE_MS;
+        device->keep_alive = ms * (TICKS_PER_SEC / 1000);
+        device->on_change = on && on[0] == '1' && id->kind != HIDPAD_KIND_DUALSENSE;   /* generic and xbox: hidpad_generic_input */
+        fprintf( stderr, "[hid-pad] ml2108 reports %s%s\n",
+                 device->on_change ? "on change" : "every 4 ms tick",
+                 device->on_change ? "" : on && on[0] == '1' ? " (on-change asked; a DualSense report changes every time)"
+                                                             : " (env.MADEIRA_HIDPAD_ON_CHANGE off)" );
+        if (device->on_change) fprintf( stderr, "[hid-pad] ml2108 keep-alive %ld ms\n", ms );
+    }
     hidpad_product_name( device );
 
     hidpad_interface_link( id, link, sizeof(link) );

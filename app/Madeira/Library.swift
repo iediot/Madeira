@@ -1092,6 +1092,12 @@ struct LibraryEntry: Codable, Identifiable {
             // value reads in ntdll (build/ntdll-unix/regcache_ios.c); every registry write of every process
             // invalidates it, so no read sees a value a finished write replaced. MADEIRA_REG_CENSUS names
             // the keys every 30 s ([reg-census]) and counts the cache's answers ([reg-cache]).
+            // Controller: the wineserver's HID pad completed every pending read each 4 ms with the same
+            // report; dinput's and xinput's HID threads in RDR2 woke 250 times a second each (~1.1k reads,
+            // 0.9k get_async_result a second, Steam's pair as many; [srv-req] ml1055, logs 2026-11-27
+            // 00:19 and 01:05). MADEIRA_HIDPAD_ON_CHANGE completes a read only when the report's bytes
+            // change -- on the same 4 ms slot as before, no deadzone -- plus a resend every 200 ms
+            // (hidpad_ios.c, [hid-pad] ml2108 counts per 30 s); env.MADEIRA_HIDPAD_ON_CHANGE = 0 turns it off.
             return socialClub + "\n" + bcd + "\n" + videoBudget + "\n" + """
             d3d12-shader-pack = 1
             replay-split = 0
@@ -1147,6 +1153,7 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_PERF_CLASSIFY = 0
             env.MADEIRA_REG_CACHE = RDR2.exe
             env.MADEIRA_REG_CENSUS = RDR2.exe
+            env.MADEIRA_HIDPAD_ON_CHANGE = 1
             """ + (steam ? "\nenv.MADEIRA_DOCK_GAME_SCM = 1\nenv.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe" : "")
         case "gta5_enhanced.exe", "playgtav.exe":
             let steamLines = """

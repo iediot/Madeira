@@ -66,3 +66,21 @@ docs/RDR2_LOAD_TIME_IPHONE18_2026-11-27.md for the per-change lines to check.
 |---|---|---|
 | Read-only key opens/values answered in ntdll | RDR2.exe via profile | `env.MADEIRA_REG_CACHE = 0` (suspect on registry errors, `[bad-close]` near 0x7ff0xxxx) |
 | `[reg-census]` naming hot keys every 30 s | RDR2.exe via profile | `env.MADEIRA_REG_CENSUS = 0` |
+
+### Social Club hide and park (process_ios.c, virtual_ios.c, server_ios.c, queue_ios.c)
+| Change | Default | Off switch |
+|---|---|---|
+| WasHidden on the helper's browsers 180 s after RDR2 starts (helper 2.4.0.302 only) | RDR2 via profile | `env.MADEIRA_SC_HIDE = 0` (suspect if the in-game Social Club overlay is blank) |
+| Helper timed waits stretched to 5 s once armed, lifted on signal/SendMessage, Present watchdog | RDR2 via profile | `env.MADEIRA_SC_PARK = 0` (first suspect if the game hangs after ~3 minutes) |
+| Signal lift for parked waits | on | `env.MADEIRA_SC_PARK_LIFT = 0` |
+| `[sc-cpu]` helper CPU report every 30 s | on | `env.MADEIRA_SC_CPU = 0` |
+| Named sampler for Chrome_InProcRendererThread | RDR2 via profile | `env.MADEIRA_SPIN_PC_NAMES =` (empty) |
+
+Hang triage: a `[sc-park] WATCHDOG` line means presents stopped while the helper was parked;
+if it repeats right after each `[sc-park] ON`, set `env.MADEIRA_SC_PARK = 0`.
+
+### Gamepad reports only on change (wineserver hidpad_ios.c)
+| Change | Default | Off switch |
+|---|---|---|
+| Pending HID reads complete only when the Xbox pad report changes, plus a 200 ms keep-alive | RDR2 via profile | `env.MADEIRA_HIDPAD_ON_CHANGE = 0` (suspect on stuck or laggy input) |
+| Keep-alive interval | 200 ms | `env.MADEIRA_HIDPAD_KEEPALIVE_MS = 4` restores a report every tick |

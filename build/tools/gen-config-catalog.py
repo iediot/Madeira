@@ -114,6 +114,17 @@ OVERLAY = {
                 "note": "1: with the HID controller on, player 1 also stays an XInput pad. Off by default, so a game "
                         "that reads both APIs does not see the same pad twice.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
+    # ml2108: the HID pad's reports on change (build/wineserver/hidpad_ios.c).
+    "env.MADEIRA_HIDPAD_ON_CHANGE": {"category": "Controllers", "title": "HID pad: reports only on change", "kind": "bool",
+                "default": "0",
+                "note": "1: the Xbox/generic HID pad completes a game's pending read only when the report's bytes "
+                        "change (on the same 4 ms clock slot, no deadzone), plus a resend every "
+                        "env.MADEIRA_HIDPAD_KEEPALIVE_MS; fewer wakeups for dinput/xinput's HID threads. "
+                        "The DualSense identity always streams. Read at session start."},
+    "env.MADEIRA_HIDPAD_KEEPALIVE_MS": {"category": "Controllers", "title": "HID pad: on-change keep-alive (ms)", "kind": "int",
+                "default": "200",
+                "note": "With env.MADEIRA_HIDPAD_ON_CHANGE = 1: ms between resends of an unchanged report "
+                        "(4-1000, else 200). Read at session start."},
     "env.MADEIRA_PSO_ARCHIVE_INLINE": {"category": "Direct3D 12", "title": "Pipeline archive: compile once",
                 "kind": "bool", "default": "1",
                 "note": "With pso-archive on: 1 (default) compiles a pipeline the saved archive does not have once, into "
