@@ -4230,6 +4230,7 @@ final class ControlsWindow: UIWindow {
 
 enum TouchControlsHost {
     private static var window: ControlsWindow?
+    private static var ensureSaid = false
 
     /// Called every half second during a session (LibraryModel.poll). The controls window
     /// is framed only when it is attached and on orientation notifications, so a session
@@ -4250,6 +4251,17 @@ enum TouchControlsHost {
         if w.windowLevel != .normal + 101 { wrong.append("level \(Int(w.windowLevel.rawValue))"); w.windowLevel = .normal + 101 }
         let bounds = scene.coordinateSpace.bounds
         if w.frame != bounds { wrong.append("frame \(w.frame) for scene \(bounds)"); w.frame = bounds }
+        // The SwiftUI root can keep the size of an earlier orientation after the window
+        // is re-framed: the controls are then laid out for 402x874 inside an 874x402
+        // window and land off screen (session 2026-11-26 17:05, last layout portrait).
+        if let v = w.rootViewController?.view, v.bounds.size != w.bounds.size {
+            wrong.append("content \(v.bounds.size) in window \(w.bounds.size)")
+            v.frame = w.bounds; v.setNeedsLayout(); v.layoutIfNeeded()
+        }
+        if !ensureSaid {
+            ensureSaid = true
+            fputs("[controls] ensure: watching (window \(w.frame), content \(w.rootViewController?.view.bounds.size ?? .zero))\n", stderr)
+        }
         if !wrong.isEmpty {
             fputs("[controls] ensure: fixed \(wrong.joined(separator: ", "))\n", stderr)
         }
@@ -4276,7 +4288,8 @@ enum TouchControlsHost {
             window = w
         }
         window?.frame = scene.coordinateSpace.bounds
-        fputs("[controls] ml644 overlay attached frame=\(window?.frame ?? .zero) " +
+        if let w = window, let v = w.rootViewController?.view { v.frame = w.bounds; v.setNeedsLayout() }
+        fputs("[controls] ml644 overlay attached frame=\(window?.frame ?? .zero) content=\(window?.rootViewController?.view.bounds.size ?? .zero) " +
               "controls=\(TouchControlsModel.shared.controls.count)\n", stderr)
     }
 }
