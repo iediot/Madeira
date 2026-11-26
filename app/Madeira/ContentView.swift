@@ -4231,6 +4231,30 @@ final class ControlsWindow: UIWindow {
 enum TouchControlsHost {
     private static var window: ControlsWindow?
 
+    /// Called every half second during a session (LibraryModel.poll). The controls window
+    /// is framed only when it is attached and on orientation notifications, so a session
+    /// could run with it missing, hidden or still framed for the portrait scene; touch
+    /// input then had all 18 controls while none were drawn (RDR2 through Dock, and other
+    /// games at times). Anything off is put right here and logged with what was wrong.
+    static func ensure() {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let scene = scenes.first(where: { $0.activationState == .foregroundActive }) else { return }
+        guard let w = window else {
+            fputs("[controls] ensure: no controls window in this session -- attaching\n", stderr)
+            attach()
+            return
+        }
+        var wrong: [String] = []
+        if w.windowScene !== scene { wrong.append("other scene"); w.windowScene = scene }
+        if w.isHidden { wrong.append("hidden"); w.isHidden = false }
+        if w.windowLevel != .normal + 101 { wrong.append("level \(Int(w.windowLevel.rawValue))"); w.windowLevel = .normal + 101 }
+        let bounds = scene.coordinateSpace.bounds
+        if w.frame != bounds { wrong.append("frame \(w.frame) for scene \(bounds)"); w.frame = bounds }
+        if !wrong.isEmpty {
+            fputs("[controls] ensure: fixed \(wrong.joined(separator: ", "))\n", stderr)
+        }
+    }
+
     static func attach() {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
