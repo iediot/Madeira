@@ -131,3 +131,96 @@ clocks.
   batch open, flush, draw and tables.
 - **A further option, not enabled:** `async-submit = 1` moves the replay off
   the game's render thread (upstream ml1120). It needs its own A/B run.
+
+## Second round: dead stores, encoder ends, ECL attribution (same day)
+
+None of this has been measured on a device yet.
+
+### What the 1127-0019 log says about the stores
+
+- `ml1137 attachments` in gameplay: store 435-451 MB per census frame. Of that,
+  "no use in the rest of the list" is 217-233 MB, "cleared next" 9.5-11.6 MB
+  and "discarded next" 0 MB. DiscardResource runs about 55 times a frame
+  ("whole discards 55.5"), but the old census only looked at the rest of the
+  same list, so it could not say where those 217-233 MB go next.
+- Each ExecuteCommandLists call has about 4 lists (about 78 lists and 19 calls
+  per frame). RDR2 signals after almost every call, and a Signal commits the
+  command buffer. A store can only be decided before its encoder ends, so the
+  proof has to come from the same call.
+
+### dead-store (default on; `dead-store = 0` turns it off)
+
+A pass leaves out an attachment's store only when D3D12 itself proves that
+nothing can read it. The proof is the first thing that happens to the
+attachment after the pass's last draw, in the rest of the list or in the later
+lists of the same call. Three things count as proof:
+
+- a whole clear of the same view and aspect (always proof)
+- a whole `DiscardResource` (proof by D3D12's rules; `dead-store-discard = 0`
+  turns this one off)
+- an aliasing barrier that names it as `pResourceBefore`, for a texture with
+  the default layout and without simultaneous access. Off unless
+  `dead-store-alias = 1`. The census counts it either way.
+
+Anything else that names the attachment first keeps the store: a draw while it
+is bound, a barrier that names it, a barrier that names every resource (except
+a UAV-all barrier), a copy, a resolve, a partial clear or discard, the end of
+the call, or 8192 commands. Another queue cannot see the gap, because it can
+only follow the call through a fence signalled after the whole call.
+
+Lists record a 64-bit `kill_bloom` filter: one bit for each whole clear, whole
+discard and aliasing `pResourceBefore`. A pass takes Unknown store actions only
+when the filter shows that a proof is possible later in the call. Its end then
+scans once for all attachments and sets the store actions through op 24.
+Capture frames and winemetal builds without op 24 keep the old stores.
+Memoryless or transient textures are not used: whether a texture is ever
+loaded is not known when it is created.
+
+### end-fuse (default on; `end-fuse = 0` turns it off)
+
+New winemetal MadeiraCtl op 25 (`dxmt/src/winemetal/unix/winemetal_unix.c`)
+does three steps in one PE-to-unix transition: it sends the encoder's last
+encode-batch chain, sets the late store actions and calls `endEncoding`.
+Before, these were three separate calls. The Metal calls stay the same, in the
+same order and on the same thread. The DLL probes for op 25 once. An old
+winemetal or remote mode keeps the separate calls. At about 210 encoders a
+frame, this saves about 210 transitions a frame, plus 2 more for each pass
+whose stores are decided at its end.
+
+### New counters (all per frame, always on unless noted)
+
+- `[perf] ecl-steps`: ExecuteCommandLists wall time, split into queue lock
+  wait, pipeline prebuild, command buffer open, list replay and mid-call
+  commits. It also gives encoders opened by kind (render, compute, blit), open
+  and end times shown separately, and how many ends op 25 fused.
+- `[perf] dead-store`: passes decided at their end; attachments not stored, by
+  proof, with MB; attachments stored, because something used them first or
+  because no proof was possible ahead; commands scanned.
+- `[perf] ml1137 stores with no use in their list` (census frames): this line
+  splits the old "no use" bucket into these cases:
+  - deactivated later in the same list
+  - in the later lists of the call: cleared, discarded, deactivated, one of
+    those behind a barrier that names every resource, used, or nothing
+  - for "nothing": what names the texture first after the call (cleared,
+    discarded, deactivated, loaded by a pass, other use) or nothing within
+    3 presents
+- `replay-split = 1` adds "of which pass changes" (passes begun through
+  `exec_begin_render`) and "of which draws' residency" (useResource).
+
+### What to read in the next device log
+
+- `[madeira-d3d12] dead-store = 1 (discard proof 1, aliasing proof 0)`,
+  `end-fuse = 1: ... (MadeiraCtl op 25)` and
+  `rp-discard: stores before a discard are decided when the pass ends`. If
+  op 24 or op 25 says "kept" or "separate calls", the app has an old
+  `libdxmt_combined.a`.
+- gpu-traffic `not stored` MB per frame should equal the dead-store line's
+  not-stored total. Store MB should drop by the same amount.
+- If the census line shows large "after the call: cleared/discarded" numbers,
+  most of the dead stores are across calls, which this change cannot prove. If
+  it shows large "deactivated", try `dead-store-alias = 1`, check visually and
+  compare the numbers.
+- Visual check: the G-buffer, shadows, water, reflections and post effects. If
+  anything changes, set `dead-store-discard = 0` first, then `dead-store = 0`.
+- `ecl-steps`: list replay against lock wait and prebuild. The encoder end time
+  should drop compared with the old combined "encoder open+end" 3.2-3.8 ms.

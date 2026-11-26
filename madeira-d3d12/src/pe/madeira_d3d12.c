@@ -492,6 +492,15 @@ static LONG g_bc_ent[5], g_f7_bsync, g_f7_none, g_f7_subset, g_f7_all;
 static LONG64 g_f7_fw6, g_f7_fwr;
 static LONG64 g_ac_load, g_ac_clear, g_ac_store, g_ac_st_cleared, g_ac_st_read, g_ac_st_rebound, g_ac_st_write, g_ac_st_none;
 static LONG64 g_ac_st_discarded;   /* madeira-bcd rp-discard: stored, then discarded whole before any other use in the list */
+/* madeira-bcd dead-store census: a store with no use in the rest of its list --
+ * what comes first in the later lists of the same call (cleared whole through
+ * that view, discarded whole, deactivated by an aliasing barrier, one of those
+ * but after a barrier naming every resource, used, or nothing), and for
+ * "nothing", what comes first after the call (g_fate). */
+enum { ACL_CLEAR, ACL_DISCARD, ACL_ALIAS, ACL_ALLBAR, ACL_USED, ACL_NONE, ACL_N };
+static LONG64 g_ac_later[ACL_N], g_ac_st_alias;
+enum { FX_CLEAR, FX_DISCARD, FX_ALIAS, FX_LOADED, FX_OTHER, FX_UNSEEN, FX_FULL, FX_N };
+static LONG64 g_fx_b[FX_N];
 static LONG g_ac_frames, g_discards;
 static volatile LONG g_att_census;   /* ml1083: built pipelines, draws that RAN, non-indexed ones */
 /* ml1057: what our GPU allocations ARE. The process dies at 8.19 GB with ~2.6 GB
@@ -668,6 +677,7 @@ static struct mad_xp {
     LONG64 t_flush, n_lat, t_lat, t_draw, t_cmt;         /* inside Present: flush, frame-latency GPU wait, nextDrawable, blit+present+commit */
     LONG64 t_pool;                                       /* worker autorelease pool drain */
     LONG64 ecl_calls, t_ecl_caller;                      /* caller side */
+    volatile LONG64 pace_seq, pace_uj, pace_dt_us;       /* madeira-bcd present-pace: WRITTEN by the unix probe (ios_xp_pace_pub) */
 } g_xp;
 static void mad_xp_role(char role) {   /* tell the probe which thread this is (unix side records its thread id) */
     static DWORD seen[32]; static LONG nseen;
@@ -751,11 +761,20 @@ struct mad_eb {
     unsigned used;                  /* arena bytes in use, a multiple of 16 */
     LONG chains, calls, alone, why[EBF_N];   /* statistics, published by mad_es_finish */
     struct mad_dd dd;
+    /* madeira-bcd end-fuse: late store actions (op 24's request) for encoder st.enc, sent with its endEncoding */
+    struct { UINT64 enc; UINT8 color[8], depth, stencil, pad[6]; } st; int st_has;
     UINT64 arena[MAD_EB_BYTES / 8] __attribute__((aligned(16)));
 };
 static int g_eb_on = -1, g_dd_on = -1;   /* encode-batch, draw-dedup: read once (mad_es_begin) */
 static LONG g_eb_tls = -1;               /* TLS index of the thread's struct mad_eb, -1 until made */
 static volatile LONG g_eb_chains, g_eb_calls, g_eb_alone, g_eb_why[EBF_N], g_dd_sets, g_dd_elided, g_dd_offsets;
+/* madeira-bcd ecl-steps: where ExecuteCommandLists' wall time goes, always on
+ * (a few timer reads per call): queue lock wait, lazy pipeline builds before
+ * the replay, command buffer opens, the lists' replay, mid-call batch commits;
+ * and the encoders by kind with their open and end times apart. */
+enum { ECS_LOCK, ECS_PREBUILD, ECS_BATCH, ECS_REPLAY, ECS_FLUSH, ECS_N };
+static volatile LONG64 g_ecs_t[ECS_N], g_es_end_t;
+static volatile LONG g_ecs_calls, g_ecs_lists, g_es_kind_n[3];
 #ifndef MAD_EB_SLOT   /* TEB TlsSlots[i]: what TlsGetValue reads, without its SetLastError */
 #ifdef __arm64ec__
 /* The TEB through one load whose base register is x18 (NT_TIB.Self at +0x30).
@@ -949,31 +968,91 @@ static obj_handle_t mad_es_renc(obj_handle_t cb, struct WMTRenderPassInfo *i) {
     UINT64 t; obj_handle_t r;
     mad_eb_flush_cur(EBF_ENCODER);
     t = mad_tick(); r = (MTLCommandBuffer_renderCommandEncoder)(cb, i);
-    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); return r;
+    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); InterlockedIncrement(&g_es_kind_n[MAD_EB_RENDER]); return r;
 }
 static obj_handle_t mad_es_cenc(obj_handle_t cb, bool concurrent) {
     UINT64 t; obj_handle_t r;
     mad_eb_flush_cur(EBF_ENCODER);
     t = mad_tick(); r = (MTLCommandBuffer_computeCommandEncoder)(cb, concurrent);
-    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); return r;
+    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); InterlockedIncrement(&g_es_kind_n[MAD_EB_COMPUTE]); return r;
 }
 static obj_handle_t mad_es_benc(obj_handle_t cb) {
     UINT64 t; obj_handle_t r;
     mad_eb_flush_cur(EBF_ENCODER);
     t = mad_tick(); r = (MTLCommandBuffer_blitCommandEncoder)(cb);
-    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); return r;
+    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); InterlockedIncrement(&g_es_kind_n[MAD_EB_BLIT]); return r;
+}
+/* madeira-bcd END-FUSE (madeira.cfg end-fuse, default 1; 0 = off). An encoder
+ * used to end in up to three PE -> unix transitions: the queued chain
+ * (encode-batch), the late store actions (op 24) and endEncoding, ~210 times
+ * a frame in Red Dead Redemption 2. MadeiraCtl op 25 does the three in one
+ * call, with the same Metal calls in the same order on the same thread. Probed
+ * once; a winemetal without op 25, or remote mode, keeps the separate calls. */
+static long long mad_cfg_int_pe(const char *key, long long dflt);
+struct mad_enc_end_req { UINT64 enc, chain; UINT32 kind, has_store; struct { UINT64 enc; UINT8 color[8], depth, stencil, pad[6]; } store; };
+static int g_ef_on = -1;
+static volatile LONG g_ef_n, g_ef_store_n;
+static int mad_ef_ok(void) {
+    if (g_ef_on < 0) {
+        int want = mad_cfg_int_pe("end-fuse", 1) ? 1 : 0, ok = 0;   /* kill switch: 0 = an encoder's last chain, store actions and end go in separate calls */
+        if (want) {
+            struct madeira_ctl_args a; struct mad_enc_end_req r;
+            memset(&a, 0, sizeof a); memset(&r, 0, sizeof r);
+            a.op = 25; a.ptr = (UINT64)(ULONG_PTR)&r; a.len = sizeof r;
+            MadeiraCtl(&a);
+            ok = a.ret != 0;
+        }
+        g_ef_on = ok;
+        d3d12_log("[madeira-d3d12] end-fuse = %d: %s\n", want, ok ? "an encoder's last chain, late store actions and endEncoding go in one call (MadeiraCtl op 25)"
+                                                         : want ? "separate calls (this winemetal has no op 25, or remote mode)" : "separate calls");
+    }
+    return g_ef_on > 0;
 }
 static void mad_es_end(obj_handle_t e) {
     UINT64 t;
-    if (g_eb_tls >= 0) {
-        struct mad_eb *b = mad_eb_cur();
-        if (b) {
-            if (b->head) mad_eb_flush(b, b->enc == e ? EBF_END : EBF_ENCODER);
+    struct mad_eb *b = g_eb_tls >= 0 ? mad_eb_cur() : NULL;
+    if (b && (b->head || b->st_has) && (!b->head || b->enc == e) && (!b->st_has || b->st.enc == (UINT64)e) && mad_ef_ok()) {
+        struct madeira_ctl_args a; struct mad_enc_end_req r;
+        memset(&r, 0, sizeof r);
+        r.enc = (UINT64)e; r.chain = (UINT64)(ULONG_PTR)b->head; r.kind = b->head ? (UINT32)b->kind : MAD_EB_RENDER;
+        if (b->st_has) { r.has_store = 1; memcpy(&r.store, &b->st, sizeof r.store); }
+        memset(&a, 0, sizeof a); a.op = 25; a.ptr = (UINT64)(ULONG_PTR)&r; a.len = sizeof r;
+        t = mad_tick(); MadeiraCtl(&a); t = mad_tick() - t;
+        if (a.ret) {
+            InterlockedExchangeAdd64(&g_es_open_t, (LONG64)t); InterlockedExchangeAdd64(&g_es_end_t, (LONG64)t);   /* the chain is in the end's time now */
+            InterlockedIncrement(&g_ef_n);
+            if (b->st_has) InterlockedIncrement(&g_ef_store_n);
+            if (b->head) { b->calls++; b->why[EBF_END]++; }
+            b->head = b->tail = NULL; b->used = 0; b->enc = 0; b->st_has = 0;
             if (b->dd.enc == e) b->dd.enc = 0;
+            return;
+        }
+        g_ef_on = 0;   /* cannot happen after a probe that answered; separate calls from now on */
+        d3d12_log("[madeira-d3d12] end-fuse: MadeiraCtl op 25 refused an encoder end; separate calls from now on\n");
+    }
+    if (b) {
+        if (b->head) mad_eb_flush(b, b->enc == e ? EBF_END : EBF_ENCODER);
+        if (b->dd.enc == e) b->dd.enc = 0;
+        if (b->st_has) {   /* the late store actions, through op 24 as before */
+            struct madeira_ctl_args a;
+            b->st_has = 0;
+            if (b->st.enc == (UINT64)e) {
+                memset(&a, 0, sizeof a); a.op = 24; a.ptr = (UINT64)(ULONG_PTR)&b->st; a.len = sizeof b->st;
+                MadeiraCtl(&a);
+            }
         }
     }
     t = mad_tick(); (MTLCommandEncoder_endEncoding)(e);
-    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t));
+    t = mad_tick() - t;
+    InterlockedExchangeAdd64(&g_es_open_t, (LONG64)t); InterlockedExchangeAdd64(&g_es_end_t, (LONG64)t);   /* ecl-steps: the end part alone */
+}
+/* exec_rp_late_store: hand the store actions to the encoder's end (1), or 0 to send them now. */
+static int mad_ef_stash_store(obj_handle_t enc, const void *req, size_t len) {
+    struct mad_eb *b = g_eb_tls >= 0 ? mad_eb_cur() : NULL;
+    if (!b || len != sizeof b->st || !mad_ef_ok()) return 0;
+    memcpy(&b->st, req, sizeof b->st);
+    b->st.enc = (UINT64)enc; b->st_has = 1;
+    return 1;
 }
 static void mad_es_release(obj_handle_t o) {   /* a queued command may name it */
     mad_eb_flush_cur(EBF_RELEASE);
@@ -1865,7 +1944,8 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
-        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
+        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref;
+                 UINT8 nalias; struct mad_resource *alias[4]; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*); madeira-bcd dead-store: aliasing pResourceBefore (nalias 5 = more than 4) */
         struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v;
                  UINT nrect, rect_at; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared; madeira-bcd clear-rects: rectangles in cdata */
         struct { UINT vcount, icount, vstart, istart; } draw;
@@ -1923,7 +2003,14 @@ struct mad_list {
      * the last latch per parameter (its table and cdata offset + 1) */
     struct mad_rootsig *rec_rs[2]; UINT64 rec_tab[2][MAD_ROOT_PARAM_MAX]; struct mad_heap *rec_heap;
     UINT64 lat_va[2][MAD_ROOT_PARAM_MAX]; unsigned lat_data[2][MAD_ROOT_PARAM_MAX];
+    UINT64 kill_bloom;   /* madeira-bcd dead-store: textures this list clears whole, discards whole or deactivates (mad_ds_bit) */
 };
+/* madeira-bcd dead-store: the aliasing pResourceBefore list must not grow a command. */
+typedef char mad_cmd_barrier_fits[sizeof(((struct mad_cmd *)0)->u.barrier) <= sizeof(((struct mad_cmd *)0)->u.rts) ? 1 : -1];
+/* madeira-bcd dead-store: one bit of a 64-bit filter per resource. */
+static inline UINT64 mad_ds_bit(const struct mad_resource *r) {
+    return 1ull << ((((UINT64)(ULONG_PTR)r >> 4) * 0x9E3779B97F4A7C15ull) >> 58);
+}
 
 static struct mad_cmd *mad_list_push(struct mad_list *l, enum mad_ck kind) {
     struct mad_cmd *c;
@@ -2001,6 +2088,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
     l->ncmds = 0;
     l->nused = 0;
     l->ncdata = 0;
+    l->kill_bloom = 0;   /* madeira-bcd dead-store */
     l->rec_rs[0] = l->rec_rs[1] = NULL; l->rec_heap = NULL;   /* madeira-bcd static-cbv */
     memset(l->rec_tab, 0, sizeof l->rec_tab); memset(l->lat_va, 0, sizeof l->lat_va); memset(l->lat_data, 0, sizeof l->lat_data);
     mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
@@ -2569,12 +2657,77 @@ static LONG64 f7_att_bytes(const struct mad_resource *r, UINT level) {
     if (!h) h = 1;
     return (LONG64)w * h * b * (r->samples ? r->samples : 1);
 }
+/* madeira-bcd dead-store census: stores nothing in their call used, keyed by
+ * texture, until the first thing after the call names them (or 3 presents go
+ * by). Census frames only; pointers are compared, never followed. */
+#define MAD_FATE_N 128
+static struct { const struct mad_resource *r; LONG64 b; LONG born; } g_fate[MAD_FATE_N];
+static volatile LONG g_fate_n, g_fate_clock;
+static SRWLOCK g_fate_lock = SRWLOCK_INIT;
+static void mad_fate_add(const struct mad_resource *r, LONG64 b) {
+    LONG i;
+    AcquireSRWLockExclusive(&g_fate_lock);
+    for (i = 0; i < g_fate_n; i++) if (g_fate[i].r == r) { g_fate[i].b += b; break; }
+    if (i == g_fate_n) {
+        if (g_fate_n < MAD_FATE_N) { g_fate[i].r = r; g_fate[i].b = b; g_fate[i].born = g_fate_clock; InterlockedIncrement(&g_fate_n); }
+        else InterlockedExchangeAdd64(&g_fx_b[FX_FULL], b);
+    }
+    ReleaseSRWLockExclusive(&g_fate_lock);
+}
+/* r was named by something after its call: its stores go to bucket cls. */
+static void mad_fate_hit(const struct mad_resource *r, int cls) {
+    LONG i, n = g_fate_n;
+    if (!r) return;
+    for (i = 0; i < n && i < MAD_FATE_N; i++) if (g_fate[i].r == r) break;   /* unlocked look first: most commands name nothing tracked */
+    if (i >= n || i >= MAD_FATE_N) return;
+    AcquireSRWLockExclusive(&g_fate_lock);
+    for (i = 0; i < g_fate_n; i++)
+        if (g_fate[i].r == r) {
+            InterlockedExchangeAdd64(&g_fx_b[cls], g_fate[i].b);
+            g_fate[i] = g_fate[g_fate_n - 1];
+            InterlockedDecrement(&g_fate_n);
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_fate_lock);
+}
+/* At each present: entries older than 3 presents were not named again. */
+static void mad_fate_age(void) {
+    LONG i;
+    LONG now = InterlockedIncrement(&g_fate_clock);
+    if (!g_fate_n) return;
+    AcquireSRWLockExclusive(&g_fate_lock);
+    for (i = 0; i < g_fate_n; )
+        if (now - g_fate[i].born >= 3) { InterlockedExchangeAdd64(&g_fx_b[FX_UNSEEN], g_fate[i].b); g_fate[i] = g_fate[g_fate_n - 1]; InterlockedDecrement(&g_fate_n); }
+        else i++;
+    ReleaseSRWLockExclusive(&g_fate_lock);
+}
+/* Before command c is replayed, while stores are tracked. */
+static void exec_fate_cmd(const struct mad_cmd *c) {
+    unsigned k;
+    switch (c->kind) {
+    case MC_CLEAR_RT: case MC_CLEAR_DS: mad_fate_hit(c->u.clear.res, c->u.clear.nrect ? FX_OTHER : FX_CLEAR); break;
+    case MC_DISCARD: mad_fate_hit(c->u.discard.res, c->u.discard.whole ? FX_DISCARD : FX_OTHER); break;
+    case MC_BARRIER:
+        for (k = 0; k < c->u.barrier.n && k < 8; k++) mad_fate_hit(c->u.barrier.res[k], FX_OTHER);
+        for (k = 0; k < c->u.barrier.nalias && k < 4; k++) mad_fate_hit(c->u.barrier.alias[k], FX_ALIAS);
+        break;
+    case MC_COPY_T2T: case MC_RESOLVE: mad_fate_hit(c->u.tt.src, FX_OTHER); mad_fate_hit(c->u.tt.dst, FX_OTHER); break;
+    case MC_COPY_B2T: case MC_COPY_T2B: mad_fate_hit(c->u.bt.tex, FX_OTHER); break;
+    case MC_FILL_TEX: mad_fate_hit(c->u.filltex.res, FX_OTHER); break;
+    default: break;
+    }
+}
+struct mad_ds_slot;
+static unsigned mad_ds_fate(const struct mad_queue *q, const struct mad_list *l, unsigned li, unsigned from,
+                            struct mad_ds_slot *s, unsigned n, int disc_ok, int alias_ok, int all_live);
+static void f7_later_census(struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v, int aspect, LONG64 b);
 /* A stored attachment: what happens to it NEXT in this command list? cleared =
  * the store was wasted; read / rebound = needed; write = overwritten by a write
- * state (usually needed: partial writes); none = no use in this list. */
-static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UINT level) {
+ * state (usually needed: partial writes); none = no use in this list (then the
+ * later lists of the call are looked at: f7_later_census). */
+static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v, int aspect) {
     const struct mad_list *l = e->l;
-    LONG64 b = f7_att_bytes(r, level), *cls = &g_ac_st_none;
+    LONG64 b = f7_att_bytes(r, v->level), *cls = &g_ac_st_none;
     unsigned j, k, lim;
     int rebound = 0;
     InterlockedExchangeAdd64(&g_ac_store, b);
@@ -2600,6 +2753,8 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
         case MC_BARRIER:
             for (k = 0; k < c->u.barrier.n; k++)
                 if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : c->u.barrier.cls[k] == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
+            for (k = 0; k < c->u.barrier.nalias && k < 4; k++)   /* madeira-bcd dead-store census */
+                if (c->u.barrier.alias[k] == r) { cls = rebound ? &g_ac_st_rebound : &g_ac_st_alias; goto done; }
             break;
         case MC_COPY_T2T: case MC_RESOLVE:
             if (c->u.tt.src == r) { cls = &g_ac_st_read; goto done; }
@@ -2618,6 +2773,7 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
         }
     }
     if (rebound) cls = &g_ac_st_rebound;
+    else f7_later_census(e, r, v, aspect, b);   /* madeira-bcd dead-store census */
 done:
     InterlockedExchangeAdd64(cls, b);
 }
@@ -2631,8 +2787,8 @@ static void exec_end(struct mad_exec *e) {
     if (e->cenc) exec_fence_compute(e, e->cenc, 1);
     if (e->renc && g_att_census && e->l) {   /* ml1137 */
         unsigned k;
-        for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] && e->enc_rt[k]->texture) f7_store_census(e, e->enc_rt[k], e->enc_rtp[k].level);
-        if (e->enc_depth && e->enc_depth->texture) f7_store_census(e, e->enc_depth, e->enc_dp.level);
+        for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] && e->enc_rt[k]->texture) f7_store_census(e, e->enc_rt[k], &e->enc_rtp[k], 0);
+        if (e->enc_depth && e->enc_depth->texture) f7_store_census(e, e->enc_depth, &e->enc_dp, 1);
     }
     e->f7_next_rts = 0;
     if (e->renc && g_fault_diag && e->diag_npso) mad_fault_label_render(e);   /* madeira-bcd */
@@ -3698,76 +3854,232 @@ static const struct mad_list *mad_rp_list_at(const struct mad_queue *q, UINT i) 
     if (!n || !n->closed || (n->alloc && n->recorded_generation != n->alloc->generation)) return NULL;
     return n;
 }
-/* What the rest of this list, then the later lists of the same call, does to
- * r (an attachment of the open pass) first, from the command after the pass's
- * last draw: 1 = a whole discard, or a whole clear of this view covering the
- * aspect (0 colour, 1 depth, 2 stencil), so the store is moot; 0 = a draw
- * while it is bound (a pass loads it), a barrier, copy or partial discard or
- * clear naming it, the end of the call, or 8192 commands. */
-static int exec_rp_dead(const struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v, int aspect) {
-    const struct mad_queue *q = e->q;
-    const struct mad_list *l = e->l;
-    unsigned j = e->rp_from, n = 0, li = q->rp_idx, k;
-    int bound = 1;   /* the pass's targets stay bound until an OMSetRenderTargets says otherwise */
-    while (l) {
-        for (; j < l->ncmds; j++) {
+/* madeira-bcd DEAD-STORE (madeira.cfg dead-store, default 1; 0 = off). A
+ * render pass stores each attachment at its end; on Apple's tile GPU that is a
+ * full write of the surface to memory, ~450 MB a frame in Red Dead Redemption 2
+ * (ml1137, 1127-0019 log), and that traffic shares the SoC power budget with
+ * the CPU. A store is left out only when D3D12 itself says nobody can read
+ * what it would write: the next thing to happen to that attachment, in the
+ * rest of this list or in the later lists of the same ExecuteCommandLists
+ * call, is
+ *  - a whole clear of the same view and aspect (always proof),
+ *  - a whole DiscardResource (proof: the contents are undefined after it;
+ *    dead-store-discard = 0 stops treating it as proof), or
+ *  - an aliasing barrier that names it as pResourceBefore, for a texture with
+ *    the default layout and no simultaneous access, which are the ones that
+ *    cannot inherit data (opt-in, dead-store-alias = 1; counted either way in
+ *    the census below).
+ * Anything else that names it first keeps the store: a draw while it is bound
+ * (that pass loads it), a barrier naming it, or one naming every resource
+ * (UAV-all excepted), a copy, resolve, partial clear or partial discard, the
+ * end of the call, or 8192 commands. Another queue cannot see the gap: it can
+ * only follow this call through a fence signalled after the whole call. A
+ * pass that might have such a proof ahead (the lists' kill_bloom filter) says
+ * Unknown store actions and exec_end decides them through MadeiraCtl op 24
+ * (winemetal), right before endEncoding; without op 24 nothing changes.
+ * Counters: the [perf] dead-store line. */
+enum { DSP_UNDECIDED = -1, DSP_LIVE = 0, DSP_CLEAR, DSP_DISCARD, DSP_ALIAS, DSP_N };
+static int g_ds_on = -1, g_ds_discard = -1, g_ds_alias = -1;
+static volatile LONG g_ds_passes, g_ds_n[DSP_N], g_ds_filtered;
+static volatile LONG64 g_ds_b[DSP_N], g_ds_filtered_b, g_ds_scan;
+static int mad_ds_on(void) {
+    if (g_ds_on < 0) {
+        g_ds_discard = mad_cfg_int_pe("dead-store-discard", 1) ? 1 : 0;   /* a whole DiscardResource next proves a store dead */
+        g_ds_alias = mad_cfg_int_pe("dead-store-alias", 0) ? 1 : 0;       /* opt-in: an aliasing barrier deactivating it next does too */
+        g_ds_on = mad_cfg_int_pe("dead-store", 1) ? 1 : 0;                 /* kill switch: 0 = every pass stores as before */
+        d3d12_log("[madeira-d3d12] dead-store = %d (discard proof %d, aliasing proof %d): %s\n", g_ds_on, g_ds_discard, g_ds_alias,
+                  g_ds_on ? "a render pass does not store an attachment whose next use in this ExecuteCommandLists call overwrites it whole"
+                          : "every render pass stores its attachments");
+    }
+    return g_ds_on > 0;
+}
+/* A texture an aliasing barrier deactivates keeps nothing D3D12 lets anyone
+ * read again (no data inheritance for the default layout without simultaneous access). */
+static int mad_ds_alias_kills(const struct mad_resource *r) {
+    return r->desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && !(r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+}
+/* One attachment aspect whose store is being decided: aspect 0 colour, 1 depth, 2 stencil. */
+struct mad_ds_slot { const struct mad_resource *r; const struct mad_rtvp *v; int aspect, bound, res; };
+/* The first thing that happens to each undecided slot, from command `from` of
+ * list `li` of the call q replays (lists[li] = l), then the call's later lists.
+ * Slots left undecided are live. Returns the commands looked at. all_live = 0
+ * (census only) passes barriers that name every resource. */
+static unsigned mad_ds_fate(const struct mad_queue *q, const struct mad_list *l, unsigned li, unsigned from,
+                            struct mad_ds_slot *s, unsigned n, int disc_ok, int alias_ok, int all_live) {
+    unsigned j = from, k, i, left = 0, cnt = 0;
+    for (i = 0; i < n; i++) { s[i].bound = 1; if (s[i].res == DSP_UNDECIDED) left++; }   /* the pass's targets stay bound */
+    while (l && left) {
+        for (; j < l->ncmds && left; j++) {
             const struct mad_cmd *c = &l->cmds[j];
-            if (++n > 8192) return 0;
-            switch (c->kind) {
-            case MC_RTS:
-                bound = c->u.rts.depth == r;
-                for (k = 0; k < c->u.rts.n && k < 8; k++) if (c->u.rts.rt[k] == r) bound = 1;
-                break;
-            case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
-                if (bound) return 0;   /* a pass loads it */
-                break;
-            case MC_DISCARD:
-                if (c->u.discard.res == r) return c->u.discard.whole != 0;
-                break;
-            case MC_CLEAR_RT: case MC_CLEAR_DS:
-                if (c->u.clear.res != r) break;
-                if (c->u.clear.nrect || !mad_rtvp_eq(&c->u.clear.v, v)) return 0;
-                if (!aspect) return c->kind == MC_CLEAR_RT;
-                return c->kind == MC_CLEAR_DS && (c->u.clear.flags & (aspect == 1 ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_STENCIL)) != 0;
-            default:
-                if (mad_cmd_names(c, r)) return 0;
-                break;
+            if (++cnt > 8192) goto out;
+            for (i = 0; i < n; i++) {
+                struct mad_ds_slot *t = &s[i];
+                int res = DSP_UNDECIDED;
+                if (t->res != DSP_UNDECIDED) continue;
+                switch (c->kind) {
+                case MC_RTS:
+                    t->bound = c->u.rts.depth == t->r;
+                    for (k = 0; k < c->u.rts.n && k < 8; k++) if (c->u.rts.rt[k] == t->r) t->bound = 1;
+                    break;
+                case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
+                    if (t->bound) res = DSP_LIVE;   /* a pass loads it */
+                    break;
+                case MC_DISCARD:
+                    if (c->u.discard.res == t->r) res = c->u.discard.whole && disc_ok ? DSP_DISCARD : DSP_LIVE;
+                    break;
+                case MC_CLEAR_RT: case MC_CLEAR_DS:
+                    if (c->u.clear.res != t->r) break;
+                    if (c->u.clear.nrect || !mad_rtvp_eq(&c->u.clear.v, t->v)) res = DSP_LIVE;
+                    else if (!t->aspect) res = c->kind == MC_CLEAR_RT ? DSP_CLEAR : DSP_LIVE;
+                    else res = c->kind == MC_CLEAR_DS && (c->u.clear.flags & (t->aspect == 1 ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_STENCIL))
+                               ? DSP_CLEAR : DSP_LIVE;
+                    break;
+                case MC_BARRIER:
+                    for (k = 0; k < c->u.barrier.n && k < 8; k++) if (c->u.barrier.res[k] == t->r) { res = DSP_LIVE; break; }
+                    if (res != DSP_UNDECIDED) break;
+                    for (k = 0; k < c->u.barrier.nalias && k < 4; k++)
+                        if (c->u.barrier.alias[k] == t->r) { res = alias_ok && mad_ds_alias_kills(t->r) ? DSP_ALIAS : DSP_LIVE; break; }
+                    if (res == DSP_UNDECIDED && all_live && c->u.barrier.all && c->u.barrier.cls_noref != BC_RAW_UAV) res = DSP_LIVE;
+                    break;
+                default:
+                    if (mad_cmd_names(c, t->r)) res = DSP_LIVE;   /* (never a barrier: handled above) */
+                    break;
+                }
+                if (res != DSP_UNDECIDED) { t->res = res; left--; }
             }
         }
         for (l = NULL; !l && ++li < q->rp_nlists; ) l = mad_rp_list_at(q, li);
-        j = 0; bound = 0;   /* a list binds its own targets */
+        j = 0;
+        for (i = 0; i < n; i++) s[i].bound = 0;   /* a list binds its own targets */
     }
-    return 0;
+out:
+    for (i = 0; i < n; i++) if (s[i].res == DSP_UNDECIDED) s[i].res = DSP_LIVE;
+    return cnt;
+}
+/* ml1137 census (see f7_store_census): a store nothing in the rest of its list
+ * used. The later lists of the call decide where it goes; nothing there sends
+ * it to the cross-call table (g_fate). */
+static void f7_later_census(struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v, int aspect, LONG64 b) {
+    struct mad_ds_slot s;
+    int cls;
+    s.r = r; s.v = v; s.aspect = aspect; s.res = DSP_UNDECIDED;
+    if (!e->l || !e->q || !e->q->rp_lists) { InterlockedExchangeAdd64(&g_ac_later[ACL_NONE], b); mad_fate_add(r, b); return; }
+    mad_ds_fate(e->q, e->l, e->q->rp_idx, e->l->ncmds, &s, 1, 1, 1, 1);   /* from this list's end: later lists only */
+    if (s.res == DSP_CLEAR) cls = ACL_CLEAR;
+    else if (s.res == DSP_DISCARD) cls = ACL_DISCARD;
+    else if (s.res == DSP_ALIAS) cls = ACL_ALIAS;
+    else {
+        unsigned li; int named = 0;
+        s.res = DSP_UNDECIDED;
+        mad_ds_fate(e->q, e->l, e->q->rp_idx, e->l->ncmds, &s, 1, 1, 1, 0);   /* again, through barriers that name everything */
+        if (s.res > DSP_LIVE) cls = ACL_ALLBAR;
+        else {   /* live: something named it, or nothing did before the call ended */
+            for (li = e->q->rp_idx + 1; li < e->q->rp_nlists && !named; li++) {
+                const struct mad_list *n = mad_rp_list_at(e->q, li);
+                unsigned j, k;
+                if (!n) continue;
+                for (j = 0; j < n->ncmds && !named; j++) {
+                    const struct mad_cmd *c = &n->cmds[j];
+                    if (c->kind == MC_BARRIER) {
+                        for (k = 0; k < c->u.barrier.n && k < 8; k++) if (c->u.barrier.res[k] == r) named = 1;
+                        for (k = 0; k < c->u.barrier.nalias && k < 4; k++) if (c->u.barrier.alias[k] == r) named = 1;
+                    } else if (c->kind == MC_RTS) {
+                        if (c->u.rts.depth == r) named = 1;
+                        for (k = 0; k < c->u.rts.n && k < 8; k++) if (c->u.rts.rt[k] == r) named = 1;
+                    } else if (mad_cmd_names(c, r)) named = 1;
+                }
+            }
+            cls = named ? ACL_USED : ACL_NONE;
+        }
+    }
+    InterlockedExchangeAdd64(&g_ac_later[cls], b);
+    if (cls == ACL_NONE) mad_fate_add(r, b);
+}
+/* The kill_bloom bits of m that this list or a later list of the call has. */
+static UINT64 exec_ds_ahead(const struct mad_exec *e, UINT64 m) {
+    const struct mad_queue *q = e->q;
+    UINT64 got;
+    UINT li;
+    if (!e->l || !m) return 0;
+    got = e->l->kill_bloom & m;
+    for (li = q->rp_idx + 1; li < q->rp_nlists && got != m; li++) {
+        const struct mad_list *n = mad_rp_list_at(q, li);
+        if (n) got |= n->kill_bloom & m;
+    }
+    return got;
+}
+/* At pass creation: could any attachment of the pass about to begin have a proof ahead? */
+static int exec_ds_want(const struct mad_exec *e) {
+    UINT64 m = 0;
+    UINT i;
+    for (i = 0; i < e->nrt && i < 8; i++) if (e->rt[i] && e->rt[i]->texture) m |= mad_ds_bit(e->rt[i]);
+    if (e->depth && e->depth->texture) m |= mad_ds_bit(e->depth);
+    return exec_ds_ahead(e, m) != 0;
 }
 /* exec_end, before endEncoding: the store actions the pass left open. */
 static void exec_rp_late_store(struct mad_exec *e) {
     struct madeira_ctl_args a; struct mad_rp_store_req r;
+    struct mad_ds_slot s[10]; UINT8 *act[10]; LONG64 bytes[10];
     LONG64 moved = 0;
-    UINT i;
+    UINT64 m = 0, ahead;
+    unsigned n = 0, i;
+    int disc_ok = g_rp_discard > 0 || (g_ds_on > 0 && g_ds_discard > 0), alias_ok = g_ds_on > 0 && g_ds_alias > 0;
     e->rp_late = 0;
     memset(&r, 0xff, sizeof r); r.enc = (UINT64)e->renc; memset(r.pad, 0, sizeof r.pad);
     for (i = 0; i < e->enc_nrt && i < 8; i++) {
         if (!e->enc_rt[i] || !e->enc_rt[i]->texture) continue;
-        r.color[i] = exec_rp_dead(e, e->enc_rt[i], &e->enc_rtp[i], 0) ? WMTStoreActionDontCare : WMTStoreActionStore;
-        if (r.color[i] == WMTStoreActionDontCare) moved += mad_tr_bytes(e->enc_rt[i], e->enc_rtp[i].level, e->enc_rtp[i].layers, 0);
+        s[n].r = e->enc_rt[i]; s[n].v = &e->enc_rtp[i]; s[n].aspect = 0; act[n] = &r.color[i];
+        bytes[n++] = mad_tr_bytes(e->enc_rt[i], e->enc_rtp[i].level, e->enc_rtp[i].layers, 0);
     }
     if (e->enc_depth && e->enc_depth->texture) {
-        r.depth = exec_rp_dead(e, e->enc_depth, &e->enc_dp, 1) ? WMTStoreActionDontCare : WMTStoreActionStore;
-        if (r.depth == WMTStoreActionDontCare) moved += mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 0);
+        s[n].r = e->enc_depth; s[n].v = &e->enc_dp; s[n].aspect = 1; act[n] = &r.depth;
+        bytes[n++] = mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 0);
         if (e->enc_depth->has_stencil) {
-            r.stencil = exec_rp_dead(e, e->enc_depth, &e->enc_dp, 2) ? WMTStoreActionDontCare : WMTStoreActionStore;
-            if (r.stencil == WMTStoreActionDontCare) moved += mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 1);
+            s[n].r = e->enc_depth; s[n].v = &e->enc_dp; s[n].aspect = 2; act[n] = &r.stencil;
+            bytes[n++] = mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 1);
         }
     }
+    for (i = 0; i < n; i++) m |= mad_ds_bit(s[i].r);
+    ahead = exec_ds_ahead(e, m);
+    for (i = 0; i < n; i++) {
+        s[i].res = (ahead & mad_ds_bit(s[i].r)) ? DSP_UNDECIDED : DSP_LIVE;   /* nothing ahead can prove it dead */
+        if (s[i].res == DSP_LIVE) { InterlockedIncrement(&g_ds_filtered); InterlockedExchangeAdd64(&g_ds_filtered_b, bytes[i]); }
+    }
+    if (ahead && e->l) InterlockedExchangeAdd64(&g_ds_scan, mad_ds_fate(e->q, e->l, e->q->rp_idx, e->rp_from, s, n, disc_ok, alias_ok, 1));
+    for (i = 0; i < n; i++) {
+        *act[i] = s[i].res > DSP_LIVE ? WMTStoreActionDontCare : WMTStoreActionStore;
+        if (s[i].res > DSP_LIVE) moved += bytes[i];
+    }
     memset(&a, 0, sizeof a); a.op = 24; a.ptr = (UINT64)(ULONG_PTR)&r; a.len = sizeof r;
-    mad_eb_flush_cur(EBF_OTHER);   /* encode-batch: the pass's queued draws reach Metal first, as before */
-    MadeiraCtl(&a);
+    if (mad_ef_stash_store(e->renc, &r, sizeof r)) a.ret = 1;   /* madeira-bcd end-fuse: sent with endEncoding, right after this */
+    else {
+        mad_eb_flush_cur(EBF_OTHER);   /* encode-batch: the pass's queued draws reach Metal first, as before */
+        MadeiraCtl(&a);
+    }
     if (!a.ret) {   /* cannot happen after a probe that answered; never use Unknown again */
         g_rp_late = 0;
         d3d12_log("[madeira-d3d12] rp-discard: MadeiraCtl op 24 refused a pass's store actions; stores kept from now on\n");
         return;
     }
+    InterlockedIncrement(&g_ds_passes);
+    for (i = 0; i < n; i++) if (s[i].res >= DSP_LIVE && s[i].res < DSP_N && (s[i].res != DSP_LIVE || (ahead & mad_ds_bit(s[i].r)))) {
+        InterlockedIncrement(&g_ds_n[s[i].res]); InterlockedExchangeAdd64(&g_ds_b[s[i].res], bytes[i]);
+    }
     if (moved) { InterlockedExchangeAdd64(&g_tr_store, -moved); InterlockedExchangeAdd64(&g_tr_nostore, moved); }   /* counted as stores at creation */
+}
+/* madeira-bcd dead-store: [perf] line, per frame. */
+static void mad_ds_report(double np) {
+    const double mb = 1048576.0;
+    LONG ps = InterlockedExchange(&g_ds_passes, 0), fl = InterlockedExchange(&g_ds_filtered, 0), nn[DSP_N];
+    LONG64 bb[DSP_N], fb = InterlockedExchange64(&g_ds_filtered_b, 0), sc = InterlockedExchange64(&g_ds_scan, 0);
+    int k;
+    for (k = 0; k < DSP_N; k++) { nn[k] = InterlockedExchange(&g_ds_n[k], 0); bb[k] = InterlockedExchange64(&g_ds_b[k], 0); }
+    if (g_ds_on < 0 && !ps) return;
+    d3d12_log("[perf] dead-store per frame (dead-store = %d, discard %d, alias %d): passes decided at their end %.1f; not stored: "
+              "cleared next %.1f (%.1f MB), discarded next %.1f (%.1f MB), deactivated next %.1f (%.1f MB); stored: used next %.1f (%.1f MB), "
+              "no proof ahead %.1f (%.1f MB); commands looked at %.0f\n",
+              g_ds_on, g_ds_discard, g_ds_alias, ps / np, nn[DSP_CLEAR] / np, bb[DSP_CLEAR] / mb / np, nn[DSP_DISCARD] / np, bb[DSP_DISCARD] / mb / np,
+              nn[DSP_ALIAS] / np, bb[DSP_ALIAS] / mb / np, nn[DSP_LIVE] / np, bb[DSP_LIVE] / mb / np, fl / np, fb / mb / np, sc / np);
 }
 
 /* rp-carry (default 0; opt-in: it removes an encoder boundary, so an ordering
@@ -3944,6 +4256,7 @@ static void mad_tr_report(double np) {
               "after a commit %.1f (%.0f MB)\n",
               cn / np, cb / mb / np, n[RPM_OFF] / np, b[RPM_OFF] / mb / np, n[RPM_PREFIX] / np, b[RPM_PREFIX] / mb / np,
               n[RPM_STATE] / np, b[RPM_STATE] / mb / np, n[RPM_CALL] / np, b[RPM_CALL] / mb / np, n[RPM_COMMIT] / np, b[RPM_COMMIT] / mb / np);
+    mad_ds_report(np);   /* madeira-bcd dead-store */
 }
 /* The next list that mad_ecl_run replays into the same command buffer, or NULL. */
 static const struct mad_list *mad_rp_next(const struct mad_queue *q, UINT count, ID3D12CommandList *const *lists, UINT i) {
@@ -4432,12 +4745,16 @@ static void mad_fault_label_render(struct mad_exec *e) {
     if (e->diag_more && n < (int)sizeof s - 8) snprintf(s + n, sizeof s - n, " ...");
     mad_label(e->renc, "%s", s);
 }
+static int g_replay_split;   /* madeira-bcd: replay split, defined below */
+static void mad_rs_pass_done(UINT64 t0);
 static int exec_begin_render(struct mad_exec *e) {
     struct WMTRenderPassInfo rpi;
     UINT i, w = 0, h = 0;
     unsigned k;
     int attachless = 0;
+    UINT64 rs_tp;   /* madeira-bcd ecl-steps: replay split "of which pass changes" */
     if (exec_same_targets(e)) { InterlockedIncrement(&g_pass_reused); e->rp_from = e->cur + 1; return 1; }
+    rs_tp = g_replay_split > 0 ? mad_tick() : 0;
     if (e->renc) InterlockedIncrement(&g_pass_end_rts);
     e->f7_next_rts = 1;   /* ml1137: the pass being closed hands over to the targets bound now */
     exec_end(e);
@@ -4452,7 +4769,7 @@ static int exec_begin_render(struct mad_exec *e) {
      * comes from the viewport the list has already set. */
     if (!e->nrt && !e->depth) {
         exec_attachless_area(e, &w, &h);
-        if (!w || !h) return 0;
+        if (!w || !h) { mad_rs_pass_done(rs_tp); return 0; }
         attachless = 1;
     }
     /* Pending clears for targets outside this pass go first, on their own.
@@ -4526,7 +4843,7 @@ static int exec_begin_render(struct mad_exec *e) {
         if (e->depth) exec_disc_forget(e, e->depth);
     }
     e->rp_late = 0;   /* madeira-bcd rp-discard: a texture the game discards: the store is decided when the pass ends */
-    if (mad_rp_discard_on() && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {
+    if (!g_capture_on && ((mad_rp_discard_on() && exec_rp_late_want(e)) || (mad_ds_on() && exec_ds_want(e))) && mad_rp_late_ok()) {   /* madeira-bcd dead-store */
         for (i = 0; i < e->nrt; i++) if (rpi.colors[i].texture) rpi.colors[i].store_action = WMTStoreActionUnknown;
         if (rpi.depth.texture) rpi.depth.store_action = WMTStoreActionUnknown;
         if (rpi.stencil.texture) rpi.stencil.store_action = WMTStoreActionUnknown;
@@ -4542,6 +4859,12 @@ static int exec_begin_render(struct mad_exec *e) {
         if (v) { rpi.visibility_buffer = mad_vis_chunk(e, v, v->next, NULL); e->enc_vis_buf = rpi.visibility_buffer; }
     }
     e->vis_prev = ~(UINT64)0;
+    if (g_fate_n) {   /* madeira-bcd dead-store census: a pass binds a store tracked past its call */
+        for (i = 0; i < e->nrt; i++) if (e->rt[i] && rpi.colors[i].texture)
+            mad_fate_hit(e->rt[i], rpi.colors[i].load_action == WMTLoadActionLoad ? FX_LOADED : rpi.colors[i].load_action == WMTLoadActionClear ? FX_CLEAR : FX_DISCARD);
+        if (e->depth && rpi.depth.texture)
+            mad_fate_hit(e->depth, rpi.depth.load_action == WMTLoadActionLoad ? FX_LOADED : rpi.depth.load_action == WMTLoadActionClear ? FX_CLEAR : FX_DISCARD);
+    }
     if (g_att_census) {   /* ml1137 */
         for (i = 0; i < e->nrt; i++)
             if (e->rt[i] && e->rt[i]->texture)
@@ -4572,6 +4895,7 @@ static int exec_begin_render(struct mad_exec *e) {
      * host's enc# resolves straight to one of these lines. */
     if (attachless && e->renc && g_said_attachless++ < 20000)
         d3d12_log("[attachless] enc#%u %ux%u UAV-only\n", e->renc_seq, w, h);
+    mad_rs_pass_done(rs_tp);   /* madeira-bcd ecl-steps */
     if (!e->renc) { d3d12_log("[madeira-d3d12] no render encoder\n"); return 0; }
     e->enc_nrt = e->nrt; memcpy(e->enc_rt, e->rt, sizeof e->rt); e->enc_depth = e->depth;
     e->pass_draws = 0;   /* ml1098 */
@@ -6737,11 +7061,13 @@ static int mad_air_build_vb_table(struct mad_exec *e, const struct mad_pso *pso,
  * argument and constant-buffer tables (mad_air_build_tables_ex). Off by
  * default; when on, one timer read per command, summed per list. */
 enum { RS_LOCK, RS_PREBUILD, RS_BATCH, RS_DRAW, RS_INDIRECT, RS_DISPATCH, RS_COPY, RS_CLEAR,
-       RS_BARRIER, RS_RTS, RS_QUERY, RS_STATE, RS_LISTEND, RS_FLUSH, RS_TABLES, RS_N };
+       RS_BARRIER, RS_RTS, RS_QUERY, RS_STATE, RS_LISTEND, RS_FLUSH, RS_TABLES, RS_DPASS, RS_DUSE, RS_N };
 static const char *const g_rs_names[RS_N] = {
     "lock wait", "prebuild", "batch open", "draw", "indirect", "dispatch", "copy", "clear",
     "barrier", "targets", "query", "state", "list end", "flush",
-    "of which argument tables" };   /* RS_TABLES is inside draw/indirect/dispatch */
+    "of which argument tables",   /* RS_TABLES is inside draw/indirect/dispatch */
+    "of which pass changes",   /* madeira-bcd ecl-steps: exec_begin_render beginning a pass (encoder end + open, clear passes) */
+    "of which draws' residency" };    /* madeira-bcd ecl-steps: useResource declarations of draws */
 static volatile LONG64 g_rs_t[RS_N];
 static volatile LONG g_rs_n[RS_N];
 static int g_replay_split = -1;
@@ -6773,8 +7099,9 @@ static inline void mad_rs_step(int b, UINT64 *t0) {
     InterlockedIncrement(&g_rs_n[b]);
     *t0 = t1;
 }
+static void mad_rs_pass_done(UINT64 t0) { if (t0) mad_rs_step(RS_DPASS, &t0); }   /* madeira-bcd ecl-steps: a pass begun (exec_begin_render) */
 static void mad_rs_report(double presents) {
-    char buf[640];
+    char buf[1024];
     double tf = (double)mad_tick_freq(), np = presents > 0 ? presents : 1.0;
     int pos, b;
     if (g_replay_split <= 0) return;
@@ -8882,6 +9209,7 @@ tess_go:
 #undef MAD_SETBUF
     /* ml1130: no 8 KB clear per draw; each entry is zeroed as it is used */
     const UINT32 use_stages = (UINT32)((gsemu || tv) ? (WMTRenderStageObject | WMTRenderStageMesh | WMTRenderStageFragment) : (WMTRenderStageVertex | WMTRenderStageFragment));
+    UINT64 t_use = g_replay_split > 0 ? mad_tick() : 0;   /* madeira-bcd ecl-steps: "of which draws' residency" */
     mad_use_begin(e, e->renc);
 #define MAD_USE_U(h, u) do { if ((h) && nur < 256 && !mad_use_seen(e, e->renc, (h), (UINT32)(u), use_stages)) { \
         memset(&ur[nur], 0, sizeof ur[nur]); ur[nur].type = WMTRenderCommandUseResource; ur[nur].resource = (h); \
@@ -8909,6 +9237,7 @@ tess_go:
     if (dev->nsrv > 190 && !said_trunc++)
         d3d12_log("[madeira-d3d12] residency list truncated at 256 per draw (%u views); a real residency set is owed\n", dev->nsrv);
     InterlockedExchangeAdd(&g_es_use_n, (LONG)nur);   /* madeira-bcd: encode split */
+    if (t_use) mad_rs_step(RS_DUSE, &t_use);
 #undef MAD_USE
 #undef MAD_USE_U
     if (e->enc_depth && (e->pso->dsso || dev->dsso)) {
@@ -10273,6 +10602,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         e.cur = i;   /* ml1137 */
         if (g_capture_on) mad_capture_log_op(c);   /* madeira-bcd */
         if ((e.npend | e.rp_ndisc) || c->kind == MC_DISCARD) exec_rp_note(&e, c);   /* madeira-bcd clear-defer, rp-discard */
+        if (g_fate_n) exec_fate_cmd(c);   /* madeira-bcd dead-store census: stores tracked past their call */
         switch (c->kind) {
         case MC_PSO: if (c->u.pso && c->u.pso->is_compute) e.cpso = c->u.pso; else e.pso = c->u.pso;
             if (g_sd_state > 0 && g_pso_first && c->u.pso && !c->u.pso->first_used) mad_pso_first(c->u.pso);   /* madeira-bcd: pso-first-use */
@@ -10502,15 +10832,19 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     obj_handle_t ml1049_pool = NSAutoreleasePool_alloc_init();
     const int rs = mad_rs_on();   /* madeira-bcd: replay split */
     UINT64 rs_t = rs ? mad_tick() : 0;
+    UINT64 es_t = mad_tick(), es_s[ECS_N] = {0}, es_u;   /* madeira-bcd ecl-steps */
     struct mad_eb *eb = mad_es_begin();   /* madeira-bcd encode-batch / draw-dedup: this replay's encode state */
     if (ml1021_q) EnterCriticalSection(&ml1021_q->submit_lock);
     if (rs) mad_rs_step(RS_LOCK, &rs_t);
+#define MAD_ECS(b_) do { es_u = mad_tick(); es_s[(b_)] += es_u - es_t; es_t = es_u; } while (0)
+    MAD_ECS(ECS_LOCK);
 
     struct mad_queue *q = (struct mad_queue *)This;
     struct mad_rp_carry rp_k; const struct mad_list *rp_want = NULL;   /* madeira-bcd rp-carry */
     if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd: sync diagnostics, read once */
     mad_prebuild_lists(count, lists);   /* lazy pipelines this batch binds, built in parallel */
     if (rs) mad_rs_step(RS_PREBUILD, &rs_t);
+    MAD_ECS(ECS_PREBUILD);
     memset(&rp_k, 0, sizeof rp_k); q->rp_carry = &rp_k; q->rp_next = NULL; q->rp_lists = lists; q->rp_nlists = count;
     for (UINT i = 0; i < count; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
@@ -10541,20 +10875,30 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             }
             if (rs) mad_rs_step(RS_BATCH, &rs_t);
         }
+        MAD_ECS(ECS_BATCH);
         if (rp_k.renc && l != rp_want) mad_rp_close(q);   /* madeira-bcd rp-carry: handed to a list that is not this one */
         q->rp_next = mad_rp_next(q, count, lists, i); rp_want = q->rp_next; q->rp_idx = i;
         if (l) mad_exec_list(q, l, q->open_cb);   /* times itself */
         if (rs) rs_t = mad_tick();
+        MAD_ECS(ECS_REPLAY); InterlockedIncrement(&g_ecs_lists);
         q->open_lists++;
         q->executed++;
         if (q->open_lists >= 48) {
             mad_rp_close(q);      /* madeira-bcd rp-carry: nothing is carried into a full batch (mad_rp_next) */
             mad_queue_flush(q);   /* bound the batch */
             if (rs) mad_rs_step(RS_FLUSH, &rs_t);
+            MAD_ECS(ECS_FLUSH);
         }
     }
     mad_rp_close(q); q->rp_carry = NULL; q->rp_next = NULL; q->rp_lists = NULL; q->rp_nlists = 0;   /* madeira-bcd rp-carry: never past the call */
     mad_es_finish(eb);   /* madeira-bcd encode-batch: anything still queued goes out under the queue's lock */
+    MAD_ECS(ECS_REPLAY);   /* the last encode-batch send belongs to the replay */
+#undef MAD_ECS
+    {   /* madeira-bcd ecl-steps */
+        int b;
+        for (b = 0; b < ECS_N; b++) if (es_s[b]) InterlockedExchangeAdd64(&g_ecs_t[b], (LONG64)es_s[b]);
+        InterlockedIncrement(&g_ecs_calls);
+    }
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (g_sd_state > 0 && g_gpu_sync && q) {   /* madeira-bcd: gpu-sync -- this submission runs to completion before the game goes on */
         mad_queue_flush(q);
@@ -10736,6 +11080,20 @@ static void mad_perf_present(void) {
                           "useResource entries %.0f (%.0f already declared, skipped; madeira.cfg use-dedup) -- the rest of ExecuteCommandLists is the replay itself\n",
                           1000.0 * (double)et / tf / np, en / np, en ? 1e6 * (double)et / tf / en : 0.0,
                           1000.0 * (double)ot / tf / np, on / np, un / np, us / np);
+                {   /* madeira-bcd ecl-steps */
+                    LONG64 st[ECS_N], endt = InterlockedExchange64(&g_es_end_t, 0);
+                    LONG calls = InterlockedExchange(&g_ecs_calls, 0), lists = InterlockedExchange(&g_ecs_lists, 0), kn[3];
+                    int b;
+                    for (b = 0; b < ECS_N; b++) st[b] = InterlockedExchange64(&g_ecs_t[b], 0);
+                    for (b = 0; b < 3; b++) kn[b] = InterlockedExchange(&g_es_kind_n[b], 0);
+                    d3d12_log("[perf] ecl-steps per frame: %.1f calls, %.1f lists; queue lock wait %.2f ms, pipeline prebuild %.2f ms, command buffer open %.2f ms, "
+                              "list replay %.2f ms, mid-call commits %.2f ms | encoders opened: render %.1f, compute %.1f, blit %.1f; open %.2f ms, end %.2f ms "
+                              "(end-fuse %d: %.1f ends carried their last chain or store actions, %.1f with store actions)\n",
+                              calls / np, lists / np, 1000.0 * st[ECS_LOCK] / tf / np, 1000.0 * st[ECS_PREBUILD] / tf / np, 1000.0 * st[ECS_BATCH] / tf / np,
+                              1000.0 * st[ECS_REPLAY] / tf / np, 1000.0 * st[ECS_FLUSH] / tf / np, kn[MAD_EB_RENDER] / np, kn[MAD_EB_COMPUTE] / np, kn[MAD_EB_BLIT] / np,
+                              1000.0 * (double)(ot - endt) / tf / np, 1000.0 * (double)endt / tf / np,
+                              g_ef_on, InterlockedExchange(&g_ef_n, 0) / np, InterlockedExchange(&g_ef_store_n, 0) / np);
+                }
                 if (g_eb_on > 0 || g_dd_on > 0) {   /* madeira-bcd encode-batch / draw-dedup */
                     LONG ch = InterlockedExchange(&g_eb_chains, 0), ca = InterlockedExchange(&g_eb_calls, 0), al = InterlockedExchange(&g_eb_alone, 0);
                     LONG w[EBF_N], ds = InterlockedExchange(&g_dd_sets, 0), de = InterlockedExchange(&g_dd_elided, 0), dof = InterlockedExchange(&g_dd_offsets, 0);
@@ -10791,6 +11149,20 @@ static void mad_perf_present(void) {
                           InterlockedExchange64(&g_ac_st_cleared, 0) / mb / nf, InterlockedExchange64(&g_ac_st_read, 0) / mb / nf, InterlockedExchange64(&g_ac_st_rebound, 0) / mb / nf,
                           InterlockedExchange64(&g_ac_st_write, 0) / mb / nf, InterlockedExchange64(&g_ac_st_none, 0) / mb / nf,
                           InterlockedExchange64(&g_ac_st_discarded, 0) / mb / nf, InterlockedExchange(&g_discards, 0));
+                {   /* madeira-bcd dead-store census: where the "no use" stores go */
+                    LONG64 lt[ACL_N], fx[FX_N];
+                    int k;
+                    for (k = 0; k < ACL_N; k++) lt[k] = InterlockedExchange64(&g_ac_later[k], 0);
+                    for (k = 0; k < FX_N; k++) fx[k] = InterlockedExchange64(&g_fx_b[k], 0);
+                    d3d12_log("[perf] ml1137 stores with no use in their list, per census frame: deactivated in the list %.1f MB; in the later lists of the call: "
+                              "cleared %.1f, discarded %.1f, deactivated %.1f, one of those behind a barrier naming every resource %.1f, used %.1f, nothing %.1f MB; "
+                              "after the call: cleared %.1f, discarded %.1f, deactivated %.1f, loaded by a pass %.1f, other use %.1f, not named in 3 presents %.1f, "
+                              "untracked %.1f MB\n",
+                              InterlockedExchange64(&g_ac_st_alias, 0) / mb / nf,
+                              lt[ACL_CLEAR] / mb / nf, lt[ACL_DISCARD] / mb / nf, lt[ACL_ALIAS] / mb / nf, lt[ACL_ALLBAR] / mb / nf, lt[ACL_USED] / mb / nf,
+                              lt[ACL_NONE] / mb / nf, fx[FX_CLEAR] / mb / nf, fx[FX_DISCARD] / mb / nf, fx[FX_ALIAS] / mb / nf, fx[FX_LOADED] / mb / nf,
+                              fx[FX_OTHER] / mb / nf, fx[FX_UNSEEN] / mb / nf, fx[FX_FULL] / mb / nf);
+                }
             }
             if (g_perf_presents) mad_tr_report((double)g_perf_presents);   /* madeira-bcd gpu-traffic */
         }
@@ -16252,17 +16624,43 @@ static int mad_sc_init(void) {
                 snprintf(g_sc_rt + l, sizeof g_sc_rt - l, ", dxbc-spaces 1");
             }
             /* The build directory is the converter's identity alone -- this DLL's
-             * stamp and the app image the converter's unix half is linked into
-             * (MADEIRA_APP_IMAGE_UUID, from the bridge) -- and only other builds'
-             * directories are pruned. The switches above get a subdirectory each, so
-             * games with different lists (and two of them running) keep their caches. */
+             * stamp and the identity of the converter's unix half the app links
+             * -- and only other builds' directories are pruned. The switches above
+             * get a subdirectory each, so games with different lists (and two of
+             * them running) keep their caches.
+             * madeira-bcd sc-conv-id: the unix half's identity is its own
+             * MADEIRA_IR_CONVERTER_ID (madeira_ir_unix.mm MAD_SC_BUILD, a hash of
+             * that converter's sources, build flags, LLVM configuration and Apple's
+             * converter library), which the bridge exports as
+             * MADEIRA_IR_CONVERTER_BUILD. The app image's LC_UUID
+             * (MADEIRA_APP_IMAGE_UUID) changes with every Xcode build, so keyed on
+             * it every app build started RDR2's ~5,000 stages from nothing (logs
+             * 2026-11-26 20:06 and 23:28: "removed 1 older build cache(s)",
+             * pipeline creation 3.2 s instead of 1.2 s with the cache warm). The
+             * UUID stays the fallback when the app does not export an identity
+             * computed from sources (an older app, or a converter built without
+             * MADEIRA_IR_CONVERTER_ID). */
             {
                 struct mad_sc_hash hr = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
-                char uuid[40] = "";
-                DWORD ul = GetEnvironmentVariableA("MADEIRA_APP_IMAGE_UUID", uuid, sizeof uuid);   /* set by the app: not a switch */
-                if (!ul || ul >= sizeof uuid) uuid[0] = 0;
+                char uuid[40] = "", conv[64] = "", ident[80];
+                DWORD ul = GetEnvironmentVariableA("MADEIRA_IR_CONVERTER_BUILD", conv, sizeof conv);   /* set by the app: not a switch */
+                if (!ul || ul >= sizeof conv || strncmp(conv, "converter ", 10) || !conv[10]) conv[0] = 0;
+                if (conv[0]) snprintf(ident, sizeof ident, "unix %s", conv);
+                else {
+                    ul = GetEnvironmentVariableA("MADEIRA_APP_IMAGE_UUID", uuid, sizeof uuid);   /* set by the app: not a switch */
+                    if (!ul || ul >= sizeof uuid) uuid[0] = 0;
+                    snprintf(ident, sizeof ident, "%s", uuid);   /* as before: the key of a cache keyed on the UUID */
+                }
                 mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
-                mad_sc_feed(&h, uuid, strlen(uuid) + 1);
+                mad_sc_feed(&h, ident, strlen(ident) + 1);
+#ifdef MAD_SC_CONVERTER_ID
+                if (conv[0] && strcmp(conv + 10, MAD_SC_CONVERTER_ID))   /* the DLL and the app built from different converter sources */
+                    d3d12_log("[madeira-d3d12] shader cache: the app's converter is '%s', this DLL was built for '%s'; "
+                              "the cache is keyed on both\n", conv, g_sc_stamp);
+#endif
+                d3d12_log("[madeira-d3d12] shader cache build identity: %s\n",
+                          conv[0] ? conv : uuid[0] ? "app image UUID (the app exports no converter identity)"
+                                                   : "this DLL only (no converter identity, no app image UUID)");
                 mad_sc_feed(&hr, g_sc_rt, sizeof g_sc_rt);
                 n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
                 if (!n || n >= MAX_PATH - 112) on = 0;
@@ -18962,6 +19360,7 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(ID3D12GraphicsCommandLi
     c->u.clear.res = rt; c->u.clear.v = v;
     if (rgba) memcpy(c->u.clear.rgba, rgba, sizeof c->u.clear.rgba);
     if (nr > 0) { c->u.clear.nrect = (UINT)nr; c->u.clear.rect_at = at; }
+    else l->kill_bloom |= mad_ds_bit(rt);   /* madeira-bcd dead-store: a whole-view clear */
 }
 static void STDMETHODCALLTYPE list_ClearDepthStencilView(ID3D12GraphicsCommandList *This,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil,
@@ -18988,6 +19387,7 @@ static void STDMETHODCALLTYPE list_ClearDepthStencilView(ID3D12GraphicsCommandLi
     c->u.clear.flags = (UINT8)(flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL));
     if (!c->u.clear.flags) c->u.clear.flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
     if (nr > 0) { c->u.clear.nrect = (UINT)nr; c->u.clear.rect_at = at; }
+    else l->kill_bloom |= mad_ds_bit(d);   /* madeira-bcd dead-store: a whole-view clear */
 }
 static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso) {
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_PSO);
@@ -19304,6 +19704,7 @@ static void STDMETHODCALLTYPE list_DiscardResource(ID3D12GraphicsCommandList *Th
     if (!c) return;
     c->u.discard.res = r;
     c->u.discard.whole = mad_discard_whole(r, region);
+    if (c->u.discard.whole) ((struct mad_list *)This)->kill_bloom |= mad_ds_bit(r);   /* madeira-bcd dead-store */
     if (c->u.discard.whole && mad_rp_discard_on()) mad_rp_dset_add(r);   /* its passes decide their store at the end */
 }
 static void STDMETHODCALLTYPE list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref) {
@@ -19480,6 +19881,13 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
             r = (struct mad_resource *)b[i].UAV.pResource;
             cls = BC_RAW_UAV;   /* UAV accesses happen only in compute and render encoders */
+        } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING && b[i].Aliasing.pResourceBefore) {
+            /* madeira-bcd dead-store: the resource this barrier deactivates (noted
+             * only; the barrier still counts as naming every resource) */
+            struct mad_resource *ab = (struct mad_resource *)b[i].Aliasing.pResourceBefore;
+            if (c->u.barrier.nalias < 4) c->u.barrier.alias[c->u.barrier.nalias++] = ab;
+            else c->u.barrier.nalias = 5;
+            if (ab->texture) l->kill_bloom |= mad_ds_bit(ab);
         }
         if (!r) {
             c->u.barrier.all = 1;
@@ -20977,11 +21385,138 @@ static void mad_vt_present(struct mad_device *d, UINT64 presents) {
         d3d12_log("[vis-trace] readback check so far: %ld mips equal to the GPU's own copy, %ld overwritten by a later readback, "
                   "%ld STALE (an earlier readback), %ld different\n", (long)g_vt_chk[0], (long)g_vt_chk[1], (long)g_vt_chk[2], (long)g_vt_chk[3]);
 }
+/* madeira-bcd present-pace (2026-11-27): POWER-STEADY FRAME PACING, OPT-IN, OFF BY DEFAULT.
+ *
+ * Under the energy clamp RDR2 alternated (log 1127-0105-wave1, [xp] every 2 s): ~1 W
+ * at P 1.44 GHz and ~45 presents, then 6-10 s at ~1.5 W (P 1.6-1.75 GHz), then one
+ * window with the cores mostly idle (cpu 4.1 s of 12, 16-28 presents) and a burst at
+ * 2.3-2.8 GHz (60-78 presents): felt as a drop and a second at 60 fps, every 10-30 s.
+ * Energy per frame was ~45 mJ at the clamp and 60-80 mJ in the 1.5 W windows. Holding
+ * the game's thread in Present to a steady interval keeps it from running into those
+ * bursts; whether the governor then stops punishing is for a device run to show.
+ *
+ *   present-cap-fps = N    hold Presents at least 1/N s apart (0 = off, the default)
+ *   present-pace-mw = M    adaptive: after each 2 s probe window whose process energy
+ *                          averaged above M mW the target drops ~10 %; after two windows
+ *                          below 85 % of M it rises 2 fps, up to present-cap-fps (60 when
+ *                          unset) and never below present-pace-min-fps (default 30).
+ *                          The energy comes from the [xp] probe (server_ios.c writes it
+ *                          into g_xp); without it the cap holds.
+ * The deadline advances from the previous deadline, not from "now", so a long frame is not
+ * paid for twice, and it is re-based when Present falls a whole interval behind, so a stall
+ * banks no catch-up frames. Only the Present caller sleeps (NtDelayExecution, a real wait);
+ * nothing else changes. [present-pace] every ~5 s: target, achieved interval, sleep, power. */
+static struct {
+    int on;                       /* -1 unread, 0 off, 1 on */
+    double cap_fps, min_fps, target_fps;
+    LONG64 budget_mw;
+    LONG64 qpf, deadline;
+    LONG64 seen_seq; unsigned under;
+    double last_mw, last_win_s;
+    LONG64 win_start, last_entry, slept;
+    double sum_iv, max_iv; unsigned n_iv, late, rebased;
+    SRWLOCK lock;
+} g_pace = { -1 };
+static void mad_pace_present(void) {
+    LARGE_INTEGER now_li; LONG64 now, period, wait = 0;
+    if (g_pace.on == 0) return;
+    if (g_pace.on < 0) {
+        LONG64 cap = mad_cfg_int_pe("present-cap-fps", 0);      /* frames a second Present is held to; 0 = off */
+        LONG64 mw = mad_cfg_int_pe("present-pace-mw", 0);       /* adaptive pacing: process power budget in mW; 0 = off */
+        LONG64 lo = mad_cfg_int_pe("present-pace-min-fps", 30); /* the adaptive target's floor */
+        LARGE_INTEGER f;
+        AcquireSRWLockExclusive(&g_pace.lock);
+        if (g_pace.on < 0) {
+            QueryPerformanceFrequency(&f);
+            g_pace.qpf = f.QuadPart;
+            g_pace.budget_mw = mw > 0 ? mw : 0;
+            g_pace.cap_fps = cap > 0 ? (double)(cap > 240 ? 240 : cap) : g_pace.budget_mw ? 60.0 : 0.0;
+            g_pace.min_fps = (double)(lo < 5 ? 5 : lo);
+            if (g_pace.min_fps > g_pace.cap_fps) g_pace.min_fps = g_pace.cap_fps;
+            g_pace.target_fps = g_pace.cap_fps;
+            if (g_pace.cap_fps > 0)
+                d3d12_log("[present-pace] ON: Presents held to %.0f fps%s (present-cap-fps = %lld, present-pace-mw = %lld, "
+                          "present-pace-min-fps = %lld)\n", g_pace.cap_fps,
+                          g_pace.budget_mw ? ", lowered while the process draws more than the power budget" : "",
+                          (long long)cap, (long long)mw, (long long)lo);
+            MemoryBarrier();
+            g_pace.on = g_pace.cap_fps > 0 ? 1 : 0;
+        }
+        ReleaseSRWLockExclusive(&g_pace.lock);
+        if (!g_pace.on) return;
+    }
+    AcquireSRWLockExclusive(&g_pace.lock);
+    if (g_pace.budget_mw) {   /* a new probe window? */
+        LONG64 seq = g_xp.pace_seq;
+        MemoryBarrier();
+        if (seq != g_pace.seen_seq) {
+            LONG64 uj = g_xp.pace_uj, dt_us = g_xp.pace_dt_us;
+            g_pace.seen_seq = seq;
+            if (dt_us > 0) {
+                double mw = (double)uj * 1000.0 / (double)dt_us;   /* uJ/us = W */
+                g_pace.last_mw = mw; g_pace.last_win_s = dt_us / 1e6;
+                if (mw > (double)g_pace.budget_mw) {
+                    double step = g_pace.target_fps * 0.1;
+                    g_pace.target_fps -= step < 2.0 ? 2.0 : step;
+                    g_pace.under = 0;
+                } else if (mw < 0.85 * (double)g_pace.budget_mw && ++g_pace.under >= 2) {
+                    g_pace.target_fps += 2.0;
+                    g_pace.under = 0;
+                }
+                if (g_pace.target_fps < g_pace.min_fps) g_pace.target_fps = g_pace.min_fps;
+                if (g_pace.target_fps > g_pace.cap_fps) g_pace.target_fps = g_pace.cap_fps;
+            }
+        }
+    }
+    period = (LONG64)((double)g_pace.qpf / g_pace.target_fps);
+    QueryPerformanceCounter(&now_li); now = now_li.QuadPart;
+    if (!g_pace.deadline || now > g_pace.deadline + period) {   /* first frame, or a whole interval behind */
+        if (g_pace.deadline) g_pace.rebased++;
+        g_pace.deadline = now + period;
+    } else if (now >= g_pace.deadline) {
+        g_pace.late++;
+        g_pace.deadline += period;
+    } else {
+        wait = g_pace.deadline - now;
+        g_pace.deadline += period;
+    }
+    ReleaseSRWLockExclusive(&g_pace.lock);
+    if (wait > 0) {
+        LARGE_INTEGER rel;
+        rel.QuadPart = -(LONG64)((double)wait * 1e7 / (double)g_pace.qpf);
+        if (rel.QuadPart < 0) NtDelayExecution(FALSE, &rel);
+    }
+    QueryPerformanceCounter(&now_li); now = now_li.QuadPart;
+    AcquireSRWLockExclusive(&g_pace.lock);
+    g_pace.slept += wait;
+    if (g_pace.last_entry) {
+        double iv = (now - g_pace.last_entry) * 1000.0 / (double)g_pace.qpf;
+        g_pace.sum_iv += iv; g_pace.n_iv++;
+        if (iv > g_pace.max_iv) g_pace.max_iv = iv;
+    }
+    g_pace.last_entry = now;
+    if (!g_pace.win_start) g_pace.win_start = now;
+    if ((now - g_pace.win_start) >= 5 * g_pace.qpf) {
+        double win_ms = (now - g_pace.win_start) * 1000.0 / (double)g_pace.qpf;
+        d3d12_log("[present-pace] target %.1f fps (%.2f ms) | %u intervals: mean %.2f ms (%.1f fps), max %.2f ms, late %u, "
+                  "re-based %u | slept %.0f ms of %.0f (%.0f%%) | power %.0f mW over the last %.1f s window (budget %lld mW%s)\n",
+                  g_pace.target_fps, 1000.0 / g_pace.target_fps, g_pace.n_iv,
+                  g_pace.n_iv ? g_pace.sum_iv / g_pace.n_iv : 0.0, g_pace.n_iv && g_pace.sum_iv > 0 ? 1000.0 * g_pace.n_iv / g_pace.sum_iv : 0.0,
+                  g_pace.max_iv, g_pace.late, g_pace.rebased, g_pace.slept * 1000.0 / (double)g_pace.qpf, win_ms,
+                  100.0 * g_pace.slept * 1000.0 / (double)g_pace.qpf / win_ms, g_pace.last_mw, g_pace.last_win_s,
+                  (long long)g_pace.budget_mw, g_pace.budget_mw ? "" : ", fixed cap");
+        g_pace.win_start = now; g_pace.slept = 0; g_pace.sum_iv = g_pace.max_iv = 0; g_pace.n_iv = g_pace.late = g_pace.rebased = 0;
+    }
+    ReleaseSRWLockExclusive(&g_pace.lock);
+}
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
-    struct mad_swapchain *s = (struct mad_swapchain *)T;
-    UINT64 stamp = mad_tick(), previous = s->diag_api_last;
+    struct mad_swapchain *s;
+    UINT64 stamp, previous;
     static volatile LONG gap_n, slow_n;
+    if (!(flags & DXGI_PRESENT_TEST)) mad_pace_present();   /* madeira-bcd present-pace (opt-in) */
+    s = (struct mad_swapchain *)T;
+    stamp = mad_tick(); previous = s->diag_api_last;
     if (!(flags & DXGI_PRESENT_TEST)) s->diag_api_last = stamp;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
     QueryPerformanceCounter(&t0);
@@ -21090,6 +21625,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             }
         }
         if (g_att_census) InterlockedIncrement(&g_ac_frames);   /* ml1137: the frame that just ended was a census frame */
+        mad_fate_age();   /* madeira-bcd dead-store census */
         g_att_census = (s->presents % 16) == 15;
         if (g_occlusion_visible < 0) {   /* ml1103 */
             g_occlusion_visible = mad_cfg_int_pe("occlusion-visible", 0) ? 1 : 0;

@@ -30,6 +30,7 @@
 #include <pwd.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
+#include <mach-o/getsect.h>   /* madeira-bcd sc-conv-id: getsectiondata */
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -539,9 +540,9 @@ static void madeira_prune_gpuarchiver_scratch(void)
 
 #include "ProfileFolders.h"
 /* The PE shader cache's build identity (madeira_d3d12.c, mad_sc_init) includes the
- * LC_UUID of the image this bridge is in: the converter's unix half is linked into it
- * too, so the UUID changes whenever the converter could have, and a cache keyed on
- * the DLL's own build would otherwise keep serving an older converter's output. */
+ * identity of the converter's unix half linked into the image this bridge is in
+ * (MADEIRA_IR_CONVERTER_BUILD, below), or failing that the image's LC_UUID: a cache
+ * keyed on the DLL's own build alone would keep serving an older converter's output. */
 static void madeira_export_image_uuid(void)
 {
     Dl_info di;
@@ -558,7 +559,41 @@ static void madeira_export_image_uuid(void)
         char hex[33];
         for (int k = 0; k < 16; k++) snprintf(hex + 2 * k, 3, "%02x", u[k]);
         setenv("MADEIRA_APP_IMAGE_UUID", hex, 1);
-        return;
+        break;
+    }
+
+    /* madeira-bcd sc-conv-id: the identity of the converter linked into this image,
+     * exported as MADEIRA_IR_CONVERTER_BUILD. madeira_d3d12.c keys the PE shader cache
+     * on it and keeps the UUID above only as the fallback: the UUID changes with every
+     * Xcode build, so each app build emptied that cache although the converter was the
+     * same (RDR2: ~5,000 stages, pipeline creation 3.2 s instead of 1.2 s, logs
+     * 2026-11-26/27). The converter's unix half (madeira_ir_unix.mm) holds its identity
+     * as the string literal MAD_SC_BUILD, "converter " plus the 16 hex digits
+     * build/dxmt-ios/build.sh hashes from its sources, flags, LLVM's configuration and
+     * Apple's converter library; it is read here from the image's C strings rather
+     * than through a new function, because any edit to the converter's sources changes
+     * that identity and would empty every cache once (RDR2 ~14 s of conversion). One
+     * distinct value is taken; none (a converter built without an identity, which
+     * answers its build time instead) or two different ones leave the UUID in charge. */
+    {
+        unsigned long size = 0;
+        const char *p = (const char *)getsectiondata(mh, "__TEXT", "__cstring", &size), *end, *hit;
+        char found[32] = "";
+        int ambiguous = 0;
+
+        if (!p || size < 27) return;
+        end = p + size;
+        for (hit = p; (hit = memmem(hit, (size_t)(end - hit), "converter ", 10)) != NULL; hit += 10)
+        {
+            int k;
+            if (end - hit < 27 || hit[26]) continue;   /* "converter " + 16 hex digits + NUL */
+            for (k = 10; k < 26 && ((hit[k] >= '0' && hit[k] <= '9') || (hit[k] >= 'a' && hit[k] <= 'f')); k++) ;
+            if (k != 26) continue;
+            if (!found[0]) memcpy(found, hit, 27);
+            else if (memcmp(found, hit, 27)) ambiguous = 1;
+        }
+        if (found[0] && !ambiguous) setenv("MADEIRA_IR_CONVERTER_BUILD", found, 1);
+        else unsetenv("MADEIRA_IR_CONVERTER_BUILD");
     }
 }
 

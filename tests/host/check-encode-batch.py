@@ -20,6 +20,11 @@ once with the switch off and once on. The calls Metal receives must be the
 same commands, with the same contents (setBytes as they were when handed over),
 on the same encoders, in the same order, interleaved with the same creations,
 ends, releases and labels; on, they must take far fewer encodeCommands calls.
+End-fuse (madeira.cfg end-fuse, default 1): an encoder's last queued chain,
+its late store actions (MadeiraCtl op 24's request) and its endEncoding go to
+winemetal as one MadeiraCtl op 25; the same scenario, with a render pass whose
+store actions are decided at its end, must give Metal the same calls with end
+fuse on, off, and against a winemetal without op 25, in fewer transitions.
 Also: on unless madeira.cfg says encode-batch = 0; a thread-local slot that
 cannot be read in place turns batching and draw-dedup off (on ARM64EC the slot
 is read through `ldr xT, [x18, #0x30]`, not an add off x18: HZD build 500
@@ -129,6 +134,7 @@ harness = r'''
 #include "winemetal.h"
 typedef uint64_t UINT64; typedef int64_t LONG64; typedef int LONG; typedef unsigned char UINT8; typedef unsigned DWORD; typedef unsigned UINT; typedef uint32_t UINT32;
 typedef union { long long QuadPart; } LARGE_INTEGER;
+typedef uintptr_t ULONG_PTR;
 #define TLS_OUT_OF_INDEXES 0xffffffffu
 static __thread void *fake_tls[64];
 static void *broken_tls[64]; static int probe_broken;   /* a TEB whose slots are not where the runtime reads */
@@ -146,15 +152,15 @@ static void d3d12_log(const char *fmt, ...) { (void)fmt; }
 static int QueryPerformanceFrequency(LARGE_INTEGER *f) { f->QuadPart = 1000000; return 1; }
 
 /* What Metal would see. */
-enum { EV_CMD = 1, EV_OPEN, EV_END, EV_REL, EV_LABEL };
+enum { EV_CMD = 1, EV_OPEN, EV_END, EV_REL, EV_LABEL, EV_STORE };
 struct ev { int op, kind; obj_handle_t enc; unsigned type; uint64_t f[4]; unsigned char pay[400]; unsigned plen; };
-static struct ev evs[60000]; static unsigned nev, ncalls, maxchain;
+static struct ev evs[60000]; static unsigned nev, ncalls, maxchain, ntrans;
 static obj_handle_t next_handle = 0x1000;
 static void ev_add(int op, int kind, obj_handle_t enc, unsigned type) {
     struct ev *v = &evs[nev++]; memset(v, 0, sizeof *v); v->op = op; v->kind = kind; v->enc = enc; v->type = type;
 }
 static void rec_chain(int kind, obj_handle_t enc, const struct wmtcmd_base *c) {
-    unsigned n = 0; ncalls++;
+    unsigned n = 0; ncalls++; ntrans++;
     for (; c; c = (const struct wmtcmd_base *)c->next.ptr, n++) {
         struct ev *v; ev_add(EV_CMD, kind, enc, c->type); v = &evs[nev - 1];
         v->f[3] = c->reserved[0] | (uint64_t)c->reserved[1] << 16 | (uint64_t)c->reserved[2] << 32;
@@ -184,18 +190,37 @@ static void rec_chain(int kind, obj_handle_t enc, const struct wmtcmd_base *c) {
 void MTLRenderCommandEncoder_encodeCommands(obj_handle_t enc, const struct wmtcmd_base *c) { rec_chain(0, enc, c); }
 void MTLComputeCommandEncoder_encodeCommands(obj_handle_t enc, const struct wmtcmd_base *c) { rec_chain(1, enc, c); }
 void MTLBlitCommandEncoder_encodeCommands(obj_handle_t enc, const struct wmtcmd_base *c) { rec_chain(2, enc, c); }
-obj_handle_t MTLCommandBuffer_renderCommandEncoder(obj_handle_t cb, struct WMTRenderPassInfo *i) { (void)cb; (void)i; ev_add(EV_OPEN, 0, next_handle, 0); return next_handle++; }
-obj_handle_t MTLCommandBuffer_computeCommandEncoder(obj_handle_t cb, bool c) { (void)cb; (void)c; ev_add(EV_OPEN, 1, next_handle, 0); return next_handle++; }
-obj_handle_t MTLCommandBuffer_blitCommandEncoder(obj_handle_t cb) { (void)cb; ev_add(EV_OPEN, 2, next_handle, 0); return next_handle++; }
-void MTLCommandEncoder_endEncoding(obj_handle_t e) { ev_add(EV_END, 0, e, 0); }
+obj_handle_t MTLCommandBuffer_renderCommandEncoder(obj_handle_t cb, struct WMTRenderPassInfo *i) { (void)cb; (void)i; ntrans++; ev_add(EV_OPEN, 0, next_handle, 0); return next_handle++; }
+obj_handle_t MTLCommandBuffer_computeCommandEncoder(obj_handle_t cb, bool c) { (void)cb; (void)c; ntrans++; ev_add(EV_OPEN, 1, next_handle, 0); return next_handle++; }
+obj_handle_t MTLCommandBuffer_blitCommandEncoder(obj_handle_t cb) { (void)cb; ntrans++; ev_add(EV_OPEN, 2, next_handle, 0); return next_handle++; }
+void MTLCommandEncoder_endEncoding(obj_handle_t e) { ntrans++; ev_add(EV_END, 0, e, 0); }
+/* winemetal's MadeiraCtl: op 24 (late store actions) and op 25 (end-fuse), as winemetal_unix.c does them */
+static int ctl_has25 = 1; static unsigned nfused;
+static void store_ev(obj_handle_t enc, const unsigned char *req) { ev_add(EV_STORE, 0, enc, 0); memcpy(evs[nev - 1].pay, req + 8, 16); evs[nev - 1].plen = 16; }
+void MadeiraCtl(struct madeira_ctl_args *a) {
+    ntrans++; a->ret = 0;
+    if (a->op == 24) { const unsigned char *r = (const void *)(uintptr_t)a->ptr; uint64_t enc; memcpy(&enc, r, 8); if (enc) store_ev(enc, r); a->ret = 1; }
+    else if (a->op == 25 && ctl_has25) {
+        const struct { uint64_t enc, chain; uint32_t kind, has_store; unsigned char store[24]; } *q = (const void *)(uintptr_t)a->ptr;
+        uint64_t senc;
+        a->ret = 1;
+        if (!q->enc) return;
+        nfused++;
+        if (q->chain) { rec_chain((int)q->kind, q->enc, (const struct wmtcmd_base *)(uintptr_t)q->chain); ntrans--; }
+        memcpy(&senc, q->store, 8);
+        if (q->has_store && q->kind == 0 && senc == q->enc) store_ev(q->enc, q->store);
+        ev_add(EV_END, 0, q->enc, 0);
+    }
+}
 void NSObject_release(obj_handle_t o) { ev_add(EV_REL, 0, o, 0); }
 void MTLCommandEncoder_setLabel(obj_handle_t e, obj_handle_t s) { ev_add(EV_LABEL, 0, e, (unsigned)s); }
 ''' + cut + r'''
-static long long cfg_eb = 1, cfg_dd = 1, cfg_reads;
+static long long cfg_eb = 1, cfg_dd = 1, cfg_ef = -1, cfg_reads;
 static long long mad_cfg_int_pe(const char *k, long long d) {
     cfg_reads++;
     if (!strcmp(k, "encode-batch")) return cfg_eb < 0 ? d : cfg_eb;
     if (!strcmp(k, "draw-dedup")) return cfg_dd < 0 ? d : cfg_dd;
+    if (!strcmp(k, "end-fuse")) return cfg_ef < 0 ? d : cfg_ef;
     return d;
 }
 static int bad;
@@ -271,6 +296,20 @@ static void scenario(int with_finish_tail) {
         MTLComputeCommandEncoder_encodeCommands(c, (const struct wmtcmd_base *)&d);
     }
     for (k = 5; k < 9; k++) draw(r2, k, bytes, vps, 0);
+    MTLCommandEncoder_endEncoding(r2);
+    {   /* a pass whose store actions are decided at its end (exec_rp_late_store, then exec_end) */
+        obj_handle_t r3 = MTLCommandBuffer_renderCommandEncoder(0xcb, &rpi);
+        unsigned char req[24]; struct madeira_ctl_args a;
+        fence(r3, 0);
+        for (k = 0; k < 6; k++) draw(r3, k, bytes, vps, 0);
+        fence(r3, 1);
+        memset(req, 0xff, sizeof req); memcpy(req, &r3, 8); req[8] = 0; req[9] = 1; req[16] = 0; req[17] = 1; memset(req + 18, 0, 6);
+        memset(&a, 0, sizeof a); a.op = 24; a.ptr = (UINT64)(uintptr_t)req; a.len = sizeof req;
+        if (!mad_ef_stash_store(r3, req, sizeof req)) { mad_eb_flush_cur(EBF_OTHER); MadeiraCtl(&a); }
+        MTLCommandEncoder_endEncoding(r3);
+    }
+    r2 = MTLCommandBuffer_renderCommandEncoder(0xcb, &rpi);
+    for (k = 0; k < 3; k++) draw(r2, k, bytes, vps, 0);
     if (with_finish_tail) { mad_es_finish(b); b = NULL; }   /* r2 still open: what is queued goes out now */
     for (k = 9; k < 12; k++) draw(r2, k, bytes, vps, 0);   /* outside the replay: sent at once */
     MTLCommandEncoder_endEncoding(r2);
@@ -299,16 +338,36 @@ int main(void) {
            "a TLS slot that cannot be read in place turns both off");
     probe_broken = 0; g_eb_on = g_dd_on = -1; cfg_reads = 0;
     /* reference: switch off */
-    cfg_eb = 0; scenario(1);
-    EXPECT(cfg_reads == 2, "switches read once each");
+    cfg_eb = 0; cfg_ef = 0; scenario(1);
+    EXPECT(cfg_reads == 3, "switches read once each");
+    EXPECT(g_ef_on == 0 && nfused == 0, "end-fuse = 0: separate calls");
     memcpy(ref, evs, nev * sizeof evs[0]); nref = nev; ref_calls = ncalls;
     EXPECT(ref_calls > 500, "reference: one call per chain");
-    /* batched */
+    /* batched, end-fuse off */
     g_eb_on = -1; g_dd_on = -1; cfg_eb = -1; nev = 0; ncalls = 0; next_handle = 0x1000;
     scenario(1);
     EXPECT(g_eb_on == 1, "on by default (madeira.cfg unset)");
     EXPECT(same_log(), "Metal receives the same commands, contents and order, interleaved the same with opens, ends, releases and labels");
     EXPECT(ncalls * 10 < ref_calls, "far fewer encodeCommands calls");
+    {   /* end-fuse: on by default; on, off and without op 25 give Metal the same calls */
+        unsigned unfused_trans, fused_trans;
+        memset(g_eb_why, 0, sizeof g_eb_why); g_eb_alone = 0;
+        nev = 0; ncalls = 0; ntrans = 0; next_handle = 0x1000; scenario(1); unfused_trans = ntrans;
+        EXPECT(same_log(), "end-fuse off, batched: the same calls");
+        g_ef_on = -1; cfg_ef = -1; nfused = 0; nev = 0; ncalls = 0; ntrans = 0; next_handle = 0x1000; scenario(1); fused_trans = ntrans;
+        EXPECT(g_ef_on == 1, "end-fuse on by default when winemetal answers op 25");
+        EXPECT(same_log(), "end-fuse on: the same commands, store actions and ends in the same order");
+        EXPECT(nfused >= 5 && fused_trans + 5 <= unfused_trans, "end-fuse on: fewer transitions");
+        printf("note: end-fuse %u transitions vs %u (%u fused ends)\n", fused_trans, unfused_trans, nfused);
+        g_ef_on = -1; ctl_has25 = 0; nfused = 0; nev = 0; ncalls = 0; next_handle = 0x1000; scenario(1);
+        EXPECT(g_ef_on == 0 && nfused == 0 && same_log(), "a winemetal without op 25: separate calls, the same Metal calls");
+        ctl_has25 = 1; g_ef_on = -1;
+        cfg_eb = 0; g_eb_on = -1; g_dd_on = -1; nfused = 0; nev = 0; ncalls = 0; next_handle = 0x1000; scenario(1);
+        EXPECT(same_log() && nfused >= 1, "end-fuse with encode-batch off: the store actions still go with the end, the same calls");
+        cfg_eb = -1; g_eb_on = -1; g_dd_on = -1;
+        nev = 0; ncalls = 0; next_handle = 0x1000; scenario(1);
+        g_ef_on = 0;   /* the remaining checks compare against the separate-call path */
+    }
     printf("note: %u encodeCommands calls batched vs %u one per chain; longest chain %u\n", ncalls, ref_calls, maxchain);
     EXPECT(g_eb_why[EBF_RELEASE] >= 1 && g_eb_why[EBF_FULL] >= 1 && g_eb_why[EBF_END] >= 3 && g_eb_alone >= 1 && g_eb_why[EBF_ENCODER] >= 1,
            "sent at release, arena full, encoder end, another encoder; the unknown type alone");
