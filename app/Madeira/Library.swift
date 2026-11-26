@@ -1039,8 +1039,10 @@ struct LibraryEntry: Codable, Identifiable {
             // smaller base and an earlier ml1075 trim keep it out of the compressor.
             // Keyed on the memory limit, not installed RAM: the 12 GB-limit iPad and the 8 GB-limit
             // iPhone both report ~11.5 GB of physicalMemory. The app is small when this runs.
+            // 3072 on the 8 GB-limit phone at the owner's request (2026-11-27): it doubled the snow
+            // scene (ph-rdr56); the 2560 MB trim still pulls the budget down as the footprint nears the line.
             let roomyLimit = os_proc_available_memory() >= 10 << 30
-            let videoBudget = roomyLimit ? "vram-mb = 4096" : "vram-mb = 2048\nvram-trim-mb = 2560"
+            let videoBudget = roomyLimit ? "vram-mb = 4096" : "vram-mb = 3072\nvram-trim-mb = 2560"
             // Per-command timing and hot-page reports are for captures, not normal play.
             return socialClub + "\n" + bcd + "\n" + videoBudget + "\n" + """
             d3d12-shader-pack = 1
