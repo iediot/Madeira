@@ -1025,6 +1025,11 @@ struct LibraryEntry: Codable, Identifiable {
         let exe = (exe == "launcher.exe" && path.contains("rockstar games/launcher")) ? "rdr2.exe" : exe
         switch exe {
         case "rdr2.exe", "playrdr2.exe":
+            // Social Club's Chromium (SocialClubHelper.exe, V8 --jitless) kept rendering its hidden
+            // overlay during play: Chrome_InProcRendererThread averaged 38 % of a core, three times
+            // RDR2's busiest thread (log 2026-11-26 15:04). Its threads, matched by name (none of
+            // RDR2's own), run at utility QoS: the efficiency cores, not the performance cores
+            // the game needs, and less heat.
             // Video budget by memory limit. 4096 MB was measured on the 12 GB iPad. The
             // iPhone 18 Pro (11.5 GB, 8 GB jetsam limit) ran 50-58 fps until RAGE's streamer
             // filled that budget: footprint 7.4 of 8.2 GB, 1.5 GB compressed, 47% page waits,
@@ -1067,6 +1072,7 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
             env.MADEIRA_POOL_BIG_CODE_EXES = RDR2.exe
             env.MADEIRA_SYNC_LEAN = 1
+            env.MADEIRA_THREAD_QOS = Chrome_*=utility;Cr*=utility;ThreadPool*=utility;VizCompositor*=utility;Compositor*=utility;DedicatedWorker*=utility;StackSamplingProfiler*=utility
             env.MADEIRA_POOL_LOW_IMAGES = 1
             env.MADEIRA_POOL_RECYCLE_IMAGES = 1
             env.MADEIRA_TOUCH_MOUSE = 1
