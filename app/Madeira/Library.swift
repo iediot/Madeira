@@ -1075,7 +1075,8 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
             env.MADEIRA_POOL_BIG_CODE_EXES = RDR2.exe
             env.MADEIRA_SYNC_LEAN = 1
-            env.MADEIRA_THREAD_QOS = exe:SocialClubHelper.exe=background;Chrome_*=background;Cr*=background;ThreadPool*=background;VizCompositor*=background;Compositor*=background;DedicatedWorker*=background;StackSamplingProfiler*=background
+            env.MADEIRA_THREAD_QOS = exe:SocialClubHelper.exe=utility;Chrome_*=background;Cr*=background;ThreadPool*=background;VizCompositor*=background;Compositor*=background;DedicatedWorker*=background;StackSamplingProfiler*=background
+            env.MADEIRA_POOL_OTHER_BIG_GAME_MB = 64
             env.MADEIRA_POOL_LOW_IMAGES = 1
             env.MADEIRA_POOL_RECYCLE_IMAGES = 1
             env.MADEIRA_TOUCH_MOUSE = 1
