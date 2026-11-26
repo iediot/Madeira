@@ -69,11 +69,12 @@ typedef int64_t LONG64;
 typedef int32_t LONG;
 static LONG64 InterlockedIncrement64(volatile LONG64 *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static LONG InterlockedIncrement(volatile LONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
-static int cfg_plan = 1, cfg_vic = 1, cfg_dedup = 1;
+static int cfg_plan = 1, cfg_vic = 1, cfg_dedup = 1, cfg_vic_big = 1;
 static long long mad_cfg_int_pe(const char *k, long long d) {
     if (!strcmp(k, "air-plan")) return cfg_plan;
     if (!strcmp(k, "view-info-cache")) return cfg_vic;
     if (!strcmp(k, "use-dedup")) return cfg_dedup;
+    if (!strcmp(k, "view-info-cache-big")) return cfg_vic_big;
     return d;
 }
 struct mad_descriptor { UINT64 gpu_va, texture_view_id, metadata; };
@@ -83,7 +84,7 @@ struct mad_rootsig { struct madeira_ir_root_param params[MAD_ROOT_PARAM_MAX]; st
     const struct mad_descriptor *stab_cpu; UINT64 serial; };
 struct mad_air_plan;
 struct mad_pso { struct mad_air_plan *volatile air_plans; volatile LONG air_nplans; };
-#define MAD_VIC_N 256u
+#define MAD_VIC_N 1024u
 struct mad_vic { UINT64 id, gen, v; UINT32 a, mode; };
 struct mad_queue { struct mad_vic vic[MAD_VIC_N]; };
 struct mad_device { volatile LONG64 vmap_gen; };
@@ -99,7 +100,7 @@ static int exec_ring_take_z(struct mad_exec *e, unsigned n, size_t z, obj_handle
     ring_takes++; memset(ring, 0, z < sizeof ring ? z : sizeof ring);
     *buf = 77; *off = 0x40; *cpu = ring; *gpu = 0x900000; return 1;
 }
-static volatile LONG64 g_vic_hits, g_vic_misses;
+static volatile LONG64 g_vic_hits, g_vic_misses, g_vic_m_stale, g_vic_m_empty, g_vic_m_other, g_vic_uncached;
 static volatile LONG g_air_plans_built, g_es_use_skipped;
 static int g_use_dedup = -1;
 #define MAD_VREC_TOMB (~(UINT64)0)
@@ -258,6 +259,23 @@ int main(void) {
             mad_air_texinfo_c(&ve, &d, id, fl, &v, &al);
             assert(v == (fl ? flat_of(id) : id) && al == alen_of(v));
             if (rnd(3) == 0) { assert(mad_air_texbuf_c(&ve, &d, id << 4, &cnt, &fst) && cnt == (UINT32)((id << 4) & 0xffff) && fst == (UINT32)((id << 4) >> 16)); }
+        }
+        assert(g_vic_misses == g_vic_m_stale + g_vic_m_empty + g_vic_m_other && g_vic_m_stale && g_vic_m_empty && g_vic_m_other && g_vic_uncached);
+        {   /* view-info-cache-big = 0: the first 256 slots, chosen as before; answers equal either way */
+            unsigned used_hi = 0, j;
+            for (j = 0; j < 2; j++) {
+                memset(&q, 0, sizeof q); cfg_vic_big = j; g_vic_big = -1;
+                for (it = 0; it < 50000; it++) {
+                    UINT64 id = 1 + rnd(3000); int fl = rnd(2);
+                    mad_air_texinfo_c(&ve, &d, id, fl, &v, &al);
+                    assert(v == (fl ? flat_of(id) : id) && al == alen_of(v));
+                    if (!j) { UINT64 h = (id ^ ((UINT64)(fl ? 3u : 2u) << 61)) * 0x9E3779B97F4A7C15ull;
+                              assert(q.vic[(h >> 56) & 255u].id == id); }   /* the slot the 256-slot cache always used */
+                }
+                for (used_hi = 0, it = 256; it < MAD_VIC_N; it++) used_hi += q.vic[it].id != 0;
+                assert(j ? used_hi > 500 : used_hi == 0);
+            }
+            cfg_vic_big = 1; g_vic_big = -1;
         }
         printf("ok   view-info cache: equal answers, map-known only, generation and switch respected (%lld hits, %lld misses)\n",
                (long long)g_vic_hits, (long long)g_vic_misses);

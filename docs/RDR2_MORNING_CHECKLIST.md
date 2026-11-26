@@ -84,3 +84,16 @@ if it repeats right after each `[sc-park] ON`, set `env.MADEIRA_SC_PARK = 0`.
 |---|---|---|
 | Pending HID reads complete only when the Xbox pad report changes, plus a 200 ms keep-alive | RDR2 via profile | `env.MADEIRA_HIDPAD_ON_CHANGE = 0` (suspect on stuck or laggy input) |
 | Keep-alive interval | 200 ms | `env.MADEIRA_HIDPAD_KEEPALIVE_MS = 4` restores a report every tick |
+
+### Incremental argument tables (madeira-d3d12)
+| Change | Default | Off switch |
+|---|---|---|
+| Roots-changed table misses rewrite only the changed entries into a copy | on | `air-table-inc = 0` (first suspect for any new graphical glitch) |
+| View-info cache 1024 slots | on | `view-info-cache-big = 0` |
+
+### Frame-cap pacer fix
+The pacer's early version that slipped into 641b711c is fixed here; the pacer itself stays off.
+
+### Still to find out in the morning
+- The ~75 s loading screen: the game is idle at full clocks with modest reads, so it is waiting on
+  something. One run with the wait probe (`env.MADEIRA_PERF = 1`) over the loading screen names it.

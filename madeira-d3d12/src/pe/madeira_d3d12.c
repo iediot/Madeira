@@ -483,6 +483,7 @@ static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
 static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */
 static LONG g_f6_rar_passed; static int g_f6_rar = -1;   /* madeira-bcd f6-rar */
+static LONG g_f6_dev_waits, g_f6_dev_covered; static volatile LONG g_f6_dev_upd;   /* madeira-bcd fence census: list-start device-fence waits, those already covered; joins so far */
 /* ml1137: GPU census, counts only. Barrier entries by the states they move
  * between, and what a state-aware wait rule would have needed at each
  * barrier-caused sync of mode 6; attachment bytes loaded / cleared / stored in
@@ -1135,6 +1136,11 @@ static volatile LONG64 g_pt_gfx, g_pt_cs, g_pt_conv, g_pt_lib, g_pt_rs, g_pt_rea
 static volatile LONG64 g_air_cache_hits, g_air_cache_misses, g_air_cache_root_reuse;
 static volatile LONG64 g_air_miss_new, g_air_miss_heap, g_air_miss_root;   /* madeira-bcd: no entry for the stage, a bound heap changed, its roots changed */
 static volatile LONG64 g_vic_hits, g_vic_misses;   /* madeira-bcd view-info cache */
+static volatile LONG64 g_vic_m_stale, g_vic_m_empty, g_vic_m_other, g_vic_uncached;   /* madeira-bcd view-info cache: why a lookup missed; answers it could not keep */
+/* madeira-bcd air-table-inc: what the table misses cost (reset by the periodic [perf] report) */
+static volatile LONG64 g_ai_full, g_ai_full_ent, g_ai_full_bytes;        /* tables built whole: builds, entries written, bytes cleared+written */
+static volatile LONG64 g_ai_inc, g_ai_inc_ent, g_ai_inc_kept, g_ai_inc_bytes, g_ai_inc_tabkept, g_ai_inc_none;
+        /* incremental builds, entries rewritten, entries kept, bytes copied, tables bound unchanged, misses with no entry changed */
 static volatile LONG g_air_plans_built;            /* madeira-bcd air-plan */
 static int g_air_cache_on = -1; /* air-table-cache=0: unchanged table builder for A/B */
 static volatile LONG g_pn_gfx, g_pn_cs, g_pn_lib, g_pn_rs, g_pn_realize;
@@ -2102,7 +2108,7 @@ static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(ID3D12GraphicsComm
 /* ---- command queue ------------------------------------------------------- */
 /* madeira-bcd view-info cache (see mad_air_texinfo_c): one entry per view id and
  * kind, valid while the device's vmap_gen is the one it was filled under. */
-#define MAD_VIC_N 256u
+#define MAD_VIC_N 1024u   /* madeira-bcd view-info-cache-big: 1024 slots used (0: the first 256, as before) */
 struct mad_vic { UINT64 id, gen, v; UINT32 a, mode; };
 struct mad_queue {
     ID3D12CommandQueueVtbl *vtbl;
@@ -2170,6 +2176,7 @@ struct mad_queue {
      * submit_lock (the replay and mad_queue_flush both hold it). */
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; } f6_pend[40]; unsigned f6_npend;
+    int f6_dev_cov; LONG f6_cov_upd;   /* madeira-bcd fence census: a pending encoder waited (itself or through a sync) for the device fence, at join count f6_cov_upd */
     UINT64 open_ticket;   /* madeira-bcd: sync diagnostics (upload-guard / desc-guard), the open batch's ticket; 0 = none */
     /* madeira-bcd: [swap-diag] what the worker is doing: job kind (MAD_SUB_*, 0 = none), the step
      * of a Present ('F' flush, 'L' GPU latency wait, 'A' layer setup on the main thread,
@@ -2268,6 +2275,9 @@ struct mad_exec {
         const struct mad_heap *srv, *smp;
         obj_handle_t cb_buf, arg_buf;
         UINT64 cb_off, arg_off;
+        void *cb_cpu, *arg_cpu;          /* madeira-bcd air-table-inc: the tables' bytes (ring memory, never written again) */
+        UINT32 cb_bytes, arg_bytes;      /* how many of them a copy takes */
+        UINT64 vmap_gen;                 /* the device's vmap_gen read before the tables' view lookups */
     } air_cache[8];
     unsigned air_cache_next;
     obj_handle_t cenc;
@@ -2286,6 +2296,7 @@ struct mad_exec {
     int f6_sync_needed;         /* a ResourceBarrier (or the list start) since the last sync point */
     int f6_list_start;          /* the next sync also waits for the device fence (other queue, earlier batch) */
     int f6_enc_synced;          /* the open encoder waited for every pending encoder at its start */
+    int f6_cur_cov;             /* madeira-bcd fence census: and it is ordered after the device fence */
     unsigned f6_cur;            /* pool index of the open encoder's fence */
     struct mad_resource *f6_att[9]; unsigned f6_natt;   /* attachments of the encoder being begun */
     int mode;                   /* ml1136: fence-chain mode for this whole list (switchable live between lists) */
@@ -2477,13 +2488,20 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     }
     if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; }
     if (need) {
-        if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
+        int cov = q->f6_npend && q->f6_dev_cov && q->f6_cov_upd == g_f6_dev_upd;   /* fence census (counts only) */
+        if (e->f6_list_start && q->device->enc_fence) {
+            waits[nw++] = q->device->enc_fence;
+            InterlockedIncrement(&g_f6_dev_waits);
+            if (cov) InterlockedIncrement(&g_f6_dev_covered);   /* a pending encoder of this command buffer already waited for it */
+            q->f6_cov_upd = g_f6_dev_upd; cov = 1;
+        }
+        e->f6_cur_cov = cov; q->f6_dev_cov = 0;
         for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
         f6_encode(enc, kind, waits, nw, 0);
         InterlockedExchangeAdd(&g_fence_waits, (LONG)nw);
         q->f6_npend = 0; e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 1;
         InterlockedIncrement(&g_f6_synced);
-    } else e->f6_enc_synced = 0;
+    } else { e->f6_enc_synced = 0; e->f6_cur_cov = 0; }
     e->f6_cur = q->f6_next++ & 63;
 }
 static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
@@ -2495,6 +2513,8 @@ static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
     p = &q->f6_pend[q->f6_npend++];   /* < 40 here: a begin with 40 pending syncs and empties the set */
     p->idx = (unsigned char)e->f6_cur; p->kind = (unsigned char)kind; p->natt = (unsigned char)e->f6_natt;
     memcpy(p->att, e->f6_att, sizeof p->att);
+    if (e->f6_cur_cov) q->f6_dev_cov = 1;   /* fence census */
+    e->f6_cur_cov = 0;
     e->f6_natt = 0;
 }
 /* At commit: one blit encoder waits for everything pending and moves the device
@@ -2509,7 +2529,8 @@ static void f6_join(struct mad_queue *q) {
     for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
     f6_encode(benc, F6_BLIT, waits, nw, dfence);
     MTLCommandEncoder_endEncoding(benc);
-    q->f6_npend = 0;
+    q->f6_npend = 0; q->f6_dev_cov = 0;
+    InterlockedIncrement(&g_f6_dev_upd);   /* fence census: the device fence moved */
     InterlockedIncrement(&g_f6_joins);
 }
 /* ml1136: a list in another mode that follows mode-6 lists first waits for the
@@ -2521,7 +2542,7 @@ static void f6_drain(struct mad_exec *e, int kind, obj_handle_t enc) {
     if (!q->f6_npend) return;
     for (i = 0; i < q->f6_npend; i++) waits[n++] = f6_fence(q, q->f6_pend[i].idx);
     f6_encode(enc, kind, waits, n, 0);
-    q->f6_npend = 0;
+    q->f6_npend = 0; q->f6_dev_cov = 0;
 }
 /* ml1137: what a STATE-AWARE rule would require for this barrier batch, against
  * the encoders pending now and the one still open (counted, not applied):
@@ -6777,8 +6798,21 @@ static int mad_vic_on(void) {
     if (g_vic_on < 0) g_vic_on = mad_cfg_int_pe("view-info-cache", 1) ? 1 : 0;   /* perf: the DXBC tables' view lookups are cached per queue (0 = every bind asks the device's view map) */
     return g_vic_on;
 }
+/* madeira-bcd view-info-cache-big (default 1; 0 = 256 slots and the same slot
+ * choice as before). RDR2 binds more distinct views a frame than 256
+ * direct-mapped slots hold (1127-0105: 10.1M misses against 49.2M hits); the
+ * [perf] view-info line says whether the misses are slot conflicts or
+ * generation changes. Which slot an answer lives in changes nothing else. */
+static int g_vic_big = -1;
 static struct mad_vic *mad_vic_slot(struct mad_queue *q, UINT64 id, UINT mode) {
-    return &q->vic[(unsigned)(((id ^ ((UINT64)mode << 61)) * 0x9E3779B97F4A7C15ull) >> 56) & (MAD_VIC_N - 1)];
+    UINT64 h = (id ^ ((UINT64)mode << 61)) * 0x9E3779B97F4A7C15ull;
+    if (g_vic_big < 0) g_vic_big = mad_cfg_int_pe("view-info-cache-big", 1) ? 1 : 0;   /* perf: the view-info cache has 1024 slots per queue (0 = 256, as before) */
+    if (g_vic_big) return &q->vic[(unsigned)(h >> 54) & (MAD_VIC_N - 1)];
+    return &q->vic[(unsigned)(h >> 56) & 255u];
+}
+static void mad_vic_miss(const struct mad_vic *c, UINT64 id, UINT mode) {   /* why: an old generation, an empty slot, another view in it */
+    InterlockedIncrement64(&g_vic_misses);
+    InterlockedIncrement64(c->id == id && c->mode == mode ? &g_vic_m_stale : !c->id ? &g_vic_m_empty : &g_vic_m_other);
 }
 /* A typed buffer view's element count and first element (mad_air_texbuf). */
 static int mad_air_texbuf_c(struct mad_exec *e, struct mad_device *d, UINT64 id, UINT32 *count, UINT32 *first) {
@@ -6791,8 +6825,8 @@ static int mad_air_texbuf_c(struct mad_exec *e, struct mad_device *d, UINT64 id,
         InterlockedIncrement64(&g_vic_hits);
         return 1;
     }
-    InterlockedIncrement64(&g_vic_misses);
-    if (!mad_air_texbuf(d, id, count, first)) return 0;
+    mad_vic_miss(c, id, 1);
+    if (!mad_air_texbuf(d, id, count, first)) { InterlockedIncrement64(&g_vic_uncached); return 0; }
     c->id = id; c->mode = 1; c->gen = gen; c->a = *count; c->v = *first;
     return 1;
 }
@@ -6809,12 +6843,13 @@ static void mad_air_texinfo_c(struct mad_exec *e, struct mad_device *d, UINT64 i
             InterlockedIncrement64(&g_vic_hits);
             return;
         }
-        InterlockedIncrement64(&g_vic_misses);
+        mad_vic_miss(c, id, mode);
     }
     if (flat) v = mad_air_flat_view(d, id, &kf);   /* ml1308 */
     *vid = v;
     *alen = mad_air_array_len(d, v, &ka);
     if (c && kf && ka) { c->id = id; c->mode = mode; c->gen = gen; c->v = v; c->a = *alen; }
+    else if (c) InterlockedIncrement64(&g_vic_uncached);
 }
 
 static UINT mad_air_range_type(UINT air_type) {
@@ -7913,8 +7948,39 @@ struct mad_air_plan {
     struct mad_air_plan *next;
     const struct madeira_ir_air_range *air; UINT nair, vis_mask; UINT64 rs_serial;
     UINT root_mask;
-    struct mad_air_route r[];   /* nair routes, then (vis_mask != ~0u) nair routes for visibility ALL */
+    const UINT64 *dep;          /* madeira-bcd air-table-inc: per declaration, what its entry depends on (mad_air_dep) */
+    struct mad_air_route r[];   /* nair routes, then (vis_mask != ~0u) nair routes for visibility ALL; then nair dep words */
 };
+/* madeira-bcd air-table-inc: a declaration's table entry is a function of the
+ * root parameters its two routes name (bits 0-31: the stage's own route and the
+ * visibility-ALL fallback route), the bound heaps and their descriptor
+ * versions, the root signature (static samplers), and for texture and typed
+ * buffer views the device's view map (MAD_AIRDEP_VMAP). A UAV counter address
+ * comes from a map no version covers, so such an entry is always rewritten
+ * (MAD_AIRDEP_ALWAYS). */
+#define MAD_AIRDEP_VMAP   (1ull << 32)
+#define MAD_AIRDEP_ALWAYS (1ull << 33)
+static UINT64 mad_air_route_dep(const struct mad_air_route *o) {
+    switch (o->kind) {
+    case MAD_AR_TABLE: case MAD_AR_CONST: case MAD_AR_ROOT_CBV: case MAD_AR_ROOT_NOLEN:
+        return o->param < 32 ? 1ull << o->param : MAD_AIRDEP_ALWAYS;
+    default: return 0;   /* static sampler: the signature, part of the key; none: never built */
+    }
+}
+static UINT mad_air_entry_words(const struct madeira_ir_air_range *rg) {   /* the words mad_air_fill_decl writes */
+    if (rg->type == MADEIRA_IR_AIR_CBV) return 1;
+    if (rg->type == MADEIRA_IR_AIR_SAMPLER) return 3;
+    return (rg->flags & MADEIRA_IR_AIR_F_UAV_COUNTER) ? 3 : 2;
+}
+static UINT64 mad_air_dep(const struct madeira_ir_air_range *rg, const struct mad_air_route *own, const struct mad_air_route *all) {
+    UINT64 d = mad_air_route_dep(own) | (all ? mad_air_route_dep(all) : 0);
+    if (rg->type == MADEIRA_IR_AIR_SRV || rg->type == MADEIRA_IR_AIR_UAV) {
+        if (!(rg->flags & MADEIRA_IR_AIR_F_BUFFER) && (rg->flags & MADEIRA_IR_AIR_F_TEXTURE)) d |= MAD_AIRDEP_VMAP;
+        if (rg->flags & MADEIRA_IR_AIR_F_UAV_COUNTER) d |= MAD_AIRDEP_ALWAYS;
+    }
+    if (rg->type > MADEIRA_IR_AIR_UAV) d |= MAD_AIRDEP_ALWAYS;
+    return d;
+}
 static UINT mad_air_root_mask(const struct mad_rootsig *rs, const struct madeira_ir_air_range *air, UINT n);
 static int g_air_plan_on = -1;
 static const struct mad_air_plan *mad_air_plan_get(const struct mad_pso *cpso, const struct mad_rootsig *rs,
@@ -7928,13 +7994,24 @@ static const struct mad_air_plan *mad_air_plan_get(const struct mad_pso *cpso, c
         if (pl->air == air && pl->nair == nair && pl->vis_mask == vis_mask && pl->rs_serial == rs->serial) return pl;
     if (pso->air_nplans >= MAD_AIR_PLANS_MAX) return NULL;
     total = vis_mask == ~0u ? nair : 2 * nair;
-    pl = malloc(sizeof *pl + (size_t)(total ? total : 1) * sizeof pl->r[0]);
+    pl = malloc(sizeof *pl + (size_t)(total ? total : 1) * sizeof pl->r[0] + (size_t)nair * sizeof(UINT64));
     if (!pl) return NULL;
     pl->air = air; pl->nair = nair; pl->vis_mask = vis_mask; pl->rs_serial = rs->serial;
     pl->root_mask = mad_air_root_mask(rs, air, nair);
     for (k = 0; k < nair; k++) {
         mad_air_route_find(rs, &air[k], vis_mask, &pl->r[k]);
         if (vis_mask != ~0u) mad_air_route_find(rs, &air[k], ~0u, &pl->r[nair + k]);
+    }
+    {   /* madeira-bcd air-table-inc; entries that share a word make the order of writes matter: no incremental builds then */
+        UINT64 *dep = (UINT64 *)(void *)&pl->r[total ? total : 1];
+        UINT j, ok = 1;
+        for (k = 0; k < nair; k++) dep[k] = mad_air_dep(&air[k], &pl->r[k], vis_mask != ~0u ? &pl->r[nair + k] : NULL);
+        for (k = 0; k < nair && ok; k++)
+            for (j = k + 1; j < nair && ok; j++)
+                if (!air[k].cb_table == !air[j].cb_table &&
+                    air[k].ptr_offset < air[j].ptr_offset + mad_air_entry_words(&air[j]) &&
+                    air[j].ptr_offset < air[k].ptr_offset + mad_air_entry_words(&air[k])) ok = 0;
+        pl->dep = ok ? dep : NULL;
     }
     head = __atomic_load_n(&pso->air_plans, __ATOMIC_RELAXED);
     do pl->next = head;
@@ -7948,46 +8025,61 @@ static void mad_air_plans_free(struct mad_pso *pso) {
     for (; pl; pl = nx) { nx = pl->next; free(pl); }
     pso->air_plans = NULL; pso->air_nplans = 0;
 }
+static unsigned g_air_said_fail;   /* ml1008 messages of the table builder (was the body's own static) */
+static int mad_air_fill_decl(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
+                             const UINT32 (*consts)[64], const struct mad_pso *pso, UINT nair,
+                             const struct madeira_ir_air_range *airv, unsigned vis_mask,
+                             const struct mad_air_plan *plan, unsigned k, UINT64 *tab);
 static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
                                    UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
                                    const struct madeira_ir_air_range *airv, unsigned vis_mask,   /* ml1083: one stage, described explicitly */
                                    const struct mad_air_plan *plan,   /* madeira-bcd air-plan: NULL = resolve each declaration */
                                    obj_handle_t *cb_buf, UINT64 *cb_off,
-                                   obj_handle_t *arg_buf, UINT64 *arg_off) {
-    struct mad_device *d = e->q->device;
+                                   obj_handle_t *arg_buf, UINT64 *arg_off,
+                                   void **cb_cpu, void **arg_cpu) {   /* madeira-bcd air-table-inc: where the tables' bytes are */
     UINT64 *cb_words = NULL, *arg_words = NULL;
     UINT64 gpu;
     void *cpu;
     unsigned k;
-    static unsigned said_fail;
-
     *cb_buf = *arg_buf = 0; *cb_off = *arg_off = 0;
+    *cb_cpu = *arg_cpu = NULL;
 
     if (cb_bind != ~0u) {
         size_t cbz = 8;   /* ml1130: up to the highest constant-buffer entry this stage has */
         for (k = 0; k < nair; k++) if (airv[k].cb_table && ((size_t)airv[k].ptr_offset + 3) * 8 > cbz) cbz = ((size_t)airv[k].ptr_offset + 3) * 8;
         if (!exec_ring_take_z(e, 1, cbz, cb_buf, cb_off, &cpu, &gpu)) return 0;
-        cb_words = (UINT64 *)cpu;
+        cb_words = (UINT64 *)cpu; *cb_cpu = cpu;
     }
     if (arg_bind != ~0u) {
         unsigned nslots = (unsigned)(((UINT64)arg_qwords * 8 + MAD_ARG_SLOT_BYTES - 1) / MAD_ARG_SLOT_BYTES);   /* ml1087 */
         if (nslots > MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES) {
-            if (said_fail++ < 8)
+            if (g_air_said_fail++ < 8)
                 d3d12_log("[madeira-d3d12] ml1008 '%s' wants a %u-qword argument table; a whole ring chunk holds %u\n",
                           pso->vs_name, arg_qwords, (unsigned)(MAD_ARG_RING_BYTES / 8));
             return 0;
         }
         if (!exec_ring_take_z(e, nslots ? nslots : 1, (size_t)arg_qwords * 8, arg_buf, arg_off, &cpu, &gpu)) return 0;   /* ml1130 */
-        arg_words = (UINT64 *)cpu;
+        arg_words = (UINT64 *)cpu; *arg_cpu = cpu;
     }
 
-    for (k = 0; k < nair; k++) {
+    for (k = 0; k < nair; k++)
+        if (!mad_air_fill_decl(e, rs, root, consts, pso, nair, airv, vis_mask, plan, k, airv[k].cb_table ? cb_words : arg_words)) return 0;
+    return 1;
+}
+/* One declaration's entry, written into tab (the table it belongs to, NULL if
+ * the stage has none). 0 = the declaration cannot be bound (reported here);
+ * the whole table is then refused, as before. */
+static int mad_air_fill_decl(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
+                             const UINT32 (*consts)[64], const struct mad_pso *pso, UINT nair,
+                             const struct madeira_ir_air_range *airv, unsigned vis_mask,
+                             const struct mad_air_plan *plan, unsigned k, UINT64 *tab) {
+    struct mad_device *d = e->q->device;
+    {
         const struct madeira_ir_air_range *rg = &airv[k];
         struct mad_descriptor de;
         UINT64 direct = 0;
         const char *why = "?";
-        UINT64 *tab = rg->cb_table ? cb_words : arg_words;
         UINT off = rg->ptr_offset;
 
         if (!tab) { why = "the table this range belongs to was not reported"; goto bad; }
@@ -8021,7 +8113,7 @@ static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_roo
                 tab[off] = d->null_gpu;
                 InterlockedIncrement(&g_null_cbv_bound);
             }
-            continue;
+            return 1;
         }
         if (rg->type == MADEIRA_IR_AIR_SAMPLER) {
             /* Three words: sampler id, cube-sampler id, LOD bias. Our sampler
@@ -8029,7 +8121,7 @@ static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_roo
             tab[off + 0] = de.gpu_va;
             tab[off + 1] = de.texture_view_id ? de.texture_view_id : de.gpu_va;
             tab[off + 2] = de.metadata & 0xffffffffull;
-            continue;
+            return 1;
         }
         /* SRV and UAV share the encoding; the flags pick which of the three. */
         if (rg->flags & MADEIRA_IR_AIR_F_BUFFER) {
@@ -8065,11 +8157,11 @@ static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_roo
                 d3d12_log("[madeira-d3d12] UAV counter for '%s' u%u space %u: the view has no counter; the shader gets address 0\n",
                           pso->vs_name, rg->lower_bound, rg->space);
         }
-        continue;
+        return 1;
 
     bad:
         mad_skip_why(why);
-        if (said_fail++ < 32) {
+        if (g_air_said_fail++ < 32) {
             static const char *cls[4] = { "b", "s", "t", "u" };
             d3d12_log("[madeira-d3d12] ml1008 '%s': cannot bind %s%u space %u (id %u, flags %#x): %s\n",
                       pso->vs_name, rg->type < 4 ? cls[rg->type] : "?", rg->lower_bound,
@@ -8077,7 +8169,6 @@ static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_roo
         }
         return 0;
     }
-    return 1;
 }
 /* Track the roots this shader can actually consume, as opposed to invalidating
  * every stage for every root write. Include all matching visibilities: resolve
@@ -8111,6 +8202,90 @@ static int mad_air_roots_equal(UINT mask, const UINT64 *a, const UINT64 *b) {
     for (i = 0; i < MAD_ROOT_PARAM_MAX; i++) if ((mask & (1u << i)) && a[i] != b[i]) return 0;
     return 1;
 }
+/* madeira-bcd AIR-TABLE-INC (madeira.cfg air-table-inc, default 1; 0 = every
+ * miss builds both tables whole, as before). Two thirds of the table misses in
+ * Red Dead Redemption 2 (1127-0105: 13.9M of 21.0M) are "its roots changed":
+ * the cache holds this very stage with today's heaps and descriptors, and one
+ * root CBV address, one table offset or a few root constants moved. Such a miss
+ * now starts from that entry. Its tables stay as they are in the ring (the GPU
+ * may read them; nothing writes them again); a table with an entry to rewrite
+ * is copied into a fresh ring slot and only the declarations whose entry can
+ * differ are written again, through the same mad_air_fill_decl a whole build
+ * uses. A table none of whose declarations changed is bound again as it is.
+ * A declaration is rewritten when a root parameter one of its two routes names
+ * (the stage's own and the visibility-ALL fallback) changed, when it reads the
+ * view map (textures, typed buffers) and the device's vmap_gen moved since the
+ * entry was built, or always (UAV counters). Everything else it reads is in the
+ * cache key (pipeline stage, root signature, bound heaps and their descriptor
+ * versions), so its words are the ones a whole build would write again; the
+ * result is the same tables, byte for byte (tests/host/check-air-table-inc.py).
+ * Needs the stage's air-plan (no plan: whole builds). */
+static int g_air_inc_on = -1;
+static int mad_air_inc_dirty(UINT64 dep, UINT changed, int gen_moved) {
+    return (dep & (UINT64)changed) || (dep & MAD_AIRDEP_ALWAYS) || (gen_moved && (dep & MAD_AIRDEP_VMAP));
+}
+/* 1 built (or bound again), 0 refused exactly as a whole build would refuse
+ * it, -1 no ring slot (the caller builds whole, which reports as before). */
+static int mad_air_build_tables_inc(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
+                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
+                                    UINT arg_qwords, UINT nair, const struct madeira_ir_air_range *airv, unsigned vis_mask,
+                                    const struct mad_air_plan *plan, typeof(e->air_cache[0]) *c, UINT changed, UINT64 gen,
+                                    UINT64 rv, const UINT64 *pv,
+                                    obj_handle_t *cb_buf, UINT64 *cb_off, obj_handle_t *arg_buf, UINT64 *arg_off) {
+    obj_handle_t nb = 0, na = 0; UINT64 nbo = 0, nao = 0, gpu; void *nbc = NULL, *nac = NULL;
+    int gen_moved = c->vmap_gen != gen, need_cb = 0, need_arg = 0;
+    unsigned k, nd = 0;
+    for (k = 0; k < nair; k++)
+        if (mad_air_inc_dirty(plan->dep[k], changed, gen_moved)) { nd++; if (airv[k].cb_table) need_cb = 1; else need_arg = 1; }
+    if (!nd) {   /* none of this stage's entries can differ: the same tables */
+        c->root_version = rv; memcpy(c->root_param_version, pv, sizeof c->root_param_version); c->vmap_gen = gen;
+        *cb_buf = c->cb_buf; *cb_off = c->cb_off; *arg_buf = c->arg_buf; *arg_off = c->arg_off;
+        InterlockedIncrement64(&g_ai_inc_none);
+        return 1;
+    }
+    if (nd == nair) return -1;   /* every entry: a whole build writes no more and copies nothing */
+    if ((need_cb && !c->cb_cpu) || (need_arg && !c->arg_cpu)) return -1;
+    if (need_cb) {
+        if (!exec_ring_take_z(e, 1, 0, &nb, &nbo, &nbc, &gpu)) return -1;
+        memcpy(nbc, c->cb_cpu, c->cb_bytes);
+    }
+    if (need_arg) {
+        unsigned nslots = (unsigned)(((UINT64)arg_qwords * 8 + MAD_ARG_SLOT_BYTES - 1) / MAD_ARG_SLOT_BYTES);
+        if (!exec_ring_take_z(e, nslots ? nslots : 1, 0, &na, &nao, &nac, &gpu)) return -1;
+        memcpy(nac, c->arg_cpu, c->arg_bytes);
+    }
+    for (k = 0; k < nair; k++)
+        if (mad_air_inc_dirty(plan->dep[k], changed, gen_moved) &&
+            !mad_air_fill_decl(e, rs, root, consts, pso, nair, airv, vis_mask, plan, k,
+                               (UINT64 *)(airv[k].cb_table ? nbc : nac))) return 0;
+    /* The entry now describes today's roots (the old tables stay valid for
+     * the draws that already bound them; nothing writes them). */
+    c->root_version = rv; memcpy(c->root_param_version, pv, sizeof c->root_param_version); c->vmap_gen = gen;
+    if (need_cb) { c->cb_buf = nb; c->cb_off = nbo; c->cb_cpu = nbc; }
+    if (need_arg) { c->arg_buf = na; c->arg_off = nao; c->arg_cpu = nac; }
+    *cb_buf = c->cb_buf; *cb_off = c->cb_off; *arg_buf = c->arg_buf; *arg_off = c->arg_off;
+    InterlockedIncrement64(&g_ai_inc);
+    InterlockedExchangeAdd64(&g_ai_inc_ent, nd);
+    InterlockedExchangeAdd64(&g_ai_inc_kept, nair - nd);
+    InterlockedExchangeAdd64(&g_ai_inc_bytes, (need_cb ? c->cb_bytes : 0) + (need_arg ? c->arg_bytes : 0));
+    InterlockedExchangeAdd64(&g_ai_inc_tabkept, (c->cb_buf && !need_cb) + (c->arg_buf && !need_arg));
+    return 1;
+}
+/* How many bytes of a table a copy takes: what the whole build cleared, and
+ * every word a declaration writes (up to the slots the table was given). */
+static void mad_air_table_bytes(UINT arg_qwords, UINT nair, const struct madeira_ir_air_range *airv,
+                                UINT32 *cb_bytes, UINT32 *arg_bytes) {
+    size_t cbz = 8, az = (size_t)arg_qwords * 8, acap;
+    unsigned k, nslots = (unsigned)(((UINT64)arg_qwords * 8 + MAD_ARG_SLOT_BYTES - 1) / MAD_ARG_SLOT_BYTES);
+    for (k = 0; k < nair; k++) {
+        size_t hi = ((size_t)airv[k].ptr_offset + 3) * 8;
+        if (airv[k].cb_table) { if (hi > cbz) cbz = hi; }
+        else if (hi > az) az = hi;
+    }
+    acap = (size_t)(nslots ? nslots : 1) * MAD_ARG_SLOT_BYTES;
+    *cb_bytes = (UINT32)(cbz > MAD_ARG_SLOT_BYTES ? MAD_ARG_SLOT_BYTES : cbz);
+    *arg_bytes = (UINT32)(az > acap ? acap : az);
+}
 static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
                                    UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
@@ -8118,16 +8293,25 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                                    obj_handle_t *cb_buf, UINT64 *cb_off,
                                    obj_handle_t *arg_buf, UINT64 *arg_off) {
     const struct mad_air_plan *plan = mad_air_plan_get(pso, rs, airv, nair, vis_mask);   /* madeira-bcd air-plan */
+    void *cb_cpu = NULL, *arg_cpu = NULL;
     if (g_air_cache_on < 0) g_air_cache_on = mad_cfg_int_pe("air-table-cache", 1) ? 1 : 0;   /* perf: an unchanged argument table is bound again (0 = every table rebuilt, for A/B) */
     if (!g_air_cache_on)
         return mad_air_build_tables_ex_body(e, rs, root, consts, pso, cb_bind, arg_bind, arg_qwords, nair, airv, vis_mask,
-                                            plan, cb_buf, cb_off, arg_buf, arg_off);
+                                            plan, cb_buf, cb_off, arg_buf, arg_off, &cb_cpu, &arg_cpu);
+    if (g_air_inc_on < 0) {
+        g_air_inc_on = mad_cfg_int_pe("air-table-inc", 1) ? 1 : 0;   /* perf: a table miss after a root change rewrites only the entries that can differ, in a copy (0 = whole tables, as before) */
+        d3d12_log("[madeira-d3d12] air-table-inc = %d (%s)\n", g_air_inc_on,
+                  g_air_inc_on ? "a table miss after a root change copies the stage's tables and rewrites only the entries whose root parameters changed"
+                               : "every table miss builds both tables whole");
+    }
     UINT bp = root == e->croot ? 1 : 0;
     UINT64 rv = e->root_version[bp];
     const UINT64 *pv = e->root_param_version[bp];
     UINT64 sv = mad_descriptor_version(e->srv), mv = mad_descriptor_version(e->smp);
+    UINT64 gen = g_air_inc_on ? (UINT64)e->q->device->vmap_gen : 0;   /* air-table-inc: read before any view lookup of this build */
     UINT root_mask = ~0u;
     int have_mask = 0, roots_moved = 0;   /* madeira-bcd: why a lookup missed */
+    typeof(e->air_cache[0]) *base = NULL; UINT base_changed = 0; int base_n = 64;   /* air-table-inc: the entry to start from */
     unsigned i;
     /* madeira-bcd: replay split "of which argument tables" */
     UINT64 t0 = g_replay_split > 0 ? mad_tick() : 0;
@@ -8135,13 +8319,22 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
     /* The ring allocation lives for the whole submitted batch, so a replay may
      * bind it again until roots, heaps or descriptor contents change. */
     if (!g_dump_tables && !(e->sk && e->sk->tab_on)) for (i = 0; i < 8; i++) {
-        const typeof(e->air_cache[0]) *c = &e->air_cache[i];
+        typeof(e->air_cache[0]) *c = &e->air_cache[i];
         if (c->rs == rs && c->pso == pso && c->air == airv && c->cb_bind == cb_bind &&
             c->arg_bind == arg_bind && c->arg_qwords == arg_qwords && c->nair == nair &&
             c->vis_mask == vis_mask && c->root_bp == bp) {
             root_mask = c->root_mask; have_mask = 1;
             if (c->srv != e->srv || c->smp != e->smp || c->srv_version != sv || c->smp_version != mv) continue;
-            if (c->root_version != rv && !mad_air_roots_equal(c->root_mask, c->root_param_version, pv)) { roots_moved = 1; continue; }
+            if (c->root_version != rv && !mad_air_roots_equal(c->root_mask, c->root_param_version, pv)) {
+                roots_moved = 1;
+                if (g_air_inc_on && plan && plan->dep) {   /* the candidate with the fewest changed parameters */
+                    UINT ch = 0; unsigned j; int n;
+                    for (j = 0; j < MAD_ROOT_PARAM_MAX; j++) if (c->root_param_version[j] != pv[j]) ch |= 1u << j;
+                    n = __builtin_popcount(ch & c->root_mask);
+                    if (n < base_n) { base = c; base_n = n; base_changed = ch; }
+                }
+                continue;
+            }
             *cb_buf = c->cb_buf; *cb_off = c->cb_off;
             *arg_buf = c->arg_buf; *arg_off = c->arg_off;
             InterlockedIncrement64(&g_air_cache_hits);
@@ -8152,8 +8345,23 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
     }
     InterlockedIncrement64(&g_air_cache_misses);
     InterlockedIncrement64(!have_mask ? &g_air_miss_new : roots_moved ? &g_air_miss_root : &g_air_miss_heap);   /* roots: an entry with today's heaps had other roots */
+    if (base) {   /* madeira-bcd air-table-inc */
+        ok = mad_air_build_tables_inc(e, rs, root, consts, pso, arg_qwords, nair, airv, vis_mask, plan, base, base_changed, gen,
+                                      rv, pv, cb_buf, cb_off, arg_buf, arg_off);
+        if (ok >= 0) {
+            if (t0) mad_rs_step(RS_TABLES, &t0);
+            return ok;
+        }
+    }
     ok = mad_air_build_tables_ex_body(e, rs, root, consts, pso, cb_bind, arg_bind, arg_qwords, nair, airv, vis_mask,
-                                      plan, cb_buf, cb_off, arg_buf, arg_off);
+                                      plan, cb_buf, cb_off, arg_buf, arg_off, &cb_cpu, &arg_cpu);
+    if (g_air_inc_on) {   /* air-table-inc: what whole builds cost, for the [perf] air-inc line */
+        UINT32 cbb, agb;
+        mad_air_table_bytes(arg_qwords, nair, airv, &cbb, &agb);
+        InterlockedIncrement64(&g_ai_full);
+        InterlockedExchangeAdd64(&g_ai_full_ent, nair);
+        InterlockedExchangeAdd64(&g_ai_full_bytes, (cb_bind != ~0u ? cbb : 0) + (arg_bind != ~0u ? agb : 0));
+    }
     if (ok && !g_dump_tables && !(e->sk && e->sk->tab_on)) {
         typeof(e->air_cache[0]) *c = &e->air_cache[e->air_cache_next++ & 7];
         c->rs = rs; c->pso = pso; c->air = airv; c->cb_bind = cb_bind; c->arg_bind = arg_bind;
@@ -8164,6 +8372,8 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
         memcpy(c->root_param_version, pv, sizeof c->root_param_version);
         c->srv_version = sv; c->smp_version = mv;
         c->cb_buf = *cb_buf; c->cb_off = *cb_off; c->arg_buf = *arg_buf; c->arg_off = *arg_off;
+        c->cb_cpu = cb_cpu; c->arg_cpu = arg_cpu; c->vmap_gen = gen;
+        if (g_air_inc_on) mad_air_table_bytes(arg_qwords, nair, airv, &c->cb_bytes, &c->arg_bytes);
     }
     if (t0) mad_rs_step(RS_TABLES, &t0);
     return ok;
@@ -11120,6 +11330,25 @@ static void mad_perf_present(void) {
                       g_perf_presents ? (double)(cw - lw) / g_perf_presents : 0.0, g_perf_presents ? (double)(cu - lu) / g_perf_presents : 0.0,
                       g_perf_presents ? (double)(cb - lb) / g_perf_presents : 0.0, g_fence_chain);
             lw = cw; lu = cu; lb = cb;
+            if (g_perf_presents && g_air_inc_on >= 0) {   /* madeira-bcd air-table-inc, view-info cache: per frame */
+                static LONG64 lh, lm, lr, lvh, lvm;
+                double np = (double)g_perf_presents, kb = 1024.0;
+                LONG64 h = g_air_cache_hits, m = g_air_cache_misses, r = g_air_miss_root, vh = g_vic_hits, vm = g_vic_misses;
+                LONG64 fb = InterlockedExchange64(&g_ai_full, 0), fe = InterlockedExchange64(&g_ai_full_ent, 0), fy = InterlockedExchange64(&g_ai_full_bytes, 0);
+                LONG64 ib = InterlockedExchange64(&g_ai_inc, 0), ie = InterlockedExchange64(&g_ai_inc_ent, 0), ik = InterlockedExchange64(&g_ai_inc_kept, 0);
+                LONG64 iy = InterlockedExchange64(&g_ai_inc_bytes, 0), it = InterlockedExchange64(&g_ai_inc_tabkept, 0), in = InterlockedExchange64(&g_ai_inc_none, 0);
+                LONG64 vs = InterlockedExchange64(&g_vic_m_stale, 0), ve = InterlockedExchange64(&g_vic_m_empty, 0), vo = InterlockedExchange64(&g_vic_m_other, 0);
+                LONG64 vu = InterlockedExchange64(&g_vic_uncached, 0);
+                d3d12_log("[perf] air-inc per frame: table lookups %.0f hits, %.0f misses (%.0f its roots changed); whole builds %.0f (%.0f entries, %.1f KB); "
+                          "incremental %.0f (%.0f entries rewritten, %.0f kept; %.1f KB copied; %.0f tables bound unchanged); %.0f misses where no entry changed "
+                          "(both tables bound again); table bytes written %.1f KB (madeira.cfg air-table-inc = %d)\n",
+                          (h - lh) / np, (m - lm) / np, (r - lr) / np, fb / np, fe / np, fy / kb / np, ib / np, ie / np, ik / np, iy / kb / np,
+                          it / np, in / np, (fy + iy) / kb / np, g_air_inc_on);
+                d3d12_log("[perf] view-info cache per frame: %.0f hits, %.0f misses (older generation %.0f, empty slot %.0f, another view in the slot %.0f); "
+                          "%.0f answers the view map did not know (not kept); %d slots (madeira.cfg view-info-cache-big = %d)\n",
+                          (vh - lvh) / np, (vm - lvm) / np, vs / np, ve / np, vo / np, vu / np, g_vic_big > 0 ? 1024 : 256, g_vic_big > 0);
+                lh = h; lm = m; lr = r; lvh = vh; lvm = vm;
+            }
             if (g_f6_used && g_perf_presents) {   /* ml1134 */
                 double np = (double)g_perf_presents;
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
@@ -11127,6 +11356,9 @@ static void mad_perf_present(void) {
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
                           "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
                           b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                d3d12_log("[perf] fence census per frame: %.1f list-start device-fence waits, %.1f of them already covered by a pending encoder of the same "
+                          "command buffer that waited for it with no join since (counted only: every wait is still encoded)\n",
+                          InterlockedExchange(&g_f6_dev_waits, 0) / np, InterlockedExchange(&g_f6_dev_covered, 0) / np);
                 if (g_f6_rar > 0)   /* madeira-bcd f6-rar */
                     d3d12_log("[perf] f6-rar per frame: %.1f read-to-read barrier batches passed without a sync\n",
                               InterlockedExchange(&g_f6_rar_passed, 0) / np);
@@ -21439,6 +21671,10 @@ static void mad_pace_present(void) {
                           "present-pace-min-fps = %lld)\n", g_pace.cap_fps,
                           g_pace.budget_mw ? ", lowered while the process draws more than the power budget" : "",
                           (long long)cap, (long long)mw, (long long)lo);
+            if (g_pace.cap_fps > 0) {   /* ask the unix probe for window energy (it writes nothing while seq is 0) */
+                g_pace.seen_seq = 1;
+                InterlockedCompareExchange64(&g_xp.pace_seq, 1, 0);
+            }
             MemoryBarrier();
             g_pace.on = g_pace.cap_fps > 0 ? 1 : 0;
         }
@@ -21446,7 +21682,7 @@ static void mad_pace_present(void) {
         if (!g_pace.on) return;
     }
     AcquireSRWLockExclusive(&g_pace.lock);
-    if (g_pace.budget_mw) {   /* a new probe window? */
+    {   /* a new probe window? (its power is logged in either mode) */
         LONG64 seq = g_xp.pace_seq;
         MemoryBarrier();
         if (seq != g_pace.seen_seq) {
@@ -21455,11 +21691,11 @@ static void mad_pace_present(void) {
             if (dt_us > 0) {
                 double mw = (double)uj * 1000.0 / (double)dt_us;   /* uJ/us = W */
                 g_pace.last_mw = mw; g_pace.last_win_s = dt_us / 1e6;
-                if (mw > (double)g_pace.budget_mw) {
+                if (g_pace.budget_mw && mw > (double)g_pace.budget_mw) {
                     double step = g_pace.target_fps * 0.1;
                     g_pace.target_fps -= step < 2.0 ? 2.0 : step;
                     g_pace.under = 0;
-                } else if (mw < 0.85 * (double)g_pace.budget_mw && ++g_pace.under >= 2) {
+                } else if (g_pace.budget_mw && mw < 0.85 * (double)g_pace.budget_mw && ++g_pace.under >= 2) {
                     g_pace.target_fps += 2.0;
                     g_pace.under = 0;
                 }
@@ -21481,10 +21717,16 @@ static void mad_pace_present(void) {
         g_pace.deadline += period;
     }
     ReleaseSRWLockExclusive(&g_pace.lock);
-    if (wait > 0) {
+    if (wait > 0) {   /* NtDelayExecution: 100 ns units (Sleep would round to whole milliseconds) */
+        static LONG (WINAPI *delay)(BOOLEAN, const LARGE_INTEGER *);
         LARGE_INTEGER rel;
+        if (!delay) delay = (LONG (WINAPI *)(BOOLEAN, const LARGE_INTEGER *))(void *)
+                            GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtDelayExecution");
         rel.QuadPart = -(LONG64)((double)wait * 1e7 / (double)g_pace.qpf);
-        if (rel.QuadPart < 0) NtDelayExecution(FALSE, &rel);
+        if (rel.QuadPart < 0) {
+            if (delay) delay(FALSE, &rel);
+            else Sleep((DWORD)((-rel.QuadPart + 9999) / 10000));
+        }
     }
     QueryPerformanceCounter(&now_li); now = now_li.QuadPart;
     AcquireSRWLockExclusive(&g_pace.lock);

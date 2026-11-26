@@ -44,7 +44,9 @@ struct mad_rootsig { struct madeira_ir_root_param params[32];
  struct madeira_ir_root_range *ranges; UINT nparams,nranges; };
 struct mad_pso { int unused; };
 struct skin { int tab_on; };
-struct mad_exec { UINT64 root_version[2], root_param_version[2][32], root[32], croot[32]; struct mad_heap *srv,*smp; struct skin *sk;
+struct mad_device { volatile LONG64 vmap_gen; };
+struct mad_queue { struct mad_device *device; };
+struct mad_exec { UINT64 root_version[2], root_param_version[2][32], root[32], croot[32]; struct mad_heap *srv,*smp; struct skin *sk; struct mad_queue *q;
 ''' + cache + r'''
 };
 static int g_replay_split,g_dump_tables;
@@ -52,7 +54,18 @@ static int g_air_cache_on=-1;
 static long long mad_cfg_int_pe(const char *key,long long fallback) { return fallback; }
 static volatile LONG64 g_air_cache_hits,g_air_cache_misses,g_air_cache_root_reuse;
 static volatile LONG64 g_air_miss_new,g_air_miss_heap,g_air_miss_root;
-struct mad_air_plan { UINT root_mask; };
+struct mad_air_plan { UINT root_mask; const UINT64 *dep; };
+#define MAD_AIRDEP_VMAP (1ull << 32)
+#define MAD_AIRDEP_ALWAYS (1ull << 33)
+#define MAD_ARG_RING_BYTES (64u * 1024u)
+#define MAD_ARG_SLOT_BYTES 1088u
+static volatile LONG64 g_ai_full,g_ai_full_ent,g_ai_full_bytes,g_ai_inc,g_ai_inc_ent,g_ai_inc_kept,g_ai_inc_bytes,g_ai_inc_tabkept,g_ai_inc_none;
+static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p,LONG64 v) { return __atomic_fetch_add(p,v,__ATOMIC_SEQ_CST); }
+static void d3d12_log(const char *f,...) { (void)f; }
+static int exec_ring_take_z(struct mad_exec *e,unsigned n,size_t z,obj_handle_t *b,UINT64 *o,void **c,UINT64 *g) { return 0; }
+struct madeira_ir_air_range;
+static int mad_air_fill_decl(struct mad_exec *e,const struct mad_rootsig *rs,const UINT64 *r,const UINT32 (*cs)[64],
+ const struct mad_pso *p,UINT n,const struct madeira_ir_air_range *v,unsigned vis,const struct mad_air_plan *plan,unsigned k,UINT64 *t) { return 0; }
 static const struct mad_air_plan *mad_air_plan_get(const struct mad_pso *p,const struct mad_rootsig *rs,
  const struct madeira_ir_air_range *a,UINT n,unsigned vis) { return NULL; }
 static UINT64 mad_tick(void) { return 0; }
@@ -61,8 +74,9 @@ static void mad_rs_step(int a,UINT64 *b) {}
 static unsigned builds;
 static int mad_air_build_tables_ex_body(struct mad_exec *e,const struct mad_rootsig *rs,const UINT64 *r,
  const UINT32 (*cs)[64],const struct mad_pso *p,UINT cb,UINT ar,UINT aq,UINT n,
- const struct madeira_ir_air_range *v,unsigned vis,const struct mad_air_plan *plan,obj_handle_t *b,UINT64 *bo,obj_handle_t *a,UINT64 *ao) {
- ++builds; *b=builds; *a=builds+100; *bo=8; *ao=16; return 1;
+ const struct madeira_ir_air_range *v,unsigned vis,const struct mad_air_plan *plan,obj_handle_t *b,UINT64 *bo,obj_handle_t *a,UINT64 *ao,
+ void **bc,void **ac) {
+ ++builds; *b=builds; *a=builds+100; *bo=8; *ao=16; *bc=*ac=NULL; return 1;
 }
 ''' + types + lookup + r'''
 static void *writer(void *heap) {
@@ -75,7 +89,8 @@ int main(void) {
  struct mad_heap a={1,da,8,0},b={1,db,8,0},s={1,ds,4,1},stage={0,staging,4,0};
  mad_descriptor_register(&a); mad_descriptor_register(&b); mad_descriptor_register(&s);mad_descriptor_register(&stage);
  assert(mad_descriptor_version(&a)==1 && mad_descriptor_version(&stage)==0);
- struct mad_exec e={0};e.srv=&a;e.smp=&s;e.root_version[0]=1;
+ struct mad_device dev={0};struct mad_queue q={&dev};
+ struct mad_exec e={0};e.srv=&a;e.smp=&s;e.root_version[0]=1;e.q=&q;
  struct mad_rootsig rs={0};struct mad_pso p={0};struct madeira_ir_air_range air={0};
  rs.nparams=2;rs.params[0].type=rs.params[1].type=MADEIRA_IR_PARAM_CBV;
  rs.params[1].shader_register=1;air.type=MADEIRA_IR_AIR_CBV;

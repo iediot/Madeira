@@ -224,3 +224,97 @@ whose stores are decided at its end.
   anything changes, set `dead-store-discard = 0` first, then `dead-store = 0`.
 - `ecl-steps`: list replay against lock wait and prebuild. The encoder end time
   should drop compared with the old combined "encoder open+end" 3.2-3.8 ms.
+
+## Third round: incremental argument tables (same day)
+
+None of this has been measured on a device yet.
+
+### What the 1127-0105 log says
+
+Source log: `~/MadeiraLogs/iphone18/1127-0105-wave1/madeira-log.txt`, gameplay
+01:00:20-01:04.
+
+- ml1119: ExecuteCommandLists takes 14.5-15 ms of a 47-57 ms frame. It was
+  25-29 ms before the first two rounds.
+- AIR line (cumulative): 3.48M hits and 21.0M misses. The misses split into
+  5.56M new stage, 1.51M bound heap changed and 13.94M "its roots changed".
+  The view-info cache had 49.2M hits and 10.1M misses.
+- ml1116 and ml1134 per frame: 220.7 fence waits, 190.6 fence updates and
+  291 barriers. 190.6 encoders, 167.9 of them synced, and 4.8 joins.
+
+### air-table-inc (default on; `air-table-inc = 0` turns it off)
+
+A "roots changed" miss means the cache holds the same stage with the same
+heaps and descriptor versions, and only some root parameters moved. Before
+this change, such a miss rebuilt both tables in full. Now it starts from the
+cached entry:
+
+- The cached tables are never written again. The GPU may still read them.
+- A table with an entry that can differ is copied into a new ring slot. Only
+  those entries are written again, through the same `mad_air_fill_decl` that
+  a full build uses.
+- A table with no such entry is bound again as it is.
+
+An entry is written again when:
+
+- a root parameter named by one of its two routes changed (the stage's own
+  route or the visibility-ALL fallback route), or
+- it reads the view map (texture or typed-buffer views) and `vmap_gen` moved
+  since the cached entry was built, or
+- it has a UAV counter (these are always written again).
+
+The pipeline stage, root signature, bound heaps and descriptor versions are
+part of the cache key, as before. If every entry would change, the path does
+a full build. It also does a full build when two entries share a word (the
+write order would then matter) and when the stage has no air-plan. Every
+refusal comes from the same declaration with the same reason as a full build.
+
+With the switch off, the code allocates and writes the same bytes as the
+previous builder. The host test compares the two directly.
+
+### view-info-cache-big (default on; `view-info-cache-big = 0` turns it off)
+
+The per-queue view-info cache now has 1024 direct-mapped slots instead of 256.
+With the switch off, it uses the first 256 slots and picks slots exactly as
+before. A lookup gives the same answer with either size.
+
+### Fence waits: counted only
+
+In mode 6, the waits on pending encoders are minimal. Each pending encoder is
+one that nothing has waited for yet. The only wait that can be redundant is
+the device-fence wait at a list start, when an earlier list in the same
+command buffer already waited for it and no join has happened since. RDR2
+records about 78 lists against about 5 joins per frame, so up to about 70 of
+the roughly 220 waits per frame may be of this kind.
+
+These waits cost no measurable CPU: they sit in a fence chain that is encoded
+anyway, and their fence was last moved in an earlier command buffer. So they
+are only counted (the `[perf] fence census` line), and all of them are still
+encoded. No synchronization changed.
+
+### New per-frame lines
+
+- `[perf] air-inc per frame`: table lookups (hits, misses, roots changed),
+  full builds (entries and KB), incremental builds (entries rewritten and
+  kept, KB copied, tables bound unchanged), misses where no entry changed,
+  and total table bytes written.
+- `[perf] view-info cache per frame`: hits and misses. Misses are split into
+  older generation, empty slot and another view in the slot. The line also
+  shows answers that could not be kept and the slot count.
+- `[perf] fence census per frame`: device-fence waits at list starts, and how
+  many of them were already covered.
+- Startup: `[madeira-d3d12] air-table-inc = 1 (...)`.
+
+### Tests
+
+- New: `tests/host/check-air-table-inc.py`, with
+  `check-air-table-inc.oldex.c` as a fixture holding the previous builder. It
+  runs 4,000 random replays. About 370k draws are compared with a full build,
+  and about 61k of them are incremental. Root-constant buffers are compared by
+  content, and refusals must give the same reason. The test also checks that
+  no bound table changes later in its list, and that the off switch matches
+  the previous builder byte for byte. Each of these deliberately broken
+  versions fails the test: dropping the view-map, UAV-counter, fallback-route
+  or overlap rule, a short copy, and writing a table in place.
+- Updated: `check-air-plan.py` (slot switch, miss split) and
+  `check-air-table-cache.py` (new builder signature).
