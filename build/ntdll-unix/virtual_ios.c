@@ -31906,9 +31906,26 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             /* Neither the native hole nor either placement of the image slot
              * is available to the tail. Default headroom remains 48MB. Pool-mid's
              * second hole is not room either: counted with the headroom. */
+            /* Without region C the code buffers and the images share the main pool
+             * alone, and the headroom is only checked when a buffer is granted: an
+             * RDR2 session on an 8 GB-limit iPhone granted 128 + 64 MB buffers with
+             * 128 MB to spare, the images then grew 140 MB more (svchost/dllhost
+             * started while the game loaded) and kernelbase.dll could not be mapped
+             * (16 carves all live, 32 MB of fragments free); the game crashed itself.
+             * Keep at least 256 MB for the images then: FEX gets smaller buffers and
+             * retranslates more, which costs time, not a failed load. */
+            size_t head_reserve = ios_pool_head_reserve;
+            if (!ios_jit_low_size_global && head_reserve < (256u << 20))
+            {
+                static int no_c_said;
+                head_reserve = 256u << 20;
+                if (!no_c_said++)
+                    dprintf( 2, "[pool-head] no region C: code-buffer budget keeps 256 MB of image headroom "
+                                "(configured %lu MB)\n", (unsigned long)(ios_pool_head_reserve >> 20) );
+            }
             size_t cap = ios_pool_code_cap( ios_jit_pool_size_global, head_now, tail_now,
                                             ios_jit_hole_off_eff, ios_jit_hole_end_eff,
-                                            ios_pool_head_reserve +
+                                            head_reserve +
                                             ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,
                                                                    ios_jit_hole2_off, ios_jit_hole2_end ) );
             /* A retired generation of this size already sitting on the carve

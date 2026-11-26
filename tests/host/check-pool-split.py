@@ -106,10 +106,10 @@ assert ('ios_jit_hole_off_eff, ios_jit_hole_end_eff,\n'
 assert ('ios_pool_skip_pieces( ios_jit_pool_size_global - start, ios_jit_pool_size_global - cur,') in tail
 assert 'if (skip_size[k] < 0x100000 || ios_tail_carve_n >= IOS_TAIL_CARVE_MAX) continue;' in tail
 
-cap = native[native.index('enum { TAIL_SMALL = 0x1000000 };'):][:2200]
+cap = native[native.index('enum { TAIL_SMALL = 0x1000000 };'):][:3600]
 assert 'ios_pool_code_cap( ios_jit_pool_size_global, head_now, tail_now,' in cap
 assert ('ios_jit_hole_off_eff, ios_jit_hole_end_eff,\n'
-        '                                            ios_pool_head_reserve +\n'
+        '                                            head_reserve +\n'
         '                                            ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,\n'
         '                                                                   ios_jit_hole2_off, ios_jit_hole2_end ) );') in cap, \
     'the second hole is not room for code either'
