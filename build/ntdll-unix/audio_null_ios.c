@@ -35,6 +35,7 @@
 #include <mach/mach_time.h>
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
+#include <pthread/qos.h>
 #include <unistd.h>
 #include <time.h>
 #include <math.h>
@@ -341,7 +342,7 @@ struct ios_stream {
     UINT32 sample_rate;
     UINT32 channels;
     UINT32 frame_bytes;          /* nBlockAlign of the stream format */
-    UINT32 buffer_frames;        /* ring capacity in frames */
+    UINT32 buffer_frames;        /* buffer size the client is told (GetBufferSize) */
     BYTE *render_scratch;        /* contiguous area handed to GetBuffer */
     UINT32 scratch_frames;       /* scratch capacity */
     int scratch_guest;           /* render_scratch lives in a 32-bit guest window */
@@ -367,7 +368,38 @@ struct ios_stream {
     _Atomic uint32_t st_cbs;       /* render passes that mixed this stream */
     _Atomic uint32_t st_short_cbs; /* passes that ran short */
     _Atomic uint32_t st_cb_max;    /* largest render pass, device frames */
+    /* ml1240: the ring can be larger than the buffer the client is told about
+     * (buffer_frames): the padding cushion below lives in the difference. All
+     * ring indexing is modulo ring_frames; ring_frames == buffer_frames unless
+     * MADEIRA_AUDIO_CUSHION_MS is set. */
+    UINT32 ring_frames;
+    int rt_resume;                 /* RT only: the previous pass ran dry (de-click fade-in) */
+    /* ml1240 padding cushion for polled clients (no event): while the device
+     * keeps running short, GetCurrentPadding reports up to this many frames
+     * less than is queued, so a client that tops the buffer up to a fixed fill
+     * keeps that much more audio ahead of the device. Client thread only. */
+    _Atomic uint32_t cushion;
+    uint64_t cu_check_ns, cu_last_short_ns;
+    uint32_t cu_scbs;
+    /* ml1240 per-stream report, every client (polled ones had none: only the
+     * event timer printed ml1230). Written by the client's threads; diagnostics
+     * only, so a racy count between two client threads is acceptable. */
+    uint64_t cs_t0_ns, cs_wr0, cs_short0, cs_frames_sum, cs_pad_sum, cs_last_rel_ns, cs_gap_max_ns;
+    uint64_t cs_writer, cs_writer_cpu0_us;
+    int64_t cs_pres0;
+    uint32_t cs_cbs0, cs_scbs0, cs_gets, cs_frames_max, cs_refused, cs_pads, cs_pad_min, cs_pad_max, cs_writer_wtid;
 };
+
+/* ml1240: de-click. A client that falls behind leaves the device a gap, and
+ * the step from a sample to silence (and back) is what is heard as a click:
+ * RDR2 on the iPhone 18 Pro delivered 65-75 % of real time through clamped
+ * gameplay (log 2026-11-27 00:19, ml1065 slot 1), a gap every few passes. The
+ * last frames before a gap fade out and the first ones after it fade in, over
+ * IOS_DECLICK_FRAMES (2 ms at 48 kHz). Nothing changes while the ring keeps
+ * up. MADEIRA_AUDIO_DECLICK=0 turns it off. Read once at create_stream, never
+ * from the RT callback. */
+#define IOS_DECLICK_FRAMES 96u
+static int g_audio_declick = 1;
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
  *
@@ -682,10 +714,12 @@ static void ios_build_mix_gains(struct ios_stream *s, UINT32 mask)
 static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
                            UINT32 dev_ch, UINT32 dev_rate)
 {
-    UINT32 cap = s->buffer_frames, sch = s->channels, fb = s->frame_bytes;
+    UINT32 cap = s->ring_frames ? s->ring_frames : s->buffer_frames, sch = s->channels, fb = s->frame_bytes;
     UINT32 mch = sch > 12 ? 12 : sch;   /* channels with a gain; the rest are dropped (ml1227: 12) */
-    uint64_t play, wr, avail, need, want;
+    uint64_t play, wr, avail, need, want, ncov;
     UInt32 f;
+    int fade_in, fade_out;
+    UINT32 fi, fo;
 
     if (!s->started || !s->mixable || !s->ring || !cap || !sch || !fb) return;
 
@@ -698,6 +732,14 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
     else need = ((uint64_t)nframes * s->sample_rate + dev_rate - 1) / dev_rate;
     want = need;
     if (avail < need) need = avail;
+
+    /* device frames that get this stream's audio in this pass */
+    ncov = (s->sample_rate == dev_rate) ? need
+           : (need * dev_rate + s->sample_rate - 1) / s->sample_rate;
+    if (ncov > nframes) ncov = nframes;
+    fade_out = g_audio_declick && need < want && ncov;
+    fade_in  = g_audio_declick && s->rt_resume && ncov;
+    fi = fo = ncov < IOS_DECLICK_FRAMES ? (UINT32)ncov : IOS_DECLICK_FRAMES;
 
     for (f = 0; f < nframes; f++)
     {
@@ -729,12 +771,21 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
             l += v * s->mix_gain[c][0];
             r += v * s->mix_gain[c][1];
         }
+        if (fade_in && f < fi) {   /* ml1240: the first frames after a gap */
+            float g = (float)(f + 1) / (float)(fi + 1);
+            l *= g; r *= g;
+        }
+        if (fade_out && (uint64_t)f + fo >= ncov) {   /* ml1240: the last frames before one */
+            float g = ncov > f ? (float)(ncov - f) / (float)(fo + 1) : 0.0f;
+            l *= g; r *= g;
+        }
 
         out[(size_t)f * dev_ch + 0] += l;
         if (dev_ch > 1) out[(size_t)f * dev_ch + 1] += r;
     }
 
     atomic_store_explicit(&s->play_pos, play + need, memory_order_release);
+    s->rt_resume = need < want;   /* the next audio this stream gets follows a gap */
 
     /* ml1230: an underrun is heard as a click; count them */
     atomic_fetch_add_explicit(&s->st_cbs, 1, memory_order_relaxed);
@@ -1230,6 +1281,151 @@ static NTSTATUS ios_get_endpoint_ids(void *args) {
     return STATUS_SUCCESS;
 }
 
+/* ml1240: padding cushion (see struct ios_stream). MADEIRA_AUDIO_CUSHION_MS =
+ * 10..200 (default 0 = off) is the most it may grow to. Polled clients only: an
+ * event-driven client is already kept ahead by the ml1230 timer. It grows one
+ * 10 ms step whenever the device ran short since the last look (at most every
+ * 250 ms) and shrinks one step after 20 s without a short pass, so a client
+ * that keeps up pays no latency. GetPosition is untouched. */
+static UINT32 ios_audio_cushion_max(UINT32 rate)
+{
+    static int ms = -1;
+    if (ms < 0) {
+        /* 10..200: up to this many ms more audio queued for a polled client while the device keeps running short (default 0 = off) */
+        const char *e = getenv("MADEIRA_AUDIO_CUSHION_MS");
+        int v = e ? atoi(e) : 0;
+        ms = (v >= 10 && v <= 200) ? v : 0;
+        if (ms) fprintf(stderr, "[ios_audio] ml1240 padding cushion for polled clients: up to %d ms\n", ms);
+    }
+    return (UINT32)((uint64_t)rate * (UINT32)ms / 1000);
+}
+
+static void ios_cushion_update(struct ios_stream *s, uint64_t now_ns)
+{
+    UINT32 max = s->ring_frames > s->buffer_frames ? s->ring_frames - s->buffer_frames : 0;
+    UINT32 step, cur, scbs;
+
+    if (!max || s->event || !s->started) return;
+    if (now_ns - s->cu_check_ns < 250000000ull) return;
+    s->cu_check_ns = now_ns;
+    step = s->sample_rate / 100 ? s->sample_rate / 100 : 1;   /* 10 ms */
+    cur = atomic_load_explicit(&s->cushion, memory_order_relaxed);
+    scbs = atomic_load_explicit(&s->st_short_cbs, memory_order_relaxed);
+    if (scbs != s->cu_scbs) {
+        s->cu_scbs = scbs;
+        s->cu_last_short_ns = now_ns;
+        if (cur < max) cur = cur + step > max ? max : cur + step;
+    } else if (cur && now_ns - s->cu_last_short_ns >= 20000000000ull) {
+        s->cu_last_short_ns = now_ns;
+        cur = cur > step ? cur - step : 0;
+    }
+    atomic_store_explicit(&s->cushion, cur, memory_order_relaxed);
+}
+
+/* What the client is told is queued: the real fill less the cushion, never
+ * more than the buffer it was given. */
+static UINT32 ios_reported_padding(struct ios_stream *s, uint64_t pad)
+{
+    UINT32 cu = atomic_load_explicit(&s->cushion, memory_order_relaxed);
+    pad = pad > cu ? pad - cu : 0;
+    return (UINT32)(pad > s->buffer_frames ? s->buffer_frames : pad);
+}
+
+/* ml1240: the client side of every stream, one line per ~10 s, printed by the
+ * thread that writes it (so its own CPU time can be read cheaply):
+ *   wrote      audio delivered against wall time (100 % = keeping up)
+ *   short      what the device asked for and the ring did not have
+ *   GetBuffer  calls, average and largest request, BUFFER_TOO_LARGE refusals
+ *   padding    the real fill at the client's GetCurrentPadding calls: the
+ *              level a polled client keeps the ring at
+ *   gap        the longest time between two writes
+ *   writer     the writing thread, its CPU time in the window and QoS class
+ *   presents   madeira_d3d12's completed Presents in the same window, when a
+ *              D3D12 game is running (audio made per game frame shows here) */
+extern volatile uint64_t ios_xp_pe_block, ios_xp_pe_len;   /* server_ios.c ml1128 */
+extern pthread_key_t ios_teb_tls_key;                      /* thread_ios.c: the TEB of a guest thread */
+
+static int64_t ios_audio_presents(void)
+{
+    const volatile int64_t *pe = (const volatile int64_t *)(uintptr_t)ios_xp_pe_block;
+    if (!pe || ios_xp_pe_len < 4 * sizeof(int64_t) || pe[0] != 0x3130305058444d4dLL) return -1;
+    return pe[3];   /* struct ios_xp_pe: magic, qpf, pres_enq, pres_done */
+}
+
+static uint64_t ios_audio_self_cpu_us(void)
+{
+    thread_basic_info_data_t bi;
+    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+    mach_port_t th = mach_thread_self();
+    uint64_t us = 0;
+    if (thread_info(th, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) == KERN_SUCCESS)
+        us = (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000ull
+             + (uint64_t)bi.user_time.microseconds + (uint64_t)bi.system_time.microseconds;
+    mach_port_deallocate(mach_task_self(), th);
+    return us;
+}
+
+static const char *ios_audio_qos_name(void)
+{
+    switch (qos_class_self()) {
+    case QOS_CLASS_USER_INTERACTIVE: return "user-interactive";
+    case QOS_CLASS_USER_INITIATED:   return "user-initiated";
+    case QOS_CLASS_DEFAULT:          return "default";
+    case QOS_CLASS_UTILITY:          return "utility";
+    case QOS_CLASS_BACKGROUND:       return "background";
+    default:                         return "unspecified";
+    }
+}
+
+static void ios_audio_client_report(struct ios_stream *s, uint64_t now_ns)
+{
+    uint64_t me = ios_current_tid(), wr, shrt, cpu;
+    uint32_t cbs, scbs, wtid = 0;
+    int64_t pres = ios_audio_presents();
+    void *teb;
+    int slot = -1, i;
+
+    if (me != s->cs_writer) {   /* a new writer: its window starts now */
+        s->cs_writer = me;
+        teb = pthread_getspecific(ios_teb_tls_key);
+        s->cs_writer_wtid = teb ? *(volatile uint32_t *)((char *)teb + 0x48) : 0;   /* TEB ClientId.UniqueThread */
+        s->cs_t0_ns = 0;
+    }
+    wr   = atomic_load_explicit(&s->write_pos, memory_order_relaxed);
+    shrt = atomic_load_explicit(&s->st_short, memory_order_relaxed);
+    cbs  = atomic_load_explicit(&s->st_cbs, memory_order_relaxed);
+    scbs = atomic_load_explicit(&s->st_short_cbs, memory_order_relaxed);
+    if (s->cs_t0_ns && now_ns - s->cs_t0_ns >= 10000000000ull) {
+        double secs = (double)(now_ns - s->cs_t0_ns) / 1e9, rate = s->sample_rate ? s->sample_rate : 48000;
+        double wrote = (double)(wr - s->cs_wr0) / rate;
+        cpu = ios_audio_self_cpu_us();
+        wtid = s->cs_writer_wtid;
+        for (i = 0; i < IOS_MAX_STREAMS; i++)
+            if (atomic_load_explicit(&g_mix[i], memory_order_relaxed) == s) { slot = i; break; }
+        fprintf(stderr, "[ios_audio] ml1240 slot=%d %s: wrote %.2f s in %.2f s (%.1f%%); device short %.1f ms in %u of %u passes; "
+                "GetBuffer %u (avg %llu, max %u frames, %u refused); padding at polls %u..%u avg %llu frames over %u polls "
+                "(buffer %u, cushion %u); longest write gap %.1f ms; writer %04x cpu %.0f ms (%.0f%%) %s; presents %lld (%.1f/s)\n",
+                slot, s->event ? "event" : "polled", wrote, secs, secs > 0 ? 100.0 * wrote / secs : 0.0,
+                (double)(shrt - s->cs_short0) * 1000.0 / rate, scbs - s->cs_scbs0, cbs - s->cs_cbs0,
+                s->cs_gets, (unsigned long long)(s->cs_gets ? s->cs_frames_sum / s->cs_gets : 0), s->cs_frames_max, s->cs_refused,
+                s->cs_pads ? s->cs_pad_min : 0, s->cs_pad_max, (unsigned long long)(s->cs_pads ? s->cs_pad_sum / s->cs_pads : 0),
+                s->cs_pads, s->buffer_frames, atomic_load_explicit(&s->cushion, memory_order_relaxed),
+                s->cs_gap_max_ns / 1e6, wtid, (cpu - s->cs_writer_cpu0_us) / 1000.0,
+                secs > 0 ? (cpu - s->cs_writer_cpu0_us) / (secs * 1e4) : 0.0, ios_audio_qos_name(),
+                (long long)(pres >= 0 && s->cs_pres0 >= 0 ? pres - s->cs_pres0 : -1),
+                pres >= 0 && s->cs_pres0 >= 0 && secs > 0 ? (pres - s->cs_pres0) / secs : 0.0);
+        s->cs_t0_ns = 0;
+    }
+    if (!s->cs_t0_ns) {
+        s->cs_t0_ns = now_ns; s->cs_wr0 = wr; s->cs_short0 = shrt; s->cs_cbs0 = cbs; s->cs_scbs0 = scbs;
+        s->cs_gets = s->cs_frames_max = s->cs_refused = s->cs_pads = s->cs_pad_max = 0;
+        s->cs_frames_sum = s->cs_pad_sum = s->cs_gap_max_ns = 0;
+        s->cs_pad_min = UINT32_MAX;
+        s->cs_writer_cpu0_us = ios_audio_self_cpu_us();
+        s->cs_pres0 = pres;
+    }
+}
+
 static NTSTATUS ios_create_stream(void *args) {
     LOG_FN_CALL(4, "create_stream");
     struct create_stream_params *p = args;
@@ -1266,8 +1462,15 @@ static NTSTATUS ios_create_stream(void *args) {
     if (dur_frames < s->sample_rate / 10) dur_frames = s->sample_rate / 10;
     if (dur_frames > s->sample_rate * 4) dur_frames = s->sample_rate * 4;
     s->buffer_frames = (UINT32)dur_frames;
+    /* ml1240: the cushion's room sits past the buffer the client sees */
+    s->ring_frames = s->buffer_frames + (p->flow == eRender ? ios_audio_cushion_max(s->sample_rate) : 0);
+    {
+        /* 0: underrun gaps are not faded (2 ms fade-out before a gap, fade-in after; on by default) */
+        const char *dc = getenv("MADEIRA_AUDIO_DECLICK");
+        g_audio_declick = !(dc && dc[0] == '0');
+    }
     free(s->ring);
-    s->ring = (BYTE *)calloc(s->buffer_frames, s->frame_bytes);
+    s->ring = (BYTE *)calloc(s->ring_frames, s->frame_bytes);
     ios_audio_free_scratch(s->render_scratch, s->scratch_guest);
     s->scratch_frames = s->buffer_frames;
     s->render_scratch = ios_audio_alloc_scratch(s->scratch_frames, s->frame_bytes, &s->scratch_guest);
@@ -1434,6 +1637,11 @@ static NTSTATUS ios_timer_loop(void *args) {
 
     if (!s) return STATUS_SUCCESS;
     LOG_FN_CALL(9, "timer_loop");
+    {   /* frame-critical threads (thread_ios.c): the QoS class first, then the
+         * time-constraint policy on top of it */
+        extern void ios_thread_qos_frame_critical( const char *why );
+        ios_thread_qos_frame_critical("audio timer");
+    }
     if (ios_audio_lead_ms()) ios_audio_timer_thread_rt();
     while (s->valid) {
         UINT32 rate = s->sample_rate ? s->sample_rate : IOS_AUDIO_SAMPLE_RATE;
@@ -1521,9 +1729,24 @@ static NTSTATUS ios_get_render_buffer(void *args) {
     struct get_render_buffer_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { if (p->data) *p->data = NULL; p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
+    {   /* frame-critical threads (thread_ios.c): whoever writes the sound */
+        extern void ios_thread_qos_frame_critical( const char *why );
+        ios_thread_qos_frame_critical("audio render client");
+    }
+    if (p->frames) {   /* ml1240 report */
+        s->cs_gets++;
+        s->cs_frames_sum += p->frames;
+        if (p->frames > s->cs_frames_max) s->cs_frames_max = p->frames;
+    }
     if (ios_stream_is_live(s)) {
-        uint64_t padding = atomic_load(&s->write_pos) - atomic_load(&s->play_pos);
-        if (p->frames + padding > s->buffer_frames) {
+        /* play_pos first (see ios_timer_loop), and the client's own view of the
+         * fill: with a cushion it may write past buffer_frames into the ring's
+         * extra room, never past the ring itself. */
+        uint64_t play = atomic_load(&s->play_pos), wr = atomic_load(&s->write_pos);
+        uint64_t padding = wr > play ? wr - play : 0;
+        if (p->frames + (uint64_t)ios_reported_padding(s, padding) > s->buffer_frames ||
+            p->frames + padding > s->ring_frames) {
+            s->cs_refused++;
             p->result = (HRESULT)0x88890006L; /* AUDCLNT_E_BUFFER_TOO_LARGE */
             if (p->data) *p->data = NULL;
             return STATUS_SUCCESS;
@@ -1571,7 +1794,7 @@ static NTSTATUS ios_release_render_buffer(void *args) {
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
     if (ios_stream_is_live(s) && p->written_frames > 0) {
         UINT32 fb = s->frame_bytes;
-        UINT32 cap = s->buffer_frames;
+        UINT32 cap = s->ring_frames;
         UINT32 n = p->written_frames;
         uint64_t wr = atomic_load_explicit(&s->write_pos, memory_order_relaxed);
         UINT32 i = 0;
@@ -1626,6 +1849,13 @@ static NTSTATUS ios_release_render_buffer(void *args) {
         /* release-store AFTER the copy so the RT callback never reads
          * frames that aren't fully written */
         atomic_store_explicit(&s->write_pos, wr + n, memory_order_release);
+        {   /* ml1240: longest gap between writes, and the per-stream report */
+            uint64_t now = mach_to_ns(mach_absolute_time());
+            if (s->cs_last_rel_ns && now - s->cs_last_rel_ns > s->cs_gap_max_ns)
+                s->cs_gap_max_ns = now - s->cs_last_rel_ns;
+            s->cs_last_rel_ns = now;
+            ios_audio_client_report(s, now);
+        }
     }
     s->pending_frames = 0;
     p->result = S_OK;
@@ -1748,8 +1978,15 @@ static NTSTATUS ios_get_current_padding(void *args) {
     if (!s) { if (p->padding) *p->padding = 0; p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
     if (p->padding) {
         if (ios_stream_is_live(s)) {
-            uint64_t pad = atomic_load(&s->write_pos) - atomic_load(&s->play_pos);
-            *p->padding = (UINT32)(pad > s->buffer_frames ? s->buffer_frames : pad);
+            uint64_t play = atomic_load(&s->play_pos), wr = atomic_load(&s->write_pos);
+            uint64_t pad = wr > play ? wr - play : 0;
+            ios_cushion_update(s, mach_to_ns(mach_absolute_time()));   /* ml1240 */
+            *p->padding = ios_reported_padding(s, pad);
+            /* ml1240 report: the real fill this client keeps */
+            s->cs_pads++;
+            s->cs_pad_sum += pad;
+            if ((UINT32)pad < s->cs_pad_min) s->cs_pad_min = (UINT32)pad;
+            if ((UINT32)pad > s->cs_pad_max) s->cs_pad_max = (UINT32)pad;
         } else {
             *p->padding = 0; /* null-mode: always hungry */
         }

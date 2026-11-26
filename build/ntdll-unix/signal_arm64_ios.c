@@ -2409,6 +2409,78 @@ static inline void ios_note_guest_delivery( uint64_t thread )
     __atomic_add_fetch( &ios_guest_deliv_seq[ios_fault_slot( thread )], 1, __ATOMIC_RELEASE );
 }
 
+/* madeira-bcd [smc-fast] (on once BSD signals are seen; MADEIRA_SMC_FAST_DECLINE=0
+ * turns it off): DECLINE A SELF-MODIFYING-CODE STORE AT ONCE.
+ *
+ * Rockstar's protector rewrites RDR2's code pages all through a run: 110,000 to
+ * 188,000 "self-modifying writes handled" per iPhone 18 Pro run (2026-11-26/27),
+ * each a store from FEX-translated code into a page of the pure-x64 image that
+ * FEX has write-protected because it translated code there. Every one of them
+ * came through here TWICE ([fault_rip] cnt=1/2, 3/4, ... 307,500 in the 00:19
+ * run): once on the thread's exception port and once on the task's, and both
+ * passes declined after the full pipeline -- an entry region query, the store
+ * emulator (no pool alias: "[store-noalias] ... exec-downgraded page"), the
+ * guest-delivery attempt with Wine's page fault service under virtual_mutex,
+ * then ml369's transient absorption declining the 1st and 2nd identical fault
+ * -- before the BSD SIGBUS reached bus_handler, which raises the exception that
+ * FEX handles (invalidate, untrap, retry). This single thread serves every
+ * fault of every thread, so that work also delayed all the others.
+ *
+ * Declined here, it takes exactly the path it took before -- KERN_FAILURE, the
+ * task port, the BSD signal, bus_handler -- without the work. Only when all of:
+ * BSD signals are known to arrive (bus_handler has run: no debugger swallowing
+ * them, which would turn a decline into a stuck thread), a WRITE permission
+ * fault (ESR) from code in the JIT pool or region C, a target outside the pool,
+ * region C and every anonymous JIT alias, and Wine's view says the page is a
+ * committed pure-x64 image page (VPROT_X64DATA, MADEIRA_X64_IMAGE_NOCOPY) with
+ * EXEC and neither WRITE, WRITECOPY, GUARD nor WRITEWATCH on its host page: a
+ * page nothing in this handler or in Wine's fault service can make writable. */
+static volatile int ios_bsd_bus_seen;
+
+static int ios_smc_fast_decline( const ios_exc_request_t *req, thread_t thread,
+                                 const arm_thread_state64_t *state, uintptr_t fault_addr )
+{
+    extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern int ios_smc_trap_write_fault( uintptr_t addr );
+    static int enabled = -1;
+    static unsigned long declined;
+    arm_exception_state64_t es;
+    mach_msg_type_number_t es_count = ARM_EXCEPTION_STATE64_COUNT;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t ps = ios_jit_pool_size_global;
+    uint64_t pc;
+    uint32_t esr, ec, dfsc;
+
+    if (!ios_bsd_bus_seen || req->exception != EXC_BAD_ACCESS || req->code_count < 2 ||
+        req->code[0] != KERN_PROTECTION_FAILURE)
+        return 0;
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_SMC_FAST_DECLINE" );   /* 0: SMC stores into armed x64 image pages take the full Mach pipeline again */
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || !rx || !ps) return 0;
+    pc = arm_thread_state64_get_pc( *state );
+    if (!(pc - rx < ps || ios_jit_low_contains( (uintptr_t)pc ))) return 0;
+    if (fault_addr - rx < ps || (rw && fault_addr - rw < ps) ||
+        ios_jit_low_contains( fault_addr ) || ios_jit_low_rw_contains( fault_addr ))
+        return 0;
+    if (thread_get_state( thread, ARM_EXCEPTION_STATE64, (thread_state_t)&es, &es_count ) != KERN_SUCCESS)
+        return 0;
+    esr = es.__esr;
+    ec = esr >> 26;
+    dfsc = esr & 0x3f;
+    if ((ec != 0x24 && ec != 0x25) || !(esr & 0x40) || dfsc < 0x0c || dfsc > 0x0f) return 0;
+    if (!ios_smc_trap_write_fault( fault_addr )) return 0;
+    declined++;
+    if (declined <= 4 || (declined & (declined - 1)) == 0)
+        dprintf( 2, "[smc-fast] #%lu store pc=0x%llx -> 0x%lx: armed pure-x64 image page, declined to the "
+                    "signal path without the Mach pipeline (MADEIRA_SMC_FAST_DECLINE=0 restores it)\n",
+                 declined, (unsigned long long)pc, (unsigned long)fault_addr );
+    return 1;
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -3084,6 +3156,12 @@ static void *ios_mach_exception_thread( void *arg )
              * thread with its state untouched. */
             int srcwatch_hit = ios_srcwatch_handle( &state, fault_addr );
             if (srcwatch_hit) handled = 1;
+
+            /* madeira-bcd [smc-fast]: a store into a pure-x64 image page the emulator
+             * armed for self-modifying code goes straight to the signal path; see
+             * ios_smc_fast_decline. */
+            if (!handled && ios_smc_fast_decline( req, thread, &state, fault_addr ))
+                goto ios_exc_reply;
 
             /* 1. Redirect user_shared_data accesses (0x7FFE0000) */
             /* PR402: an emulated access has already updated the thread state.
@@ -7363,6 +7441,7 @@ dispatch_guest_fault:
             }
         }
 
+ios_exc_reply: ;   /* [smc-fast] declines jump here */
         /* Build reply */
         ios_exc_reply_t reply;
         reply.head.msgh_bits = MACH_MSGH_BITS( MACH_MSGH_BITS_REMOTE(req->head.msgh_bits), 0 );
@@ -13856,6 +13935,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         ios_decline_foreign_fault( signal, (void *)PC_sig( (ucontext_t *)sigcontext ), siginfo->si_addr );
         return;
     }
+    ios_bsd_bus_seen = 1;           /* [smc-fast]: BSD SIGBUS reaches this process */
     ios_make_wine_logging_safe();   /* ml375: before any ERR/WARN — see helper */
     ios_track_signal( signal, sigcontext );
     static int bus_count = 0;

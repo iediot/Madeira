@@ -1473,6 +1473,11 @@ static pthread_mutex_t ios_xp_role_lock = PTHREAD_MUTEX_INITIALIZER;
 void ios_xp_set_role( int role, uint64_t wtid )
 {
     uint64_t tid = 0; int i, n;
+    {   /* frame-critical threads (thread_ios.c): a frame waits on every role thread */
+        extern void ios_thread_qos_frame_critical( const char *why );
+        ios_thread_qos_frame_critical( role == 'P' ? "Present" : role == 'E' ? "ExecuteCommandLists"
+                                       : role == 'W' ? "submission worker" : "d3d12 role" );
+    }
     pthread_threadid_np( NULL, &tid );
     pthread_mutex_lock( &ios_xp_role_lock );
     n = ios_xp_nroles;
@@ -1541,6 +1546,101 @@ static struct { uint64_t peb, teb; double ms; } ios_xp_fb[8];
 static int ios_xp_nfb;
 static uint64_t ios_xp_fb_peb;        /* the process the fallback currently follows */
 static volatile unsigned ios_xp_rebind;   /* bumped on a switch; the reporter restarts its deltas */
+/* madeira-bcd spin-pc (2026-11-27): WHERE a thread spins. RDR2 logs 2026-11-26
+ * 20:11 and 2026-11-27 00:19: Social Club's HangWatcher, NetworkService,
+ * CacheThread_BlockFile and wine_threadpool_waitqueue each ran ~1 core at ~6
+ * instructions per cycle for 40 s to 6+ minutes; [xp-t] gave the rate, nothing
+ * gave the place. env.MADEIRA_SPIN_PC = 1: a thread that used at least 30 % of
+ * a core in an [xp-t] window at 4 or more instructions per cycle (a short loop
+ * without system calls) is stopped for a moment, twice 1 ms apart, and its host
+ * PC/LR (symbol), guest RIP as module+RVA and the guest's last return
+ * addresses are logged as [spin-pc] lines, at most 96 in a run (one per thread
+ * and window). Module lookup walks the thread's own PEB loader list. */
+static int ios_spin_mod_for( uint64_t teb, uint64_t va, char *out, size_t cap )
+{
+    uint64_t peb = 0, ldr = 0, head, cur;
+    int guard = 0;
+
+    if (!va || !teb || (teb & 0xfff) || !ios_ts_read( teb + 0x60, &peb, 8 ) || !peb) return 0;
+    if (!ios_ts_read( peb + 0x18, &ldr, 8 ) || !ldr) return 0;
+    head = ldr + 0x10;
+    if (!ios_ts_read( head, &cur, 8 )) return 0;
+    while (cur && cur != head && guard++ < 400)
+    {
+        uint64_t base = 0, buf = 0, next = 0; uint32_t size = 0; uint16_t len = 0, w[40]; int k;
+        if (!ios_ts_read( cur + 0x30, &base, 8 ) || !ios_ts_read( cur + 0x40, &size, 4 )) break;
+        if (base && va >= base && va < base + size)
+        {
+            char name[41] = "?";
+            if (ios_ts_read( cur + 0x58, &len, 2 ) && ios_ts_read( cur + 0x60, &buf, 8 ))
+            {
+                len /= 2; if (len > 40) len = 40;
+                if (len && ios_ts_read( buf, w, len * 2 ))
+                {
+                    for (k = 0; k < len; k++) name[k] = w[k] < 128 ? (char)w[k] : '?';
+                    name[len] = 0;
+                }
+            }
+            snprintf( out, cap, "%s+0x%llx", name, (unsigned long long)(va - base) );
+            return 1;
+        }
+        if (!ios_ts_read( cur, &next, 8 )) break;
+        cur = next;
+    }
+    return 0;
+}
+
+static void ios_spin_pc_sample( thread_t port, uint32_t wtid, uint64_t teb, double ms, double window_ms, double ipc )
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    static int printed;
+    char line[1100];
+    int n, pass;
+    uint32_t wpid = 0;
+
+    if (printed >= 96 || port == pthread_mach_thread_np( pthread_self() )) return;
+    printed++;
+    if (teb) ios_ts_read( teb + 0x40, &wpid, 4 );
+    n = snprintf( line, sizeof(line), "[spin-pc] tid=%04x pid=%04x %.0f of %.0f ms at %.1f instructions/cycle:",
+                  wtid, wpid, ms, window_ms, ipc );
+    for (pass = 0; pass < 2 && n < (int)sizeof(line) - 200; pass++)
+    {
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        uint64_t pc, lr, bb = 0, rip = 0, cr[12];
+        int have_cr, i;
+        const char *why = "";
+        char s1[120], s2[120], m[80];
+
+        if (pass) usleep( 1000 );
+        if (thread_suspend( port ) != KERN_SUCCESS) break;
+        if (thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+        {
+            thread_resume( port );
+            break;
+        }
+        pc = arm_thread_state64_get_pc( st ); lr = arm_thread_state64_get_lr( st );
+        if (ios_ts_read( st.__x[28], &bb, 8 ) && bb <= 0x10000) bb = 0;
+        have_cr = ios_ts_read( st.__x[17], cr, sizeof(cr) );
+        thread_resume( port );
+        if (bb) rip = ios_native_rip_from_hostpc( bb, pc, &why );
+        ios_ts_sym( pc, s1, sizeof(s1) ); ios_ts_sym( lr, s2, sizeof(s2) );
+        n += snprintf( line + n, sizeof(line) - n, " #%d pc=%s lr=%s", pass + 1, s1, s2 );
+        if (!rip) { n += snprintf( line + n, sizeof(line) - n, " native" ); continue; }
+        if (ios_spin_mod_for( teb, rip, m, sizeof(m) ))
+            n += snprintf( line + n, sizeof(line) - n, " GUEST %s", m );
+        else
+            n += snprintf( line + n, sizeof(line) - n, " GUEST rip=0x%llx", (unsigned long long)rip );
+        n += snprintf( line + n, sizeof(line) - n, " callret=[" );
+        for (i = 0; have_cr && i < 6 && cr[i * 2] && n < (int)sizeof(line) - 90; i++)
+        {
+            if (ios_spin_mod_for( teb, cr[i * 2], m, sizeof(m) )) n += snprintf( line + n, sizeof(line) - n, " %s", m );
+            else n += snprintf( line + n, sizeof(line) - n, " 0x%llx", (unsigned long long)cr[i * 2] );
+        }
+        n += snprintf( line + n, sizeof(line) - n, " ]" );
+    }
+    wine_log_write( "%s", line );
+}
+
 static void ios_xp_fallback_add( uint64_t teb, double ms )
 {
     uint64_t peb = 0; int i;
@@ -1987,6 +2087,13 @@ static void ios_xprobe_main( void )
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
                                 if (r->role && teb && (strchr( r->role, 'P' ) || strchr( r->role, 'E' ))) ios_xp_game_teb = teb;   /* ml1131 */
                                 if (teb && !ios_xp_nroles) ios_xp_fallback_add( teb, pt + et );   /* ml1131c */
+                                {   /* madeira-bcd spin-pc: see ios_spin_pc_sample */
+                                    static int spin_pc = -1;
+                                    if (spin_pc < 0) { const char *e = getenv( "MADEIRA_SPIN_PC" ); spin_pc = e && e[0] == '1'; }
+                                    if (spin_pc && pt + et >= 0.3 * dt_ms && pcy + ecy > 0 &&
+                                        r->minst * 1e6 / (pcy + ecy) >= 4.0)
+                                        ios_spin_pc_sample( th[k], w, teb, pt + et, dt_ms, r->minst * 1e6 / (pcy + ecy) );
+                                }
                                 sum_thr_ms += pt + et; nrows++;
                             }
                         }

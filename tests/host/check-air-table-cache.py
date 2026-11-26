@@ -10,7 +10,7 @@ versions = source[source.index('static SRWLOCK g_descriptor_heaps_lock'):source.
 begin = source.index('    struct {\n        const struct mad_rootsig *rs;', source.index('UINT64 root_version[2]'))
 cache = source[begin:source.index('    obj_handle_t cenc;', begin)]
 types = source[source.index('static UINT mad_air_range_type('):source.index('/* Resolve one declaration range')]
-begin = source.index('static UINT mad_air_root_mask(')
+begin = source.index('static UINT mad_air_root_mask(const struct mad_rootsig *rs, const struct madeira_ir_air_range *air, UINT n) {')
 lookup = source[begin:source.index('static int mad_air_build_tables(struct mad_exec', begin)]
 harness = r'''
 #include <stdint.h>
@@ -51,13 +51,17 @@ static int g_replay_split,g_dump_tables;
 static int g_air_cache_on=-1;
 static long long mad_cfg_int_pe(const char *key,long long fallback) { return fallback; }
 static volatile LONG64 g_air_cache_hits,g_air_cache_misses,g_air_cache_root_reuse;
+static volatile LONG64 g_air_miss_new,g_air_miss_heap,g_air_miss_root;
+struct mad_air_plan { UINT root_mask; };
+static const struct mad_air_plan *mad_air_plan_get(const struct mad_pso *p,const struct mad_rootsig *rs,
+ const struct madeira_ir_air_range *a,UINT n,unsigned vis) { return NULL; }
 static UINT64 mad_tick(void) { return 0; }
 enum { RS_TABLES };
 static void mad_rs_step(int a,UINT64 *b) {}
 static unsigned builds;
 static int mad_air_build_tables_ex_body(struct mad_exec *e,const struct mad_rootsig *rs,const UINT64 *r,
  const UINT32 (*cs)[64],const struct mad_pso *p,UINT cb,UINT ar,UINT aq,UINT n,
- const struct madeira_ir_air_range *v,unsigned vis,obj_handle_t *b,UINT64 *bo,obj_handle_t *a,UINT64 *ao) {
+ const struct madeira_ir_air_range *v,unsigned vis,const struct mad_air_plan *plan,obj_handle_t *b,UINT64 *bo,obj_handle_t *a,UINT64 *ao) {
  ++builds; *b=builds; *a=builds+100; *bo=8; *ao=16; return 1;
 }
 ''' + types + lookup + r'''
@@ -90,6 +94,8 @@ int main(void) {
  struct skin sk={1};e.sk=&sk;assert(BUILD() && builds==7);e.sk=NULL;
  g_air_cache_on=0;assert(BUILD() && builds==8);g_air_cache_on=1;
  assert(g_air_cache_root_reuse>0);
+ assert(g_air_miss_new>0 && g_air_miss_heap>0 && g_air_miss_root>0);
+ assert(g_air_miss_new+g_air_miss_heap+g_air_miss_root==g_air_cache_misses);
  // Even equal version numbers cannot alias graphics and compute root state.
  assert(mad_air_build_tables_ex(&e,&rs,e.croot,constants,&p,1,2,4,1,&air,~0u,&cb,&co,&arg,&ao) && builds==9);
  e.root_version[1]++;e.root_param_version[1][1]++;

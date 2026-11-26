@@ -1532,6 +1532,92 @@ static void ios_thread_qos_named( HANDLE handle, const char *name )
     else if (changed) __atomic_add_fetch( &ios_eco_gen, 1, __ATOMIC_RELEASE );
 }
 
+/* frame-critical threads (2026-11-27). An "exe:Game.exe=initiated" rule lowers
+ * every thread of a game one step, to user-initiated: still eligible for the
+ * performance cores and in the same timer-latency tier, but scheduled below
+ * user-interactive (priority 37, not 47). The threads a frame or the sound waits
+ * for are lifted back to user-interactive as they show themselves:
+ *  - madeira_d3d12's Present, ExecuteCommandLists and submission threads
+ *    (ios_xp_set_role, server_ios.c), and every thread that waits on the GPU
+ *    timeline or builds pipelines (its fence worker and pipeline-build pool;
+ *    winemetal_unix.c);
+ *  - every thread that writes a WASAPI render stream (audio_null_ios.c);
+ *  - a thread the game raises to THREAD_PRIORITY_HIGHEST or above.
+ * RDR2 names none of its threads. Log 2026-11-27 00:19 (iPhone 18 Pro, CPU held
+ * at P 1.44 / E 1.8 GHz through gameplay): with ~20 busy threads at one class
+ * and two performance cores, the main thread ran 45 % of its time on the
+ * efficiency cores and the render thread 20 %, next to eight job workers.
+ * Only a user-initiated or default exe rule opts a process in: a process held
+ * at utility or background (Social Club's helper) is never lifted. A thread
+ * named after it was lifted takes its name rule again. */
+static __thread int tq_self_critical;
+
+static int tq_critical_allowed(void)
+{
+    qos_class_t c = tq_exe_class();
+    return c == QOS_CLASS_USER_INITIATED || c == QOS_CLASS_DEFAULT;
+}
+
+void ios_thread_qos_frame_critical( const char *why )
+{
+    extern void ios_eco_apply_self(void);
+    char name[48];
+    unsigned self;
+
+    if (tq_self_critical) return;
+    tq_self_critical = 1;   /* one look per thread */
+    if (!tq_enabled() || !NtCurrentTeb() || !tq_critical_allowed()) return;
+    if (!(self = (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread)) return;
+    snprintf( name, sizeof(name), "(frame-critical: %s)", why ? why : "?" );
+    tq_self_tid = self;
+    if (tq_store( self, QOS_CLASS_USER_INTERACTIVE, name )) ios_eco_apply_self();
+}
+
+/* NtSetInformationThread(ThreadBasePriority) succeeded: log what a game with an
+ * exe rule asks for (Windows tells the scheduler which threads matter this
+ * way; RDR2's choices were never visible), and lift HIGHEST and above. */
+static void ios_thread_qos_win_priority( HANDLE handle, int priority )
+{
+    extern void ios_eco_apply_self(void);
+    extern volatile int ios_eco_gen;
+    static int logged;
+    unsigned self, tid = 0;
+    int lift;
+    char name[48];
+
+    if (!tq_enabled() || !NtCurrentTeb() || !tq_exe_class()) return;
+    lift = priority >= 2 /* THREAD_PRIORITY_HIGHEST, TIME_CRITICAL = 15 */ && tq_critical_allowed();
+    if (!lift && logged >= 96) return;
+    self = (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
+    if (handle == GetCurrentThread() || handle == 0) tid = self;
+    else
+    {
+        SERVER_START_REQ( get_thread_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->access = THREAD_QUERY_LIMITED_INFORMATION;
+            if (!wine_server_call( req )) tid = reply->tid;
+        }
+        SERVER_END_REQ;
+    }
+    if (logged < 96)
+    {
+        logged++;
+        dprintf( 2, "[win-prio] tid=%04x priority %d (set by %04x)%s\n", tid, priority, self,
+                 lift && tid ? " -> frame-critical, user-interactive" : "" );
+    }
+    if (!lift || !tid) return;
+    snprintf( name, sizeof(name), "(frame-critical: priority %d)", priority );
+    if (!tq_store( tid, QOS_CLASS_USER_INTERACTIVE, name )) return;
+    if (tid == self)
+    {
+        tq_self_critical = 1;
+        tq_self_tid = self;
+        ios_eco_apply_self();
+    }
+    else __atomic_add_fetch( &ios_eco_gen, 1, __ATOMIC_RELEASE );
+}
+
 /***********************************************************************
  *           start_thread
  *
@@ -3436,6 +3522,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status) ios_thread_qos_win_priority( handle, (int)*base_priority );   /* frame-critical threads */
         return status;
     }
 

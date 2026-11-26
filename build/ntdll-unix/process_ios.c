@@ -1377,6 +1377,320 @@ static int sc_browser_cmdline( const WCHAR *cl, int cl_len, int jitless, const c
     out[o] = 0;
     return o;
 }
+
+/* madeira-bcd sc-lite (2026-11-27): env.MADEIRA_SC_CEF_LITE = 1 trims the work
+ * Social Club's browser does while a game runs. RDR2 log 2026-11-27 00:19: with
+ * the launcher window hidden (its child 0x100b8 "parent shown or hidden:
+ * hidden=1" as RDR2's window came up) the helper went on producing off-screen
+ * frames -- Chrome_InProcRendererThread ~0.7 core, Compositor, VizCompositor and
+ * Chrome_InProcGpuThread ~0.25 core each -- and averaged ~1 core of the game's
+ * cores, bursting to 2.6. Applied to the command line sc_browser_cmdline made
+ * (which always carries a --disable-features= list):
+ *   - EnableHangWatcher goes into its last --disable-features= list: the
+ *     HangWatcher thread only reports hangs (a crash dump) and was one of the
+ *     spinning threads in both RDR2 logs;
+ *   - switches that keep a hidden page running at full rate are removed:
+ *     --disable-background-timer-throttling, --disable-renderer-backgrounding,
+ *     --disable-backgrounding-occluded-windows;
+ *   - added unless present: --disable-background-networking,
+ *     --disable-component-update, --disable-domain-reliability (background
+ *     fetches the launcher does not need), --num-raster-threads=1 (one
+ *     CompositorTileWorker), --disable-smooth-scrolling, and
+ *     --off-screen-frame-rate=<fps> (cefclient's switch; the helper already
+ *     takes cefclient's --off-screen-rendering-enabled) with
+ *     env.MADEIRA_SC_CEF_FPS (default 30, 0 = not added).
+ * Returns the new length (SC_LITE_* bits in *how), or -1 when `cap` is small. */
+enum { SC_LITE_HANG = 1, SC_LITE_STRIPPED = 2, SC_LITE_ADDED = 4, SC_LITE_FPS = 8 };
+
+/* Does the comma-separated value starting at cl[at] (up to a blank, tab or
+ * quote) hold `item` (given with its trailing comma, e.g. "Name,")? */
+static int sc_list_has( const WCHAR *cl, int cl_len, int at, const char *item )
+{
+    int n = (int)strlen( item ) - 1, k, j;
+
+    for (k = at; k < cl_len && cl[k] != ' ' && cl[k] != '\t' && cl[k] != '"'; k++)
+    {
+        if (k != at && cl[k - 1] != ',') continue;
+        for (j = 0; j < n && k + j < cl_len; j++) if (cl[k + j] != (WCHAR)item[j]) break;
+        if (j == n && (k + n == cl_len || cl[k + n] == ',' || cl[k + n] == ' ' || cl[k + n] == '\t' ||
+                       cl[k + n] == '"'))
+            return 1;
+    }
+    return 0;
+}
+
+static int sc_lite_cmdline( const WCHAR *cl, int cl_len, int fps, WCHAR *out, int cap, int *how )
+{
+    static const char *const strip[] = { "--disable-background-timer-throttling",
+                                         "--disable-renderer-backgrounding",
+                                         "--disable-backgrounding-occluded-windows" };
+    static const char *const add[] = { "--disable-background-networking", "--disable-component-update",
+                                       "--disable-domain-reliability", "--num-raster-threads=",
+                                       "--disable-smooth-scrolling" };
+    static const char *const add_value[] = { "", "", "", "1", "" };
+    static const char hang[] = "EnableHangWatcher,";
+    int need = cl_len + 1 + (int)sizeof(hang) + 220, o, k, s, df;
+    const char *p;
+    char num[16];
+
+    *how = 0;
+    if (cl_len < 0 || cap < need) return -1;
+    memcpy( out, cl, cl_len * sizeof(WCHAR) );
+    o = cl_len;
+    for (s = 0; s < (int)(sizeof(strip) / sizeof(strip[0])); s++)
+    {
+        int end, n = (int)strlen( strip[s] ), start;
+        while ((end = sc_switch_end( out, o, strip[s] )) >= 0)
+        {
+            start = end - n;
+            if (end < o && out[end] == '=')   /* a value: up to the next blank */
+                while (end < o && out[end] != ' ' && out[end] != '\t') end++;
+            if (start > 0 && out[start - 1] == ' ') start--;   /* the separating blank goes too */
+            memmove( out + start, out + end, (o - end) * sizeof(WCHAR) );
+            o -= end - start;
+            *how |= SC_LITE_STRIPPED;
+        }
+    }
+    if ((df = sc_switch_end( out, o, "--disable-features=" )) >= 0 && !sc_list_has( out, o, df, hang ))
+    {
+        int n = (int)sizeof(hang) - 1;
+        memmove( out + df + n, out + df, (o - df) * sizeof(WCHAR) );
+        for (k = 0; k < n; k++) out[df + k] = (WCHAR)hang[k];
+        o += n;
+        *how |= SC_LITE_HANG;
+    }
+    for (s = 0; s < (int)(sizeof(add) / sizeof(add[0])); s++)
+    {
+        if (sc_switch_end( out, o, add[s] ) >= 0) continue;
+        out[o++] = ' ';
+        for (p = add[s]; *p; p++) out[o++] = (WCHAR)*p;
+        for (p = add_value[s]; *p; p++) out[o++] = (WCHAR)*p;
+        *how |= SC_LITE_ADDED;
+    }
+    if (fps > 0 && sc_switch_end( out, o, "--off-screen-frame-rate=" ) < 0)
+    {
+        snprintf( num, sizeof(num), "%d", fps > 240 ? 240 : fps );
+        for (p = " --off-screen-frame-rate="; *p; p++) out[o++] = (WCHAR)*p;
+        for (p = num; *p; p++) out[o++] = (WCHAR)*p;
+        *how |= SC_LITE_FPS;
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* madeira-bcd wait-floor (2026-11-27): a minimum for the short timed waits of
+ * chosen processes while a game runs.
+ *
+ * env.MADEIRA_WAIT_FLOOR = "Name.exe=<ms>[;Other.exe=<ms>]": in those processes
+ * a relative wait or sleep of at least 1 ms and less than <ms> lasts <ms>
+ * (NtWaitForSingleObject, NtWaitForMultipleObjects, NtDelayExecution,
+ * NtRemoveIoCompletion(Ex), NtWaitForAlertByThreadId; sync.c). Signals, I/O
+ * completions, messages and APCs still end a wait at once; zero-timeout polls,
+ * infinite and absolute waits and sub-millisecond back-off sleeps are left
+ * alone. Only timer-driven work slows down: Chromium's delayed tasks, CEF's
+ * off-screen frame timer, the helper's 10 ms renderer loop task ([sc-rph]).
+ *
+ * env.MADEIRA_WAIT_FLOOR_AFTER = "Game.exe[:<seconds>]": the floor applies only
+ * from <seconds> after this session started Game.exe until that process is
+ * gone (checked every 5 s), so the launcher, sign-in and the game's loading
+ * screen run as before. Unset: always on for the listed processes.
+ * [wait-floor] lines report the switch-on/off and the waits raised per 30 s. */
+#define IOS_WF_MAX 8
+static struct { char name[64]; int ms; } ios_wf_rules[IOS_WF_MAX];
+static int ios_wf_nrules;
+static int ios_wf_state = -1;              /* -1 not parsed, 0 off, 1 rules present */
+static char ios_wf_after_name[64];
+static long long ios_wf_after_ns;
+static volatile long long ios_wf_started_ns;   /* when the game was started, 0 = not running */
+static volatile unsigned int ios_wf_game_pid;
+static volatile long long ios_wf_check_ns, ios_wf_report_ns;
+static volatile int ios_wf_announced;
+static volatile long long ios_wf_raised;
+static pthread_once_t ios_wf_once = PTHREAD_ONCE_INIT;
+static __thread int ios_wf_thread_ms = -1;   /* this thread's process floor, -1 unknown */
+
+static long long ios_wf_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (long long)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
+/* "Name.exe=50;Other.exe=30" -> rules; names lower-cased. Returns the count. */
+static int ios_wf_parse( const char *spec )
+{
+    char buf[512], *p, *next;
+    int n = 0;
+
+    if (!spec || !*spec) return 0;
+    snprintf( buf, sizeof(buf), "%s", spec );
+    for (p = buf; p && *p && n < IOS_WF_MAX; p = next)
+    {
+        char *semi = strchr( p, ';' ), *eq, *q;
+        int ms, len;
+        next = semi ? semi + 1 : NULL;
+        if (semi) *semi = 0;
+        while (*p == ' ') p++;
+        if (!(eq = strchr( p, '=' ))) continue;
+        *eq = 0;
+        ms = atoi( eq + 1 );
+        len = (int)strlen( p );
+        while (len && p[len - 1] == ' ') p[--len] = 0;
+        if (!len || len >= (int)sizeof(ios_wf_rules[0].name) || ms <= 0) continue;
+        for (q = p; *q; q++) if (*q >= 'A' && *q <= 'Z') *q += 32;
+        snprintf( ios_wf_rules[n].name, sizeof(ios_wf_rules[n].name), "%s", p );
+        ios_wf_rules[n].ms = ms > 1000 ? 1000 : ms;
+        n++;
+    }
+    return n;
+}
+
+/* "Game.exe:120" -> name (lower case) and delay; returns 1 when a name was given. */
+static int ios_wf_parse_after( const char *spec, char *name, int name_size, long long *delay_ns )
+{
+    const char *colon;
+    int len, k;
+
+    *delay_ns = 0;
+    if (!spec || !*spec) return 0;
+    while (*spec == ' ') spec++;
+    colon = strchr( spec, ':' );
+    len = colon ? (int)(colon - spec) : (int)strlen( spec );
+    while (len && spec[len - 1] == ' ') len--;
+    if (!len || len >= name_size) return 0;
+    for (k = 0; k < len; k++) name[k] = (spec[k] >= 'A' && spec[k] <= 'Z') ? spec[k] + 32 : spec[k];
+    name[len] = 0;
+    if (colon && atoi( colon + 1 ) > 0) *delay_ns = (long long)atoi( colon + 1 ) * 1000000000ll;
+    return 1;
+}
+
+static void ios_wf_init(void)
+{
+    ios_wf_nrules = ios_wf_parse( getenv( "MADEIRA_WAIT_FLOOR" ) );
+    ios_wf_parse_after( getenv( "MADEIRA_WAIT_FLOOR_AFTER" ), ios_wf_after_name,
+                        sizeof(ios_wf_after_name), &ios_wf_after_ns );
+    if (ios_wf_nrules)
+    {
+        int i;
+        for (i = 0; i < ios_wf_nrules; i++)
+            dprintf( 2, "[wait-floor] %s: timed waits of 1..%d ms last %d ms %s%s%s\n",
+                     ios_wf_rules[i].name, ios_wf_rules[i].ms - 1, ios_wf_rules[i].ms,
+                     ios_wf_after_name[0] ? "once " : "(always on)", ios_wf_after_name,
+                     ios_wf_after_name[0] ? " has run its delay" : "" );
+    }
+    __atomic_store_n( &ios_wf_state, ios_wf_nrules ? 1 : 0, __ATOMIC_RELEASE );
+}
+
+/* NtCreateUserProcess: the session started `image` as process `pid`. */
+static void ios_wait_floor_note_process( const WCHAR *image, int image_len, unsigned int pid )
+{
+    pthread_once( &ios_wf_once, ios_wf_init );
+    if (ios_wf_state <= 0 || !ios_wf_after_name[0]) return;
+    if (!ios_image_name_is( image, image_len, ios_wf_after_name )) return;
+    __atomic_store_n( &ios_wf_game_pid, pid, __ATOMIC_RELAXED );
+    __atomic_store_n( &ios_wf_started_ns, ios_wf_now_ns(), __ATOMIC_RELEASE );
+    __atomic_store_n( &ios_wf_announced, 0, __ATOMIC_RELAXED );
+    dprintf( 2, "[wait-floor] %s started (pid %04x): the floor applies %lld s from now\n",
+             ios_wf_after_name, pid, ios_wf_after_ns / 1000000000ll );
+}
+
+/* The floor of the calling thread's process, in ms (0 = none); cached per thread. */
+static int ios_wf_thread_floor(void)
+{
+    const RTL_USER_PROCESS_PARAMETERS *pp;
+    int i;
+
+    if (ios_wf_thread_ms >= 0) return ios_wf_thread_ms;
+    if (!NtCurrentTeb() || !NtCurrentTeb()->Peb || !(pp = NtCurrentTeb()->Peb->ProcessParameters) ||
+        !pp->ImagePathName.Buffer)
+        return 0;   /* not cached: the PEB may not be filled in yet */
+    ios_wf_thread_ms = 0;
+    for (i = 0; i < ios_wf_nrules; i++)
+        if (ios_image_name_is( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR),
+                               ios_wf_rules[i].name ))
+        {
+            ios_wf_thread_ms = ios_wf_rules[i].ms;
+            break;
+        }
+    return ios_wf_thread_ms;
+}
+
+/* Is the game (MADEIRA_WAIT_FLOOR_AFTER) past its delay and still there? */
+static int ios_wf_game_active( long long now )
+{
+    long long started = __atomic_load_n( &ios_wf_started_ns, __ATOMIC_ACQUIRE ), last;
+
+    if (!ios_wf_after_name[0]) return 1;
+    if (!started || now - started < ios_wf_after_ns) return 0;
+    last = __atomic_load_n( &ios_wf_check_ns, __ATOMIC_RELAXED );
+    if (now - last >= 5000000000ll &&
+        __atomic_compare_exchange_n( &ios_wf_check_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+    {
+        OBJECT_ATTRIBUTES attr;
+        CLIENT_ID cid;
+        HANDLE process = 0;
+        unsigned int pid = __atomic_load_n( &ios_wf_game_pid, __ATOMIC_RELAXED );
+        NTSTATUS st;
+        PROCESS_BASIC_INFORMATION pbi;
+
+        InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
+        cid.UniqueProcess = ULongToHandle( pid );
+        cid.UniqueThread = 0;
+        st = NtOpenProcess( &process, PROCESS_QUERY_LIMITED_INFORMATION, &attr, &cid );
+        if (!st)
+        {
+            if (!NtQueryInformationProcess( process, ProcessBasicInformation, &pbi, sizeof(pbi), NULL ) &&
+                pbi.ExitStatus != STATUS_PENDING)
+                st = STATUS_PROCESS_IS_TERMINATING;
+            NtClose( process );
+        }
+        if (st)
+        {
+            long long expect = started;
+            if (__atomic_compare_exchange_n( &ios_wf_started_ns, &expect, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED ))
+                dprintf( 2, "[wait-floor] %s (pid %04x) is gone: the floor is off; %lld waits were raised\n",
+                         ios_wf_after_name, pid, (long long)__atomic_load_n( &ios_wf_raised, __ATOMIC_RELAXED ) );
+            return 0;
+        }
+    }
+    return 1;
+}
+
+const LARGE_INTEGER *ios_wait_floor( const LARGE_INTEGER *timeout, LARGE_INTEGER *store )
+{
+    long long now, last, floor_100ns;
+    int ms;
+
+    /* infinite, a poll, an absolute deadline or a sub-millisecond sleep: untouched */
+    if (!timeout || timeout->QuadPart > -10000) return timeout;
+    if (__builtin_expect( ios_wf_state < 0, 0 )) pthread_once( &ios_wf_once, ios_wf_init );
+    if (ios_wf_state <= 0) return timeout;
+    if (!(ms = ios_wf_thread_floor())) return timeout;
+    floor_100ns = (long long)ms * 10000;
+    if (-timeout->QuadPart >= floor_100ns) return timeout;
+    now = ios_wf_now_ns();
+    if (!ios_wf_game_active( now )) return timeout;
+    if (!__atomic_exchange_n( &ios_wf_announced, 1, __ATOMIC_RELAXED ))
+        dprintf( 2, "[wait-floor] ON: %s's timed waits of 1..%d ms now last %d ms (%s%s)\n",
+                 NtCurrentTeb()->Peb->ProcessParameters
+                     ? debugstr_us( &NtCurrentTeb()->Peb->ProcessParameters->ImagePathName ) : "?",
+                 ms - 1, ms, ios_wf_after_name[0] ? ios_wf_after_name : "always on",
+                 ios_wf_after_name[0] ? " running" : "" );
+    __atomic_add_fetch( &ios_wf_raised, 1, __ATOMIC_RELAXED );
+    last = __atomic_load_n( &ios_wf_report_ns, __ATOMIC_RELAXED );
+    if (!last) __atomic_compare_exchange_n( &ios_wf_report_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED );
+    else if (now - last >= 30000000000ll &&
+             __atomic_compare_exchange_n( &ios_wf_report_ns, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+    {
+        static long long reported;
+        long long total = __atomic_load_n( &ios_wf_raised, __ATOMIC_RELAXED );
+        dprintf( 2, "[wait-floor] %lld waits raised to the floor in the last %lld s (%lld in all)\n",
+                 total - reported, (now - last) / 1000000000ll, total );
+        reported = total;
+    }
+    store->QuadPart = -floor_100ns;
+    return store;
+}
 #endif
 
 /**********************************************************************
@@ -2094,9 +2408,51 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
             int cap = cl_len + 160 + (extra ? (int)strlen( extra ) : 0);
             WCHAR *nbuf = malloc( cap * sizeof(WCHAR) );   /* leaks once per launch, as above */
 
+            /* madeira-bcd sc-lite: the helper's own switches, so a log shows what Rockstar passes */
+            {
+                int part, parts = (cl_len + 239) / 240, ti;
+                char chunk[244];
+                for (part = 0; part < parts && part < 8; part++)
+                {
+                    for (ti = 0; ti < 240 && part * 240 + ti < cl_len; ti++)
+                    {
+                        WCHAR c = params->CommandLine.Buffer[part * 240 + ti];
+                        chunk[ti] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+                    }
+                    chunk[ti] = 0;
+                    dprintf( 2, "[sc-cef] cmdline-in %d/%d: %s\n", part + 1, parts, chunk );
+                }
+            }
             if (nbuf)
                 o = sc_browser_cmdline( params->CommandLine.Buffer, cl_len, !(jl && jl[0] == '0'), extra,
                                         nbuf, cap, &how );
+            {
+                const char *lite = getenv( "MADEIRA_SC_CEF_LITE" );
+                if (o >= 0 && lite && lite[0] == '1')
+                {
+                    const char *fe = getenv( "MADEIRA_SC_CEF_FPS" );
+                    int fps = fe && *fe ? atoi( fe ) : 30, lcap = o + 320, lhow = 0, lo = -1;
+                    WCHAR *lbuf = malloc( lcap * sizeof(WCHAR) );   /* leaks once per launch, as above */
+
+                    if (lbuf) lo = sc_lite_cmdline( nbuf, o, fps, lbuf, lcap, &lhow );
+                    if (lo >= 0)
+                    {
+                        free( nbuf );
+                        nbuf = lbuf;
+                        o = lo;
+                        dprintf( 2, "[sc-cef] sc-lite: %s; %s; %s; %s (env.MADEIRA_SC_CEF_LITE=0 turns it off)\n",
+                                 (lhow & SC_LITE_HANG) ? "EnableHangWatcher disabled" : "hang watcher left as set",
+                                 (lhow & SC_LITE_STRIPPED) ? "anti-throttling switches REMOVED" : "no anti-throttling switch",
+                                 (lhow & SC_LITE_ADDED) ? "background-network/raster switches added" : "switches already present",
+                                 (lhow & SC_LITE_FPS) ? "--off-screen-frame-rate added" : "frame rate left as set" );
+                    }
+                    else
+                    {
+                        free( lbuf );
+                        dprintf( 2, "[sc-cef] sc-lite: NOT applied (no memory)\n" );
+                    }
+                }
+            }
             if (o >= 0)
             {
                 char tail[136];
@@ -2385,6 +2741,11 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     TRACE( "%s pid %04x tid %04x handles %p/%p\n", debugstr_us(&path),
            HandleToULong(id.UniqueProcess), HandleToULong(id.UniqueThread),
            process_handle, thread_handle );
+#ifdef WINE_IOS
+    /* madeira-bcd wait-floor: env.MADEIRA_WAIT_FLOOR_AFTER names the game that arms it */
+    ios_wait_floor_note_process( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                                 HandleToULong( id.UniqueProcess ) );
+#endif
 
     /* update output attributes */
 

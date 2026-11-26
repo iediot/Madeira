@@ -1027,11 +1027,20 @@ struct LibraryEntry: Codable, Identifiable {
         case "rdr2.exe", "playrdr2.exe":
             // Social Club's Chromium (SocialClubHelper.exe, V8 --jitless) kept rendering its hidden
             // overlay during play: Chrome_InProcRendererThread averaged 38 % of a core, three times
-            // RDR2's busiest thread (log 2026-11-26 15:04). Its threads, matched by name (none of
-            // RDR2's own), run at background QoS: they get the CPU when nothing else wants it (the
-            // launcher and sign-in run as before) and almost none while the game loads the cores.
-            // Not a suspend: Wine's suspend cannot hold a thread on iOS, and a pseudo-process held
-            // inside a shared lock (malloc, the JIT pool, the futex table) would stop the game too.
+            // RDR2's busiest thread (log 2026-11-26 15:04). The whole helper runs at utility QoS, ONE
+            // class for all its threads: with its Chrome_* / ThreadPool* threads at background and the
+            // rest above, the threads above (HangWatcher, NetworkService, CacheThread_BlockFile, the
+            // wine waitqueue) spun ~1 core each at ~6 instructions per cycle for 40 s (log 2026-11-27
+            // 00:19) and 6+ minutes (2026-11-26 20:11), most likely on a lock whose lower-class holder
+            // never got a core; the futex bucket spin now backs off ([futex-spin]). Three minutes after
+            // RDR2.exe starts (its load screen took 2-3 minutes in those logs) the helper's short timed
+            // waits last at least 50 ms ([wait-floor]): its frame timer and polling slow to <= 20 Hz
+            // while I/O, IPC and messages still wake it at once.
+            // MADEIRA_SC_CEF_LITE drops background networking, the hang watcher and anti-throttling
+            // switches and asks for 30 off-screen fps ([sc-cef] sc-lite). [spin-pc] names the code of
+            // any thread still spinning. Not a suspend: Wine's suspend cannot hold a thread on iOS, and a
+            // pseudo-process held inside a shared lock (malloc, the JIT pool, the futex table) would stop
+            // the game too.
             // Video budget by memory limit. 4096 MB was measured on the 12 GB iPad. The
             // iPhone 18 Pro (11.5 GB, 8 GB jetsam limit) ran 50-58 fps until RAGE's streamer
             // filled that budget: footprint 7.4 of 8.2 GB, 1.5 GB compressed, 47% page waits,
@@ -1043,10 +1052,28 @@ struct LibraryEntry: Codable, Identifiable {
             // scene (ph-rdr56); the 2560 MB trim still pulls the budget down as the footprint nears the line.
             let roomyLimit = os_proc_available_memory() >= 10 << 30
             let videoBudget = roomyLimit ? "vram-mb = 4096" : "vram-mb = 3072\nvram-trim-mb = 2560"
+            // RDR2's own threads (all unnamed) run one QoS step down, at user-initiated, and the ones a
+            // frame or the sound waits for are lifted back to user-interactive as they show themselves:
+            // Present / ExecuteCommandLists callers, madeira_d3d12's fence, submission and pipeline
+            // threads, every audio writer, and threads the game raises to HIGHEST (thread_ios.c,
+            // "frame-critical"). With all ~20 busy threads at one class on two performance cores the main
+            // thread ran 45 % of its time on the efficiency cores and the render thread 20 %, beside
+            // eight job workers (log 2026-11-27 00:19, CPU held at P 1.44 / E 1.8 GHz through play).
+            // RockstarService.exe (the launcher's entitlement service) runs at utility: one of its Wine
+            // threadpool wait-queue threads (01d0) used 0.3-0.45 of a core through that whole gameplay
+            // at the game's own class.
+            // The polled sound stream gets up to 40 ms more audio queued while it keeps running short
+            // (ml1240; it delivered 65-75 % of real time in that log, heard as crackle).
             // Per-command timing and hot-page reports are for captures, not normal play.
+            // rp-carry: RDR2 draws one pass over the same targets across several command lists of one
+            // ExecuteCommandLists call, and each list boundary stored and reloaded those targets
+            // (gpu-traffic "possible with rp-carry": 5 boundaries, 177-215 MB a frame at 1312x604, log
+            // 2026-11-27 00:19). The pass stays open into the next list when only state comes between
+            // (madeira_d3d12.c rp-carry): same draws in the same order, no graphics setting changed.
             return socialClub + "\n" + bcd + "\n" + videoBudget + "\n" + """
             d3d12-shader-pack = 1
             replay-split = 0
+            rp-carry = 1
             ring-share = 1
             pool-mid = 1
             swap-mb = 8192
@@ -1076,10 +1103,16 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
             env.MADEIRA_POOL_BIG_CODE_EXES = RDR2.exe
             env.MADEIRA_SYNC_LEAN = 1
-            env.MADEIRA_THREAD_QOS = exe:SocialClubHelper.exe=utility;Chrome_*=background;Cr*=background;ThreadPool*=background;VizCompositor*=background;Compositor*=background;DedicatedWorker*=background;StackSamplingProfiler*=background
+            env.MADEIRA_THREAD_QOS = exe:SocialClubHelper.exe=utility;exe:RockstarService.exe=utility;exe:RDR2.exe=initiated
+            env.MADEIRA_SC_CEF_LITE = 1
+            env.MADEIRA_WAIT_FLOOR = SocialClubHelper.exe=50
+            env.MADEIRA_WAIT_FLOOR_AFTER = RDR2.exe:180
+            env.MADEIRA_SPIN_PC = 1
+            env.MADEIRA_AUDIO_CUSHION_MS = 40
             env.MADEIRA_POOL_OTHER_BIG_GAME_MB = 64
             env.MADEIRA_POOL_LOW_IMAGES = 1
             env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+            env.MADEIRA_POOL_IMAGE_TRIM = 1
             env.MADEIRA_TOUCH_MOUSE = 1
             env.MADEIRA_WOW_MIN_FREE_GB = 2
             env.MADEIRA_X64_GRAPHICS_ENTRY = 1

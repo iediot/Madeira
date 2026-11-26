@@ -185,6 +185,8 @@ struct ios_jit_mapping {
     unsigned char  hybrid_cached;   /* ml1245: image carries ARM64EC metadata */
     unsigned char  hybrid_valid;    /* 0 = hybrid_cached not yet populated */
     unsigned char  is_fex;          /* copy of FEX's ARM64EC module (xtajit64.dll) */
+    size_t full_size;   /* madeira-bcd [image-trim]: SizeOfImage when the copy (`size`)
+                         * stops before the image's trailing resources; 0 = whole copy */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
@@ -2327,6 +2329,140 @@ static size_t ios_jit_data_align_delta( const void *image_base, size_t image_siz
     return (0x4000 - (first_w & 0x3fff)) & 0x3fff;
 }
 
+/* madeira-bcd [image-trim] (env MADEIRA_POOL_IMAGE_TRIM=1; off by default, set in
+ * RDR2's list): THE POOL COPY OF A WINE DLL STOPS AT ITS RESOURCES.
+ *
+ * Every pseudo-process copies each hybrid DLL it loads WHOLE into the JIT pool
+ * (code + data + headers, so ADRP references between sections keep working).
+ * For Wine's DLLs most of that is .rsrc: shell32.dll is 8.3 of its 9.5 MB
+ * (icons), kernelbase.dll 1.9 of 2.9 MB (locale tables), user32.dll 0.9 of
+ * 2.1 MB. The iPhone 18 Pro RDR2 run of 2026-11-27 00:19 made 614 copies
+ * (675 MB) with 11 of shell32, 20 of kernelbase and 17 of user32 among them,
+ * the head of the 896 MB pool stood at 550-610 MB in every run, and FEX's code
+ * buffers fell to 16 MB (77-560 "exec alloc degraded" per run).
+ *
+ * Nothing executes or ADRP-addresses resources: Wine reaches them through the
+ * module handle (the PE VA) and the resource directory's RVAs, and the PE view
+ * keeps every byte. So the copy -- and its JIT mapping, its ledger record and
+ * everything that bounds itself by the mapping's size -- ends at the first
+ * section of the image's TRAILING run of .rsrc / discardable, non-code,
+ * non-writable sections (.rsrc, .reloc, debug sections), rounded up to 16 KB.
+ * The relocation table stays readable at the PE VA; the readers that walked it
+ * in the pool copy take it from there when it lies past the copy
+ * (ios_jit_mapping_reloc_src).
+ *
+ * Trimmed only when all of these hold, else the copy is whole as before:
+ * a Wine builtin (its DOS stub says so), PE32+, not FEX's own module, every
+ * data directory except resources, security and base relocations, and the
+ * entry point, below the cut, no DIR64 relocation target past the cut, no
+ * other relocation type, and at least IOS_IMAGE_TRIM_MIN saved. */
+#define IOS_IMAGE_TRIM_MIN 0x40000u
+
+static int ios_pool_image_trim_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_POOL_IMAGE_TRIM" );   /* 1: a Wine DLL's pool copy stops at its trailing resources (off by default) */
+        cached = (s && s[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static uint32_t ios_trim_rd32( const unsigned char *p )
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* Bytes of the image the pool copy keeps, from its first `avail` header bytes:
+ * image_size when nothing may be trimmed. Pure (header bytes only). */
+static size_t ios_image_trim_size( const unsigned char *hdr, size_t avail, size_t image_size )
+{
+    static const char builtin[] = "Wine builtin DLL";
+    const unsigned char *nt, *opt, *sec;
+    uint32_t lfanew, nsec, opt_size, ndirs, run, i, cut, entry;
+    size_t keep;
+
+    if (!hdr || avail < 0x200 || image_size < 2 * IOS_IMAGE_TRIM_MIN) return image_size;
+    if (hdr[0] != 'M' || hdr[1] != 'Z' || memcmp( hdr + 0x40, builtin, sizeof(builtin) - 1 )) return image_size;
+    lfanew = ios_trim_rd32( hdr + 0x3c );
+    if (lfanew < 0x40 || lfanew > avail || avail - lfanew < 0x18 + 0x70) return image_size;
+    nt = hdr + lfanew;
+    if (memcmp( nt, "PE\0\0", 4 )) return image_size;
+    nsec = (uint32_t)nt[6] | (uint32_t)nt[7] << 8;
+    opt_size = (uint32_t)nt[0x14] | (uint32_t)nt[0x15] << 8;
+    opt = nt + 0x18;
+    if (opt_size < 0x70 || ((uint32_t)opt[0] | (uint32_t)opt[1] << 8) != 0x20b) return image_size;
+    if (!nsec || nsec > 96 || (size_t)(avail - lfanew - 0x18) < (size_t)opt_size + (size_t)nsec * 40) return image_size;
+    sec = opt + opt_size;
+
+    /* the trailing run: .rsrc, or discardable, never code or writable */
+    for (run = nsec; run > 1; run--)
+    {
+        const unsigned char *s = sec + (run - 1) * 40;
+        uint32_t chars = ios_trim_rd32( s + 36 );
+        if (chars & (0x00000020 /* CNT_CODE */ | 0x20000000 /* MEM_EXECUTE */ | 0x80000000 /* MEM_WRITE */)) break;
+        if (memcmp( s, ".rsrc\0\0\0", 8 ) && !(chars & 0x02000000 /* MEM_DISCARDABLE */)) break;
+    }
+    if (run == nsec) return image_size;                       /* no such run */
+    cut = ios_trim_rd32( sec + run * 40 + 12 );               /* first section of the run */
+    for (i = run + 1; i < nsec; i++)                          /* the run ascends */
+        if (ios_trim_rd32( sec + i * 40 + 12 ) < cut) return image_size;
+    for (i = 0; i < run; i++)                                 /* everything kept ends at the cut */
+    {
+        uint32_t va = ios_trim_rd32( sec + i * 40 + 12 ), vs = ios_trim_rd32( sec + i * 40 + 8 );
+        if (va > cut || vs > cut - va) return image_size;
+    }
+    keep = ((size_t)cut + 0x3fff) & ~(size_t)0x3fff;
+    if (keep >= image_size || image_size - keep < IOS_IMAGE_TRIM_MIN) return image_size;
+    if (ios_trim_rd32( opt + 0x3c ) > keep) return image_size;   /* SizeOfHeaders */
+    entry = ios_trim_rd32( opt + 0x10 );
+    if (entry >= keep) return image_size;
+    ndirs = ios_trim_rd32( opt + 0x6c );
+    for (i = 0; i < ndirs && i < 16 && 0x70 + (i + 1) * 8 <= opt_size; i++)
+    {
+        uint32_t rva = ios_trim_rd32( opt + 0x70 + i * 8 ), size = ios_trim_rd32( opt + 0x74 + i * 8 );
+        if (i == 2 || i == 4 || i == 5 || !rva || !size) continue;   /* resources, security, relocations */
+        if (rva >= keep || size > keep - rva) return image_size;
+    }
+    return keep;
+}
+
+/* The image's base relocations, read at the PE VA: 1 when no DIR64 target lies in
+ * [keep, image_size) (as an address at the view or at the header's ImageBase) and
+ * every entry is DIR64 or padding; 0 otherwise or when the table is malformed. */
+static int ios_image_trim_relocs_ok( const unsigned char *view, size_t image_size, size_t keep )
+{
+    const unsigned char *opt = view + ios_trim_rd32( view + 0x3c ) + 0x18;
+    uint64_t hdr_base;
+    uint32_t rva = ios_trim_rd32( opt + 0x70 + 5 * 8 ), size = ios_trim_rd32( opt + 0x74 + 5 * 8 ), pos = 0;
+
+    memcpy( &hdr_base, opt + 0x18, sizeof(hdr_base) );
+    if (!rva || !size) return 1;
+    if (rva >= image_size || size > image_size - rva) return 0;
+    while (pos + 8 <= size)
+    {
+        uint32_t page = ios_trim_rd32( view + rva + pos ), bsize = ios_trim_rd32( view + rva + pos + 4 ), j;
+        if (bsize < 8 || bsize > size - pos) return bsize == 0 && pos + 8 >= size;
+        for (j = 8; j + 2 <= bsize; j += 2)
+        {
+            uint16_t e = (uint16_t)(view[rva + pos + j] | view[rva + pos + j + 1] << 8);
+            uint32_t at = page + (e & 0xfff);
+            uint64_t v;
+            if (!(e >> 12)) continue;                         /* ABSOLUTE: padding */
+            if ((e >> 12) != 10) return 0;                    /* only DIR64 is understood */
+            if (at >= image_size || image_size - at < 8) return 0;
+            if (at >= keep) continue;                         /* a slot the copy does not hold */
+            memcpy( &v, view + at, sizeof(v) );
+            if ((v - (uint64_t)(uintptr_t)view >= keep && v - (uint64_t)(uintptr_t)view < image_size) ||
+                (v - hdr_base >= keep && v - hdr_base < image_size))
+                return 0;
+        }
+        pos += bsize;
+    }
+    return 1;
+}
+
 static void ios_va_gap_probe( const char *why )
 {
     const mach_vm_address_t CARVE_LO = 0x1000000000ULL;   /* 64G  */
@@ -4233,6 +4369,7 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
         ios_jit_mappings[slot].hybrid_cached = 0;    /* ml1245: same for the EC memo */
         ios_jit_mappings[slot].hybrid_valid = 0;
         ios_jit_mappings[slot].is_fex = ios_image_is_fex( pe_base, size );
+        ios_jit_mappings[slot].full_size = 0;   /* [image-trim]: ios_jit_set_full_size after a trimmed copy */
         if (ios_jit_mappings[slot].is_fex)
             dprintf( 2, "[jit-pool] FEX module copy pe=%p jit=%p+0x%lx\n", pe_base, jit_base, (unsigned long)size );
         __sync_synchronize();
@@ -5125,6 +5262,28 @@ uintptr_t ios_jit_anon_alias_lookup_rx(uintptr_t fault_addr)
         }
     }
     return 0;
+}
+
+/* madeira-bcd [image-trim]: where a mapping's relocation table can be read. The
+ * pool copy holds it unless the copy was trimmed before it (ios_image_trim_size);
+ * then it is read at the PE VA, whose view keeps every section. `pool_rw` is the
+ * copy's RW alias. Returns the base the table's RVA is added to. */
+static const char *ios_jit_mapping_reloc_src( const struct ios_jit_mapping *m, const char *pool_rw )
+{
+    if (m->reloc_rva <= m->size && m->reloc_size <= m->size - m->reloc_rva) return pool_rw;
+    return (const char *)m->pe_base;
+}
+
+/* [image-trim]: record SizeOfImage on the mapping of a trimmed copy (`size` is the
+ * copy's length); the already-copied check and ml352's validation use it. */
+static void ios_jit_set_full_size( void *pe_base, void *jit_base, size_t full_size )
+{
+    int i;
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_mapping_count; i++)
+        if (ios_jit_mappings[i].pe_base == pe_base && ios_jit_mappings[i].jit_base == jit_base)
+            ios_jit_mappings[i].full_size = full_size;
+    pthread_mutex_unlock( &ios_pool_lock );
 }
 
 void ios_jit_set_reloc_info(void *pe_base, uint64_t pe_image_base, intptr_t delta,
@@ -14831,15 +14990,27 @@ static int ios_pool_big_code_allowed( size_t want )
      * more (MADEIRA_POOL_OTHER_BIG_GAME_MB, 0 by default, is their allowance on top).
      * Before that the launcher validates the game with the full share: with 64 MB
      * its "game launch validation" timed out after 14 s and RDR2.exe never started
-     * (launcher.log 2026-11-26 15:38 UTC). */
+     * (launcher.log 2026-11-26 15:38 UTC).
+     *
+     * "On top" of what they held when the game was first seen running. This used to
+     * compare their total against the allowance alone, so with 192 MB already held a
+     * 64 MB allowance never admitted anything: iPhone 18 Pro 2026-11-27 00:19 logged
+     * "other processes keep their 192 MB and take no more" with GAME_MB=64 set, and
+     * SocialClubHelper.exe's thread 0x350 then fell to 16 MB buffers 47 times (181
+     * times in the 2026-11-26 21:58 hang) while the game waited on Social Club. */
     if (game_live)
     {
-        size_t extra = 0;
+        static size_t held_at_game = (size_t)-1;
+        size_t extra = 0, limit;
         if ((b = getenv( "MADEIRA_POOL_OTHER_BIG_GAME_MB" )) && *b) extra = (size_t)strtoul( b, NULL, 10 ) << 20;
-        if (others + want > extra && !game_said++)
+        if (held_at_game == (size_t)-1) held_at_game = others < budget ? others : budget;
+        limit = held_at_game + extra;
+        if (others + want > limit && !game_said++)
             dprintf( 2, "[jit-pool] big code buffers: the game is running, other processes keep their %lu MB "
-                        "and take no more (MADEIRA_POOL_OTHER_BIG_GAME_MB)\n", (unsigned long)(others >> 20) );
-        return others + want <= extra;
+                        "(held when the game started: %lu MB) plus %lu MB and take no more "
+                        "(MADEIRA_POOL_OTHER_BIG_GAME_MB)\n", (unsigned long)(others >> 20),
+                     (unsigned long)(held_at_game >> 20), (unsigned long)(extra >> 20) );
+        return others + want <= limit;
     }
     return others + want <= budget;
 }
@@ -17645,6 +17816,38 @@ static int ios_x64_image_is_host_data( const void *base, size_t size )
 #endif
 }
 
+/* madeira-bcd [smc-fast] (signal_arm64_ios.c, ios_smc_fast_decline): 1 when a
+ * write fault at `addr` hit a committed pure-x64 image page (VPROT_X64DATA) whose
+ * host page Wine itself keeps without write -- EXEC and neither WRITE, WRITECOPY,
+ * GUARD nor WRITEWATCH on any of its 4 KB pages, which is how the emulator arms a
+ * page it translated code from -- and no anonymous JIT alias covers it. Such a
+ * fault is the emulator's to handle; no Mach-side service applies. Runs on the
+ * Mach exception thread: try-locks virtual_mutex and answers 0 if it is busy. */
+int ios_smc_trap_write_fault( uintptr_t addr )
+{
+#ifdef WINE_IOS
+    struct file_view *view;
+    BYTE vprot;
+    int ret = 0;
+
+    if (!ios_x64_image_nocopy_enabled()) return 0;
+    if (pthread_mutex_trylock( &virtual_mutex )) return 0;
+    if ((view = find_view( (const void *)addr, 0 )) &&
+        (view->protect & (VPROT_X64DATA | SEC_IMAGE)) == (VPROT_X64DATA | SEC_IMAGE))
+    {
+        vprot = get_host_page_vprot( (const void *)addr );
+        ret = (vprot & (VPROT_COMMITTED | VPROT_EXEC)) == (VPROT_COMMITTED | VPROT_EXEC) &&
+              !(vprot & (VPROT_WRITE | VPROT_WRITECOPY | VPROT_GUARD | VPROT_WRITEWATCH));
+    }
+    pthread_mutex_unlock( &virtual_mutex );
+    if (ret && ios_jit_anon_alias_overlaps( (void *)(addr & ~(uintptr_t)0x3fff), 0x4000, NULL, NULL )) ret = 0;
+    return ret;
+#else
+    (void)addr;
+    return 0;
+#endif
+}
+
 
 /* A guest's anonymous RWX data heap is plain read/write memory to the host.
  *
@@ -18489,7 +18692,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             {
                 uintptr_t a = (uintptr_t)base;
                 uintptr_t mb = (uintptr_t)ios_jit_mappings[i].pe_base;
-                if (a >= mb && a < mb + ios_jit_mappings[i].size)
+                /* [image-trim]: a trimmed copy's image still spans SizeOfImage; a page of
+                 * its untrimmed tail is this image's too, never a reason for a new copy */
+                if (a >= mb && a < mb + (ios_jit_mappings[i].full_size ? ios_jit_mappings[i].full_size
+                                                                        : ios_jit_mappings[i].size))
                 {
                     /* ml352: containment alone LIES when the entry is STALE.
                      * rsaenh.dll unloaded, windows.ui.dll later mapped INSIDE
@@ -18520,7 +18726,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                                    (mach_vm_address_t)&imgsz, &got) == KERN_SUCCESS &&
                             got == 4 &&
                             (imgsz == ios_jit_mappings[i].size ||
-                             ((imgsz + 0x3fffu) & ~0x3fffu) == ios_jit_mappings[i].size);
+                             ((imgsz + 0x3fffu) & ~0x3fffu) == ios_jit_mappings[i].size ||
+                             (ios_jit_mappings[i].full_size && imgsz == ios_jit_mappings[i].full_size));
                         if (!entry_ok)
                         {
                             dprintf(2, "[jit-pool] STALE containment rev=ml352: entry pe=%p+0x%lx "
@@ -19097,6 +19304,29 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
              * and tramps are byte-identical across copies (precondition for
              * page sharing). Also kills the 80MB-anchor dance: worst-case
              * text→tramp distance is now ≤ image size, far under ±128MB. */
+            /* madeira-bcd [image-trim]: see ios_image_trim_size. From here on
+             * image_size is the COPY's length -- allocation, memcpy, JIT mapping,
+             * EC bitmap, verification -- and image_full_size SizeOfImage. */
+            size_t image_full_size = image_size;
+            if (ios_pool_image_trim_enabled() && !ios_image_is_fex( image_base, image_size ))
+            {
+                size_t keep = ios_image_trim_size( (const unsigned char *)image_base, 0x1000, image_size );
+                if (keep < image_size && ios_image_trim_relocs_ok( (const unsigned char *)image_base, image_size, keep ))
+                {
+                    static unsigned long trim_n;
+                    static size_t trim_saved;
+                    trim_n++;
+                    trim_saved += image_size - keep;
+                    if (trim_n <= 16 || !(trim_n % 64))
+                        dprintf( 2, "[image-trim] %s %p+0x%lx: pool copy keeps 0x%lx, its trailing resources "
+                                    "(0x%lx) stay at the PE VA only (#%lu, %lu MB not copied so far; "
+                                    "MADEIRA_POOL_IMAGE_TRIM)\n",
+                                 ios_pe_module_name( image_base, image_size ), image_base,
+                                 (unsigned long)image_size, (unsigned long)keep,
+                                 (unsigned long)(image_size - keep), trim_n, (unsigned long)(trim_saved >> 20) );
+                    image_size = keep;
+                }
+            }
             size_t page_size = 0x4000;
             size_t image_alloc = (image_size + page_size - 1) & ~(page_size - 1);
             size_t tramp_prealloc = ios_x18_tramp_prealloc_scan(image_base, image_size);
@@ -19178,7 +19408,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             /* Record mapping for the entire image */
             ios_jit_add_mapping(image_base, (char *)jit_rx_base + offset, image_size);
-            ios_jit_anon_alias_retire_overlap( image_base, image_size );
+            if (image_full_size != image_size)
+                ios_jit_set_full_size( image_base, (char *)jit_rx_base + offset, image_full_size );
+            ios_jit_anon_alias_retire_overlap( image_base, image_full_size );
 
             int image_in_low = ios_jit_low_contains( (uintptr_t)jit_rx_base + offset );
             size_t image_used = image_in_low ? ios_jit_low_reserved : offset + alloc_size;
@@ -19510,7 +19742,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
                     if (reloc_rva && reloc_sz && delta)
                     {
-                        char *reloc_data = rw_image + reloc_rva;
+                        /* [image-trim]: a table past the copy is read at the PE VA */
+                        char *reloc_data = ((size_t)reloc_rva + reloc_sz <= image_size ? rw_image : (char *)image_base)
+                                           + reloc_rva;
                         char *block = reloc_data;
                         int fixup_count = 0;
 
@@ -19535,6 +19769,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                 int off  = entries[j] & 0xFFF;
 
                                 if (type == 0) continue;
+                                /* [image-trim]: a slot past the copy is not in the pool */
+                                if ((size_t)block_rva + off + 8 > image_size) continue;
 
                                 if (type == 10)  /* IMAGE_REL_BASED_DIR64 */
                                 {
@@ -19965,19 +20201,21 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
      * runtime-written unix addresses (dispatchers, hooks). */
     if (m->reloc_rva && m->reloc_size)
     {
-        char *reloc = rw_dest + m->reloc_rva;
-        char *reloc_end = reloc + m->reloc_size;
+        /* [image-trim]: a table past a trimmed copy is read at the parent's PE VA */
+        const char *reloc = ios_jit_mapping_reloc_src( m, rw_dest ) + m->reloc_rva;
+        const char *reloc_end = reloc + m->reloc_size;
         int fixups = 0;
         while (reloc < reloc_end)
         {
             unsigned int block_rva = *(unsigned int *)reloc;
             unsigned int block_size = *(unsigned int *)(reloc + 4);
-            unsigned short *entries = (unsigned short *)(reloc + 8);
+            const unsigned short *entries = (const unsigned short *)(reloc + 8);
             int j, num;
             if (!block_size || block_size < 8) break;
             num = (block_size - 8) / 2;
             for (j = 0; j < num; j++)
             {
+                if ((size_t)block_rva + (entries[j] & 0xFFF) + 8 > m->size) continue;   /* [image-trim] */
                 if ((entries[j] >> 12) == 10)  /* IMAGE_REL_BASED_DIR64 */
                 {
                     uint64_t *fixup = (uint64_t *)(rw_dest + block_rva + (entries[j] & 0xFFF));
@@ -33728,8 +33966,9 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         !(off & 7) && size / 8 <= sizeof(ios_sync_keep) * 8)
                     {
                         const uint64_t *src = (const uint64_t *)base, *dst = (const uint64_t *)jit_rw_dest;
-                        const char *rel = (const char *)ios_jit_rw_base_global + pool_offset
-                                          + ios_jit_mappings[idx].reloc_rva;
+                        const char *rel = ios_jit_mapping_reloc_src( &ios_jit_mappings[idx],
+                                                                     (const char *)ios_jit_rw_base_global + pool_offset )
+                                          + ios_jit_mappings[idx].reloc_rva;   /* [image-trim] */
                         pthread_mutex_lock( &ios_sync_keep_lock );
                         keep_locked = 1;
                         const char *rel_end = rel + ios_jit_mappings[idx].reloc_size;
@@ -33833,8 +34072,9 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         /* Region bounds as offsets within the PE image */
                         size_t rgn_off_start = off;
                         size_t rgn_off_end   = off + size;
-                        char *block = rw_image + r_rva;
-                        char *block_end = block + r_sz;
+                        /* [image-trim]: a table past a trimmed copy is read at the PE VA */
+                        const char *block = ios_jit_mapping_reloc_src( &ios_jit_mappings[idx], rw_image ) + r_rva;
+                        const char *block_end = block + r_sz;
                         int dir64_count = 0;
 
                         while (block < block_end)
