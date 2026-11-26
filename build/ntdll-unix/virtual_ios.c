@@ -14811,16 +14811,36 @@ static int ios_pool_big_code_allowed( size_t want )
     const char *list = getenv( "MADEIRA_POOL_BIG_CODE_EXES" ), *b;
     size_t budget = 192u << 20, others = 0;
     unsigned i;
+    int game_live = 0;
+    static int game_said;
 
     if (!list || !*list) return 1;
     if (ios_peb_in_big_code_list( ios_jit_current_peb(), list ) != 0) return 1;   /* the game, or unknown */
     if ((b = getenv( "MADEIRA_POOL_OTHER_BIG_MB" )) && *b) budget = (size_t)strtoul( b, NULL, 10 ) << 20;
     pthread_mutex_lock( &ios_tail_carve_lock );
     for (i = 0; i < ios_tail_carve_n; i++)
-        if (!ios_tail_carves[i].free && ios_tail_carves[i].size > 0x1000000 &&
-            ios_peb_in_big_code_list( ios_tail_carves[i].peb, list ) == 0)
+    {
+        if (ios_tail_carves[i].free) continue;
+        if (ios_peb_in_big_code_list( ios_tail_carves[i].peb, list ) == 1) game_live = 1;
+        else if (ios_tail_carves[i].size > 0x1000000 &&
+                 ios_peb_in_big_code_list( ios_tail_carves[i].peb, list ) == 0)
             others += ios_tail_carves[i].size;
+    }
     pthread_mutex_unlock( &ios_tail_carve_lock );
+    /* Once the game holds a code buffer, the others keep what they have but take no
+     * more (MADEIRA_POOL_OTHER_BIG_GAME_MB, 0 by default, is their allowance on top).
+     * Before that the launcher validates the game with the full share: with 64 MB
+     * its "game launch validation" timed out after 14 s and RDR2.exe never started
+     * (launcher.log 2026-11-26 15:38 UTC). */
+    if (game_live)
+    {
+        size_t extra = 0;
+        if ((b = getenv( "MADEIRA_POOL_OTHER_BIG_GAME_MB" )) && *b) extra = (size_t)strtoul( b, NULL, 10 ) << 20;
+        if (others + want > extra && !game_said++)
+            dprintf( 2, "[jit-pool] big code buffers: the game is running, other processes keep their %lu MB "
+                        "and take no more (MADEIRA_POOL_OTHER_BIG_GAME_MB)\n", (unsigned long)(others >> 20) );
+        return others + want <= extra;
+    }
     return others + want <= budget;
 }
 
