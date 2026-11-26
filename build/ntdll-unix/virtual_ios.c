@@ -14762,6 +14762,51 @@ static int ios_sc_current_is_helper(void)
     return ios_sc_path_is_helper( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR) );
 }
 
+/* MADEIRA_POOL_BIG_CODE_EXES=A.exe;B.exe: only these processes get FEX code
+ * buffers above 16 MB. Unset: every process may (the old policy). The JIT pool's
+ * code space is first come, first served, and a game started from Steam and a
+ * launcher arrives last: on an 8 GB-limit iPhone Steam's processes and
+ * SocialClubHelper.exe held five 128 MB buffers when RDR2.exe began loading its
+ * world, so RDR2 ran on 16 MB buffers, rotated them 270 times in a minute
+ * (generation sweeps of 73 threads, every translation discarded each time) and
+ * never left the loading screen. 1 when the calling pseudo-process may. */
+static int ios_pool_big_code_allowed(void)
+{
+    const char *list = getenv( "MADEIRA_POOL_BIG_CODE_EXES" );
+    PEB *peb;
+    RTL_USER_PROCESS_PARAMETERS *pp;
+    const WCHAR *path;
+    size_t len, base = 0, k;
+
+    if (!list || !*list) return 1;
+    peb = ios_jit_current_peb();
+    pp = peb ? peb->ProcessParameters : NULL;
+    if (!pp || !pp->ImagePathName.Buffer) return 1;   /* unknown: do not starve it */
+    path = pp->ImagePathName.Buffer;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    while (*list)
+    {
+        const char *end = list;
+        size_t n;
+        while (*end && *end != ';') end++;
+        n = (size_t)(end - list);
+        if (n && n == len - base)
+        {
+            for (k = 0; k < n; k++)
+            {
+                WCHAR a = path[base + k], b = (unsigned char)list[k];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != b) break;
+            }
+            if (k == n) return 1;
+        }
+        list = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
 /* madeira-bcd: [sc-rph] the renderer half of Social Club's pages under
  * --single-process.
  *
@@ -31943,6 +31988,15 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             }
             tail_cap = cap;
 
+            if (alloc_size > TAIL_SMALL && !ios_pool_big_code_allowed()) {
+                static int other_log_n;
+                if (other_log_n < 16) {
+                    other_log_n++;
+                    dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx to a process outside MADEIRA_POOL_BIG_CODE_EXES "
+                            "so FEX halves down to 0x%x\n", (unsigned long)alloc_size, TAIL_SMALL);
+                }
+                return STATUS_NO_MEMORY;
+            }
             if (alloc_size > cap && !low_fits) {
                 static int cap_log_n;
                 if (cap_log_n < 16) {

@@ -1065,6 +1065,7 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_PIN_GRAPHICS_DLLS = 1
             env.MADEIRA_PRELOAD_DLLS = xinput1_4.dll
             env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+            env.MADEIRA_POOL_BIG_CODE_EXES = RDR2.exe
             env.MADEIRA_POOL_LOW_IMAGES = 1
             env.MADEIRA_POOL_RECYCLE_IMAGES = 1
             env.MADEIRA_TOUCH_MOUSE = 1
