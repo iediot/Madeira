@@ -1112,9 +1112,6 @@ struct LibraryEntry: Codable, Identifiable {
             d3d12-typed-uav-load = 1
             vram-mb = 4096
             env.FEX_VECTORTSOENABLED = 0
-            // TRIAL 2026-11-26 (owner-approved): no x86 memory-ordering emulation for scalar
-            // loads/stores. Remove this line if RDR2 crashes, hangs or corrupts.
-            env.FEX_TSOENABLED = 0
             env.MADEIRA_KMT_ADAPTER = 1
             env.MADEIRA_PAD_MODE = hid
             env.MADEIRA_EC_HOOK_TRACE = 0
