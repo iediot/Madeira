@@ -1441,12 +1441,54 @@ int madeira_guest_qos_self( qos_class_t cls, int rel )
     return pthread_set_qos_class_self_np( cls, rel );
 }
 
+/* "exe:Name.exe=class" rules: every thread of that process, named or not. Social
+ * Club's helper spun six unnamed or oddly named threads (HangWatcher, NetworkService,
+ * CacheThread_BlockFile, a wine waitqueue) at ~0.8 core each through RDR2's gameplay,
+ * past every name rule, and the game's own threads got a fraction of a core (log
+ * 2026-11-26 20:11). Pseudo-processes share the address space, so the PEB is read live. */
+static qos_class_t tq_exe_class(void)
+{
+    RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb()->Peb ? NtCurrentTeb()->Peb->ProcessParameters : NULL;
+    const WCHAR *path;
+    size_t len, base = 0, k;
+    int i;
+
+    if (!pp || !pp->ImagePathName.Buffer) return QOS_CLASS_UNSPECIFIED;
+    path = pp->ImagePathName.Buffer;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (i = 0; i < tq_nrules; i++)
+    {
+        const char *pat = tq_rules[i].pat;
+        size_t n;
+        if (strncmp( pat, "exe:", 4 )) continue;
+        pat += 4;
+        n = strlen( pat );
+        if (n != len - base) continue;
+        for (k = 0; k < n; k++)
+        {
+            WCHAR a = path[base + k], b = (unsigned char)pat[k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+        }
+        if (k == n) return tq_rules[i].cls;
+    }
+    return QOS_CLASS_UNSPECIFIED;
+}
+
 /* start_thread, once the TEB is published: a thread named before it ran */
 static void ios_thread_qos_start( unsigned tid )
 {
     extern void ios_eco_apply_self(void);
     tq_self_tid = tid;
-    if (tq_enabled() && tq_lookup( tid, NULL )) ios_eco_apply_self();
+    if (!tq_enabled()) return;
+    if (!tq_lookup( tid, NULL ))
+    {
+        qos_class_t c = tq_exe_class();
+        if (c) tq_store( tid, c, "(process rule)" );
+    }
+    if (tq_lookup( tid, NULL )) ios_eco_apply_self();
 }
 
 /* thread exit: a reused tid must not inherit the class */
@@ -1479,7 +1521,8 @@ static void ios_thread_qos_named( HANDLE handle, const char *name )
     }
     if (!tid) return;
     for (i = 0; i < tq_nrules; i++)
-        if (tq_glob( tq_rules[i].pat, name )) { cls = tq_rules[i].cls; break; }
+        if (strncmp( tq_rules[i].pat, "exe:", 4 ) && tq_glob( tq_rules[i].pat, name )) { cls = tq_rules[i].cls; break; }
+    if (!cls) cls = tq_exe_class();   /* a name with no rule keeps its process's class */
     changed = tq_store( tid, cls, name );
     if (tid == self)
     {
