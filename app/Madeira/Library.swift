@@ -1059,8 +1059,6 @@ struct LibraryEntry: Codable, Identifiable {
             fullscreen-window = 1
             env.WINE_D3D_CONFIG = renderer=no3d
             env.FEX_VECTORTSOENABLED = 0
-            // TRIAL 2026-11-26 (owner-approved): no x86 memory-ordering emulation for scalar
-            // loads/stores. Remove this line if RDR2 crashes, hangs or corrupts.
             env.FEX_TSOENABLED = 0
             env.MADEIRA_RDR2_VA_HOLD = 1
             env.MADEIRA_COMMIT_LIMIT_MB = 10240
