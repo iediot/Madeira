@@ -14762,26 +14762,24 @@ static int ios_sc_current_is_helper(void)
     return ios_sc_path_is_helper( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR) );
 }
 
-/* MADEIRA_POOL_BIG_CODE_EXES=A.exe;B.exe: only these processes get FEX code
- * buffers above 16 MB. Unset: every process may (the old policy). The JIT pool's
- * code space is first come, first served, and a game started from Steam and a
- * launcher arrives last: on an 8 GB-limit iPhone Steam's processes and
+/* MADEIRA_POOL_BIG_CODE_EXES=A.exe;B.exe names the game's processes. Unset: the
+ * old first-come policy. Set: the other processes (Steam, a launcher, Social
+ * Club's Chromium) may hold FEX code buffers above 16 MB only up to a combined
+ * MADEIRA_POOL_OTHER_BIG_MB (192 by default); the rest stays for the game. The
+ * pool's code space is first come, first served and a game started from Steam
+ * and a launcher arrives last: on an 8 GB-limit iPhone Steam's processes and
  * SocialClubHelper.exe held five 128 MB buffers when RDR2.exe began loading its
- * world, so RDR2 ran on 16 MB buffers, rotated them 270 times in a minute
- * (generation sweeps of 73 threads, every translation discarded each time) and
- * never left the loading screen. 1 when the calling pseudo-process may. */
-static int ios_pool_big_code_allowed(void)
+ * world, so RDR2 ran on 16 MB buffers, rotated them 270 times in a minute and
+ * never left the loading screen. Holding the others to 16 MB outright starved
+ * their Chromium UIs instead and the launcher gave up starting the game. All
+ * pseudo-processes share this address space, so a live carve's PEB is readable. */
+static int ios_peb_in_big_code_list( PEB *peb, const char *list )
 {
-    const char *list = getenv( "MADEIRA_POOL_BIG_CODE_EXES" );
-    PEB *peb;
-    RTL_USER_PROCESS_PARAMETERS *pp;
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
     const WCHAR *path;
     size_t len, base = 0, k;
 
-    if (!list || !*list) return 1;
-    peb = ios_jit_current_peb();
-    pp = peb ? peb->ProcessParameters : NULL;
-    if (!pp || !pp->ImagePathName.Buffer) return 1;   /* unknown: do not starve it */
+    if (!pp || !pp->ImagePathName.Buffer) return -1;   /* unknown */
     path = pp->ImagePathName.Buffer;
     len = pp->ImagePathName.Length / sizeof(WCHAR);
     for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
@@ -14805,6 +14803,25 @@ static int ios_pool_big_code_allowed(void)
         list = *end ? end + 1 : end;
     }
     return 0;
+}
+
+/* 1 when the calling pseudo-process may take a code buffer of `want` bytes (> 16 MB). */
+static int ios_pool_big_code_allowed( size_t want )
+{
+    const char *list = getenv( "MADEIRA_POOL_BIG_CODE_EXES" ), *b;
+    size_t budget = 192u << 20, others = 0;
+    unsigned i;
+
+    if (!list || !*list) return 1;
+    if (ios_peb_in_big_code_list( ios_jit_current_peb(), list ) != 0) return 1;   /* the game, or unknown */
+    if ((b = getenv( "MADEIRA_POOL_OTHER_BIG_MB" )) && *b) budget = (size_t)strtoul( b, NULL, 10 ) << 20;
+    pthread_mutex_lock( &ios_tail_carve_lock );
+    for (i = 0; i < ios_tail_carve_n; i++)
+        if (!ios_tail_carves[i].free && ios_tail_carves[i].size > 0x1000000 &&
+            ios_peb_in_big_code_list( ios_tail_carves[i].peb, list ) == 0)
+            others += ios_tail_carves[i].size;
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+    return others + want <= budget;
 }
 
 /* madeira-bcd: [sc-rph] the renderer half of Social Club's pages under
@@ -31988,12 +32005,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             }
             tail_cap = cap;
 
-            if (alloc_size > TAIL_SMALL && !ios_pool_big_code_allowed()) {
+            if (alloc_size > TAIL_SMALL && !ios_pool_big_code_allowed( alloc_size )) {
                 static int other_log_n;
                 if (other_log_n < 16) {
                     other_log_n++;
                     dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx to a process outside MADEIRA_POOL_BIG_CODE_EXES "
-                            "so FEX halves down to 0x%x\n", (unsigned long)alloc_size, TAIL_SMALL);
+                            "(its share of big buffers is spent, MADEIRA_POOL_OTHER_BIG_MB) so FEX halves down\n",
+                            (unsigned long)alloc_size);
                 }
                 return STATUS_NO_MEMORY;
             }

@@ -68,7 +68,7 @@ static uintptr_t ios_jit_low_rx_global, ios_jit_low_rw_global;
 static size_t ios_jit_low_size_global, ios_jit_pool_size_global;
 static volatile size_t ios_jit_low_reserved;
 static size_t jit_pool_offset, ios_jit_tail_reserved, ios_pool_head_reserve;
-static int ios_pool_big_code_allowed(void) { return 1; }
+static int ios_pool_big_code_allowed(size_t want) { (void)want; return 1; }
 static size_t ios_jit_hole_off_eff, ios_jit_hole_end_eff;
 static size_t ios_jit_hole2_off, ios_jit_hole2_end;
 static int ios_jit_low_full_logged, wow, lose_race;
