@@ -1059,7 +1059,6 @@ struct LibraryEntry: Codable, Identifiable {
             fullscreen-window = 1
             env.WINE_D3D_CONFIG = renderer=no3d
             env.FEX_VECTORTSOENABLED = 0
-            env.FEX_TSOENABLED = 0
             env.MADEIRA_RDR2_VA_HOLD = 1
             env.MADEIRA_COMMIT_LIMIT_MB = 10240
             env.MADEIRA_TOTAL_PHYS_MB = 8192
