@@ -1323,7 +1323,8 @@ struct LibraryEntry: Codable, Identifiable {
             // the virtual monitor follows this entry's Resolution, as below. "The game" starts
             // its own program below, like any library game.
             if !startsSteamGameDirectly {
-                GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: pixelResolution)
+                let mode = GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: pixelResolution)
+                fitRockstarResolution(width: mode.w, height: mode.h)
                 return
             }
         }
@@ -1347,7 +1348,34 @@ struct LibraryEntry: Codable, Identifiable {
         // Every session's virtual monitor takes this entry's Resolution
         // (MADEIRA_SCREEN_W/H, source "knob"); for the Desktop entry it is the
         // same size as its /desktop= argument.
-        GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: pixelResolution)
+        let mode = GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: pixelResolution)
+        fitRockstarResolution(width: mode.w, height: mode.h)
+    }
+
+    /// RDR2 runs in a window (fullscreen-window) at the size it saved, and picks that size
+    /// from its own list: on a 1312x604 monitor (the iPhone 18 Pro at 50%) it chose
+    /// 1280x604, and the 32 missing columns showed as bars in Dock. Its settings file gets
+    /// the session's monitor size, windowed and fullscreen, before each launch; nothing else
+    /// in the file changes. No file yet: RDR2 writes one and the next launch fixes it.
+    func fitRockstarResolution(width: Int, height: Int) {
+        let exe = (relativePath as NSString).lastPathComponent.lowercased()
+        guard rockstarMinmodeTitle == "rdr2" || exe == "rdr2.exe" || steamAppID == 1174180 else { return }
+        let file = LibraryModel.drive.appendingPathComponent(
+            "users/mobile/Documents/Rockstar Games/Red Dead Redemption 2/Settings/system.xml")
+        guard var text = try? String(contentsOf: file, encoding: .utf8) else { return }
+        let before = text
+        for (key, value) in [("screenWidth", width), ("screenHeight", height),
+                             ("screenWidthWindowed", width), ("screenHeightWindowed", height)] {
+            text = text.replacingOccurrences(of: "<\(key) value=\"[0-9]+\" />", with: "<\(key) value=\"\(value)\" />",
+                                             options: .regularExpression)
+        }
+        guard text != before else { return }
+        do {
+            try text.write(to: file, atomically: true, encoding: .utf8)
+            LogStore.shared.log("[rdr2] Settings/system.xml: resolution -> \(width)x\(height) (the virtual monitor, edge to edge)")
+        } catch {
+            LogStore.shared.log("[rdr2] could not set the resolution in Settings/system.xml: \(error.localizedDescription)", level: .error)
+        }
     }
 }
 
