@@ -70,6 +70,10 @@ static __thread qos_class_t applied = QOS_CLASS_UNSPECIFIED;
 static int fake_set_qos(qos_class_t c, int rel) { (void)rel; applied = c; return 0; }
 #define pthread_set_qos_class_self_np fake_set_qos
 volatile int ios_eco_gen = 1;
+#include <time.h>
+#include <strings.h>
+int ios_wf_arming_game(char *name, int size, long long *delay) { (void)name; (void)size; (void)delay; return 0; }   /* process_ios.c */
+int ios_wf_game_armed(void) { return 0; }
 int madeira_guest_qos_self(qos_class_t cls, int rel);
 void ios_eco_apply_self(void) { madeira_guest_qos_self(QOS_CLASS_USER_INTERACTIVE, 0); }   /* sync.c with eco off */
 """ + section + r"""

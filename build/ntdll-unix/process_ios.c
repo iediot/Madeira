@@ -1494,7 +1494,12 @@ static int sc_lite_cmdline( const WCHAR *cl, int cl_len, int fps, WCHAR *out, in
  * from <seconds> after this session started Game.exe until that process is
  * gone (checked every 5 s), so the launcher, sign-in and the game's loading
  * screen run as before. Unset: always on for the listed processes.
- * [wait-floor] lines report the switch-on/off and the waits raised per 30 s. */
+ * [wait-floor] lines report the switch-on/off and the waits raised per 30 s.
+ *
+ * The same arming also gates env.MADEIRA_THREAD_QOS_EXE_AFTER (thread_ios.c):
+ * when that is set, the game's start is recorded even with no floor or
+ * Social Club feature on, and ios_wf_game_armed() tells thread_ios.c when it
+ * has run its delay. */
 #define IOS_WF_MAX 8
 static struct { char name[64]; int ms; } ios_wf_rules[IOS_WF_MAX];
 static int ios_wf_nrules;
@@ -1508,6 +1513,9 @@ static volatile int ios_wf_announced;
 static volatile long long ios_wf_raised;
 static pthread_once_t ios_wf_once = PTHREAD_ONCE_INIT;
 static __thread int ios_wf_thread_ms = -1;   /* this thread's process floor, -1 unknown */
+static int ios_wf_track_game;              /* MADEIRA_THREAD_QOS_EXE_AFTER set: record the start anyway */
+extern volatile int ios_tq_after_pending;  /* thread_ios.c: deferred exe rules wait for the arming */
+extern void ios_thread_qos_after_poll(void);
 
 static long long ios_wf_now_ns(void)
 {
@@ -1573,6 +1581,11 @@ static void ios_wf_init(void)
     ios_wf_parse_after( getenv( "MADEIRA_WAIT_FLOOR_AFTER" ), ios_wf_after_name,
                         sizeof(ios_wf_after_name), &ios_wf_after_ns );
     ios_sc_quiet_init();
+    {
+        /* Default off. "SocialClubHelper.exe;RockstarService.exe": those exe: rules of MADEIRA_THREAD_QOS apply only once the MADEIRA_WAIT_FLOOR_AFTER game has run its delay (thread_ios.c) */
+        const char *qa = getenv( "MADEIRA_THREAD_QOS_EXE_AFTER" );
+        ios_wf_track_game = qa && *qa;
+    }
     if (ios_wf_nrules)
     {
         int i;
@@ -1593,13 +1606,17 @@ static void ios_wait_floor_note_process( const WCHAR *image, int image_len, unsi
     pthread_once( &ios_wf_once, ios_wf_init );
     if (ios_image_name_is( image, image_len, "socialclubhelper.exe" ))
         __atomic_store_n( &ios_sc_helper_pid, pid, __ATOMIC_RELAXED );
-    if (ios_wf_state <= 0 || !ios_wf_after_name[0]) return;
+    if ((ios_wf_state <= 0 && !ios_wf_track_game) || !ios_wf_after_name[0]) return;
     if (!ios_image_name_is( image, image_len, ios_wf_after_name )) return;
     __atomic_store_n( &ios_wf_game_pid, pid, __ATOMIC_RELAXED );
     __atomic_store_n( &ios_wf_started_ns, ios_wf_now_ns(), __ATOMIC_RELEASE );
     __atomic_store_n( &ios_wf_announced, 0, __ATOMIC_RELAXED );
-    dprintf( 2, "[wait-floor] %s started (pid %04x): the floor applies %lld s from now\n",
-             ios_wf_after_name, pid, ios_wf_after_ns / 1000000000ll );
+    if (ios_wf_state > 0)
+        dprintf( 2, "[wait-floor] %s started (pid %04x): the floor applies %lld s from now\n",
+                 ios_wf_after_name, pid, ios_wf_after_ns / 1000000000ll );
+    if (ios_wf_track_game)
+        dprintf( 2, "[thread-qos] %s started (pid %04x): deferred exe rules apply %lld s from now\n",
+                 ios_wf_after_name, pid, ios_wf_after_ns / 1000000000ll );
 }
 
 /* madeira-bcd load-wait (loadwait_ios.h, server_ios.c): the calling thread's
@@ -1681,6 +1698,25 @@ static int ios_wf_game_active_after( long long now, long long delay_ns )
 static int ios_wf_game_active( long long now )
 {
     return ios_wf_game_active_after( now, ios_wf_after_ns );
+}
+
+/* madeira-bcd thread-qos (MADEIRA_THREAD_QOS_EXE_AFTER, thread_ios.c): the game
+ * that arms (lower case) and its delay; 0 when MADEIRA_WAIT_FLOOR_AFTER names none. */
+int ios_wf_arming_game( char *name, int name_size, long long *delay_ns )
+{
+    pthread_once( &ios_wf_once, ios_wf_init );
+    if (!ios_wf_after_name[0]) return 0;
+    snprintf( name, name_size, "%s", ios_wf_after_name );
+    *delay_ns = ios_wf_after_ns;
+    return 1;
+}
+
+/* ... and whether that game has run its delay and is still there (needs a TEB:
+ * ios_wf_game_active_after checks the process every 5 s). */
+int ios_wf_game_armed(void)
+{
+    pthread_once( &ios_wf_once, ios_wf_init );
+    return ios_wf_after_name[0] && ios_wf_game_active_after( ios_wf_now_ns(), ios_wf_after_ns );
 }
 
 /* madeira-bcd thread names (2026-11-27): Windows tid -> the name the thread gave
@@ -2081,6 +2117,8 @@ const LARGE_INTEGER *ios_wait_floor( const LARGE_INTEGER *timeout, LARGE_INTEGER
 
     /* infinite, a poll, an absolute deadline or a sub-millisecond sleep: untouched */
     if (!timeout || timeout->QuadPart > -10000) return timeout;
+    /* MADEIRA_THREAD_QOS_EXE_AFTER: any guest thread's timed wait checks the arming (every 250 ms) */
+    if (__builtin_expect( ios_tq_after_pending, 0 )) ios_thread_qos_after_poll();
     if (__builtin_expect( ios_wf_state < 0, 0 )) pthread_once( &ios_wf_once, ios_wf_init );
     if (ios_wf_state <= 0) return timeout;
     if (ios_sc_features && ios_sc_is_helper_thread())

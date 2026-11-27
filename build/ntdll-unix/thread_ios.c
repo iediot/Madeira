@@ -1271,7 +1271,7 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
  * changes: madeira_guest_qos_self passes the class through untouched. */
 #define TQ_MAX_RULES   32
 #define TQ_MAX_THREADS 512
-struct tq_rule { char pat[64]; qos_class_t cls; };
+struct tq_rule { char pat[64]; qos_class_t cls; int deferred; };   /* deferred: MADEIRA_THREAD_QOS_EXE_AFTER */
 struct tq_thread { unsigned tid; qos_class_t cls; char name[48]; };
 static struct tq_rule tq_rules[TQ_MAX_RULES];
 static int tq_nrules;
@@ -1281,6 +1281,13 @@ static pthread_mutex_t tq_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct tq_thread tq_threads[TQ_MAX_THREADS];   /* tid 0 = free slot */
 static __thread unsigned tq_self_tid;                 /* set once the TEB is known */
 static __thread qos_class_t tq_self_applied;          /* class this thread set through the switch, 0 = none */
+static int tq_after_on;                               /* MADEIRA_THREAD_QOS_EXE_AFTER: some exe rules are deferred */
+static volatile int tq_after_armed;                   /* ... and the game has armed them (never goes back) */
+volatile int ios_tq_after_pending;                    /* read by ios_wait_floor (process_ios.c): poll the arming */
+static char tq_after_list[256];                       /* the deferred exe names, for the log */
+static __thread int tq_self_after_done;               /* this thread looked for its deferred rule after arming */
+static void tq_after_init(void);
+static qos_class_t tq_after_pickup( char *name );
 
 static const char *tq_class_name( qos_class_t c )
 {
@@ -1357,6 +1364,7 @@ static void tq_init_once(void)
     }
     tq_on = tq_nrules > 0;
     dprintf( 2, "[thread-qos] MADEIRA_THREAD_QOS: %d rule(s)%s\n", tq_nrules, tq_on ? "" : ", switch off" );
+    if (tq_on) tq_after_init();
 }
 
 static int tq_enabled(void)
@@ -1420,6 +1428,9 @@ int madeira_guest_qos_self( qos_class_t cls, int rel )
     {
         char name[48];
         qos_class_t want = tq_lookup( tq_self_tid, name );
+        if (!want && __builtin_expect( tq_after_on, 0 ) && !tq_self_after_done &&
+            __atomic_load_n( &tq_after_armed, __ATOMIC_ACQUIRE ))
+            want = tq_after_pickup( name );   /* MADEIRA_THREAD_QOS_EXE_AFTER */
         if (want)
         {
             int r = pthread_set_qos_class_self_np( want, 0 );
@@ -1446,14 +1457,15 @@ int madeira_guest_qos_self( qos_class_t cls, int rel )
  * CacheThread_BlockFile, a wine waitqueue) at ~0.8 core each through RDR2's gameplay,
  * past every name rule, and the game's own threads got a fraction of a core (log
  * 2026-11-26 20:11). Pseudo-processes share the address space, so the PEB is read live. */
-static qos_class_t tq_exe_class(void)
+/* the index of the exe: rule of the calling thread's process; -1 none, -2 the PEB is not filled in yet */
+static int tq_exe_rule(void)
 {
     RTL_USER_PROCESS_PARAMETERS *pp = NtCurrentTeb()->Peb ? NtCurrentTeb()->Peb->ProcessParameters : NULL;
     const WCHAR *path;
     size_t len, base = 0, k;
     int i;
 
-    if (!pp || !pp->ImagePathName.Buffer) return QOS_CLASS_UNSPECIFIED;
+    if (!pp || !pp->ImagePathName.Buffer) return -2;
     path = pp->ImagePathName.Buffer;
     len = pp->ImagePathName.Length / sizeof(WCHAR);
     for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
@@ -1472,9 +1484,139 @@ static qos_class_t tq_exe_class(void)
             if (b >= 'A' && b <= 'Z') b += 32;
             if (a != b) break;
         }
-        if (k == n) return tq_rules[i].cls;
+        if (k == n) return i;
     }
-    return QOS_CLASS_UNSPECIFIED;
+    return -1;
+}
+
+static qos_class_t tq_exe_class(void)
+{
+    int i = tq_exe_rule();
+    if (i < 0) return QOS_CLASS_UNSPECIFIED;
+    /* MADEIRA_THREAD_QOS_EXE_AFTER: before the arming, as if no exe rule matched */
+    if (tq_rules[i].deferred && !__atomic_load_n( &tq_after_armed, __ATOMIC_ACQUIRE )) return QOS_CLASS_UNSPECIFIED;
+    return tq_rules[i].cls;
+}
+
+/* env.MADEIRA_THREAD_QOS_EXE_AFTER = "SocialClubHelper.exe;RockstarService.exe"
+ * (opt-in, 2026-11-27). The exe: rules of the listed processes take effect only
+ * once the game named by MADEIRA_WAIT_FLOOR_AFTER ("RDR2.exe:180") has run its
+ * delay (process_ios.c ios_wf_game_armed, the arming the wait floor and the
+ * Social Club park use). RDR2's loading screen has a 9-70 s dead zone in which
+ * its main thread idles while Social Club's helper burns 2-4.9 s of CPU per 2 s
+ * and which ends with the Rockstar sign-in requests: the game may be waiting on
+ * Social Club there, and a utility helper would stretch that wait (not proven;
+ * docs/RDR2_LOAD_TIME_IPHONE18_2026-11-27.md). Before the arming those processes'
+ * threads run exactly as if no exe rule matched them (name rules still apply).
+ * The arming is checked from ios_wait_floor, every 250 ms of any guest thread's
+ * timed waits, and latches for the session: it does not revert when the game
+ * exits (the deferred processes are the game's, they go with it). At the
+ * arming ios_eco_gen is bumped, so every guest thread re-runs ios_eco_apply_self
+ * at its next wait, sleep or yield; a thread of a listed process with no stored
+ * class then stores its exe rule (tq_after_pickup), once per thread. QoS can
+ * only be set by a thread on itself, so a thread that never waits, sleeps or
+ * yields keeps its class until it does -- the same limit as a thread named by
+ * another one. A process's frame-critical / priority lifts look at the exe
+ * class, so a process deferred at user-initiated is not lifted before the
+ * arming (only matters if the game itself is listed). Unset, or with no exe:
+ * rule for any listed name, or with no MADEIRA_WAIT_FLOOR_AFTER game: nothing
+ * changes. [thread-qos] lines report the deferral and the arming. */
+static void tq_after_init(void)
+{
+    extern int ios_wf_arming_game( char *name, int name_size, long long *delay_ns );
+    const char *e = getenv( "MADEIRA_THREAD_QOS_EXE_AFTER" );
+    char buf[512], game[64], *p, *next;
+    long long delay;
+    int i, n = 0;
+
+    if (!e || !*e) return;
+    snprintf( buf, sizeof(buf), "%s", e );
+    for (p = buf; p && *p; p = next)
+    {
+        char *semi = strchr( p, ';' ), *end = semi ? semi : p + strlen( p ), *name;
+        int hit = 0;
+        next = semi ? semi + 1 : NULL;
+        name = tq_trim( p, end );
+        if (!*name) continue;
+        for (i = 0; i < tq_nrules; i++)
+            if (!strncmp( tq_rules[i].pat, "exe:", 4 ) && !strcasecmp( tq_rules[i].pat + 4, name ))
+                tq_rules[i].deferred = hit = 1;
+        if (!hit)
+        {
+            dprintf( 2, "[thread-qos] MADEIRA_THREAD_QOS_EXE_AFTER: no exe:%s rule, ignored\n", name );
+            continue;
+        }
+        if (strlen( tq_after_list ) + strlen( name ) + 2 < sizeof(tq_after_list))
+        {
+            if (n) strcat( tq_after_list, ";" );
+            strcat( tq_after_list, name );
+        }
+        n++;
+    }
+    if (!n) return;
+    if (!ios_wf_arming_game( game, sizeof(game), &delay ))
+    {
+        for (i = 0; i < tq_nrules; i++) tq_rules[i].deferred = 0;
+        dprintf( 2, "[thread-qos] MADEIRA_THREAD_QOS_EXE_AFTER ignored: MADEIRA_WAIT_FLOOR_AFTER names no game; "
+                    "exe rules for %s apply at once\n", tq_after_list );
+        return;
+    }
+    tq_after_on = 1;
+    __atomic_store_n( &ios_tq_after_pending, 1, __ATOMIC_RELEASE );
+    dprintf( 2, "[thread-qos] exe rules for %s deferred until %s has run %lld s\n",
+             tq_after_list, game, delay / 1000000000ll );
+}
+
+/* ios_wait_floor (process_ios.c) while ios_tq_after_pending: arm once the game has run its delay */
+void ios_thread_qos_after_poll(void)
+{
+    extern int ios_wf_game_armed(void);
+    extern volatile int ios_eco_gen;
+    static volatile long long next_ns;
+    struct timespec ts;
+    long long now, next = __atomic_load_n( &next_ns, __ATOMIC_RELAXED );
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+    if (now < next ||
+        !__atomic_compare_exchange_n( &next_ns, &next, now + 250000000ll, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        return;
+    if (!ios_wf_game_armed()) return;
+    if (__atomic_exchange_n( &tq_after_armed, 1, __ATOMIC_ACQ_REL )) return;
+    __atomic_store_n( &ios_tq_after_pending, 0, __ATOMIC_RELEASE );
+    dprintf( 2, "[thread-qos] armed: exe rules now apply to %s\n", tq_after_list );
+    __atomic_add_fetch( &ios_eco_gen, 1, __ATOMIC_RELEASE );   /* every guest thread re-applies at its next wait */
+}
+
+/* insert tid's class unless it has one already (a name stored meanwhile wins) */
+static void tq_store_absent( unsigned tid, qos_class_t cls, const char *name )
+{
+    int i, free_slot = -1;
+    pthread_mutex_lock( &tq_lock );
+    for (i = 0; i < TQ_MAX_THREADS; i++)
+    {
+        if (tq_threads[i].tid == tid) break;
+        if (!tq_threads[i].tid && free_slot < 0) free_slot = i;
+    }
+    if (i == TQ_MAX_THREADS && free_slot >= 0)
+    {
+        tq_threads[free_slot].cls = cls;
+        snprintf( tq_threads[free_slot].name, sizeof(tq_threads[free_slot].name), "%s", name );
+        __atomic_store_n( &tq_threads[free_slot].tid, tid, __ATOMIC_RELEASE );
+    }
+    pthread_mutex_unlock( &tq_lock );
+}
+
+/* madeira_guest_qos_self, the first re-apply after the arming of a thread with no
+ * stored class: its process's deferred exe rule, if any. Returns the stored class. */
+static qos_class_t tq_after_pickup( char *name )
+{
+    int i;
+    if (!NtCurrentTeb() || (i = tq_exe_rule()) == -2) return QOS_CLASS_UNSPECIFIED;   /* look again next time */
+    tq_self_after_done = 1;
+    if (i < 0 || !tq_rules[i].deferred) return QOS_CLASS_UNSPECIFIED;
+    tq_store_absent( tq_self_tid, tq_rules[i].cls, "(process rule, deferred)" );
+    return tq_lookup( tq_self_tid, name );
 }
 
 /* start_thread, once the TEB is published: a thread named before it ran */

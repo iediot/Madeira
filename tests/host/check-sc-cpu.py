@@ -138,6 +138,9 @@ static NTSTATUS NtOpenProcess( HANDLE *h, ULONG a, OBJECT_ATTRIBUTES *o, CLIENT_
 static NTSTATUS NtQueryInformationProcess( HANDLE h, int c, void *i, ULONG l, ULONG *r )
 { (void)h; (void)c; (void)l; (void)r; ((PROCESS_BASIC_INFORMATION *)i)->ExitStatus = STATUS_PENDING; return 0; }
 static NTSTATUS NtClose( HANDLE h ) { (void)h; return 0; }
+volatile int ios_tq_after_pending;   /* thread_ios.c MADEIRA_THREAD_QOS_EXE_AFTER */
+static int tq_polls;
+void ios_thread_qos_after_poll( void ) { tq_polls++; }
 ''' + helpers + lite_src + wf_src + r'''
 static WCHAR *w( const char *s, int *len )
 {
@@ -190,13 +193,57 @@ static LONGLONG floored( LONGLONG t )
     return r->QuadPart;
 }
 
-int main( void )
+/* MADEIRA_THREAD_QOS_EXE_AFTER: the arming accessors, and the start recorded with no floor on */
+static int qos_after( int on )
+{
+    int len, nlen; char name[64]; long long d = -1;
+    WCHAR *img = w( "C:\\Games\\RDR2.exe", &nlen );
+    unsetenv( "MADEIRA_WAIT_FLOOR" );
+    setenv( "MADEIRA_WAIT_FLOOR_AFTER", "RDR2.exe:180", 1 );
+    if (on) setenv( "MADEIRA_THREAD_QOS_EXE_AFTER", "SocialClubHelper.exe;RockstarService.exe", 1 );
+    else unsetenv( "MADEIRA_THREAD_QOS_EXE_AFTER" );
+    set_image( "C:\\Program Files\\Rockstar Games\\Social Club\\SocialClubHelper.exe" );
+    if (!ios_wf_arming_game( name, sizeof(name), &d ) || strcmp( name, "rdr2.exe" ) || d != 180000000000ll)
+        FAIL("ios_wf_arming_game: %s %lld\n", name, d);
+    if (ios_wf_state != 0 || ios_wf_track_game != on) FAIL("state %d track %d\n", ios_wf_state, ios_wf_track_game);
+    if (ios_wf_game_armed()) FAIL("armed before the game started\n");
+    ios_wait_floor_note_process( w( "C:\\x\\PlayRDR2.exe", &len ), len, 0x40 );
+    live_pid = 0x48c;
+    ios_wait_floor_note_process( img, nlen, 0x48c );
+    if (!on)
+    {
+        if (ios_wf_started_ns || ios_wf_game_armed()) FAIL("off: the start was recorded with no floor on\n");
+        ios_tq_after_pending = 0;
+        if (floored( -10000 ) != -10000 || tq_polls) FAIL("off: wait changed or polled (%d)\n", tq_polls);
+        puts("PASS: MADEIRA_THREAD_QOS_EXE_AFTER unset: no floor, no start recorded, no arming poll");
+        return 0;
+    }
+    if (!ios_wf_started_ns) FAIL("the game's start not recorded\n");
+    fake_ns += 179000000000ll;
+    if (ios_wf_game_armed()) FAIL("armed before 180 s\n");
+    ios_tq_after_pending = 1;
+    if (floored( -10000 ) != -10000 || floored( -1000 ) != -1000 || tq_polls != 1)
+        FAIL("pending: wait changed or poll count %d (want 1: sub-ms waits do not poll)\n", tq_polls);
+    ios_tq_after_pending = 0;
+    if (floored( -10000 ) != -10000 || tq_polls != 1) FAIL("not pending but polled\n");
+    fake_ns += 2000000000ll;
+    if (!ios_wf_game_armed()) FAIL("not armed after 180 s\n");
+    live_pid = 0;                        /* the game exits: the accessor says so (the latch is thread_ios.c's) */
+    fake_ns += 6000000000ll;
+    if (ios_wf_game_armed()) FAIL("armed after the game left\n");
+    puts("PASS: MADEIRA_THREAD_QOS_EXE_AFTER: the game's start is recorded with no floor on, armed from 180 s while it runs, "
+         "timed waits poll only while pending");
+    return 0;
+}
+
+int main( int argc, char **argv )
 {
     const char *base = "\"C:\\Program Files\\Rockstar Games\\Social Club\\SocialClubHelper.exe\"  --lang=en "
                        "--off-screen-rendering-enabled --disable-features=PartitionAllocBackupRefPtr --single-process";
     const char *r; int how, len, i;
     WCHAR small[64];
 
+    if (argc > 1) return qos_after( !strcmp( argv[1], "qos-after" ) );
     r = lite( base, 30, &how );
     if (!strstr( r, "--disable-features=EnableHangWatcher,PartitionAllocBackupRefPtr " )) FAIL("hang: %s\n", r);
     if (count( r, "EnableHangWatcher" ) != 1) FAIL("hang twice: %s\n", r);
@@ -275,6 +322,7 @@ int main( void )
     if (floored( -10000 ) != -10000 || ios_wf_started_ns) FAIL("still on after the game left\n");
     for (i = 0; i < 3; i++) fake_ns += 6000000000ll, floored( -10000 );
     if (opens > 2) FAIL("process checks while off: %d\n", opens);
+    if (tq_polls || ios_wf_track_game) FAIL("thread-qos arming polled with MADEIRA_THREAD_QOS_EXE_AFTER unset\n");
     puts("PASS: wait floor: only the helper's 1 ms..50 ms relative waits are raised, from 120 s after RDR2.exe starts until it is gone");
     return 0;
 }
@@ -354,9 +402,10 @@ with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(['cc', '-std=gnu11', '-O1', '-Wall', '-Wno-unused-function', '-Wno-unused-variable', '-Wno-format',
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', str(c), '-o', str(exe), '-lpthread'],
                        check=True)
-        out = subprocess.run([str(exe)], capture_output=True, text=True)
-        print(out.stdout, end='')
-        if out.returncode:
-            print(out.stderr)
-            raise SystemExit('FAIL: %s exited %d' % (name, out.returncode))
+        for args in ([[]] if name != 'sc_cpu' else [[], ['qos-after'], ['qos-after-off']]):
+            out = subprocess.run([str(exe)] + args, capture_output=True, text=True)
+            print(out.stdout, end='')
+            if out.returncode:
+                print(out.stderr)
+                raise SystemExit('FAIL: %s %s exited %d' % (name, ' '.join(args), out.returncode))
 print('ALL PASS')

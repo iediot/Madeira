@@ -175,3 +175,25 @@ Morning run (no extra settings needed; leave `MADEIRA_PERF` off):
 5. If the Files app can reach the app's Documents folder, also copy
    `wine/drive_c/users/mobile/Documents/Rockstar Games/Social Club/*.log` and
    `wine/drive_c/users/mobile/AppData/Local/Rockstar Games/Social Club/ipc.log`.
+
+## A/B tries for the morning
+
+Opt-in switches that are in no profile. Run the normal launch first (A), then add the line to RDR2's
+game config for the second launch (B), and compare.
+
+| Try | Line to add | When |
+|---|---|---|
+| Social Club / RockstarService at default QoS until RDR2 has run 180 s (their `exe:…=utility` rules wait for the `MADEIRA_WAIT_FLOOR_AFTER = RDR2.exe:180` arming) | `env.MADEIRA_THREAD_QOS_EXE_AFTER = SocialClubHelper.exe;RockstarService.exe` | try if the loading dead zone is long |
+
+What to compare between A and B:
+- The dead-zone length: the `[xp-t]` rows after the first loading frame in which RDR2's main thread (pid+4,
+  e.g. 0450) has < 50 ms CPU per 2 s; count the seconds until it runs again. Also the helper's
+  (SocialClubHelper.exe) CPU in the same rows and the `[sc-cpu]` lines.
+- The `[load-wait]` census lines in that window: whether the main thread's wait (`main 0450 waited …`,
+  `[load-wait-srv] … last_set_tid=`, `waker=`) is set by the helper/RockstarService and ends sooner in B.
+- Proof B ran: `[thread-qos] exe rules for SocialClubHelper.exe;RockstarService.exe deferred until rdr2.exe
+  has run 180 s` once at start, `[thread-qos] rdr2.exe started (pid …): deferred exe rules apply 180 s from now`,
+  then `[thread-qos] armed: exe rules now apply to SocialClubHelper.exe;RockstarService.exe` once ~180 s
+  later, followed by `[thread-qos] <tid> (process rule, deferred) -> utility` lines for the helper's threads.
+- Gameplay after the arming should match A (same classes from then on); a slower first 3 minutes of
+  gameplay in B would mean the helper at default QoS costs the game more than the dead zone saves.
