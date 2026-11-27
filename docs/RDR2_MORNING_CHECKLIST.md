@@ -106,3 +106,21 @@ The pacer's early version that slipped into 641b711c is fixed here; the pacer it
 | ProMotion display link on its own thread (MAX/RAW/40 caps only) | on | madeira.cfg `env.MADEIRA_PROMOTE_LINK_THREAD = 0` (suspect if pacing changes at those caps) |
 | Developer FPS overlay single 4 Hz tick | on | madeira.cfg `env.MADEIRA_HUD_LEAN = 0` |
 | Log-tail poll parked while log display is paused | on | madeira.cfg `env.MADEIRA_UI_LOG_IDLE_POLL = 0` |
+
+### Fastsync: RDR2's semaphores and multi-object waits in-process (wine unix sync.c, server event.c/semaphore.c)
+Log 01:05 gameplay, per second: ~5.4k `select` (req29), ~1.2k `release_semaphore` (req41), ~0.7k
+`event_op` (req31). ~1.7k of the selects were single semaphore waits (semaphores had no fastsync cells:
+`sem=off`), ~2.3k were wait-any on several events (fastsync took only one-handle waits). The `tid` after
+each `reqN` in `[srv-req]` is a space-saving heavy hitter (~25 % of every count is inherited), not the
+one thread that sends them.
+| Change | Default | Off switch |
+|---|---|---|
+| Semaphore cells and fast path for semaphores RDR2.exe creates (others keep server semaphores) | RDR2 via profile | `env.MADEIRA_FASTSYNC_SEM_EXES = 0` (FIRST suspect on any load stall or hang: the session-wide `MADEIRA_FASTSYNC_SEM` was pulled after a Dock load stall, dd39f3b2, never root-caused) |
+| Non-alertable wait-any on 2-64 cell objects answered in-process (lowest signalled index; parks ≤ 2 ms, then the server) | RDR2 via profile | `env.MADEIRA_FASTSYNC_MULTI = 0` (second suspect) |
+| Threads parked in a multi wait at once | 4 | `env.MADEIRA_FASTSYNC_MULTI_PARKED = N` (1-32) |
+
+Lines that prove they ran: `[fastsync] ml2120 per-image: semaphore fast path for RDR2.exe; multi-object
+wait-any fast path for RDR2.exe`, `[fastsync] ml2120 server: semaphore cells for MADEIRA_FASTSYNC_SEM_EXES=RDR2.exe
+(first from pid …)` (RDR2's pid), and every 30 s `[fastsync] ml2120 multi-wait 30s: … no server N …`.
+Compare `[srv-req]` req29/req41/req31 and `select by shape … first object: semaphore` with the 01:05 log.
+Must not appear: `[fastsync] desync: … kind=sem`.

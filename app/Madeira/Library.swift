@@ -1098,6 +1098,17 @@ struct LibraryEntry: Codable, Identifiable {
             // 00:19 and 01:05). MADEIRA_HIDPAD_ON_CHANGE completes a read only when the report's bytes
             // change -- on the same 4 ms slot as before, no deadzone -- plus a resend every 200 ms
             // (hidpad_ios.c, [hid-pad] ml2108 counts per 30 s); env.MADEIRA_HIDPAD_ON_CHANGE = 0 turns it off.
+            // Sync (ml2120): under fastsync auto the game still sent ~5.4k selects, ~1.2k semaphore releases and
+            // ~0.7k event wakes a second to the wineserver in clamped play (log 2026-11-27 01:05): semaphores
+            // had no cells (MADEIRA_FASTSYNC_SEM off; ~1.7k of the selects were single semaphore waits) and
+            // fastsync took no wait on more than one handle (~2.3k a second, all events). MADEIRA_FASTSYNC_SEM_EXES
+            // gives semaphores cells and the fast path for RDR2.exe only -- the launcher, Social Club and Steam
+            // keep server semaphores, unlike the session-wide switch whose Dock trial stalled a load (dd39f3b2).
+            // MADEIRA_FASTSYNC_MULTI answers RDR2's non-alertable wait-any on cell objects in-process, lowest
+            // signalled index first, parking at most the 2 ms fast cap ([fastsync] ml2120 multi-wait line every
+            // 30 s). Madsync is not an option here: this Dock session runs the service manager, which turns it
+            // off (services.exe never answered its RPC clients under madsync). env.MADEIRA_FASTSYNC_SEM_EXES = 0
+            // and env.MADEIRA_FASTSYNC_MULTI = 0 turn them off.
             return socialClub + "\n" + bcd + "\n" + videoBudget + "\n" + """
             d3d12-shader-pack = 1
             replay-split = 0
@@ -1154,6 +1165,8 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_REG_CACHE = RDR2.exe
             env.MADEIRA_REG_CENSUS = RDR2.exe
             env.MADEIRA_HIDPAD_ON_CHANGE = 1
+            env.MADEIRA_FASTSYNC_SEM_EXES = RDR2.exe
+            env.MADEIRA_FASTSYNC_MULTI = RDR2.exe
             """ + (steam ? "\nenv.MADEIRA_DOCK_GAME_SCM = 1\nenv.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe" : "")
         case "gta5_enhanced.exe", "playgtav.exe":
             let steamLines = """

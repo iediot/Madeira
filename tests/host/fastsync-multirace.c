@@ -27,6 +27,7 @@
  */
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,6 +50,10 @@ static unsigned long long madeira_now_ns(void)
 
 /* the control for check 30: suppress the kick of every setter below */
 static int no_kick;
+/* sync.c's MADEIRA_FASTSYNC_MULTI_PARKED; more than the waiters below, so the
+ * liveness check parks every one of them */
+static unsigned int madeira_multi_max_parked = 8;
+static unsigned int parks_dummy;   /* single-threaded callers only */
 
 #include "multi_core.inc"
 
@@ -138,16 +143,21 @@ static void ws_init( struct waitset *w, int n, const int *idx )
     }
 }
 
-/* BUSY (too many re-looks) sends a real caller to the server; here it looks again */
-static long busy_count;
+/* BUSY (too many re-looks) and HERD (the park limit) send a real caller to
+ * the server; here it looks again */
+static long busy_count, herd_count;
 static int ws_wait( struct waitset *w, unsigned long long budget_ns, int *phase, int *inv )
 {
+    unsigned int parks;
     int k;
     *inv = 0;
-    while ((k = madeira_multi_core( w->cells, w->gens, w->manuals, w->kinds, w->n, 1, budget_ns, phase ))
-           == MADEIRA_MULTI_BUSY)
-        __atomic_add_fetch( &busy_count, 1, __ATOMIC_RELAXED );
-    return k;
+    for (;;)
+    {
+        k = madeira_multi_core( w->cells, w->gens, w->manuals, w->kinds, w->n, 1, budget_ns, phase, &parks );
+        if (k == MADEIRA_MULTI_BUSY) __atomic_add_fetch( &busy_count, 1, __ATOMIC_RELAXED );
+        else if (k == MADEIRA_MULTI_HERD) { __atomic_add_fetch( &herd_count, 1, __ATOMIC_RELAXED ); sched_yield(); }
+        else return k;
+    }
 }
 
 static int fail( int code, const char *what )
@@ -346,6 +356,18 @@ static void check_conservation_and_liveness( int secs )
     if (!ok) fail( 30, "liveness: a parked waiter missed the quit event" );
     if (!tak) fail( 25, "conservation: nothing was taken" );
 
+    /* again with a park limit of 2, so most waiters take the server branch */
+    madeira_multi_max_parked = 2;
+    ok = cs_run( secs, 1, 1000 );
+    madeira_multi_max_parked = 8;
+    for (i = 0; i < CS_SEMS; i++)
+        if (cs_released[cs_sem[i]] != cs_taken[cs_sem[i]] + MADEIRA_SG_STATE( madeira_sync_cells[cs_sem[i]].sg ))
+            fail( 26, "conservation with the park limit: a semaphore's tokens do not add up" );
+    if (madeira_multi_parked) fail( 27, "conservation with the park limit: the parked count did not return to 0" );
+    printf( "park limit 2: tokens add up, %ld calls sent past the limit, waiters left %s\n",
+            herd_count, ok ? "within 1 s" : "LATE" );
+    if (!ok) fail( 32, "liveness with the park limit: a waiter missed the quit event" );
+
     /* the control: without the kick, parked waiters must sleep through the quit */
     ok = cs_run( 1, 0, 1000 );
     printf( "control without the kick: %s\n", ok ? "every waiter still left (BAD control)" : "stalled, as it must" );
@@ -486,24 +508,24 @@ static void check_bounds(void)
     ws_init( &w, 2, idx );
     /* one look: nothing there, no park */
     t0 = madeira_now_ns();
-    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 0, 0, &phase );
+    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 0, 0, &phase, &parks_dummy );
     if (k != MADEIRA_MULTI_NONE || phase != 0 || madeira_now_ns() - t0 > 50000000ull)
         fail( 70, "bounds: a poll did more than one look" );
     sem_release( 51, 2 );
-    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 0, 0, &phase );
+    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 0, 0, &phase, &parks_dummy );
     if (k != 1 || MADEIRA_SG_STATE( madeira_sync_cells[51].sg ) != 1) fail( 71, "bounds: a poll missed a token" );
-    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 0, 0, &phase );   /* the last token */
+    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 0, 0, &phase, &parks_dummy );   /* the last token */
     if (k != 1 || MADEIRA_SG_STATE( madeira_sync_cells[51].sg ) != 0) fail( 71, "bounds: a poll missed a token" );
     /* the herd limit: with the limit reached a waiter goes to the server at once */
-    madeira_multi_parked = MADEIRA_MULTI_MAX_PARKED;
+    madeira_multi_parked = madeira_multi_max_parked;
     t0 = madeira_now_ns();
-    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 1, 1000000000ull, &phase );
-    if (k != MADEIRA_MULTI_NONE || madeira_now_ns() - t0 > 100000000ull || phase == 2)
+    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 1, 1000000000ull, &phase, &parks_dummy );
+    if (k != MADEIRA_MULTI_HERD || madeira_now_ns() - t0 > 100000000ull || phase == 2)
         fail( 72, "bounds: a waiter parked past the herd limit" );
     madeira_multi_parked = 0;
     /* the budget ends a park */
     t0 = madeira_now_ns();
-    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 1, 3000000ull, &phase );
+    k = madeira_multi_core( w.cells, w.gens, w.manuals, w.kinds, w.n, 1, 3000000ull, &phase, &parks_dummy );
     if (k != MADEIRA_MULTI_NONE || phase != 2 || madeira_now_ns() - t0 > 200000000ull)
         fail( 73, "bounds: the budget did not end the park" );
     if (madeira_sync_cells[50].mwaiters || madeira_sync_cells[51].mwaiters)
