@@ -62,6 +62,18 @@ static NTSTATUS rc_srv_close( HANDLE key )
     return NtClose( key );
 }
 
+/* the cache and census locks are held across server requests: hold them the way
+ * Wine holds fd_cache_mutex (signals blocked; a killed thread leaves first) */
+static void rc_enter_section( pthread_mutex_t *mutex, sigset_t *sigset )
+{
+    server_enter_uninterrupted_section( mutex, sigset );
+}
+
+static void rc_leave_section( pthread_mutex_t *mutex, sigset_t *sigset )
+{
+    server_leave_uninterrupted_section( mutex, sigset );
+}
+
 #include "regcache_ios.h"
 
 #ifndef ARRAY_SIZE
@@ -88,7 +100,8 @@ struct rc_cen_item
 
 struct rc_census
 {
-    pthread_mutex_t lock;       /* recursive; taken before a process's cache lock, never after */
+    pthread_mutex_t lock;       /* recursive; taken before a process's cache lock, never after;
+                                 * through rc_enter_section / rc_leave_section */
     struct rc_cen_item items[RC_CEN];
     unsigned int used;
     unsigned long long dropped, n[4], fails[4];
@@ -120,6 +133,7 @@ static unsigned int rc_rec_clock;
 static pthread_mutex_t rc_recs_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct rc_rec *rc_tls_rec;
 static __thread struct rc_proc *rc_tls_close_proc;
+static __thread sigset_t rc_tls_close_sigset;   /* rc_close's root case, until ios_regcache_close_done */
 
 static unsigned long long rc_now_ms( void )
 {
@@ -283,9 +297,10 @@ static const char *rc_handle_label( struct rc_rec *r, HANDLE h, char *buf )
     if (r->proc && rc_is_virtual( h ))
     {
         const char *label = NULL;
-        pthread_mutex_lock( &r->proc->lock );
+        sigset_t sigset;
+        rc_lock( r->proc, &sigset );
         if ((si = rc_slot_of( r->proc, h )) >= 0) label = rc_entry_label( r, r->proc->slots[si].entry );
-        pthread_mutex_unlock( &r->proc->lock );
+        rc_unlock( r->proc, &sigset );
         return label ? label : "<cached handle>";
     }
     for (i = 0; i < RC_HPATH; i++) if (c->hpath[i].h == h) return c->hpath[i].path;
@@ -368,8 +383,9 @@ static void rc_report( struct rc_rec *r, unsigned long long now )
         struct rc_census *c = r->cen;
         int order[16], n = 0, i, j;
         unsigned int k;
+        sigset_t csig;
 
-        pthread_mutex_lock( &c->lock );
+        rc_enter_section( &c->lock, &csig );
         for (k = 0; k < RC_CEN; k++)
         {
             if (!c->items[k].used) continue;
@@ -396,7 +412,7 @@ static void rc_report( struct rc_rec *r, unsigned long long now )
         memset( c->fails, 0, sizeof(c->fails) );
         c->used = 0;
         c->dropped = 0;
-        pthread_mutex_unlock( &c->lock );
+        rc_leave_section( &c->lock, &csig );
     }
     r->last_report = now;
     r->gen0 = gen;
@@ -432,13 +448,14 @@ int ios_regcache_open( HANDLE *key, HANDLE root, const UNICODE_STRING *name, ACC
     struct rc_rec *r = rc_current();
     char rootbuf[RC_PATH], path[RC_PATH];
     int handled = 0;
+    sigset_t csig;
 
     if (!r || (!r->proc && !r->cen)) return 0;
     if (r->cen)
     {
-        pthread_mutex_lock( &r->cen->lock );
+        rc_enter_section( &r->cen->lock, &csig );
         rc_join( path, rc_handle_label( r, root, rootbuf ), name->Buffer, name->Length );
-        pthread_mutex_unlock( &r->cen->lock );
+        rc_leave_section( &r->cen->lock, &csig );
     }
     if (r->proc)
         handled = rc_open( r->proc, key, root, name->Buffer, name->Length, access, attributes, options, status );
@@ -450,10 +467,10 @@ int ios_regcache_open( HANDLE *key, HANDLE root, const UNICODE_STRING *name, ACC
     }
     if (r->cen)
     {
-        pthread_mutex_lock( &r->cen->lock );
+        rc_enter_section( &r->cen->lock, &csig );
         rc_census_add( r->cen, RC_K_OPEN, path, NULL, *status != STATUS_SUCCESS );
         if (!*status && *key && !rc_is_virtual( *key )) rc_hpath_set( r->cen, *key, path );
-        pthread_mutex_unlock( &r->cen->lock );
+        rc_leave_section( &r->cen->lock, &csig );
     }
     rc_tick( r );
     return 1;
@@ -464,13 +481,14 @@ void ios_regcache_note_create( HANDLE root, const UNICODE_STRING *name, NTSTATUS
 {
     struct rc_rec *r;
     char rootbuf[RC_PATH], path[RC_PATH];
+    sigset_t csig;
 
     if (ios_regcache_on <= 0 || !(r = rc_current()) || !r->cen) return;
-    pthread_mutex_lock( &r->cen->lock );
+    rc_enter_section( &r->cen->lock, &csig );
     rc_join( path, rc_handle_label( r, root, rootbuf ), name ? name->Buffer : NULL, name ? name->Length : 0 );
     rc_census_add( r->cen, RC_K_CREATE, path, NULL, status != STATUS_SUCCESS );
     if (!status && key) rc_hpath_set( r->cen, key, path );
-    pthread_mutex_unlock( &r->cen->lock );
+    rc_leave_section( &r->cen->lock, &csig );
     rc_tick( r );
 }
 
@@ -482,18 +500,19 @@ int ios_regcache_query( HANDLE *handle, const UNICODE_STRING *name, ULONG *type,
     HANDLE orig = *handle;
     char buf[RC_PATH], path[RC_PATH], value[64];
     int served = 0;
+    sigset_t csig;
 
     if (!r || (!r->proc && !r->cen)) return 0;
     if (r->proc) served = rc_query( r->proc, handle, name->Buffer, name->Length, type, total, data, max, status );
     if (r->cen)
     {
-        pthread_mutex_lock( &r->cen->lock );
+        rc_enter_section( &r->cen->lock, &csig );
         snprintf( path, sizeof(path), "%s", rc_handle_label( r, orig, buf ) );
         value[0] = 0;
         rc_wcs_to_path( value, sizeof(value), name->Buffer, name->Length / sizeof(WCHAR) );
         /* a read the server answers is counted by ios_regcache_query_done */
         if (served) rc_census_add( r->cen, RC_K_VALUE, path, value, *status != STATUS_SUCCESS );
-        pthread_mutex_unlock( &r->cen->lock );
+        rc_leave_section( &r->cen->lock, &csig );
     }
     rc_tick( r );
     return served;
@@ -504,15 +523,16 @@ void ios_regcache_query_done( HANDLE handle, const UNICODE_STRING *name, NTSTATU
 {
     struct rc_rec *r;
     char buf[RC_PATH], path[RC_PATH], value[64];
+    sigset_t csig;
 
     if (ios_regcache_on <= 0 || !(r = rc_current()) || !r->cen) return;
-    pthread_mutex_lock( &r->cen->lock );
+    rc_enter_section( &r->cen->lock, &csig );
     snprintf( path, sizeof(path), "%s", rc_handle_label( r, handle, buf ) );
     value[0] = 0;
     rc_wcs_to_path( value, sizeof(value), name->Buffer, name->Length / sizeof(WCHAR) );
     rc_census_add( r->cen, RC_K_VALUE, path, value,
                    status != STATUS_SUCCESS && status != STATUS_BUFFER_OVERFLOW && status != STATUS_BUFFER_TOO_SMALL );
-    pthread_mutex_unlock( &r->cen->lock );
+    rc_leave_section( &r->cen->lock, &csig );
 }
 
 /* any other use of a handle: a cached one becomes its real handle. `op` names a
@@ -521,14 +541,15 @@ NTSTATUS ios_regcache_real( HANDLE *handle, const char *op )
 {
     struct rc_rec *r;
     char buf[RC_PATH];
+    sigset_t csig;
 
     if (!op && !rc_is_virtual( *handle )) return STATUS_SUCCESS;   /* the generic object calls */
     if (!(r = rc_current()) || (!r->proc && !r->cen)) return STATUS_SUCCESS;
     if (op && r->cen)
     {
-        pthread_mutex_lock( &r->cen->lock );
+        rc_enter_section( &r->cen->lock, &csig );
         rc_census_add( r->cen, RC_K_OTHER, rc_handle_label( r, *handle, buf ), op, 0 );
-        pthread_mutex_unlock( &r->cen->lock );
+        rc_leave_section( &r->cen->lock, &csig );
     }
     if (!r->proc || !rc_is_virtual( *handle )) return STATUS_SUCCESS;
     return rc_real( r->proc, handle );
@@ -552,7 +573,7 @@ int ios_regcache_close( HANDLE handle, NTSTATUS *ret )
             if (r->cen->hpath[i].h == handle) __atomic_store_n( &r->cen->hpath[i].h, (HANDLE)0, __ATOMIC_RELAXED );
     }
     if (!r->proc) return 0;
-    res = rc_close( r->proc, handle, ret );
+    res = rc_close( r->proc, handle, ret, &rc_tls_close_sigset );
     if (res == 2) rc_tls_close_proc = r->proc;
     return res;
 }
@@ -561,7 +582,7 @@ void ios_regcache_close_done( void )
 {
     struct rc_proc *p = rc_tls_close_proc;
     rc_tls_close_proc = NULL;
-    if (p) rc_close_done( p );
+    if (p) rc_close_done( p, &rc_tls_close_sigset );
 }
 
 /* NtDuplicateObject with DUPLICATE_CLOSE_SOURCE on cached handle `handle`,

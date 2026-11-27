@@ -15,8 +15,15 @@ Compiles the production code from wine/dlls/ntdll/unix/sync.c and checks:
   - ios_ystat_get + server_ios.c ios_xp_ystat: the same hash and table, so the sampler finds
     every slot a thread claimed (also from several threads at once);
   - server_ios.c ios_xp_tok_extra: the [xp-t] token suffix;
+  - NtYieldExecution's escalation hunk with ios_poll_yield: the yields ntdll makes after a
+    failed poll (server_wait's STATUS_TIMEOUT yield, the fastsync peek) never sleep and
+    never count toward the streak, however many there are and however they interleave with
+    SwitchToThread / Sleep(0), which still escalate after `after` of their own; a timed
+    sleep's yield never escalates; ios_poll_yield restores the caller's mark;
 and textually: every real-wait entry point resets the streak (eight of them), NtDelayExecution
-marks its own yield (timed sleep = not a spin, Sleep(0) = a spin), NtYieldExecution escalates
+marks its own yield (timed sleep = not a spin, Sleep(0) = a spin), the poll paths
+(server_ios.c / server.c server_wait, the fastsync peek) yield through ios_poll_yield and
+nothing else in unix ntdll calls NtYieldExecution, NtYieldExecution escalates
 before the ml1063 adaptive yield, the switch is env.MADEIRA_YIELD_ESCALATE (off unless set),
 only the RDR2 profile sets it, the [xp] loop samples run state per slice with
 MADEIRA_XP_RUNQ=0 as the off switch, the worker [spin-pc] gate is capped, and [xp-api]
@@ -24,6 +31,7 @@ reports escalations.
 Needs python3 and a C compiler (AddressSanitizer/UBSan).
 """
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -64,8 +72,8 @@ assert mark < call < clear < delay.index('if (!when) return status;')
 assert 'timeout->QuadPart ? &ys->shortsleep : &ys->zero' in delay
 yld = function(sync, 'NTSTATUS WINAPI NtYieldExecution(')
 assert yld.index('ios_yesc_step(') < yld.index('ml1063: ADAPTIVE YIELD')
-assert 'if (ys && !ios_yesc_in_timed_delay) __atomic_add_fetch( &ys->yields' in yld
-assert 'if (ios_yesc_in_timed_delay != 1 && ios_yesc_thread_on())' in yld
+assert 'if (ys && (!ios_yesc_in_timed_delay || ios_yesc_in_timed_delay == 3)) __atomic_add_fetch( &ys->yields' in yld
+assert 'if ((!ios_yesc_in_timed_delay || ios_yesc_in_timed_delay == 2) && ios_yesc_thread_on())' in yld
 assert 'clock_gettime_nsec_np( CLOCK_THREAD_CPUTIME_ID )' in yld and 'usleep( us );' in yld
 init = function(sync, 'static void ios_yesc_init(void)')
 assert 'getenv( "MADEIRA_YIELD_ESCALATE" )' in init and "ios_yesc_mode = 0; return;" in init
@@ -76,6 +84,23 @@ for key, default in (('yield-esc-after', '32'), ('yield-esc-us', '20'), ('yield-
                      ('yield-esc-work-us', '250')):
     assert 'madeira_cfg_int( "%s", %s )' % (key, default) in init, key
 print('PASS: Sleep(0) escalates, a timed sleep\'s own yield does not; escalation precedes ml1063; env switch, cfg defaults')
+
+# the yields after a failed poll go through ios_poll_yield (no escalation, no streak)
+server_c = (root / 'wine/dlls/ntdll/unix/server.c').read_text()
+private_h = (root / 'wine/dlls/ntdll/unix/unix_private.h').read_text()
+poll_yield = function(sync, 'void ios_poll_yield(void)')
+assert 'ios_yesc_in_timed_delay = 3;' in poll_yield and 'ios_yesc_in_timed_delay = prev;' in poll_yield
+assert 'extern void ios_poll_yield(void);' in private_h
+for name, src in (('server_ios.c', server), ('server.c', server_c)):
+    wait = function(src, 'unsigned int server_wait( const union select_op *select_op')
+    assert 'if (ret == STATUS_TIMEOUT) ios_poll_yield();' in wait, name
+budget = function(sync, 'static inline int madeira_peek_budget(void)')
+assert 'ios_poll_yield();' in budget and 'NtYieldExecution' not in budget
+yield_calls = re.findall(r'\bNtYieldExecution\(\);', sync)
+assert len(yield_calls) == 2, 'unix sync.c: NtYieldExecution called outside NtDelayExecution / ios_poll_yield'
+assert 'status = NtYieldExecution();' in delay and 'NtYieldExecution();' in poll_yield
+assert not re.search(r'\bNtYieldExecution\(\);', server), 'server_ios.c: a yield outside ios_poll_yield'
+print('PASS: server_wait (server_ios.c, server.c) and the fastsync peek yield through ios_poll_yield; no other internal yields')
 
 rdr2 = library[library.index('case "rdr2.exe", "playrdr2.exe":'):]
 rdr2 = rdr2[:rdr2.index('case "gta5_enhanced.exe"')]
@@ -103,6 +128,7 @@ block = sync[sync.index('struct ios_ystat { volatile uint64_t tid;'):sync.index(
 srv_ystat = function(server, 'static int ios_xp_ystat( uint64_t tid, long long v[5] )')
 srv_row = server[server.index('struct ios_xp_row {'):server.index('/* madeira-bcd yield-esc: the per-thread yield counts')]
 tok = function(server, 'static int ios_xp_tok_extra(')
+yld_hunk = yld[yld.index('    {   /* madeira-bcd yield-esc: per-thread counts'):yld.index('    /* iOS-Madeira ml1063: ADAPTIVE YIELD.')]
 assert 'struct ios_ystat { volatile uint64_t tid; volatile long long yields, zero, shortsleep, esc, esc_us; };' in server
 assert 'extern struct ios_ystat ios_ystat_tab[1024];' in server and '#define IOS_YSTAT_N 1024' in block
 
@@ -121,6 +147,44 @@ static int pthread_threadid_np_fake( pthread_t t, uint64_t *id ) { (void)t; *id 
 #undef pthread_threadid_np
 struct ios_xp_tcd { uint64_t instr, cyc, ut, st, nj; };
 ''' + srv_row.replace('struct ios_xp_row', 'struct ios_xp_row', 1) + srv_ystat + tok + r'''
+/* NtYieldExecution's yield-esc hunk as built, then an ordinary yield (returns 1) */
+typedef int NTSTATUS;
+#define STATUS_SUCCESS 0
+static volatile long long ios_xp_yield;
+static unsigned long long fake_cpu_ns;
+static unsigned int slept_us, escalated;
+static __thread struct ios_yesc_state ios_yesc;
+static __thread int ios_yesc_in_timed_delay;
+static struct ios_yesc_cfg ios_yesc_conf = { 32, 20, 100, 250000 };
+static int ios_yesc_thread_on(void) { return 1; }
+#define clock_gettime_nsec_np(clk) (fake_cpu_ns)
+#define usleep(us) (slept_us = (us), escalated++)
+static NTSTATUS NtYieldExecution(void)
+{
+    slept_us = 0;
+''' + yld_hunk + r'''
+    return 1;
+}
+#undef usleep
+''' + poll_yield + r'''
+/* one yield of each kind, 3 us (a poll: 1 us) of the thread's CPU after the previous one;
+ * returns the sleep, 0 = none. (More than work_ns of CPU between two counted yields is
+ * work and resets the streak by design, polls included, so the polls here stay below it.) */
+static unsigned int guest_yield(void) { fake_cpu_ns += 3000; NtYieldExecution(); return slept_us; }
+static unsigned int poll_yield_now(void) { fake_cpu_ns += 1000; slept_us = 0; ios_poll_yield(); return slept_us; }
+static unsigned int sleep0(void)
+{
+    unsigned int us;
+    fake_cpu_ns += 3000; ios_yesc_in_timed_delay = 2; NtYieldExecution(); us = slept_us; ios_yesc_in_timed_delay = 0;
+    return us;
+}
+static unsigned int timed(void)
+{
+    unsigned int us;
+    fake_cpu_ns += 3000; ios_yesc_in_timed_delay = 1; NtYieldExecution(); us = slept_us; ios_yesc_in_timed_delay = 0;
+    return us;
+}
+
 static void *claim( void *arg )
 {
     uintptr_t base = (uintptr_t)arg; int i;
@@ -227,6 +291,37 @@ int main( void )
         if (ios_xp_tok_extra( buf, 32, &r ) != 0) FAIL("small buffer\n");
     }
     printf("PASS: [xp-t] token suffix ':r<ms>' then y/z/s/e counts only when non-zero\n");
+
+    {   /* Y1: the yields after failed polls */
+        struct ios_ystat *ys;
+        long long y0;
+        unsigned int k;
+        ios_ystat_on = 1; ios_ystat_self = NULL; ios_ystat_none = 0; fake_tid = 4242;
+        if (!(ys = ios_ystat_get())) FAIL("no ystat slot\n");
+        ios_yesc_reset( &ios_yesc ); escalated = 0;
+        y0 = ys->yields;
+        for (k = 0; k < 5000; k++) if (poll_yield_now()) FAIL("poll yield %u slept\n", k);
+        if (ios_yesc.streak || escalated) FAIL("poll yields counted toward the streak (%u)\n", ios_yesc.streak);
+        if (ys->yields - y0 != 5000) FAIL("poll yields must stay in [xp-t] y\n");
+        if (ios_yesc_in_timed_delay) FAIL("ios_poll_yield left its mark\n");
+        for (k = 0; k < 32; k++) if (guest_yield()) FAIL("guest yield %u slept inside the grace streak\n", k);
+        if (guest_yield() != 20) FAIL("the 33rd guest yield did not escalate\n");
+        for (k = 0; k < 200; k++) if (poll_yield_now()) FAIL("poll yield slept during an escalated streak\n");
+        if (guest_yield() != 40) FAIL("polls reset or changed the guest streak\n");
+        ios_yesc_reset( &ios_yesc );   /* a real wait */
+        for (k = 0; k < 320; k++)      /* 32 guest yields spread over 288 polls */
+        {
+            unsigned int us = (k % 10 == 9) ? guest_yield() : poll_yield_now();
+            if (us) FAIL("slept at %u: polls counted toward the streak\n", k);
+        }
+        if (ios_yesc.streak != 32) FAIL("streak %u, expected 32 guest yields\n", ios_yesc.streak);
+        if (sleep0() != 20) FAIL("Sleep(0) after 32 guest yields did not escalate\n");
+        if (timed()) FAIL("a timed sleep's yield escalated\n");
+        ios_yesc_in_timed_delay = 2; slept_us = 1; ios_poll_yield();
+        if (ios_yesc_in_timed_delay != 2 || slept_us) FAIL("ios_poll_yield inside a Sleep(0) mark\n");
+        ios_yesc_in_timed_delay = 0;
+    }
+    printf("PASS: yields after failed polls never sleep or count toward the streak; SwitchToThread/Sleep(0) still escalate\n");
     return 0;
 }
 '''

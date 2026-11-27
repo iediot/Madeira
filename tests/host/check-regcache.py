@@ -13,7 +13,14 @@ ASan/UBSan and then TSan:
   * closing a root handle materializes the cached handles below it, and the same
     handle value reused for another key never answers from the old key's cache;
   * cached handles as roots, tag bits, big values, ProtectFromClose and
-    DUPLICATE_CLOSE_SOURCE behave as real handles do.
+    DUPLICATE_CLOSE_SOURCE behave as real handles do;
+  * NtClose of a root while another thread drops a different root (the review's R1
+    interleaving, forced through RC_SCAN_HOOK): the unlocked root scan reads the slot
+    the other root is about to leave, the drop happens, the scan goes on; the closed
+    root is still found, its cached opens die, and the next key with its handle value
+    gets the server's answer;
+  * every server request the cache makes is inside rc_enter_section, with signals
+    (SIGUSR1, as server_block_set) blocked.
 
 Also checks that every ntdll function that hands a key handle to the server converts
 cached handles first and that every registry write is bracketed, so the cache cannot
@@ -88,6 +95,20 @@ check("ios_regcache_write_begin" in functions(security).get("NtSetSecurityObject
 for name in ("NtQueryObject", "NtSetInformationObject"):
     check("ios_regcache_real" in functions(filec).get(name, ""), f"file.c {name}: no ios_regcache_real")
 srv_funcs = functions(server)
+# R2: the cache and census locks are held like fd_cache_mutex (signals blocked, killed threads leave first)
+hdr = header.read_text()
+check("pthread_mutex_lock" not in hdr and "pthread_mutex_unlock" not in hdr,
+      "regcache_ios.h takes the cache lock without rc_lock/rc_unlock (rc_enter_section)")
+check("server_enter_uninterrupted_section( mutex, sigset );" in glue and
+      "server_leave_uninterrupted_section( mutex, sigset );" in glue,
+      "regcache_ios.c: rc_enter_section/rc_leave_section must be Wine's uninterrupted section")
+check(not re.search(r"pthread_mutex_(un)?lock\( &(r->cen|c|r->proc|p)->lock", glue),
+      "regcache_ios.c takes a cache or census lock outside rc_enter_section")
+# R1: roots never move between slots while NtClose may be scanning them
+remove_at = hdr[hdr.index("static void rc_base_remove_at("):]
+remove_at = remove_at[:remove_at.index("\n}\n")]
+check("p->bases[last]" not in remove_at and "(HANDLE)0" in remove_at,
+      "rc_base_remove_at must free the slot, never move another root into it")
 check("ios_regcache_close(" in srv_funcs.get("NtClose", "") and "ios_regcache_close_done" in srv_funcs.get("NtClose", ""),
       "server_ios.c NtClose: cache hook missing")
 check("ios_regcache_real" in srv_funcs.get("NtDuplicateObject", "") and "ios_regcache_forget" in srv_funcs.get("NtDuplicateObject", ""),
@@ -124,6 +145,7 @@ code = r'''
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,6 +178,33 @@ static unsigned long srv_opens, srv_queries, srv_closes;
 static unsigned int seed = 1;
 
 static void jitter(void) { if ((__atomic_add_fetch( &seed, 2654435761u, __ATOMIC_RELAXED ) >> 13) % 5 == 0) sched_yield(); }
+
+/* the cache's lock, as ntdll holds it: SIGUSR1 (in server_block_set) blocked while held */
+static __thread int in_section;
+static sigset_t block_set;
+static unsigned long unsectioned;
+static void rc_enter_section( pthread_mutex_t *mutex, sigset_t *sigset )
+{
+    pthread_sigmask( SIG_BLOCK, &block_set, sigset );
+    pthread_mutex_lock( mutex );
+    in_section++;
+}
+static void rc_leave_section( pthread_mutex_t *mutex, sigset_t *sigset )
+{
+    in_section--;
+    pthread_mutex_unlock( mutex );
+    pthread_sigmask( SIG_SETMASK, sigset, NULL );
+}
+/* a request from the cache (not from t_open's own pass-through) must be inside the section */
+static __thread int direct;
+static void check_section( void )
+{
+    sigset_t cur_set;
+    if (direct) return;
+    pthread_sigmask( SIG_BLOCK, NULL, &cur_set );
+    if (!in_section || !sigismember( &cur_set, SIGUSR1 )) __atomic_add_fetch( &unsectioned, 1, __ATOMIC_RELAXED );
+}
+
 
 static struct node *mknode( struct node *parent, const char *name )
 {
@@ -201,6 +250,7 @@ static struct node *walk( struct node *n, const char *path )
 static NTSTATUS rc_srv_open( HANDLE *key, HANDLE root, const WCHAR *name, USHORT len, ACCESS_MASK access, ULONG attributes )
 {
     char path[400]; NTSTATUS st = 0; struct node *n;
+    check_section();
     jitter();
     pthread_mutex_lock( &srv );
     srv_opens++;
@@ -214,6 +264,7 @@ static NTSTATUS rc_srv_open( HANDLE *key, HANDLE root, const WCHAR *name, USHORT
 static NTSTATUS rc_srv_query( HANDLE key, const WCHAR *name, USHORT len, ULONG *type, ULONG *total, void *data, ULONG max )
 {
     char vn[200]; NTSTATUS st = 0; struct node *n;
+    check_section();
     jitter();
     pthread_mutex_lock( &srv );
     srv_queries++;
@@ -246,6 +297,11 @@ static NTSTATUS srv_close_raw( HANDLE key )
 }
 static NTSTATUS rc_srv_close( HANDLE key );
 
+/* R1: a forced schedule inside NtClose's unlocked root scan */
+static void (*scan_hook)( int i );
+static __thread int scan_hook_armed;
+#define RC_SCAN_HOOK(p, i) do { if (scan_hook_armed && scan_hook) scan_hook( i ); } while (0)
+
 #include "REGCACHE_H"
 
 /* ---- the ntdll side, as registry.c / server_ios.c call the core ---- */
@@ -255,10 +311,11 @@ static void S( const char *a, WCHAR *w, USHORT *len ) { int n = (int)strlen( a )
 static NTSTATUS t_close( HANDLE h )
 {
     NTSTATUS ret;
-    switch (rc_close( &procs[cur], h, &ret ))
+    sigset_t root_sigset;
+    switch (rc_close( &procs[cur], h, &ret, &root_sigset ))
     {
     case 1: return ret;
-    case 2: ret = srv_close_raw( h ); rc_close_done( &procs[cur] ); return ret;
+    case 2: ret = srv_close_raw( h ); rc_close_done( &procs[cur], &root_sigset ); return ret;
     default: return srv_close_raw( h );
     }
 }
@@ -269,14 +326,21 @@ static NTSTATUS t_open( HANDLE *key, HANDLE root, const char *name, ACCESS_MASK 
     WCHAR w[200]; USHORT len; NTSTATUS st;
     S( name, w, &len );
     if (rc_open( &procs[cur], key, root, w, len, access, OBJ_CASE_INSENSITIVE, 0, &st )) return st;
-    return rc_srv_open( key, root, w, len, access, OBJ_CASE_INSENSITIVE );
+    direct = 1;
+    st = rc_srv_open( key, root, w, len, access, OBJ_CASE_INSENSITIVE );
+    direct = 0;
+    return st;
 }
 static NTSTATUS t_query( HANDLE h, const char *name, ULONG *val )
 {
     WCHAR w[100]; USHORT len; NTSTATUS st; ULONG type = 0, total = 0; BYTE data[600];
     S( name, w, &len );
     if (!rc_query( &procs[cur], &h, w, len, &type, &total, data, sizeof(data), &st ))
+    {
+        direct = 1;
         st = rc_srv_query( h, w, len, &type, &total, data, sizeof(data) );
+        direct = 0;
+    }
     if (!st && val) memcpy( val, data, 4 );
     return st;
 }
@@ -285,7 +349,11 @@ static NTSTATUS t_query_big( HANDLE h, const char *name, BYTE *data, ULONG *tota
     WCHAR w[100]; USHORT len; NTSTATUS st; ULONG type = 0;
     S( name, w, &len );
     if (!rc_query( &procs[cur], &h, w, len, &type, total, data, 600, &st ))
+    {
+        direct = 1;
         st = rc_srv_query( h, w, len, &type, total, data, 600 );
+        direct = 0;
+    }
     return st;
 }
 static NTSTATUS t_set( HANDLE h, const char *name, const void *data, ULONG len )
@@ -394,6 +462,26 @@ static void *reader( void *arg )
     return NULL;
 }
 
+/* ---- R1: NtClose(B) scans the roots while another thread drops root X ---- */
+static HANDLE r1_x;
+static volatile int r1_go, r1_done, r1_fired;
+static int r1_x_slot;
+static void r1_hook( int i )
+{
+    if (i != r1_x_slot || r1_fired) return;
+    r1_fired = 1;          /* the scan has read X's slot (not B) and not yet the slots after it */
+    __atomic_store_n( &r1_go, 1, __ATOMIC_SEQ_CST );
+    while (!__atomic_load_n( &r1_done, __ATOMIC_SEQ_CST )) sched_yield();
+}
+static void *r1_close_x( void *arg )
+{
+    cur = 0;
+    while (!__atomic_load_n( &r1_go, __ATOMIC_SEQ_CST )) sched_yield();
+    assert( !t_close( r1_x ) );     /* drops root X under the lock */
+    __atomic_store_n( &r1_done, 1, __ATOMIC_SEQ_CST );
+    return NULL;
+}
+
 int main( void )
 {
     HANDLE h, h2, hw, v, sub, rootk;
@@ -401,6 +489,8 @@ int main( void )
     unsigned long o0, q0;
     struct node *mach, *soft, *game, *other;
 
+    sigemptyset( &block_set );
+    sigaddset( &block_set, SIGUSR1 );
     top = mknode( NULL, "" );
     mach = mknode( top, "Machine" );
     soft = mknode( mach, "Software" );
@@ -512,7 +602,11 @@ int main( void )
         {
             assert( !t_open( &dv, 0, "\\Machine\\Software\\Game", KEY_READ ) );
             if (!rc_query( &procs[0], &dv, NULL, 0, &type, &total, data, sizeof(data), &st ))
+            {
+                direct = 1;
                 st = rc_srv_query( dv, w, 0, &type, &total, data, sizeof(data) );
+                direct = 0;
+            }
             assert( !st && total == 4 && !memcmp( data, &three, 4 ) );
             t_close( dv );
         }
@@ -536,6 +630,50 @@ int main( void )
         assert( !stale );
         assert( procs[0].slots_used == 0 );
     }
+
+    /* 10: R1. Roots X then B in the list, B in the last used slot; cached opens below
+     * both. Thread A closes X while this thread closes B, with A's close forced into
+     * the moment B's unlocked scan has read X's slot and not the ones after it. */
+    {
+        HANDLE x, b, r1, r2, k;
+        pthread_t a;
+        int bslot;
+        cur = 0;
+        /* real root handles (opens for writing are never cached) */
+        assert( !t_open( &x, 0, "\\Machine\\Software", KEY_ALL_ACCESS ) && !rc_is_virtual( x ) );
+        assert( !t_open( &b, 0, "\\Machine\\Software", KEY_ALL_ACCESS ) && !rc_is_virtual( b ) );
+        for (int i = 0; i < 3; i++)
+        {
+            assert( !t_open( &k, x, "Game", KEY_READ ) ); t_close( k );
+            assert( !t_open( &k, b, "Game", KEY_READ ) ); t_close( k );
+        }
+        r1_x_slot = rc_base_index( &procs[0], x );
+        bslot = rc_base_index( &procs[0], b );
+        assert( r1_x_slot >= 0 && bslot > r1_x_slot && bslot == procs[0].nbases - 1 );
+        assert( procs[0].slots_used == 0 );
+        r1_x = x;
+        scan_hook = r1_hook;
+        pthread_create( &a, NULL, r1_close_x, NULL );
+        scan_hook_armed = 1;
+        assert( !t_close( b ) );
+        scan_hook_armed = 0;
+        pthread_join( a, NULL );
+        assert( r1_fired );
+        /* the freed values come back: X's first, then B's, now naming a key with no "Game" */
+        assert( !t_open( &r1, 0, "\\Machine\\Software\\Other", KEY_ALL_ACCESS ) );
+        assert( !t_open( &r2, 0, "\\Machine\\Software\\Other", KEY_ALL_ACCESS ) );
+        assert( (r1 == x && r2 == b) || (r1 == b && r2 == x) );
+        k = 0;
+        assert( t_open( &k, b, "Game", KEY_READ ) == STATUS_OBJECT_NAME_NOT_FOUND && !k );
+        assert( t_open( &k, x, "Game", KEY_READ ) == STATUS_OBJECT_NAME_NOT_FOUND && !k );
+        t_close( r1 ); t_close( r2 );
+        assert( rc_base_index( &procs[0], b ) < 0 && rc_base_index( &procs[0], x ) < 0 );
+        scan_hook = NULL;
+        printf( "R1: NtClose(B) during the drop of root X found B; B's reused value opens fresh\n" );
+    }
+
+    printf( "server requests from the cache outside its section: %lu\n", unsectioned );
+    assert( !unsectioned );
     (void)other; (void)u32;
     printf( "ok\n" );
     return 0;

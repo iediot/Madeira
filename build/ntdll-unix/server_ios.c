@@ -4031,7 +4031,7 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
     /* A test on Windows 2000 shows that Windows always yields during
        a wait, but a wait that is hit by an event gets a priority
        boost as well.  This seems to model that behavior the closest.  */
-    if (ret == STATUS_TIMEOUT) NtYieldExecution();
+    if (ret == STATUS_TIMEOUT) ios_poll_yield();   /* madeira-bcd yield-esc: not a spin yield (sync.c) */
     return ret;
 }
 
@@ -6716,9 +6716,9 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     SERVER_END_REQ;
 
     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
-    if (rc_root) ios_regcache_close_done();
 
     if (fd != -1) close( fd );
+    if (rc_root) ios_regcache_close_done();   /* last: a killed thread exits here */
 
     if (ret != STATUS_INVALID_HANDLE || !handle) return ret;
 

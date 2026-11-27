@@ -54,9 +54,22 @@
  *   static NTSTATUS rc_srv_query( HANDLE key, const WCHAR *name, USHORT len, ULONG *type,
  *                                 ULONG *total, void *data, ULONG max );
  *   static NTSTATUS rc_srv_close( HANDLE key );
+ *   static void rc_enter_section( pthread_mutex_t *mutex, sigset_t *sigset );
+ *   static void rc_leave_section( pthread_mutex_t *mutex, sigset_t *sigset );
+ *
+ * The last two take and release a process's cache lock. ntdll passes them to
+ * server_enter_uninterrupted_section / server_leave_uninterrupted_section, the
+ * way Wine guards fd_cache_mutex: the lock is held across server round trips,
+ * so signals stay blocked while it is held (a thread suspended or sent a
+ * system APC by signal cannot stop holding it, or re-enter the cache in the
+ * middle of an update), and a thread killed while holding it finishes the
+ * cache call and releases the lock before it exits (server_ios.c,
+ * ios_defer_section_abort) instead of leaving every later registry call of
+ * its process blocked.
  */
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -74,6 +87,11 @@
  * WOW64 view bits: the only access a cached open may ask for */
 #define RC_READ_ACCESS  (0x00020019u | 0x0100u | 0x0200u)
 #define RC_HANDLE(i)    ((HANDLE)(uintptr_t)(RC_VIRT_FIRST + ((unsigned int)(i) << 2)))
+
+/* tests/host/check-regcache.py: runs after NtClose's unlocked root scan has read slot i */
+#ifndef RC_SCAN_HOOK
+#define RC_SCAN_HOOK(p, i) do { } while (0)
+#endif
 
 /* ---- freshness: shared by every process ---- */
 
@@ -165,9 +183,9 @@ struct rc_proc
     unsigned int vclock;
     struct rc_slot slots[RC_SLOTS];
     unsigned int shint, slots_used;
-    HANDLE bases[RC_BASES];
+    HANDLE bases[RC_BASES];         /* 0: a free slot; a root never moves to another slot */
     int base_refs[RC_BASES];
-    int nbases;
+    int nbases;                     /* slots in use: the last one is never free */
     struct rc_stats st;
 };
 
@@ -185,6 +203,17 @@ static void rc_proc_init( struct rc_proc *p, int cache, unsigned int hot )
     pthread_mutexattr_destroy( &attr );
     for (i = 0; i < RC_EBUCKETS; i++) p->ebuckets[i] = -1;
     for (i = 0; i < RC_VBUCKETS; i++) p->vbuckets[i] = -1;
+}
+
+/* the cache lock, with signals blocked while it is held (see rc_enter_section above) */
+static inline void rc_lock( struct rc_proc *p, sigset_t *sigset )
+{
+    rc_enter_section( &p->lock, sigset );
+}
+
+static inline void rc_unlock( struct rc_proc *p, sigset_t *sigset )
+{
+    rc_leave_section( &p->lock, sigset );
 }
 
 static inline uintptr_t rc_hval( HANDLE h )
@@ -227,10 +256,18 @@ static unsigned int rc_entry_hash( int parent, HANDLE root, ACCESS_MASK access, 
 
 /* ---- root handles ---- */
 
+/* The list is changed only under the lock, but NtClose scans it without the
+ * lock (rc_maybe_base), so a root stays in its slot from rc_base_add until it
+ * is removed: removal frees the slot and never moves another root into it.
+ * Moving the last root down (as this did before) let a concurrent scan read
+ * the slot before the move and the last slot after it, and miss that root:
+ * its cached opens then outlived its NtClose, and the next key to get the
+ * same handle value answered opens below it from the old key's cache. */
 static int rc_base_index( struct rc_proc *p, HANDLE base )
 {
     int i;
-    for (i = 0; i < p->nbases; i++) if (rc_hval( p->bases[i] ) == rc_hval( base )) return i;
+    for (i = 0; i < p->nbases; i++)
+        if (p->bases[i] && rc_hval( p->bases[i] ) == rc_hval( base )) return i;
     return -1;
 }
 
@@ -243,20 +280,21 @@ static int rc_base_add( struct rc_proc *p, HANDLE base )
         p->base_refs[i]++;
         return 1;
     }
-    if (p->nbases == RC_BASES) return 0;
-    __atomic_store_n( &p->bases[p->nbases], base, __ATOMIC_RELAXED );
-    p->base_refs[p->nbases] = 1;
-    __atomic_store_n( &p->nbases, p->nbases + 1, __ATOMIC_RELEASE );
+    for (i = 0; i < p->nbases; i++) if (!p->bases[i]) break;
+    if (i == RC_BASES) return 0;
+    p->base_refs[i] = 1;
+    __atomic_store_n( &p->bases[i], base, __ATOMIC_RELEASE );
+    if (i == p->nbases) __atomic_store_n( &p->nbases, i + 1, __ATOMIC_RELEASE );
     return 1;
 }
 
 static void rc_base_remove_at( struct rc_proc *p, int i )
 {
-    int last = p->nbases - 1;
-    __atomic_store_n( &p->bases[i], p->bases[last], __ATOMIC_RELAXED );
-    p->base_refs[i] = p->base_refs[last];
-    __atomic_store_n( &p->bases[last], (HANDLE)0, __ATOMIC_RELAXED );
-    __atomic_store_n( &p->nbases, last, __ATOMIC_RELEASE );
+    int n = p->nbases;
+    p->base_refs[i] = 0;
+    __atomic_store_n( &p->bases[i], (HANDLE)0, __ATOMIC_RELEASE );
+    while (n && !p->bases[n - 1]) n--;   /* only free slots leave the scanned range */
+    __atomic_store_n( &p->nbases, n, __ATOMIC_RELEASE );
 }
 
 static void rc_base_del( struct rc_proc *p, HANDLE base )
@@ -266,12 +304,18 @@ static void rc_base_del( struct rc_proc *p, HANDLE base )
     if (!--p->base_refs[i]) rc_base_remove_at( p, i );
 }
 
-/* lock-free hint for NtClose: may `h` be the root of cached opens? */
+/* lock-free hint for NtClose: may `h` be the root of cached opens? Never 0 for
+ * a root that stays in the list for the whole scan (roots do not move); a 1 is
+ * confirmed under the lock. */
 static int rc_maybe_base( struct rc_proc *p, HANDLE h )
 {
     int i, n = __atomic_load_n( &p->nbases, __ATOMIC_ACQUIRE );
     for (i = 0; i < n && i < RC_BASES; i++)
-        if (rc_hval( __atomic_load_n( &p->bases[i], __ATOMIC_RELAXED ) ) == rc_hval( h )) return 1;
+    {
+        HANDLE b = __atomic_load_n( &p->bases[i], __ATOMIC_ACQUIRE );
+        if (b && rc_hval( b ) == rc_hval( h )) return 1;
+        RC_SCAN_HOOK( p, i );
+    }
     return 0;
 }
 
@@ -464,11 +508,12 @@ static int rc_open( struct rc_proc *p, HANDLE *key, HANDLE root, const WCHAR *na
     HANDLE real_root = root, base = root, h = 0;
     unsigned int hash = 0;
     long long gen = 0;
+    sigset_t sigset;
 
-    pthread_mutex_lock( &p->lock );
+    rc_lock( p, &sigset );
     if (rc_is_virtual( root ) && (rslot = rc_slot_of( p, root )) < 0)
     {
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return 0;
     }
     /* read-only opens only: a key opened for writing is likely written through,
@@ -498,7 +543,7 @@ static int rc_open( struct rc_proc *p, HANDLE *key, HANDLE root, const WCHAR *na
                     *key = 0;
                     *status = e->status;
                     p->st.open_neg_hit++;
-                    pthread_mutex_unlock( &p->lock );
+                    rc_unlock( p, &sigset );
                     return 1;
                 }
                 if (e->opens > p->hot && (si = rc_alloc_slot( p, ei, 0 )) >= 0)
@@ -506,7 +551,7 @@ static int rc_open( struct rc_proc *p, HANDLE *key, HANDLE root, const WCHAR *na
                     *key = RC_HANDLE( si );
                     *status = STATUS_SUCCESS;
                     p->st.open_hit++;
-                    pthread_mutex_unlock( &p->lock );
+                    rc_unlock( p, &sigset );
                     return 1;
                 }
             }
@@ -518,7 +563,7 @@ static int rc_open( struct rc_proc *p, HANDLE *key, HANDLE root, const WCHAR *na
         if ((*status = rc_materialize( p, rslot )))
         {
             *key = 0;
-            pthread_mutex_unlock( &p->lock );
+            rc_unlock( p, &sigset );
             return 1;
         }
         real_root = p->slots[rslot].real;
@@ -546,7 +591,7 @@ static int rc_open( struct rc_proc *p, HANDLE *key, HANDLE root, const WCHAR *na
     }
     else p->st.open_pass++;
     *key = h;
-    pthread_mutex_unlock( &p->lock );
+    rc_unlock( p, &sigset );
     return 1;
 }
 
@@ -626,12 +671,13 @@ static int rc_query( struct rc_proc *p, HANDLE *handle, const WCHAR *name, USHOR
     unsigned int hash;
     long long gen = 0;
     int si, vi, snapped;
+    sigset_t sigset;
 
     if (!rc_is_virtual( *handle )) return 0;
-    pthread_mutex_lock( &p->lock );
+    rc_lock( p, &sigset );
     if ((si = rc_slot_of( p, *handle )) < 0)
     {
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return 0;
     }
     s = &p->slots[si];
@@ -640,7 +686,7 @@ static int rc_query( struct rc_proc *p, HANDLE *handle, const WCHAR *name, USHOR
     {
         p->st.val_pass++;
         if (!(*status = rc_materialize( p, si ))) *handle = s->real;
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return *status != STATUS_SUCCESS;
     }
     hash = rc_value_hash( s->entry, e->epoch, name, len );
@@ -652,7 +698,7 @@ static int rc_query( struct rc_proc *p, HANDLE *handle, const WCHAR *name, USHOR
         {
             p->st.val_big++;
             if (!(*status = rc_materialize( p, si ))) *handle = s->real;
-            pthread_mutex_unlock( &p->lock );
+            rc_unlock( p, &sigset );
             return *status != STATUS_SUCCESS;
         }
         if (!(*status = v->status))
@@ -662,13 +708,13 @@ static int rc_query( struct rc_proc *p, HANDLE *handle, const WCHAR *name, USHOR
             if (max && v->data_len) memcpy( data, v->data, max < v->data_len ? max : v->data_len );
         }
         p->st.val_hit++;
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return 1;
     }
 
     if ((*status = rc_materialize( p, si )))
     {
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return 1;
     }
     snapped = rc_snap( &gen );
@@ -681,7 +727,7 @@ static int rc_query( struct rc_proc *p, HANDLE *handle, const WCHAR *name, USHOR
             rc_store_value( p, vi, s->entry, e->epoch, name, len, hash, gen, STATUS_SUCCESS, t, tot, NULL );
         p->st.val_big++;
         *handle = s->real;
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return 0;
     }
     if ((*status == STATUS_SUCCESS || *status == STATUS_OBJECT_NAME_NOT_FOUND) && snapped && rc_still( gen ))
@@ -693,7 +739,7 @@ static int rc_query( struct rc_proc *p, HANDLE *handle, const WCHAR *name, USHOR
         if (max && tot) memcpy( data, buf, max < tot ? max : tot );
     }
     p->st.val_miss++;
-    pthread_mutex_unlock( &p->lock );
+    rc_unlock( p, &sigset );
     return 1;
 }
 
@@ -703,29 +749,31 @@ static int rc_query( struct rc_proc *p, HANDLE *handle, const WCHAR *name, USHOR
 static NTSTATUS rc_real( struct rc_proc *p, HANDLE *handle )
 {
     NTSTATUS status = STATUS_SUCCESS;
+    sigset_t sigset;
     int si;
 
     if (!rc_is_virtual( *handle )) return STATUS_SUCCESS;
-    pthread_mutex_lock( &p->lock );
+    rc_lock( p, &sigset );
     if ((si = rc_slot_of( p, *handle )) >= 0 && !(status = rc_materialize( p, si )))
         *handle = p->slots[si].real;
-    pthread_mutex_unlock( &p->lock );
+    rc_unlock( p, &sigset );
     return status;
 }
 
 /* NtClose. 1: a cached handle, closed here (*ret). 2: the root of cached opens;
- * they have been dropped and the lock is held until rc_close_done, after the
- * caller has closed the handle. 0: nothing to do with the cache. */
-static int rc_close( struct rc_proc *p, HANDLE h, NTSTATUS *ret )
+ * they have been dropped and the lock is held until rc_close_done( p, root_sigset ),
+ * after the caller has closed the handle. 0: nothing to do with the cache. */
+static int rc_close( struct rc_proc *p, HANDLE h, NTSTATUS *ret, sigset_t *root_sigset )
 {
+    sigset_t sigset;
     int si, i, b;
 
     if (rc_is_virtual( h ))
     {
-        pthread_mutex_lock( &p->lock );
+        rc_lock( p, &sigset );
         if ((si = rc_slot_of( p, h )) < 0)
         {
-            pthread_mutex_unlock( &p->lock );
+            rc_unlock( p, &sigset );
             return 0;
         }
         *ret = STATUS_SUCCESS;
@@ -734,21 +782,21 @@ static int rc_close( struct rc_proc *p, HANDLE h, NTSTATUS *ret )
             *ret = rc_srv_close( p->slots[si].real );
             if (*ret == STATUS_HANDLE_NOT_CLOSABLE)
             {
-                pthread_mutex_unlock( &p->lock );
+                rc_unlock( p, &sigset );
                 return 1;
             }
             *ret = STATUS_SUCCESS;
         }
         rc_free_slot( p, si );
         p->st.closes++;
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return 1;
     }
     if (!h || !rc_maybe_base( p, h )) return 0;
-    pthread_mutex_lock( &p->lock );
+    rc_lock( p, &sigset );
     if ((b = rc_base_index( p, h )) < 0)
     {
-        pthread_mutex_unlock( &p->lock );
+        rc_unlock( p, &sigset );
         return 0;
     }
     /* the cached handles below it get real handles while it still exists */
@@ -770,24 +818,26 @@ static int rc_close( struct rc_proc *p, HANDLE h, NTSTATUS *ret )
     }
     if ((b = rc_base_index( p, h )) >= 0) rc_base_remove_at( p, b );
     p->st.root_closes++;
+    *root_sigset = sigset;      /* still held: rc_close_done leaves the section with it */
     return 2;
 }
 
-static void rc_close_done( struct rc_proc *p )
+static void rc_close_done( struct rc_proc *p, sigset_t *root_sigset )
 {
-    pthread_mutex_unlock( &p->lock );
+    rc_unlock( p, root_sigset );
 }
 
 /* NtDuplicateObject with DUPLICATE_CLOSE_SOURCE took the real handle of cached handle
  * `h` (rc_real gave it); forget it without closing it again */
 static void rc_forget( struct rc_proc *p, HANDLE h )
 {
+    sigset_t sigset;
     int si;
-    pthread_mutex_lock( &p->lock );
+    rc_lock( p, &sigset );
     if ((si = rc_slot_of( p, h )) >= 0)
     {
         rc_free_slot( p, si );
         p->st.closes++;
     }
-    pthread_mutex_unlock( &p->lock );
+    rc_unlock( p, &sigset );
 }
