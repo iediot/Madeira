@@ -237,4 +237,16 @@ struct ios_wait_probe_req
     volatile uint64_t     posted_ns;
 };
 
+/* madeira-bcd load-wait (loadwait_ios.h): (Wine pid, handle) pairs whose objects
+ * the server names ([load-wait-srv]). Same protocol: ids first, gen last. */
+#define IOS_HANDLE_PROBE_MAX 16
+struct ios_handle_probe_req
+{
+    volatile unsigned int gen;
+    volatile unsigned int count;
+    volatile unsigned int pids[IOS_HANDLE_PROBE_MAX];
+    volatile unsigned int handles[IOS_HANDLE_PROBE_MAX];
+    volatile uint64_t     posted_ns;
+};
+
 #endif /* MADEIRA_WAIT_REGISTRY_IOS_H */

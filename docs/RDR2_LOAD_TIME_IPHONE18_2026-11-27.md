@@ -129,3 +129,74 @@ conversion.
   at about 1.6 ns/byte on the M-series host. The estimate is a 0.2-0.4 s CPU
   saving per load. The persistent key would change, so this is left for a
   change that alters the converter identity anyway.
+
+## The dead zone: what the loading screen waits on (evening analysis, 2026-11-27)
+
+Read from every RDR2 log in `~/MadeiraLogs/iphone18` (per-process CPU summed from the `[xp-t]` rows,
+thread-to-process from `[srv-own] new_thread`). No log has v3 wait-probe lines (`[stall-wait*]`,
+`[wait-done]`): `MADEIRA_PERF` was off, and even on, its snapshot needs a window with no completed Present,
+which the loading screen (~55 fps) never has.
+
+### The load has three phases
+
+| Run (log) | First loading frame | Dead zone: main thread <= 30 ms CPU / 2 s | Length | Then main thread CPU-bound | Ends with |
+|---|---|---|---|---|---|
+| 1126-1419 (`RDR2.exe-…13-30-41`) | 13:31:00 | 13:31:18-13:31:29 | ~10 s | 13:31:30-13:32:00 | 192.81.241.100 `tx=3/802B rx=6/420B` + Akamai 23.209.17.207 `tx=3/776B rx=6/306B` (L176230/L176238) |
+| 1126-1445 | 14:41:17 | 14:41:36-14:41:45 | ~9 s | 14:41:46-14:42:00 | same pair, 14:41:44 (L177906/L177918) |
+| 1126-1513 | 15:04:44 | 15:04:59-15:06:08 (main a flat 13-14 ms / 2 s) | ~70 s | 15:06:10-15:06:25 | same pair, 15:06:06 (L183672/L183677) |
+| 1126-1719c | 17:13:02 | 17:13:16-17:13:26 (+17:13:51-17:14:01) | ~10 s (+10 s) | 17:13:28-17:13:45 | pair not logged; first 60 s heartbeat 17:13:35 |
+| 1126-2017e | 20:07:14 | 20:07:22-20:07:38 | ~16 s | 20:07:40-20:08:01 | same pair, 20:07:38 (L179438/L179452) |
+| 1127-0019 (`.prev`) | 23:28:37 | 23:28:43-23:29:10 | ~27 s | 23:29:12-23:29:31 | same pair, 23:29:08 (L187282/L187293) |
+| 1127-0105-wave1 | 00:58:56 | 00:59:04-00:59:22 | ~18 s | 00:59:22-00:59:32 | same pair, 00:59:20 (L176694/L176700) |
+
+After that comes the parallel load (main 0.4-0.8 s, streaming/job threads 0.3-2 s each per 2 s) until
+gameplay. In wave1: dead zone 18 s, main-thread phase ~10-20 s, parallel phase ~40 s.
+
+In the dead zone RDR2 uses ~0.5-1.1 s CPU per 2 s, nearly all its render thread drawing the loading
+screen (04b8 ~340 ms) plus audio; its job threads are idle. Reads are 0-35 MB per 2 s, page waits small.
+
+### Ranked candidates
+
+1. **RDR2 waits on the Social Club / Rockstar online sign-in path (strongest, not yet proven).**
+   - `socialclub.dll` loads into RDR2 at 00:58:54 (wave1 L153484), two seconds before the first frame.
+   - 00:59:00-00:59:08: ~40 HTTPS connections to Rockstar services (prod.ros, crews, ugc, tm, app-rgl,
+     inbox, feed, posse, prs, prod-core, prod-locator-cloud, prs55, prod.cloud) and sentry.io; then quiet.
+   - The SocialClubHelper process (CEF, V8 `--jitless`, utility QoS) runs 2-4.9 s of CPU per 2 s in the
+     dead zone (wave1 pid 0268: 3.7, 3.0, 3.2, 2.1 s at 00:59:04-00:59:10; 0019 pid 025c: 2.3-4.9 s;
+     1513: one helper thread, 0354, 1.14 s per 2 s for the whole 70 s).
+   - Every zone ends with the same prod.ros request + Akamai download (table above), and the 60 s
+     `192.81.241.13x tx=1/35B rx=2/31B` heartbeat starts 2-11 s later in every run but 1513.
+   - The length varies 9-70 s with the same build family: an outside dependency, not RDR2's own work.
+   - Chrome IPC named pipes are the launcher link (`\??\pipe\chrome.rgsc_launcher_0`, `rgsc_ipc_118_channel_0`
+     on the helper's command line).
+   - Not proven: which object the main thread waits on and who signals it. The `[load-wait]` run decides.
+2. **Not a network timeout.** All Rockstar connections complete: ClientHello -> server flight ~115-120 ms
+   (one round trip), whole requests 0.35-0.95 s, DNS 0-70 ms, no connect failures or retries in the zone.
+   One slow Akamai IPv6 connection (wave1 fd 3267, 4.5 s, L172701) is a single request, inside the burst.
+3. **Not TLS crypto under FEX.** Handshakes are round-trip bound (see 2); RDR2's TLS CPU is small.
+4. **Not disk.** 0-35 MB read per 2 s and low page wait in the zone; the big reads come later.
+5. **Not GPU fences.** `[perf] ml1109 sync per frame … game blocked 0.0 ms/frame` in the zone (wave1
+   00:59:08).
+6. **No sign of Wine services (rpcss, services.exe) in the zone.** They are absent from the `[srv-req]`
+   heavy hitters; the busiest requesters are RDR2's dinput worker (04dc, HID reads) and the helper.
+7. **The main-thread phase after the zone is CPU, not waiting**: ~1.9 s per 2 s at IPC 4.2,
+   `[spin-pc]` in RDR2.exe+0x2e5915b (wave1 L177146; the phase before the first frame looks the same, L132907), with heavy self-modifying-code
+   faults (anti-tamper). FEX's code cache stays off for RDR2 (it re-encrypts its code).
+8. **The parallel phase is short of cores**: runnable 8-14 s per 2 s against 5-6 s of CPU, with the helper
+   still at 1.3-1.8 s per 2 s. QoS work, unchanged here.
+
+### What was added to settle candidate 1 (diagnostics only)
+
+- `[load-wait]` (`MADEIRA_LOAD_WAIT`, RDR2 profile `RDR2.exe:180`): every RDR2 wait for 180 s from the first
+  Present, per (thread, kind, object, timeout): count, sum, max, timeouts, last waker (Wine tid/pid from
+  the wineserver's wake record). Kinds: `select` (every wineserver wait, including IOCP and async pipe /
+  socket / file I/O), `sleep` (non-alertable NtDelayExecution), `alert` (critical sections, SRW, condition
+  variables, WaitOnAddress).
+- `[load-wait-now]`, `[stall-wait-stack]`, `[stall-wait-srv]`, `[load-wait-srv]`: the main thread's and the
+  three longest waiters' current waits, their guest callers (module+offset on the stack, e.g.
+  socialclub.dll), and the server's view of the objects (type, name, waiters, who set an event last).
+- `[guest-log] F#` (`MADEIRA_GUEST_LOG_FILES = Social Club`): every line of Social Club's own logs. The
+  keyword mirror's 64 lines were used up by the launcher's "Start Menu" errors a minute before RDR2 started.
+- `[sock-tl] … by=<pid>/<tid>` (`MADEIRA_SOCK_TL_OWNER`, on): which process made each connection.
+
+Switches, off lines and the morning procedure: docs/RDR2_MORNING_CHECKLIST.md, "Loading-screen wait census".

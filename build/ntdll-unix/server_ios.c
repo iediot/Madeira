@@ -2250,6 +2250,8 @@ static int ios_xp_mname( char *out, size_t cap, uint64_t tid )
     return n;
 }
 
+static void ios_lw_sampler( int pe_valid, long long pres );   /* madeira-bcd load-wait, below */
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -2572,6 +2574,7 @@ static void ios_xprobe_main( void )
             if (!(gen & 3)) ios_xp_api_report( wall, XP_MS( now - t_start ) / 1000.0 );   /* ml1131: ~1 s */
         }
         else if (ru_rc && gen < 4) wine_log_write( "[xp] ml1128 proc_pid_rusage v6 failed rc=%d errno=%d", ru_rc, errno );
+        ios_lw_sampler( pe.magic == 0x3130305058444d4dLL, pe.pres_enq );   /* madeira-bcd load-wait */
         if (!ru_rc) { pru = ru; have_ru = 1; }
         if (pe.magic == 0x3130305058444d4dLL) { ppe = pe; have_pe = 1; }
         t_prev = now;
@@ -3652,11 +3655,228 @@ static void ios_wait_report_done( struct ios_wait_token *tok, unsigned int ret )
              (unsigned long long)frame_pc, (unsigned long long)frame_lr, dropped );
 }
 
+/* madeira-bcd load-wait (2026-11-27): the loading-screen wait census, see
+ * loadwait_ios.h. MADEIRA_LOAD_WAIT unset: ios_lw_state stays IOS_LW_OFF and
+ * every hook below is one load. */
+#include "loadwait_ios.h"
+volatile int ios_lw_state;
+struct ios_handle_probe_req ios_handle_probe;   /* load-wait posts (pid, handle), queue_ios.c answers */
+static __thread signed char ios_lw_me = -1;     /* this thread's image is listed: -1 = not decided */
+
+/* Is this thread in a listed image? Notes the first such process's Wine pid. */
+static int ios_lw_thread_followed( unsigned int *pid_out )
+{
+    TEB *teb = NtCurrentTeb();
+    unsigned int pid;
+    /* acquire: pairs with the sampler's release after it filled ios_lw.exes */
+    if (__atomic_load_n( &ios_lw_state, __ATOMIC_ACQUIRE ) == IOS_LW_OFF) return 0;
+    if (ios_lw_me < 0)
+    {
+        extern const WCHAR *ios_current_image_path( int *len );   /* process_ios.c */
+        int len = 0;
+        const WCHAR *path = ios_current_image_path( &len );
+        if (!path) return 0;   /* not cached: the PEB may not be filled in yet */
+        ios_lw_me = ios_lw_image_listed( (const uint16_t *)path, len, ios_lw.exes ) ? 1 : 0;
+    }
+    if (!ios_lw_me || !teb) return 0;
+    pid = (unsigned int)(uintptr_t)teb->ClientId.UniqueProcess;
+    if (!__atomic_load_n( &ios_lw.pid, __ATOMIC_ACQUIRE ))
+    {
+        unsigned int zero = 0;
+        __atomic_compare_exchange_n( &ios_lw.pid, &zero, pid, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE );
+    }
+    *pid_out = pid;
+    return 1;
+}
+
+static void ios_lw_note_select( struct ios_wait_token *tok, unsigned int ret )
+{
+    struct ios_wait_entry *e = tok->slot;
+    struct ios_wait_info in;
+    struct ios_lw_key k;
+    struct timespec ts;
+    LARGE_INTEGER qpc;
+    uint64_t now, wake_ns = 0;
+    unsigned int pid, waker = 0, waker_pid = 0;
+    int wake_status = 0, woke;
+
+    if (!ios_lw_thread_followed( &pid )) return;
+    if (__atomic_load_n( &ios_lw_state, __ATOMIC_ACQUIRE ) != IOS_LW_ARMED ||
+        pid != __atomic_load_n( &ios_lw.pid, __ATOMIC_RELAXED )) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    ios_wait_copy_out( e, &in );     /* owner thread: no concurrent writer */
+    if (now < in.t0_ns) return;
+    woke = ios_wait_take_wake( e, in.cookie, in.t0_ns, &waker, &waker_pid, &wake_status, &wake_ns );
+    NtQueryPerformanceCounter( &qpc, NULL );
+    memset( &k, 0, sizeof(k) );
+    k.tid    = in.wine_tid;
+    k.kind   = IOS_LW_SELECT;
+    k.op     = (int8_t)in.op;
+    k.count  = (uint16_t)in.count;
+    k.obj    = in.count > 0 ? in.handles[0] : 0;
+    k.h1     = in.count > 1 ? in.handles[1] : 0;
+    k.tmo_ms = ios_lw_tmo_bucket( in.timeout, now - in.t0_ns, qpc.QuadPart );
+    ios_lw_record( &k, now - in.t0_ns, woke, waker, waker_pid, ret, ret == STATUS_TIMEOUT );
+}
+
+/* sync.c's NtDelayExecution (non-alertable) and NtWaitForAlertByThreadId
+ * wrappers, only while ios_lw_state == IOS_LW_ARMED. kind: IOS_LW_SLEEP or
+ * IOS_LW_ALERT; obj: the alert address; t0_ns: CLOCK_MONOTONIC at entry. */
+void ios_lw_note_other( int kind, uint64_t obj, const LARGE_INTEGER *timeout, uint64_t t0_ns, unsigned int ret )
+{
+    struct ios_lw_key k;
+    struct timespec ts;
+    uint64_t now;
+    unsigned int pid;
+    long long t;
+
+    if (!ios_lw_thread_followed( &pid )) return;
+    if (__atomic_load_n( &ios_lw_state, __ATOMIC_ACQUIRE ) != IOS_LW_ARMED ||
+        pid != __atomic_load_n( &ios_lw.pid, __ATOMIC_RELAXED )) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    if (now < t0_ns) return;
+    memset( &k, 0, sizeof(k) );
+    k.tid    = (unsigned int)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread;
+    k.kind   = (uint8_t)kind;
+    k.op     = -1;
+    k.obj    = kind == IOS_LW_ALERT ? obj : 0;
+    if (timeout) t = timeout->QuadPart;
+    k.tmo_ms = ios_lw_nt_tmo_bucket( timeout ? &t : NULL );
+    ios_lw_record( &k, now - t0_ns, 0, 0, 0, ret, ret == STATUS_TIMEOUT );
+}
+
 static void ios_wait_leave( struct ios_wait_token *tok, unsigned int ret )
 {
     if (!tok->slot) return;
+    if (__builtin_expect( __atomic_load_n( &ios_lw_state, __ATOMIC_RELAXED ) != IOS_LW_OFF, 0 ))
+        ios_lw_note_select( tok, ret );   /* madeira-bcd load-wait */
     ios_wait_report_done( tok, ret );
     ios_wait_unpublish( tok );
+}
+
+/* madeira-bcd load-wait: the [xp] sampler's step (every pass, ~2 s; 250 ms with
+ * MADEIRA_PERF=1). Reads MADEIRA_LOAD_WAIT once, arms at the first Present,
+ * prints a report every ~2 s while armed and names the main thread's and the
+ * longest waiters' current waits and objects (perf_ios.c, queue_ios.c). */
+static void ios_lw_sampler( int pe_valid, long long pres )
+{
+    static int configured;
+    static struct ios_lw_ent rows[IOS_LW_SLOTS];
+    static struct { unsigned int h; uint64_t ns; } named[64];
+    static unsigned int named_next;
+    extern void ios_perf_load_wait_now( unsigned int pid, unsigned int main_tid, const unsigned int *tids,
+                                        unsigned int ntids, const unsigned int *handles, unsigned int nhandles,
+                                        double t_s );
+    struct { unsigned int tid; uint64_t sum[4]; unsigned int n[4]; } thr[24];
+    unsigned int nthr = 0, n, i, j, dropped = 0, waits = 0, pid, main_tid, tids[4], ntids = 0;
+    unsigned int handles[IOS_HANDLE_PROBE_MAX], nh = 0;
+    struct timespec ts;
+    uint64_t now;
+    int st, final = 0;
+    double t_s, window_ms;
+    char line[1000];
+    int len;
+
+    if (!configured)
+    {
+        const char *spec = getenv( "MADEIRA_LOAD_WAIT" );   /* loading-screen wait census: "<exe>[;<exe>][:<seconds>]" from the first Present (RDR2 profile: RDR2.exe:180); unset/0 = off */
+        configured = 1;
+        if (ios_lw_parse( spec, ios_lw.exes, sizeof(ios_lw.exes), &ios_lw.secs ))
+        {
+            wine_log_write( "[load-wait] madeira-bcd: following %s; a wait census runs for %d s from its first "
+                            "Present, one report per ~2 s (MADEIRA_LOAD_WAIT=%s; 0 = off)",
+                            ios_lw.exes, ios_lw.secs, spec );
+            __atomic_store_n( &ios_lw_state, IOS_LW_WAITING, __ATOMIC_RELEASE );
+        }
+        else if (spec && spec[0] && strcmp( spec, "0" ))
+            wine_log_write( "[load-wait] MADEIRA_LOAD_WAIT=%s not understood (want <exe>[;<exe>][:<seconds>]): off", spec );
+    }
+    st = __atomic_load_n( &ios_lw_state, __ATOMIC_RELAXED );
+    if (st != IOS_LW_WAITING && st != IOS_LW_ARMED) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    if (!ios_lw_tick( now, pe_valid, pres, &final ))
+    {
+        if (st == IOS_LW_WAITING && __atomic_load_n( &ios_lw_state, __ATOMIC_RELAXED ) == IOS_LW_ARMED)
+            wine_log_write( "[load-wait] armed: pid=%04x (%s), first Present seen (count %lld); census for %d s",
+                            ios_lw.pid, ios_lw.exes, pres, ios_lw.secs );
+        return;
+    }
+    n = ios_lw_take( rows, IOS_LW_SLOTS, &dropped, &waits );
+    t_s = (now - ios_lw.t0_ns) / 1e9;
+    window_ms = (now - ios_lw.window_t0_ns) / 1e6;
+    ios_lw.window_t0_ns = ios_lw.last_report_ns = now;
+    pid = ios_lw.pid;
+    main_tid = pid + 4;   /* Wine gives a new process's first thread the next id (044c -> 0450 in every RDR2 log) */
+
+    /* per thread: summed wait by kind */
+    for (i = 0; i < n; i++)
+    {
+        int kind = rows[i].k.kind <= 3 ? rows[i].k.kind : 0;
+        for (j = 0; j < nthr && thr[j].tid != rows[i].k.tid; j++) ;
+        if (j == nthr)
+        {
+            if (nthr == 24) continue;
+            memset( &thr[nthr], 0, sizeof(thr[nthr]) );
+            thr[nthr++].tid = rows[i].k.tid;
+        }
+        thr[j].sum[kind] += rows[i].sum_ns; thr[j].n[kind] += rows[i].n;
+        thr[j].sum[0] += rows[i].sum_ns;    thr[j].n[0] += rows[i].n;   /* [0] = all kinds */
+    }
+    for (i = 1; i < nthr; i++)   /* largest summed wait first */
+        for (j = i; j > 0 && thr[j - 1].sum[0] < thr[j].sum[0]; j--)
+        { __typeof__(thr[0]) tmp = thr[j]; thr[j] = thr[j - 1]; thr[j - 1] = tmp; }
+
+    len = snprintf( line, sizeof(line), "[load-wait] +%.1fs pid=%04x window=%.0fms waits=%u entries=%u dropped=%u | ",
+                    t_s, pid, window_ms, waits, n, dropped );
+    for (j = 0; j < nthr && thr[j].tid != main_tid; j++) ;
+    if (j < nthr)
+        len += snprintf( line + len, sizeof(line) - len,
+                         "main %04x waited %.0fms in %u (select %.0f/%u sleep %.0f/%u alert %.0f/%u)",
+                         main_tid, thr[j].sum[0] / 1e6, thr[j].n[0], thr[j].sum[1] / 1e6, thr[j].n[1],
+                         thr[j].sum[2] / 1e6, thr[j].n[2], thr[j].sum[3] / 1e6, thr[j].n[3] );
+    else len += snprintf( line + len, sizeof(line) - len, "main %04x: no finished wait", main_tid );
+    wine_log_write( "%s", line );
+    len = snprintf( line, sizeof(line), "[load-wait] +%.1fs threads (wait ms/count):", t_s );
+    for (j = 0; j < nthr && j < 16 && len < (int)sizeof(line) - 48; j++)
+        len += snprintf( line + len, sizeof(line) - len, " %04x%s=%.0f/%u", thr[j].tid,
+                         thr[j].tid == main_tid ? "*" : "", thr[j].sum[0] / 1e6, thr[j].n[0] );
+    wine_log_write( "%s", line );
+    for (i = 0; i < n && i < 12; i++)
+    {
+        len = snprintf( line, sizeof(line), "[load-wait] +%.1fs   ", t_s );
+        ios_lw_format( line + len, sizeof(line) - len, &rows[i], main_tid );
+        wine_log_write( "%s", line );
+    }
+
+    /* who to look at now: the main thread and the three longest other waiters */
+    tids[ntids++] = main_tid;
+    for (j = 0; j < nthr && ntids < 4; j++) if (thr[j].tid != main_tid) tids[ntids++] = thr[j].tid;
+    /* objects to name: handles of the top select entries not named in the last 20 s */
+    for (i = 0; i < n && i < 12 && nh < IOS_HANDLE_PROBE_MAX; i++)
+    {
+        unsigned int hs[2], nhs = 0, q;
+        if (rows[i].k.kind != IOS_LW_SELECT || !rows[i].k.count) continue;
+        hs[nhs++] = (unsigned int)rows[i].k.obj;
+        if (rows[i].k.count > 1) hs[nhs++] = rows[i].k.h1;
+        for (q = 0; q < nhs && nh < IOS_HANDLE_PROBE_MAX; q++)
+        {
+            unsigned int s, dup = 0;
+            if (!hs[q]) continue;
+            for (s = 0; s < nh && !dup; s++) dup = handles[s] == hs[q];
+            for (s = 0; s < 64 && !dup; s++) dup = named[s].h == hs[q] && now - named[s].ns < 20000000000ull;
+            if (dup) continue;
+            handles[nh++] = hs[q];
+            named[named_next].h = hs[q]; named[named_next].ns = now;
+            named_next = (named_next + 1) % 64;
+        }
+    }
+    ios_perf_load_wait_now( pid, main_tid, tids, ntids, handles, nh, t_s );
+    if (final)
+        wine_log_write( "[load-wait] done: %.0f s after pid %04x's first Present; census off for the rest of the session",
+                        t_s, pid );
 }
 
 /***********************************************************************

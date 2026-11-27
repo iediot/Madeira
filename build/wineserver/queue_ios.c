@@ -4646,16 +4646,86 @@ static void ios_wait_probe_object( unsigned int tid, int idx, struct object *obj
     if (sync) release_object( sync );
 }
 
+/* madeira-bcd load-wait (build/ntdll-unix/loadwait_ios.h): the census's top
+ * waited handles, named from their process's handle table: type, name, waiter
+ * count, an event's set/reset history (who signals it) and the object's state.
+ * Reads only; at most 16 handles per ~2 s report while the census runs. */
+extern struct ios_handle_probe_req ios_handle_probe;
+
+static void ios_handle_probe_service( void )
+{
+    extern int ios_evt_brief( struct object *, unsigned int *, unsigned int *, unsigned int *, unsigned int * );
+    static unsigned int seen;
+    unsigned int gen = __atomic_load_n( &ios_handle_probe.gen, __ATOMIC_ACQUIRE );
+    unsigned int pids[IOS_HANDLE_PROBE_MAX], handles[IOS_HANDLE_PROBE_MAX], n, i;
+
+    if (gen == seen) return;
+    seen = gen;
+    n = ios_handle_probe.count;
+    if (n > IOS_HANDLE_PROBE_MAX) n = IOS_HANDLE_PROBE_MAX;
+    for (i = 0; i < n; i++) { pids[i] = ios_handle_probe.pids[i]; handles[i] = ios_handle_probe.handles[i]; }
+    if (__atomic_load_n( &ios_handle_probe.gen, __ATOMIC_ACQUIRE ) != gen) return;  /* rewritten: next pass */
+    for (i = 0; i < n; i++)
+    {
+        struct process *process = get_process_from_id( pids[i] );
+        struct object *obj, *sync;
+        const WCHAR *name;
+        data_size_t len = 0;
+        unsigned int k, n_set, set_tid, n_reset, reset_tid, waiters = 0;
+        struct list *entry;
+        char type[32], oname[96];
+
+        if (!process)
+        {
+            clear_error();
+            fprintf( stderr, "[load-wait-srv] pid=%04x h=%x: no such process\n", pids[i], handles[i] );
+            continue;
+        }
+        if (!(obj = get_handle_obj( process, handles[i], 0, NULL )))
+        {
+            clear_error();
+            fprintf( stderr, "[load-wait-srv] pid=%04x h=%x: not open now\n", pids[i], handles[i] );
+            release_object( process );
+            continue;
+        }
+        for (k = 0; k < obj->ops->type->name.len / sizeof(WCHAR) && k < sizeof(type) - 1; k++)
+            type[k] = (char)obj->ops->type->name.str[k];
+        type[k] = 0;
+        oname[0] = 0;
+        if ((name = get_object_name( obj, &len )) && len)
+        {
+            for (k = 0; k < len / sizeof(WCHAR) && k < sizeof(oname) - 1; k++)
+                oname[k] = name[k] < 0x80 ? (char)name[k] : '?';
+            oname[k] = 0;
+        }
+        sync = get_obj_sync( obj );
+        if (sync) LIST_FOR_EACH( entry, &sync->wait_queue ) if (++waiters >= 1000) break;
+        fprintf( stderr, "[load-wait-srv] pid=%04x h=%x obj=%p type=%s name=%s waiters=%u",
+                 pids[i], handles[i], obj, type, oname[0] ? oname : "-", waiters );
+        if (ios_evt_brief( obj, &n_set, &set_tid, &n_reset, &reset_tid ))
+            fprintf( stderr, " sets=%u last_set_tid=%04x resets=%u last_reset_tid=%04x",
+                     n_set, set_tid, n_reset, reset_tid );
+        fprintf( stderr, " state: " );
+        obj->ops->dump( obj, 0 );      /* prints its own newline */
+        if (sync) release_object( sync );
+        release_object( obj );
+        release_object( process );
+    }
+    fflush( stderr );
+}
+
 void ios_wait_probe_service( void )
 {
     extern int ios_thread_wait_brief( struct thread *, int *, int *, long long *,
                                       unsigned long long *, struct object **, int );
     static unsigned int seen;
-    unsigned int gen = __atomic_load_n( &ios_wait_probe.gen, __ATOMIC_ACQUIRE );
+    unsigned int gen;
     unsigned int tids[IOS_WAIT_PROBE_MAX], n, i;
     uint64_t posted, now_ns;
     struct timespec now;
 
+    ios_handle_probe_service();   /* madeira-bcd load-wait; one load when idle */
+    gen = __atomic_load_n( &ios_wait_probe.gen, __ATOMIC_ACQUIRE );
     if (gen == seen) return;
     seen = gen;
     n = ios_wait_probe.count;

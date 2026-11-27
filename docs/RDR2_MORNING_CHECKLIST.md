@@ -138,3 +138,40 @@ burst to 60.
 | WILLNEED prefetch | off | enable: `env.MADEIRA_PGW_PREFETCH_KB = 512` |
 | Upload buffers off the file tier | off | enable: `upload-anon-mb = 256` (adds up to 256 MB to the footprint) |
 Check: `[swap] ml1291 F_PUNCHHOLE (deferred) … took` should no longer line up with `[present-api-hitch] entry_gap_ms` of ~1 s.
+
+### Loading-screen wait census (server_ios.c, loadwait_ios.h, perf_ios.c, queue_ios.c, sync.c, socket.c, file.c)
+Diagnostics only: no wait, timeout, signal, QoS or graphics setting changes. Background: in all seven RDR2
+loads in `~/MadeiraLogs/iphone18` the main thread sits at 10-30 ms of CPU per 2 s for 9-70 s right after the
+first loading frame (the "dead zone"; 18 s in 1127-0105-wave1, 00:59:04-00:59:22), and the zone ends with the
+same pair of HTTPS requests (prod.ros 192.81.241.100, then an Akamai CDN host). The v3 wait probe never fires
+there (it needs a window without Presents; the loading screen presents at ~55 fps). Details:
+docs/RDR2_LOAD_TIME_IPHONE18_2026-11-27.md, section "The dead zone".
+| Change | Default | Off switch |
+|---|---|---|
+| `[load-wait]` census of RDR2's waits (select/sleep/alert per thread, object, timeout; waker pid/tid), 180 s from the first Present, a report every ~2 s, then off for the session | RDR2 via profile (`env.MADEIRA_LOAD_WAIT = RDR2.exe:180`) | `env.MADEIRA_LOAD_WAIT = 0` |
+| `[load-wait-now]` main thread + 3 longest waiters' current server wait, `[stall-wait-stack]` guest callers, `[stall-wait-srv]` / `[load-wait-srv]` object type, name, last setter | with the census | with the census |
+| `[guest-log] F#` every line of Social Club's own log files (own 4000-line budget, tickets/emails/passwords redacted) | RDR2 via profile (`env.MADEIRA_GUEST_LOG_FILES = Social Club`) | `env.MADEIRA_GUEST_LOG_FILES =` (empty) |
+| `[sock-tl] ... by=<pid>/<tid>`: which process made each connection | on (all games) | `env.MADEIRA_SOCK_TL_OWNER = 0` |
+
+Cost: unset = one load per wait; armed = one short locked insert per RDR2 wait for 180 s; nothing after.
+None of this can hang the game (reads only; the wineserver answers from its own tables).
+
+Morning run (no extra settings needed; leave `MADEIRA_PERF` off):
+1. Launch RDR2 as usual, touch nothing until gameplay, play ~1 minute, AirDrop `madeira-log.txt`.
+2. Proof it ran: `[load-wait] madeira-bcd: following RDR2.exe`, `[load-wait] armed: pid=…`, then
+   `[load-wait] +Ns …` every ~2 s and `[load-wait] done` ~180 s later; `[guest-log] madeira-bcd file mirror`;
+   `[sock-tl] … by=`.
+3. Find the dead zone: `[xp-t]` rows where the main thread (pid+4, e.g. 0450) has < 50 ms. In those
+   windows read `[load-wait] +Ns … main 0450 waited …` and the entries below it (`0450*` = main thread):
+   - `select … h=X` + `[load-wait-srv] … h=X type=… name=… last_set_tid=…` + `waker=tid/pid`: map the
+     waker pid with the `[srv-own] new_thread … pid=` lines (launcher, SocialClubHelper.exe,
+     RockstarService.exe or RDR2 itself). An Event/IoCompletion/pipe set by the launcher or the helper =
+     RDR2 waits on Social Club's IPC; a Socket/File with `timeouts=` and `waker=server/` = a network
+     or I/O timeout.
+   - `sleep … tmo=Nms xK` = a poll loop; `[load-wait-now]` + `[stall-wait-stack]` name the code.
+   - `alert addr=…` = a lock or condition variable.
+4. `[guest-log] F#` lines (Social Club's logs) with their own timestamps around the zone's end, and which
+   pid made the prod.ros + Akamai pair (`[sock-tl] … by=`).
+5. If the Files app can reach the app's Documents folder, also copy
+   `wine/drive_c/users/mobile/Documents/Rockstar Games/Social Club/*.log` and
+   `wine/drive_c/users/mobile/AppData/Local/Rockstar Games/Social Club/ipc.log`.

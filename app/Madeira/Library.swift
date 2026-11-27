@@ -1109,6 +1109,13 @@ struct LibraryEntry: Codable, Identifiable {
             // 30 s). Madsync is not an option here: this Dock session runs the service manager, which turns it
             // off (services.exe never answered its RPC clients under madsync). env.MADEIRA_FASTSYNC_SEM_EXES = 0
             // and env.MADEIRA_FASTSYNC_MULTI = 0 turn them off.
+            // Loading screen (diagnostics only, 2026-11-27): in every RDR2 log the main thread then sits at
+            // 10-30 ms of CPU per 2 s for 10-70 s, and that stretch ends with the same HTTPS pair (prod.ros,
+            // then an Akamai host) each time. MADEIRA_LOAD_WAIT lists what RDR2's threads wait on for 180 s
+            // from its first Present ([load-wait], [load-wait-now], [load-wait-srv]); MADEIRA_GUEST_LOG_FILES
+            // mirrors Social Club's own logs ([guest-log] F#); [sock-tl] lines name the
+            // process of each connection (by=pid/tid). Off: env.MADEIRA_LOAD_WAIT = 0,
+            // env.MADEIRA_GUEST_LOG_FILES = (empty), env.MADEIRA_SOCK_TL_OWNER = 0.
             return socialClub + "\n" + bcd + "\n" + videoBudget + "\n" + """
             d3d12-shader-pack = 1
             replay-split = 0
@@ -1167,6 +1174,8 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_HIDPAD_ON_CHANGE = 1
             env.MADEIRA_FASTSYNC_SEM_EXES = RDR2.exe
             env.MADEIRA_FASTSYNC_MULTI = RDR2.exe
+            env.MADEIRA_LOAD_WAIT = RDR2.exe:180
+            env.MADEIRA_GUEST_LOG_FILES = Social Club
             """ + (steam ? "\nenv.MADEIRA_DOCK_GAME_SCM = 1\nenv.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe" : "")
         case "gta5_enhanced.exe", "playgtav.exe":
             let steamLines = """

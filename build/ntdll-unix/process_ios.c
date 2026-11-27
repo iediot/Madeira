@@ -1602,6 +1602,20 @@ static void ios_wait_floor_note_process( const WCHAR *image, int image_len, unsi
              ios_wf_after_name, pid, ios_wf_after_ns / 1000000000ll );
 }
 
+/* madeira-bcd load-wait (loadwait_ios.h, server_ios.c): the calling thread's
+ * process image path (UTF-16, *len code units), or NULL while the PEB is not
+ * filled in yet. */
+const WCHAR *ios_current_image_path( int *len )
+{
+    const RTL_USER_PROCESS_PARAMETERS *pp;
+
+    if (!NtCurrentTeb() || !NtCurrentTeb()->Peb || !(pp = NtCurrentTeb()->Peb->ProcessParameters) ||
+        !pp->ImagePathName.Buffer)
+        return NULL;
+    *len = pp->ImagePathName.Length / sizeof(WCHAR);
+    return pp->ImagePathName.Buffer;
+}
+
 /* The floor of the calling thread's process, in ms (0 = none); cached per thread. */
 static int ios_wf_thread_floor(void)
 {

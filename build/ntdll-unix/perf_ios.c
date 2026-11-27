@@ -462,6 +462,65 @@ void ios_perf_wait_report(const uint64_t *ids, unsigned nids)
     ios_wineserver_wake();
 }
 
+/* madeira-bcd load-wait (loadwait_ios.h): every census report, the followed
+ * process's main thread and longest waiters as they are now: the server wait
+ * they are in ([load-wait-now]), where it was called from ([stall-wait-stack]:
+ * guest modules on the stack, e.g. socialclub.dll), and the server's view of
+ * the waited objects ([stall-wait-srv]) plus the census's top handles
+ * ([load-wait-srv]: type, name, who last set it). Runs on the XP thread once
+ * per report (~2 s) while the census is armed; reads only. */
+void ios_perf_load_wait_now(unsigned int pid, unsigned int main_tid, const unsigned int *tids, unsigned int ntids,
+                            const unsigned int *handles, unsigned int nhandles, double t_s)
+{
+    extern struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
+    extern struct ios_wait_probe_req ios_wait_probe;
+    extern struct ios_handle_probe_req ios_handle_probe;
+    extern void ios_wineserver_wake(void);
+    struct timespec ts;
+    struct ios_wait_info w;
+    uint64_t now;
+    unsigned int i, j, depth, probe[IOS_WAIT_PROBE_MAX], nprobe = 0, found[8] = {0};
+
+    if (ntids > 8) ntids = 8;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    for (i = 0; i < IOS_WAITREG_SLOTS; i++)
+    {
+        if (!ios_wait_read(&ios_wait_reg[i], &w, &depth) || w.wine_pid != pid) continue;
+        for (j = 0; j < ntids && tids[j] != w.wine_tid; j++) ;
+        if (j == ntids || found[j]) continue;
+        found[j] = 1;
+        dprintf(2, "[load-wait-now] +%.1fs %04x%s in a server wait for %.1f ms: phase=%s depth=%u op=%d flags=%x "
+                   "n=%d h=%x,%x,%x,%x key=%llx timeout=%lld requests=%u apcs=%u\n",
+                t_s, w.wine_tid, w.wine_tid == main_tid ? "*" : "", now > w.t0_ns ? (now - w.t0_ns) / 1e6 : 0.0,
+                perf_wait_phase_name(ios_wait_reg[i].phase), depth, w.op, w.flags, w.count,
+                w.handles[0], w.handles[1], w.handles[2], w.handles[3], (unsigned long long)w.key,
+                (long long)w.timeout, ios_wait_reg[i].requests, ios_wait_reg[i].apcs);
+        perf_wait_caller(&w, w.native_tid);
+        if (nprobe < IOS_WAIT_PROBE_MAX) probe[nprobe++] = w.wine_tid;
+    }
+    for (j = 0; j < ntids; j++)
+        if (!found[j])
+            dprintf(2, "[load-wait-now] +%.1fs %04x%s not in a server wait (running, sleeping, alert-waiting or "
+                       "in a fastsync park)\n", t_s, tids[j], tids[j] == main_tid ? "*" : "");
+    if (nprobe)
+    {
+        for (i = 0; i < nprobe; i++) ios_wait_probe.tids[i] = probe[i];
+        ios_wait_probe.count = nprobe;
+        ios_wait_probe.posted_ns = now;
+        __atomic_add_fetch(&ios_wait_probe.gen, 1, __ATOMIC_RELEASE);
+    }
+    if (nhandles)
+    {
+        if (nhandles > IOS_HANDLE_PROBE_MAX) nhandles = IOS_HANDLE_PROBE_MAX;
+        for (i = 0; i < nhandles; i++) { ios_handle_probe.pids[i] = pid; ios_handle_probe.handles[i] = handles[i]; }
+        ios_handle_probe.count = nhandles;
+        ios_handle_probe.posted_ns = now;
+        __atomic_add_fetch(&ios_handle_probe.gen, 1, __ATOMIC_RELEASE);
+    }
+    if (nprobe || nhandles) ios_wineserver_wake();
+}
+
 /* Task and host VM counters over the last XP window (~250 ms). Uninterruptible
  * threads plus rising pageins/decompressions point at memory, not scheduling. */
 void ios_perf_vm_tick(int report)
