@@ -1120,6 +1120,7 @@ struct LibraryEntry: Codable, Identifiable {
             d3d12-shader-pack = 1
             replay-split = 0
             rp-carry = 1
+            present-cap-fps = 30
             ring-share = 1
             pool-mid = 1
             swap-mb = 8192

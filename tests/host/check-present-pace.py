@@ -55,10 +55,12 @@ assert 'struct ios_xp_pace_pub { int64_t seq, uj, dt_us; };' in server
 present = function(d3d, 'static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags)')
 assert 'if (!(flags & DXGI_PRESENT_TEST)) mad_pace_present();' in present
 assert present.index('mad_pace_present();') < present.index('stamp = mad_tick();') < present.index('swap_Present_pool(T, sync, flags)')
-for key in ('present-cap-fps', 'present-pace-mw', 'present-pace-min-fps'):
+# the owner turned on a fixed 30 fps cap for RDR2 (2026-11-27); nothing else sets the pacer keys
+assert library.count('present-cap-fps = 30') == 1, 'RDR2 profile: present-cap-fps = 30'
+for key in ('present-pace-mw', 'present-pace-min-fps'):
     assert key not in library, key
 print('PASS: g_xp appends the pacer fields after the 20 mirrored ones; the probe writes only into long blocks whose pacer asked (seq != 0), seq last')
-print('PASS: Present paces before its timing stamp, never for DXGI_PRESENT_TEST; no profile sets the pacer keys')
+print('PASS: Present paces before its timing stamp, never for DXGI_PRESENT_TEST; only RDR2's profile sets present-cap-fps = 30')
 
 # --- compiled ------------------------------------------------------------------------
 start = d3d.index('static struct {\n    int on;                       /* -1 unread, 0 off, 1 on */')

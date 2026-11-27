@@ -59,7 +59,7 @@ docs/RDR2_LOAD_TIME_IPHONE18_2026-11-27.md for the per-change lines to check.
 | Worker `[spin-pc]` samples | on with MADEIRA_SPIN_PC | `env.MADEIRA_SPIN_PC_WORKERS = 0` |
 | FEX per-event log sampling | on | `env.MADEIRA_FEX_LOG_ALL = 1` |
 | `[decommit-zero]` rate limit | on | `env.MADEIRA_DECOMMIT_LOG_ALL = 1` |
-| Frame pacer (`present-cap-fps`, `present-pace-mw`) | OFF, in no profile | owner decision: `present-cap-fps = 30` to try a locked 30 |
+| Frame pacer: fixed 30 fps cap | ON for RDR2 since 2026-11-27 (owner) | `present-cap-fps = 0` |
 
 ### Registry read cache (wine unix registry.c, regcache_ios.c)
 | Change | Default | Off switch |
