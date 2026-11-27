@@ -2200,6 +2200,56 @@ static double ios_xp_rank( const struct ios_xp_row *r )
     return r->p_ms + r->e_ms + (r->rq_ms > 0 ? r->rq_ms : 0);
 }
 
+/* madeira-bcd thread-names (2026-11-27): an [xp-t] row without a Wine tid printed
+ * only "m<mach tid>", so the app's own busy threads could not be told apart (log
+ * 1127-0105-wave1: m1476036 at 250-450 ms per 2 s through RDR2 gameplay, m1475797
+ * at 331 ms in one window). Such a row's token is now "m<tid>~<name>": "main" for
+ * the app's main thread, else the kernel's name for the thread (pthread_setname_np:
+ * wineserver, madeira-xprobe, winios-freeze, madeira-perf ...; CoreAudio and other
+ * frameworks name theirs), every character outside [A-Za-z0-9._-] made '_', at most
+ * 24 kept. An unnamed thread gets "~pri<n>", its current scheduling priority (GCD
+ * workers and framework threads: 4 background, 20 utility, 31 default, 37 user
+ * initiated, 47 user interactive, 97 real-time audio). Read by thread id at print
+ * time (proc_pidinfo PROC_PIDTHREADID64INFO): nothing is kept per thread, and a
+ * thread that has exited just prints without a name. MADEIRA_XP_TNAMES=0: the
+ * bare "m<tid>" as before. */
+struct ios_xp_pthinfo
+{
+    uint64_t ut, st;
+    int32_t cpu, policy, run_state, flags, sleep_time, curpri, priority, maxpri;
+    char name[64];   /* MAXTHREADNAMESIZE */
+};
+static int ios_xp_mname( char *out, size_t cap, uint64_t tid )
+{
+    static int on = -1;
+    static uint64_t main_tid;
+    struct ios_xp_pthinfo ti;
+    int i, n;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_XP_TNAMES" );   /* [xp-t] m<tid>~<name> for threads without a Wine tid; 0 = bare m<tid> */
+        pthread_t (*main_np)(void) = (pthread_t (*)(void))dlsym( RTLD_DEFAULT, "pthread_main_thread_np" );
+        pthread_t mt = main_np ? main_np() : NULL;
+        if (!mt || pthread_threadid_np( mt, &main_tid )) main_tid = 0;
+        on = !(e && e[0] == '0');
+    }
+    if (!on || cap < 40) return 0;
+    if (main_tid && tid == main_tid) return snprintf( out, cap, "~main" );
+    memset( &ti, 0, sizeof(ti) );
+    if (proc_pidinfo( getpid(), 15 /* PROC_PIDTHREADID64INFO */, tid, &ti, sizeof(ti) ) < (int)sizeof(ti)) return 0;
+    ti.name[sizeof(ti.name) - 1] = 0;
+    if (!ti.name[0]) return snprintf( out, cap, "~pri%d", (int)ti.curpri );
+    out[0] = '~';
+    for (i = 0, n = 1; ti.name[i] && n < 25; i++, n++)
+    {
+        char c = ti.name[i];
+        out[n] = ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '.' || c == '_' || c == '-') ? c : '_';
+    }
+    out[n] = 0;
+    return n;
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -2210,6 +2260,7 @@ static void ios_xprobe_main( void )
     uint32_t gen = 0; int have_ru = 0, have_pe = 0, used = 0, ru_rc;
     char n0[32] = "?", n1[32] = "?"; size_t sz; int nlev = 0;
 
+    pthread_setname_np( "madeira-xprobe" );   /* madeira-bcd thread-names: this dispatch worker never returns */
     if (ios_ts_tsd_off < 0) ios_ts_calibrate();
     mach_timebase_info( &tb );
     sz = sizeof(nlev); sysctlbyname( "hw.nperflevels", &nlev, &sz, NULL, 0 );
@@ -2480,8 +2531,12 @@ static void ios_xprobe_main( void )
                         tn += snprintf( tl + tn, sizeof(tl) - tn, " -%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[best].wtid,
                                         rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
                     else
-                        tn += snprintf( tl + tn, sizeof(tl) - tn, " m%llu:%.0f/%.0f:%.1f/%.1f:%.0f", (unsigned long long)rows[best].tid,
+                    {   /* madeira-bcd thread-names: "m<tid>~<name>" (ios_xp_mname) */
+                        tn += snprintf( tl + tn, sizeof(tl) - tn, " m%llu", (unsigned long long)rows[best].tid );
+                        tn += ios_xp_mname( tl + tn, sizeof(tl) - tn, rows[best].tid );
+                        tn += snprintf( tl + tn, sizeof(tl) - tn, ":%.0f/%.0f:%.1f/%.1f:%.0f",
                                         rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
+                    }
                     tn += ios_xp_tok_extra( tl + tn, sizeof(tl) - tn, &rows[best] );
                 }
                 if (rq_slices && tn < (int)sizeof(tl) - 160)

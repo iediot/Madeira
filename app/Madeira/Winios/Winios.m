@@ -275,6 +275,8 @@ static void *winios_freeze_watch(void *arg) {
     unsigned gaps = 0, beats = 0;
     int dbg = winios_cs_debugged();     /* ml522: track debugger attachment */
 
+    pthread_setname_np("winios-freeze");   /* madeira-bcd thread-names: [xp-t] m<tid>~winios-freeze */
+
     dprintf(STDERR_FILENO, "[freeze] detector started gen=%u (sleep=%.2fs gap>%.1fs) rev=ml525\n",
             my_gen, SLEEP_S, GAP_S);
 
@@ -361,6 +363,7 @@ static void *winios_freeze_watch(void *arg) {
 static void *winios_freeze_super(void *arg) {
     const double CHECK_S = 10.0;
     (void)arg;
+    pthread_setname_np("winios-freeze-super");   /* madeira-bcd thread-names */
     for (;;) {
         double s0 = winios_now_mono();
         uint64_t a = wfz_iter;

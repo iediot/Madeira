@@ -28,6 +28,28 @@ final class ProMotionIntent {
     static let shared = ProMotionIntent()
     private var link: CADisplayLink?
     private var activeMax: Float = 0
+    /// A link is armed, on the main run loop (`link`) or on the link thread (`bgLink`).
+    private var armed = false
+    /// The armed link lives on the link thread; touched there only (in its blocks).
+    private var bgLink: CADisplayLink?
+    private var bgArmed = false
+
+    /// madeira-bcd app-lean (2026-11-27): the link only states a frame-rate intent and
+    /// its tick does nothing, but on the main run loop each tick (up to 120 a second in
+    /// MAX, RAW and the 40 cap) woke the main thread and ran its run-loop observers
+    /// (Core Animation's commit, SwiftUI's update pass). It now runs on its own thread
+    /// ("madeira-promote"), whose run loop has nothing else to do; the range, the panel's
+    /// rate and when the link is armed are unchanged. madeira.cfg
+    /// `env.MADEIRA_PROMOTE_LINK_THREAD = 0`: on the main run loop, as before. Read at
+    /// each arm.
+    private static var linkThread: ProMotionLinkThread?
+    private static func linkThreadIfWanted() -> ProMotionLinkThread? {
+        guard MadeiraConfig.flag("MADEIRA_PROMOTE_LINK_THREAD") else { return nil }   // ProMotion intent link on its own thread, off the main run loop; 0 = main run loop
+        if let t = linkThread { return t.runLoop != nil ? t : nil }
+        let t = ProMotionLinkThread()
+        linkThread = t
+        return t.startAndWait() ? t : nil
+    }
 
     /// Honest report of what the panel can do, for the native `[frame]` line.
     static var panelMaxFPS: Int { UIScreen.main.maximumFramesPerSecond }
@@ -62,24 +84,52 @@ final class ProMotionIntent {
     func setActive(_ active: Bool, maxHz: Int = ProMotionIntent.panelMaxFPS) {
         let want = Float(max(maxHz, 0))
         if active && want > 0 {
-            if link != nil && activeMax == want { return }
-            link?.invalidate()
-            let l = CADisplayLink(target: self, selector: #selector(tick))
+            if armed && activeMax == want { return }
+            disarm()
             // `minimum` must not exceed the panel's own maximum or CoreAnimation
             // clamps the whole range away (a 60Hz device asked for min 60 /
             // max 120 gets nothing useful).
             let lo = Float(min(60, maxHz))
-            l.preferredFrameRateRange = CAFrameRateRange(minimum: lo, maximum: want, preferred: want)
-            l.add(to: .main, forMode: .common)
-            link = l
+            let range = CAFrameRateRange(minimum: lo, maximum: want, preferred: want)
+            let thread = Self.linkThreadIfWanted()
+            if let thread {
+                bgArmed = true
+                thread.perform { [self] in
+                    bgLink?.invalidate()
+                    let l = CADisplayLink(target: self, selector: #selector(tick))
+                    l.preferredFrameRateRange = range
+                    l.add(to: .current, forMode: .common)
+                    bgLink = l
+                }
+            } else {
+                let l = CADisplayLink(target: self, selector: #selector(tick))
+                l.preferredFrameRateRange = range
+                l.add(to: .main, forMode: .common)
+                link = l
+            }
+            armed = true
             activeMax = want
-            fputs("[promote] display link armed preferred=\(Int(want))Hz panel_max=\(ProMotionIntent.panelMaxFPS)Hz\n", stderr)
+            fputs("[promote] display link armed preferred=\(Int(want))Hz panel_max=\(ProMotionIntent.panelMaxFPS)Hz" +
+                  " thread=\(thread != nil ? "madeira-promote" : "main")\n", stderr)
         } else {
-            if link != nil { fputs("[promote] display link released\n", stderr) }
-            link?.invalidate()
-            link = nil
+            if armed { fputs("[promote] display link released\n", stderr) }
+            disarm()
             activeMax = 0
         }
+    }
+
+    /// Takes down whichever link is armed (main thread).
+    private func disarm() {
+        link?.invalidate()
+        link = nil
+        if bgArmed, let thread = Self.linkThread {
+            thread.perform { [self] in
+                bgLink?.invalidate()
+                bgLink = nil
+            }
+        }
+        bgArmed = false
+        armed = false
     }
 
     /// The intent that belongs to a given pacing mode (0 = none). See the type comment.
@@ -97,6 +147,43 @@ final class ProMotionIntent {
     }
 
     @objc private func tick(_ sender: CADisplayLink) {}
+}
+
+/// madeira-bcd app-lean: the thread ProMotionIntent's display link runs on (see
+/// linkThreadIfWanted). Its run loop holds a port so it never returns, and runs the
+/// blocks `perform` queues, in order, so the link is created, re-ranged and
+/// invalidated on this thread only.
+final class ProMotionLinkThread: Thread {
+    private let ready = DispatchSemaphore(value: 0)
+    private(set) var runLoop: CFRunLoop?
+
+    override func main() {
+        runLoop = CFRunLoopGetCurrent()
+        RunLoop.current.add(NSMachPort(), forMode: .default)
+        ready.signal()
+        while true {
+            autoreleasepool { _ = RunLoop.current.run(mode: .default, before: .distantFuture) }
+        }
+    }
+
+    /// Starts the thread; false when it did not come up within a second (the caller
+    /// then arms on the main run loop, as before).
+    func startAndWait() -> Bool {
+        name = "madeira-promote"
+        qualityOfService = .userInteractive
+        start()
+        guard ready.wait(timeout: .now() + 1) == .success, runLoop != nil else {
+            fputs("[promote] link thread did not start: the link stays on the main run loop\n", stderr)
+            return false
+        }
+        return true
+    }
+
+    func perform(_ block: @escaping () -> Void) {
+        guard let rl = runLoop else { return }
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.defaultMode.rawValue, block)
+        CFRunLoopWakeUp(rl)
+    }
 }
 
 /// Opt-in `env.MADEIRA_THERMAL_CAP = 1`: when iOS reports the device as
@@ -404,6 +491,27 @@ struct FPSOverlay: View {
         vsyncMode = madeira_get_vsync_locked()
         ProMotionIntent.apply(mode: vsyncMode)
 
+        // madeira-bcd app-lean (2026-11-27): one 250 ms tick does the sampling, the
+        // present counter, the FPS and the memory readout, so the overlay's state
+        // changes 4 times a second instead of 14 (the 100 ms sampler set
+        // presentCount, which the wide overlay draws, on every tick). The FPS window
+        // is still >= 1 s with >= 3 presents, over the same 5 s of samples (20 at
+        // 250 ms). madeira.cfg `env.MADEIRA_HUD_LEAN = 0`: the 100 ms sampler and the
+        // 250 ms display tick, as before. Read when the overlay appears.
+        if MadeiraConfig.flag("MADEIRA_HUD_LEAN") {   // developer FPS overlay: one 250 ms tick instead of 100 ms + 250 ms; 0 = as before
+            memMB = ProcessMemory.footprintMB(); freeMB = ProcessMemory.availableMB()
+            displayTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+                let t = CFAbsoluteTimeGetCurrent()
+                let cur = madeira_frame_count()
+                samples.append((t, cur))
+                if samples.count > 20 { samples.removeFirst() }
+                presentCount = cur
+                fps = computeAdaptiveFPS()
+                memMB = ProcessMemory.footprintMB(); freeMB = ProcessMemory.availableMB()
+            }
+            return
+        }
+
         // 100ms sampling — keeps the buffer fresh
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
             let t = CFAbsoluteTimeGetCurrent()
@@ -483,6 +591,81 @@ enum ProcessMemory {
 
     /// What remains before jetsam, in MB (os_proc_available_memory).
     static func availableMB() -> Int { Int(os_proc_available_memory() / (1024 * 1024)) }
+}
+
+/// madeira-bcd app-cpu (2026-11-27): "[app-cpu]" in the game log every 30 s from
+/// the start of a Wine session: the app's main thread's CPU time per second over the
+/// window (user + system), how many times a second its run loop woke from sleep, and
+/// the in-process wineserver thread's CPU time per second. iOS holds the app to about
+/// 1 W of CPU energy once its budget is spent (RDR2 on iPhone 18 Pro), so each of
+/// these comes out of the game's frame rate; [xp-t] names the same threads
+/// (m<tid>~main, m<tid>~wineserver). Started from runWineFullSequence on the main
+/// thread; a run-loop observer on the main thread counts the wake-ups (one integer
+/// add per wake). madeira.cfg `env.MADEIRA_APP_CPU_LOG = 0`: no line and no observer
+/// (a game's own `env.MADEIRA_APP_CPU_LOG=0` line stops both at the first 30 s tick,
+/// since the game's lines are exported after the start).
+enum AppCPULog {
+    private static var timer: Timer?
+    private static var observer: CFRunLoopObserver?
+    private static var mainPort: mach_port_t = 0
+    private static var wakes = 0
+    private static var lines = 0
+    private static var last: (at: TimeInterval, user: Double, sys: Double, server: Double, wakes: Int)?
+
+    static func start() {
+        guard Thread.isMainThread else { DispatchQueue.main.async { start() }; return }
+        guard timer == nil, MadeiraConfig.flag("MADEIRA_APP_CPU_LOG") else { return }   // [app-cpu] every 30 s: main thread and wineserver CPU ms/s, main run-loop wakes/s; 0 = off
+        mainPort = pthread_mach_thread_np(pthread_self())
+        let o = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.afterWaiting.rawValue, true, 0) { _, _ in
+            AppCPULog.wakes &+= 1
+        }
+        if let o { CFRunLoopAddObserver(CFRunLoopGetMain(), o, .commonModes) }
+        observer = o
+        last = sample()
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in tick() }
+    }
+
+    static func stop() {
+        timer?.invalidate(); timer = nil
+        if let o = observer { CFRunLoopRemoveObserver(CFRunLoopGetMain(), o, .commonModes) }
+        observer = nil; last = nil
+    }
+
+    private static func tick() {
+        guard MadeiraConfig.flag("MADEIRA_APP_CPU_LOG") else {
+            stop()
+            fputs("[app-cpu] off (env.MADEIRA_APP_CPU_LOG=0)\n", stderr)
+            return
+        }
+        guard let now = sample() else { return }
+        defer { last = now }
+        guard let was = last else { return }
+        let dt = now.at - was.at
+        guard dt > 0.5 else { return }
+        let user = (now.user - was.user) / dt, sys = (now.sys - was.sys) / dt
+        let server = now.server >= 0 && was.server >= 0 ? String(format: "%.1f ms/s", (now.server - was.server) / dt) : "-"
+        lines += 1
+        let head = String(format: "[app-cpu] main=%.1f ms/s (user %.1f sys %.1f) wakes=%.0f/s",
+                          user + sys, user, sys, Double(now.wakes &- was.wakes) / dt)
+        fputs(head + " wineserver=\(server)" + String(format: " window=%.1fs", dt)
+              + (lines == 1 ? " (env.MADEIRA_APP_CPU_LOG=0 turns it off)" : "") + "\n", stderr)
+    }
+
+    /// CPU times in ms; server < 0 while no wineserver thread runs.
+    private static func sample() -> (at: TimeInterval, user: Double, sys: Double, server: Double, wakes: Int)? {
+        var info = thread_basic_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_info(mainPort, thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        let user = Double(info.user_time.seconds) * 1000 + Double(info.user_time.microseconds) / 1000
+        let sys = Double(info.system_time.seconds) * 1000 + Double(info.system_time.microseconds) / 1000
+        let us = wineserver_thread_cpu_us()
+        return (ProcessInfo.processInfo.systemUptime, user, sys, us >= 0 ? Double(us) / 1000 : -1, wakes)
+    }
 }
 
 /// "[mem]" lines in the game log while a game session runs: the footprint,

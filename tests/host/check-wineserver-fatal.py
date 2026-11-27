@@ -86,7 +86,9 @@ static void wine_log_msg_impl( const char *fmt, ... )
     va_end( args );
 }
 void fatal_error( const char *err, ... );
-''' + (flag[0] + '\n' if flag else '')
+''' + (flag[0] + '\n' if flag else '') + ''.join(
+    # madeira-bcd app-cpu: fatal_error also clears the server thread's port (wineserver_thread_cpu_us)
+    '#include <mach/mach.h>\n' + m + '\n' for m in re.findall(r'^static mach_port_t g_wineserver_mach;$', bridge, re.M))
 
 harness_main = r'''
 static int bad;

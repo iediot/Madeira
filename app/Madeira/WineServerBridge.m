@@ -9,6 +9,7 @@
 
 #include "WineServerBridge.h"
 #include <sys/time.h>
+#include <mach/mach.h>
 
 static FILE *g_ws_bridge_log = NULL;
 static pthread_mutex_t g_ws_bridge_log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -49,6 +50,21 @@ extern void wineserver_set_nls_dir(const char *path);
 
 static volatile int g_wineserver_running = 0;
 
+/* madeira-bcd thread-names / app-cpu (2026-11-27): the server thread's mach port while
+ * it runs (0 otherwise), for wineserver_thread_cpu_us and the [app-cpu] line. It is
+ * cleared before the thread ends (fatal_error's pthread_exit included), and
+ * thread_info on a stale name only fails, so a late read cannot fault. */
+static mach_port_t g_wineserver_mach;
+
+long long wineserver_thread_cpu_us(void) {
+    mach_port_t port = __atomic_load_n(&g_wineserver_mach, __ATOMIC_ACQUIRE);
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (!port || thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) return -1;
+    return (long long)info.user_time.seconds * 1000000 + info.user_time.microseconds
+         + (long long)info.system_time.seconds * 1000000 + info.system_time.microseconds;
+}
+
 // Override wineserver's fatal_error to use logging and pthread_exit instead of exit(1)
 void fatal_error( const char *err, ... ) {
     va_list args;
@@ -60,6 +76,7 @@ void fatal_error( const char *err, ... ) {
     // pthread_exit skips the end of wineserver_thread_func, so clear the flag here. The launch
     // waits on it and startWineProcess refuses to start Wine without a server (#562).
     g_wineserver_running = 0;
+    __atomic_store_n(&g_wineserver_mach, 0, __ATOMIC_RELEASE);
     // Don't call exit(1) — that kills the whole app.
     // Instead, terminate just this thread.
     pthread_exit(NULL);
@@ -76,6 +93,9 @@ static pthread_t g_wineserver_thread;
 static char *g_prefix_path = NULL;
 
 static void *wineserver_thread_func(void *arg) {
+    /* madeira-bcd thread-names: [xp-t] prints this thread as m<tid>~wineserver */
+    pthread_setname_np("wineserver");
+    __atomic_store_n(&g_wineserver_mach, pthread_mach_thread_np(pthread_self()), __ATOMIC_RELEASE);
     @autoreleasepool {
         // Set up file-based logging
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -130,6 +150,7 @@ static void *wineserver_thread_func(void *arg) {
 
         g_wineserver_running = 0;
     }
+    __atomic_store_n(&g_wineserver_mach, 0, __ATOMIC_RELEASE);
     return NULL;
 }
 

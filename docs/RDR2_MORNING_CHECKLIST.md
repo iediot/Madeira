@@ -97,3 +97,12 @@ The pacer's early version that slipped into 641b711c is fixed here; the pacer it
 ### Still to find out in the morning
 - The ~75 s loading screen: the game is idle at full clocks with modest reads, so it is waiting on
   something. One run with the wait probe (`env.MADEIRA_PERF = 1`) over the loading screen names it.
+
+### App-side threads (Swift, WineServerBridge.m, server_ios.c)
+| Change | Default | Off switch |
+|---|---|---|
+| Native thread names in `[xp-t]` (`m<tid>~wineserver`, `~main`) | on | `env.MADEIRA_XP_TNAMES = 0` |
+| `[app-cpu]` main thread / wineserver CPU every 30 s | on | madeira.cfg `env.MADEIRA_APP_CPU_LOG = 0` |
+| ProMotion display link on its own thread (MAX/RAW/40 caps only) | on | madeira.cfg `env.MADEIRA_PROMOTE_LINK_THREAD = 0` (suspect if pacing changes at those caps) |
+| Developer FPS overlay single 4 Hz tick | on | madeira.cfg `env.MADEIRA_HUD_LEAN = 0` |
+| Log-tail poll parked while log display is paused | on | madeira.cfg `env.MADEIRA_UI_LOG_IDLE_POLL = 0` |

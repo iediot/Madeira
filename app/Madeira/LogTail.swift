@@ -18,14 +18,29 @@ final class LogTail {
         queue.async { [weak self] in
             guard let self, self.displayPaused != paused else { return }
             self.displayPaused = paused
-            if paused { self.source?.suspend() }
+            if paused {
+                self.source?.suspend()
+                self.parkPollTimer()
+            }
             else {
                 // Hidden lines remain in the file, but need not be parsed later.
                 if self.fd >= 0 { lseek(self.fd, 0, SEEK_END) }
                 self.lineBuffer.removeAll(keepingCapacity: true)
                 self.source?.resume()
+                self.pollTimer?.schedule(deadline: .now() + 0.25, repeating: 0.25)
             }
         }
+    }
+
+    /// madeira-bcd app-lean (2026-11-27): while display parsing is paused (a game
+    /// session with the log hidden, MADEIRA_UI_LOG_IDLE) the 250 ms backup poll only
+    /// woke this queue to return at once, four times a second; it is rescheduled to
+    /// never fire and back to 250 ms when parsing resumes (rescheduling, not suspending,
+    /// so no suspend count has to balance at stop). madeira.cfg
+    /// `env.MADEIRA_UI_LOG_IDLE_POLL = 0`: it keeps firing, as before. Queue only.
+    private func parkPollTimer() {
+        guard displayPaused, MadeiraConfig.flag("MADEIRA_UI_LOG_IDLE_POLL") else { return }   // log tail backup poll parked while display parsing is paused; 0 = keeps firing
+        pollTimer?.schedule(deadline: .distantFuture, repeating: .never)
     }
 
     init(path: String, onLine: @escaping (String) -> Void) {
@@ -99,6 +114,7 @@ final class LogTail {
         }
         t.resume()
         pollTimer = t
+        parkPollTimer()   // paused before the file opened
     }
 
     private func readAvailable() {

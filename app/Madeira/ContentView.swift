@@ -2762,6 +2762,7 @@ struct ContentView: View {
             heartbeatCount += 1
             os_log("[HEARTBEAT] main thread alive #%d", heartbeatCount)
         }
+        AppCPULog.start()   // madeira-bcd app-cpu: [app-cpu] every 30 s (FPSOverlay.swift)
 
         // Pause UI flushing — prevents ALL SwiftUI re-renders during Wine execution,
         // so zero main thread hang time accumulates while debugger is attached

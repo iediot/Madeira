@@ -16,6 +16,10 @@ int wineserver_is_running(void);
  * its main loop: the point from which Wine may start. */
 int wineserver_is_ready(void);
 
+/* madeira-bcd app-cpu: the server thread's CPU time so far (user + system), in
+ * microseconds, or -1 while no server thread runs. Any thread. */
+long long wineserver_thread_cpu_us(void);
+
 // Stop the wineserver (signals the thread to exit)
 void wineserver_stop(void);
 
