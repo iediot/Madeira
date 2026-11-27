@@ -1154,7 +1154,7 @@ struct LibraryEntry: Codable, Identifiable {
             env.MADEIRA_WAIT_FLOOR = SocialClubHelper.exe=50
             env.MADEIRA_WAIT_FLOOR_AFTER = RDR2.exe:180
             env.MADEIRA_SC_HIDE = 1
-            env.MADEIRA_SC_PARK = 1
+            env.MADEIRA_SC_PARK = 2
             env.MADEIRA_SPIN_PC_NAMES = Chrome_InProcRendererThread
             env.MADEIRA_SPIN_PC = 1
             env.MADEIRA_YIELD_ESCALATE = RDR2.exe

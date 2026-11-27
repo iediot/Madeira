@@ -197,3 +197,13 @@ What to compare between A and B:
   later, followed by `[thread-qos] <tid> (process rule, deferred) -> utility` lines for the helper's threads.
 - Gameplay after the arming should match A (same classes from then on); a slower first 3 minutes of
   gameplay in B would mean the helper at default QoS costs the game more than the dead zone saves.
+
+### Review notes (two read-only reviews, 2026-11-27 night)
+- No confirmed hang, deadlock or corruption in any overnight change.
+- Social Club park now uses 2 s slices (`env.MADEIRA_SC_PARK = 2`): a helper reply behind a
+  non-alertable Sleep or a polled pipe can't be lifted, so a caller (launcher heartbeat, game IPC) could
+  wait a whole slice. Watch for `[sc-park] WATCHDOG`, many `[sc-park] lifted`, or a launcher disconnect
+  message; any of those: `env.MADEIRA_SC_PARK = 0`. If the 2 s run is clean, try `= 5`.
+- Social Club overlay opened in play: may be blank for a few seconds and re-hides after 120 s
+  (`env.MADEIRA_SC_HIDE = 0` if you need the overlay).
+- `[pgw]` sampler runs for every game (diagnostic; `env.MADEIRA_PGW = 0` to remove its cost).

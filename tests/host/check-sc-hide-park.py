@@ -432,10 +432,10 @@ check('madeira_sc_park_demands' in sm and 'current->process != thread->process' 
 check('ios_sc_xp_row( th[k]' in server and 'ios_sc_xp_window( dt_ms )' in server, '[sc-cpu] wired into the xprobe loop')
 check('ios_thread_name_note(' in (root / 'build/ntdll-unix/thread_ios.c').read_text(), 'thread names published')
 rdr2 = section(library, 'case "rdr2.exe", "playrdr2.exe":', 'case "gta5_enhanced.exe"')
-for line in ('env.MADEIRA_SC_HIDE = 1', 'env.MADEIRA_SC_PARK = 1', 'env.MADEIRA_SPIN_PC_NAMES = Chrome_InProcRendererThread',
+for line in ('env.MADEIRA_SC_HIDE = 1', 'env.MADEIRA_SC_PARK = 2', 'env.MADEIRA_SPIN_PC_NAMES = Chrome_InProcRendererThread',
              'env.MADEIRA_WAIT_FLOOR_AFTER = RDR2.exe:180'):
     check(line in rdr2, 'RDR2 profile: ' + line)
-check(len(re.findall(r'^\s*env\.MADEIRA_SC_PARK = 1$', library, re.M)) == 1 and
+check(len(re.findall(r'^\s*env\.MADEIRA_SC_PARK = 2$', library, re.M)) == 1 and
       len(re.findall(r'^\s*env\.MADEIRA_SC_HIDE = 1$', library, re.M)) == 1, 'enabled only in the RDR2 profile')
 
 shutil.rmtree(tmp, ignore_errors=True)
