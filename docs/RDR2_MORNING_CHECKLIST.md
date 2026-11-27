@@ -124,3 +124,17 @@ wait-any fast path for RDR2.exe`, `[fastsync] ml2120 server: semaphore cells for
 (first from pid …)` (RDR2's pid), and every 30 s `[fastsync] ml2120 multi-wait 30s: … no server N …`.
 Compare `[srv-req]` req29/req41/req31 and `select by shape … first object: semaphore` with the 01:05 log.
 Must not appear: `[fastsync] desync: … kind=sem`.
+
+### Page waits and the ~1 s freezes (virtual_ios.c swap tier, madeira-d3d12)
+Finding: 6 of the 7 slowest deferred swap-file F_PUNCHHOLE calls (0.7-2.1 s) were followed by a
+Present gap of about the same length. Likely cause: the swap tier's disk-cap fstat runs under the VM
+lock and waits behind the punch, so every Wine VM operation stalls. These are the drops followed by a
+burst to 60.
+| Change | Default | Off switch |
+|---|---|---|
+| Disk-cap check reads a cached swap-file size (refreshed off the lock every 250 ms) | on | `env.MADEIRA_SWAP_DISK_CACHE = 0` |
+| Hot decommit/recommit of ≤1 MB resident ranges zeroed in place instead of rotated | on | `env.MADEIRA_SWAP_ZERO_INPLACE = 0` (bug if any `*** NOT ZEROED ***` with branch=swap-inplace) |
+| `[pgw]` page-wait sampler and per-cause split every 2 s | on | `env.MADEIRA_PGW = 0` (also disables the disk cache refresher) |
+| WILLNEED prefetch | off | enable: `env.MADEIRA_PGW_PREFETCH_KB = 512` |
+| Upload buffers off the file tier | off | enable: `upload-anon-mb = 256` (adds up to 256 MB to the footprint) |
+Check: `[swap] ml1291 F_PUNCHHOLE (deferred) … took` should no longer line up with `[present-api-hitch] entry_gap_ms` of ~1 s.

@@ -22143,6 +22143,10 @@ void madeira_swap_overlay_stats( unsigned long long *file_mb, unsigned long long
 }
 /* madeira-bcd swap-images: image sections in the file now / at most, sections backed, refused */
 static unsigned long long ios_swap_img_bytes, ios_swap_img_peak, ios_swap_img_backs, ios_swap_img_refused;
+/* madeira-bcd pgw: for the [pgw] window line (ios_pgw_thread): bytes given fresh zero
+ * backing by decommit rotation, and F_PUNCHHOLE calls and their time (worker and
+ * synchronous callers alike, so updated atomically). Counters only. */
+static unsigned long long ios_swap_rotate_bytes, ios_swap_punch_calls, ios_swap_punch_ns;
 
 /* COVERAGE, FREE-SPACE REUSE AND A LOW-VOLUME CENSUS (only while the tier is on).
  *
@@ -22436,7 +22440,12 @@ static int ios_swap_punch_timed( uint64_t off, uint64_t len, const char *why )
         if (said++ < 8) dprintf( 2, "[swap] ml1291 F_PUNCHHOLE (%s) off=%llu len=%llu failed errno=%d\n",
                                  why, (unsigned long long)off, (unsigned long long)len, errno );
     }
-    ms = (ios_swap_now_ns() - t0) / 1000000;
+    {   /* madeira-bcd pgw: punch count and time for the [pgw] line */
+        uint64_t took = ios_swap_now_ns() - t0;
+        __atomic_add_fetch( &ios_swap_punch_calls, 1, __ATOMIC_RELAXED );
+        __atomic_add_fetch( &ios_swap_punch_ns, took, __ATOMIC_RELAXED );
+        ms = took / 1000000;
+    }
     if (ms > ios_swap_punch_max_ms) ios_swap_punch_max_ms = ms;
     if (ms >= 100 && (++ios_swap_punch_slow <= 16 || (ios_swap_punch_slow % 64) == 0))
         dprintf( 2, "[swap] ml1291 F_PUNCHHOLE (%s) off=%llu len=%llu took %llu ms (%llu slow, max %llu ms)\n",
@@ -22704,8 +22713,10 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     char *hs = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
     char *he = (char *)(((uintptr_t)base + size) & ~(uintptr_t)host_page_mask);
     size_t len; uint64_t off; void *p;
+    uint64_t map_t0;   /* madeira-bcd pgw: a backing that takes 20 ms or more under the VM lock is logged */
     if (he <= hs) return IOS_SW_SMALL;
     if (ios_swap_n >= 16384) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
+    map_t0 = ios_swap_now_ns();
     /* ml1257: in broad the cap is the disk the sparse file really occupies */
     if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
@@ -22718,6 +22729,13 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
         if (said++ < 8) dprintf( 2, "[swap] ml1077 mmap MAP_SHARED %p+0x%zx failed errno=%d (range stays anonymous)\n", hs, len, errno );
         ios_swap_give( off, len );
         return IOS_SW_MAPFAIL;
+    }
+    {
+        uint64_t map_ms = (ios_swap_now_ns() - map_t0) / 1000000;
+        static unsigned map_slow;
+        if (map_ms >= 20 && (++map_slow <= 32 || !(map_slow % 128)))
+            dprintf( 2, "[swap] backing %p+0x%zx took %llu ms under the VM lock (disk check + mmap; %u slow)\n",
+                     hs, len, (unsigned long long)map_ms, map_slow );
     }
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
     ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size; ios_swap_ext[ios_swap_n].img = 0;
@@ -22933,6 +22951,7 @@ static int ios_swap_rotate_resv( unsigned i, char *lo, size_t len )
     replacement.va = lo; replacement.len = len; replacement.off = off;
     ios_swap_ext[ios_swap_n++] = replacement;
     ios_swap_rotate_merged += pieces - 1;
+    ios_swap_rotate_bytes += len;   /* madeira-bcd pgw */
     t3 = ios_swap_now_ns();
     if (t3 - begin >= 20000000)
     {
@@ -23328,11 +23347,69 @@ static unsigned long long ios_swap_footprint_mb( void )
     return (unsigned long long)vmi.phys_footprint >> 20;
 }
 /* ml1257: the disk the sparse file really occupies (fstat: no page touches) */
-static unsigned long long ios_swap_disk_used( void )
+/* madeira-bcd disk-cache: the broad tier's disk cap is checked on every new backing
+ * (ios_swap_map, ios_swap_image_take) with virtual_mutex held, by an fstat of the
+ * swap file. In RDR2's log 1127-0105-wave1, six of the seven deferred F_PUNCHHOLEs of
+ * 0.7-2.1 s were followed at once by a 0.9-1.3 s Present gap (2131 ms -> 1337 ms,
+ * 840 -> 1071, 1724 -> 1249, 744 -> 1104, 1231 -> 1110, 1119 -> 933) with the window's
+ * CPU halved and page wait mostly unchanged: threads waiting for the virtual lock,
+ * not for pages. The worker holds no lock while it punches, but an fstat (APFS
+ * getattr) of the same file can wait for the punch, and it runs with the lock held.
+ * With env.MADEIRA_SWAP_DISK_CACHE on (default 1) the check uses the size the [pgw]
+ * thread reads off the lock every 250 ms (fresh for 10 s; older, or with
+ * env.MADEIRA_PGW=0, the fstat under the lock as before). The cap was already soft
+ * (checked when a block is backed, not when its pages are written back); this makes
+ * it up to 10 s late. 0 = fstat every time, as before. fstats of 20 ms or more are
+ * logged either way. */
+static unsigned long long ios_swap_disk_cached, ios_swap_disk_cache_hits;
+static uint64_t ios_swap_disk_stamp;   /* ns of the last off-lock fstat; 0 = none yet */
+static int ios_swap_disk_cache = -1;
+static unsigned long long ios_swap_disk_fstat( void )
 {
     struct stat st;
     if (ios_swap_fd < 0 || fstat( ios_swap_fd, &st )) return 0;
     return (unsigned long long)st.st_blocks * 512;
+}
+/* the [pgw] thread, no lock held */
+static void ios_swap_disk_refresh( void )
+{
+    unsigned long long v;
+    if (ios_swap_fd < 0) return;
+    v = ios_swap_disk_fstat();
+    __atomic_store_n( &ios_swap_disk_cached, v, __ATOMIC_RELAXED );
+    __atomic_store_n( &ios_swap_disk_stamp, ios_swap_now_ns(), __ATOMIC_RELEASE );
+}
+static unsigned long long ios_swap_disk_used( void )
+{
+    unsigned long long v;
+    uint64_t t0, ms;
+    if (ios_swap_fd < 0) return 0;
+    if (ios_swap_disk_cache < 0)
+    {
+        /* broad swap tier's disk-cap check from a size read off the virtual lock (default 1; 0 = fstat under the lock) */
+        const char *e = getenv( "MADEIRA_SWAP_DISK_CACHE" );
+        ios_swap_disk_cache = !(e && e[0] == '0');
+    }
+    if (ios_swap_disk_cache)
+    {
+        uint64_t stamp = __atomic_load_n( &ios_swap_disk_stamp, __ATOMIC_ACQUIRE );
+        if (stamp && ios_swap_now_ns() - stamp < 10000000000ull)
+        {
+            ios_swap_disk_cache_hits++;
+            return __atomic_load_n( &ios_swap_disk_cached, __ATOMIC_RELAXED );
+        }
+    }
+    t0 = ios_swap_now_ns();
+    v = ios_swap_disk_fstat();
+    ms = (ios_swap_now_ns() - t0) / 1000000;
+    if (ms >= 20)
+    {
+        static unsigned slow;
+        if (++slow <= 32 || !(slow % 128))
+            dprintf( 2, "[swap] disk-cache: fstat of the swap file took %llu ms (%u slow)%s\n", (unsigned long long)ms, slow,
+                     ios_swap_disk_cache ? " -- no fresh size from the [pgw] thread" : " -- env.MADEIRA_SWAP_DISK_CACHE=0" );
+    }
+    return v;
 }
 
 /* ml1257: madeira.cfg swap-mode = 2 selects broad coverage (when
@@ -23449,6 +23526,650 @@ static void ios_swap_image_flush( int ok )
     }
 }
 
+/* madeira-bcd zero-inplace and pgw: HOT DECOMMIT CYCLES AND PAGE-WAIT ATTRIBUTION.
+ *
+ * RDR2 on the iPhone (log 1127-0105-wave1, swap-mode 2, broad coverage) decommitted
+ * ~1500 ranges a second (622,592 in ~7 minutes, mostly 64-512 KB) inside its
+ * file-backed reservations. Each one rotates (ios_swap_rotate_resv): msync
+ * MS_KILLPAGES, a MAP_FIXED mmap of fresh sparse offsets, and a deferred F_PUNCHHOLE
+ * of the old ones on the worker, some of which took 0.7-2.1 s. Every page of the range
+ * touched after the recommit is then a page-in of a file hole. Page wait (the [xp]
+ * line's pgw) jumped from 5-40 ms to 178-697 ms per ~2 s window, pageins ran far
+ * ahead of disk reads (01:00:22: 21,547 pageins against 111 MB read), and the
+ * windows right after the two slowest punches were the worst (475 and 697 ms).
+ *
+ * zero-inplace (env.MADEIRA_SWAP_ZERO_INPLACE, default 1; 0 = every decommit
+ * rotates exactly as before): a decommit of a range whose same base was decommitted
+ * and then recommitted within MADEIRA_SWAP_ZERO_HOT_MS (default 2000), that lies in
+ * one file-backed reservation extent, is at most MADEIRA_SWAP_ZERO_INPLACE_KB
+ * (default 1024) long, has every 4 KB page committed read-write (no guard, write
+ * watch, exec or write-copy: nothing the emulator has armed) and every host page
+ * resident (mincore), is zeroed with memset where it is instead. Same file offsets,
+ * no msync, no mmap, no punch, and the recommit's touches find resident pages. The
+ * zero contract is the same (decommit_pages reads it back as for mmap-over). File
+ * pages are not charged to phys_footprint, so jetsam's number does not move; the
+ * pages stay resident only until iOS writes them back, as any dirty file page.
+ * Ranges that are not hot keep rotating, so cold memory still goes back as holes.
+ * The only page touches under virtual_mutex are memsets of pages mincore just
+ * found resident (the edge zeroing already memsets committed pages there).
+ *
+ * pgw (env.MADEIRA_PGW, default 1; 0 = no thread, no line, no bookkeeping): a
+ * host thread prints a [pgw] line every MADEIRA_PGW_WINDOW_MS (2000): the
+ * process's page wait, pageins, page-cache hits, bytes read, faults, COW and
+ * decompressions; the tier's rotations, in-place zeroings (and why others were
+ * not), punches and their time, and how soon decommitted ranges were committed
+ * again. Every MADEIRA_PGW_SAMPLE_MS (20; 0 = counters only) it looks at the
+ * threads that ran in the last second and, for each one the kernel reports
+ * uninterruptible (and, every second sweep, up to 12 waiting ones: a user fault
+ * waits interruptibly for a page another thread is bringing in; one whose PC is
+ * just after an svc is in a syscall and is skipped), decodes the instruction at its
+ * PC (arm64_mem_ea.h) and names the memory: a syscall (by number), a swap-file page
+ * that is a hole (zero fill) or holds data (a read), resident (busy), an image
+ * section in the file, compressed anonymous memory, another file, anonymous memory
+ * not yet there (zero fill) or present (a busy page, or a protection fault waiting
+ * for its Mach exception reply), or an instruction page that is not resident. No
+ * thread is suspended (thread_get_state holds a thread that is already blocked for
+ * the copy of its registers); a sample costs a few Mach calls.
+ * Samples x period approximate the uninterruptible thread time per cause. The top
+ * threads (Wine tid, Mach thread id and name), the top 1 MB sites and syscalls
+ * follow.
+ *
+ * prefetch (env.MADEIRA_PGW_PREFETCH_KB, default 0 = off): when a sample finds a
+ * thread waiting for a swap-file page that holds data, madvise(MADV_WILLNEED) the
+ * next N KB of that extent (at most 32 a window, only with 1.5 GB or more of
+ * os_proc_available_memory, and only after checking the extent under the virtual
+ * lock: WILLNEED on anonymous memory would fault all of it in). Candidates are
+ * counted while it is off. */
+#include <sys/resource.h>
+#include <pthread/qos.h>
+#include <mach/mach_time.h>
+#include "arm64_mem_ea.h"
+extern int proc_pid_rusage( int pid, int flavor, rusage_info_t *buffer );
+extern size_t os_proc_available_memory( void );
+/* in libsystem_kernel, not in the iOS SDK headers (perf_ios.c calls it too) */
+extern kern_return_t mach_vm_page_query( vm_map_t map, mach_vm_offset_t offset, integer_t *disposition, integer_t *ref_count );
+extern int ios_thread_registry_count( void );
+extern uintptr_t ios_thread_registry_teb( int i );
+extern thread_t ios_thread_registry_mach( int i );
+
+static int ios_pgw_cfg_done;
+static int ios_pgw_on;               /* MADEIRA_PGW */
+static unsigned ios_pgw_sample_ms;   /* MADEIRA_PGW_SAMPLE_MS */
+static unsigned ios_pgw_window_ms;   /* MADEIRA_PGW_WINDOW_MS */
+static unsigned ios_pgw_pf_kb;       /* MADEIRA_PGW_PREFETCH_KB */
+static int ios_swap_zip;             /* MADEIRA_SWAP_ZERO_INPLACE */
+static size_t ios_swap_zip_max;      /* MADEIRA_SWAP_ZERO_INPLACE_KB */
+static uint64_t ios_swap_zip_hot_ns; /* MADEIRA_SWAP_ZERO_HOT_MS */
+
+static long ios_pgw_num( const char *e, long def, long lo, long hi )
+{
+    long v;
+    if (!e || !*e) return def;
+    v = strtol( e, NULL, 10 );
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+static void ios_pgw_config( void )
+{
+    if (ios_pgw_cfg_done) return;
+    ios_pgw_cfg_done = 1;
+    /* [pgw] page-wait attribution line every ~2 s (default 1; 0 = no thread, no line, no bookkeeping) */
+    ios_pgw_on = ios_pgw_num( getenv( "MADEIRA_PGW" ), 1, 0, 1 );
+    /* [pgw] thread-state sample period in ms (default 20; 0 = process counters only) */
+    ios_pgw_sample_ms = ios_pgw_num( getenv( "MADEIRA_PGW_SAMPLE_MS" ), 20, 0, 1000 );
+    /* [pgw] window in ms (default 2000) */
+    ios_pgw_window_ms = ios_pgw_num( getenv( "MADEIRA_PGW_WINDOW_MS" ), 2000, 250, 60000 );
+    /* KB to MADV_WILLNEED after a sampled read of a swap-file page (default 0 = off) */
+    ios_pgw_pf_kb = ios_pgw_num( getenv( "MADEIRA_PGW_PREFETCH_KB" ), 0, 0, 4096 );
+    /* hot swap-tier decommits zeroed in place instead of rotated (default 1; 0 = every decommit rotates) */
+    ios_swap_zip = ios_pgw_num( getenv( "MADEIRA_SWAP_ZERO_INPLACE" ), 1, 0, 1 );
+    /* largest decommit zero-inplace takes, in KB (default 1024) */
+    ios_swap_zip_max = (size_t)ios_pgw_num( getenv( "MADEIRA_SWAP_ZERO_INPLACE_KB" ), 1024, 16, 4096 ) << 10;
+    /* how soon a decommitted-and-recommitted base must be decommitted again to count as hot, ms (default 2000) */
+    ios_swap_zip_hot_ns = (uint64_t)ios_pgw_num( getenv( "MADEIRA_SWAP_ZERO_HOT_MS" ), 2000, 1, 60000 ) * 1000000ull;
+}
+
+/* The decommit/recommit table: one slot per host-page-aligned base (direct-mapped,
+ * a collision just forgets the older base). virtual_mutex held for every access. */
+#define IOS_SWAP_CYC_N 4096
+static struct { uintptr_t base; uint64_t t_dec, t_rec; } ios_swap_cyc[IOS_SWAP_CYC_N];
+enum { IOS_ZIP_COLD, IOS_ZIP_BIG, IOS_ZIP_EXTENT, IOS_ZIP_PROT, IOS_ZIP_NOTRES, IOS_ZIP_SKIPS };
+static unsigned long long ios_swap_zip_n, ios_swap_zip_bytes, ios_swap_zip_skip[IOS_ZIP_SKIPS];
+/* recommits of a decommitted base after <1 ms, <10 ms, <100 ms, <1 s, <10 s, later */
+static unsigned long long ios_swap_cyc_decs, ios_swap_cyc_rec[6];
+
+static inline unsigned ios_swap_cyc_slot( uintptr_t b )
+{
+    return (unsigned)(((b >> 14) * 0x9E3779B97F4A7C15ull) >> 52) & (IOS_SWAP_CYC_N - 1);
+}
+
+static int ios_swap_cyc_on( void )
+{
+    ios_pgw_config();
+    return ios_swap_fd >= 0 && (ios_pgw_on || ios_swap_zip);
+}
+
+/* A commit of [base, ...) succeeded: if its base was decommitted and not committed
+ * since, note when (and how soon). virtual_mutex held. */
+static void ios_swap_cyc_recommit( const void *base )
+{
+    uintptr_t b = ((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask;
+    unsigned s;
+    uint64_t now, lat;
+    int k;
+    if (!ios_swap_cyc_on()) return;
+    s = ios_swap_cyc_slot( b );
+    if (ios_swap_cyc[s].base != b || !ios_swap_cyc[s].t_dec || ios_swap_cyc[s].t_rec) return;
+    now = ios_swap_now_ns();
+    ios_swap_cyc[s].t_rec = now;
+    lat = now - ios_swap_cyc[s].t_dec;
+    k = lat < 1000000ull ? 0 : lat < 10000000ull ? 1 : lat < 100000000ull ? 2 :
+        lat < 1000000000ull ? 3 : lat < 10000000000ull ? 4 : 5;
+    ios_swap_cyc_rec[k]++;
+}
+
+/* Decommit of the host-page interior [lo, lo+len): 1 = zeroed in place (see above),
+ * 0 = the caller rotates/releases as before. Records the decommit either way.
+ * virtual_mutex held. */
+static int ios_swap_zero_inplace( char *lo, size_t len )
+{
+    uintptr_t b = (uintptr_t)lo;
+    unsigned s, i;
+    uint64_t now;
+    int hot;
+    char *p;
+    if (!len || !ios_swap_n || !ios_swap_cyc_on()) return 0;
+    now = ios_swap_now_ns();
+    s = ios_swap_cyc_slot( b );
+    hot = ios_swap_cyc[s].base == b && ios_swap_cyc[s].t_dec && ios_swap_cyc[s].t_rec >= ios_swap_cyc[s].t_dec &&
+          now - ios_swap_cyc[s].t_dec <= ios_swap_zip_hot_ns;
+    ios_swap_cyc[s].base = b;
+    ios_swap_cyc[s].t_dec = now;
+    ios_swap_cyc[s].t_rec = 0;
+    ios_swap_cyc_decs++;
+    if (!ios_swap_zip) return 0;
+    if (!hot) { ios_swap_zip_skip[IOS_ZIP_COLD]++; return 0; }
+    if (len > ios_swap_zip_max || (len & host_page_mask) || (b & host_page_mask)) { ios_swap_zip_skip[IOS_ZIP_BIG]++; return 0; }
+    for (i = 0; i < ios_swap_n; i++)
+        if (ios_swap_ext[i].resv && !ios_swap_ext[i].img && lo >= ios_swap_ext[i].va &&
+            lo + len <= ios_swap_ext[i].va + ios_swap_ext[i].len) break;
+    if (i == ios_swap_n) { ios_swap_zip_skip[IOS_ZIP_EXTENT]++; return 0; }
+    for (p = lo; p < lo + len; p += page_size)
+    {
+        BYTE v = get_page_vprot( p );
+        if ((v & (VPROT_COMMITTED | VPROT_WRITE | VPROT_GUARD | VPROT_WRITEWATCH | VPROT_EXEC | VPROT_WRITECOPY)) !=
+            (VPROT_COMMITTED | VPROT_WRITE)) { ios_swap_zip_skip[IOS_ZIP_PROT]++; return 0; }
+    }
+    {
+        char vec[4096 / 16];   /* ios_swap_zip_max <= 4 MB of 16 KB pages */
+        size_t np = len / (host_page_mask + 1), k;
+        if (np > sizeof(vec) || mincore( lo, len, (void *)vec )) { ios_swap_zip_skip[IOS_ZIP_NOTRES]++; return 0; }
+        for (k = 0; k < np; k++)
+            if (!(vec[k] & MINCORE_INCORE) || (vec[k] & MINCORE_PAGED_OUT)) { ios_swap_zip_skip[IOS_ZIP_NOTRES]++; return 0; }
+    }
+    memset( lo, 0, len );
+    ios_swap_zip_n++;
+    ios_swap_zip_bytes += len;
+    if (ios_swap_zip_n <= 4 || !(ios_swap_zip_n % 65536))
+        dprintf( 2, "[swap] zero-inplace #%llu %p+0x%zx: hot decommit zeroed where it is (no rotation, no punch; "
+                    "env.MADEIRA_SWAP_ZERO_INPLACE=0 rotates every decommit)\n", ios_swap_zip_n, lo, len );
+    return 1;
+}
+
+/* ---- [pgw] sampler ---- */
+enum { PGW_SYS, PGW_SWAP_ZF, PGW_SWAP_RD, PGW_SWAP_RES, PGW_IMG, PGW_ANON_CMP, PGW_FILE, PGW_ANON, PGW_PRESENT,
+       PGW_IFETCH, PGW_OTHER, PGW_UNK, PGW_N };
+static const char * const ios_pgw_cls_name[PGW_N] =
+    { "sys", "swap-zf", "swap-rd", "swap-res", "img", "anon-cmp", "file", "anon-zf", "present", "ifetch", "other", "unk" };
+
+#define IOS_PGW_THR 32
+#define IOS_PGW_SITE 32
+#define IOS_PGW_SYS 16
+static struct
+{
+    unsigned sweeps, checked, unint, waitf, cls[PGW_N];
+    struct { uint64_t tid; uint32_t wtid; unsigned n, cls[PGW_N]; char name[16]; } thr[IOS_PGW_THR];
+    unsigned nthr, thr_lost;
+    struct { int cls; uint64_t mb; unsigned n; } site[IOS_PGW_SITE];
+    unsigned nsite;
+    struct { long nr; unsigned n; } sys[IOS_PGW_SYS];
+    unsigned nsys;
+    unsigned pf_cand, pf_issued, pf_busy, pf_low;
+    unsigned long long pf_bytes;
+    double lag_max_ms;
+} ios_pgw_w;
+
+struct ios_pgw_snap
+{
+    uint64_t ns, pw, ru_pageins, hits, rd, fp;
+    integer_t faults, pageins, cow;
+    uint64_t decomp, compressed, external;
+    unsigned long long rot, rot_bytes, holes, zip, zip_bytes, zip_skip[IOS_ZIP_SKIPS], punch_calls, punch_ns,
+                       pq_done, slow, backs, releases, decs, rec[6], swap_bytes, dchits;
+};
+
+static void ios_pgw_take( struct ios_pgw_snap *s )
+{
+    struct rusage_info_v6 ru;
+    task_events_info_data_t ev;
+    task_vm_info_data_t vm;
+    mach_msg_type_number_t n;
+    int i;
+    memset( s, 0, sizeof(*s) );
+    s->ns = ios_swap_now_ns();
+    memset( &ru, 0, sizeof(ru) );
+    if (!proc_pid_rusage( getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&ru ))
+    {
+#ifdef MADEIRA_HAVE_RUSAGE_PAGE_WAIT_TIME_MACH
+        s->pw = ru.ri_page_wait_time_mach;
+#endif
+        s->hits = ru.ri_page_cache_hits;
+        s->ru_pageins = ru.ri_pageins;
+        s->rd = ru.ri_diskio_bytesread;
+        s->fp = ru.ri_phys_footprint;
+    }
+    n = TASK_EVENTS_INFO_COUNT;
+    if (task_info( mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ev, &n ) == KERN_SUCCESS)
+    { s->faults = ev.faults; s->pageins = ev.pageins; s->cow = ev.cow_faults; }
+    n = TASK_VM_INFO_COUNT;
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n ) == KERN_SUCCESS)
+    {
+        s->compressed = vm.compressed;
+        s->external = vm.external;
+        if (n >= TASK_VM_INFO_REV5_COUNT) s->decomp = vm.decompressions;
+    }
+    /* the tier's counters, read without the lock: aligned 64-bit loads, a window may be off by one */
+    s->rot = ios_swap_rotations; s->rot_bytes = ios_swap_rotate_bytes; s->holes = ios_swap_holes;
+    s->zip = ios_swap_zip_n; s->zip_bytes = ios_swap_zip_bytes;
+    for (i = 0; i < IOS_ZIP_SKIPS; i++) s->zip_skip[i] = ios_swap_zip_skip[i];
+    s->punch_calls = __atomic_load_n( &ios_swap_punch_calls, __ATOMIC_RELAXED );
+    s->punch_ns = __atomic_load_n( &ios_swap_punch_ns, __ATOMIC_RELAXED );
+    s->pq_done = ios_swap_pq_done; s->slow = ios_swap_punch_slow;
+    s->backs = ios_swap_backs; s->releases = ios_swap_releases;
+    s->decs = ios_swap_cyc_decs;
+    for (i = 0; i < 6; i++) s->rec[i] = ios_swap_cyc_rec[i];
+    s->swap_bytes = ios_swap_bytes;
+    s->dchits = ios_swap_disk_cache_hits;
+}
+
+/* The extent containing addr (lock-free like ios_swap_diag_classify: a candidate). */
+static int ios_pgw_swap_find( uint64_t addr, uint64_t *va, uint64_t *len, uint64_t *off, int *img )
+{
+    unsigned i, n = ios_swap_n;
+    if (ios_swap_fd < 0) return 0;
+    if (n > 16384) n = 16384;
+    for (i = 0; i < n; i++)
+    {
+        uint64_t a = (uint64_t)(uintptr_t)ios_swap_ext[i].va, l = ios_swap_ext[i].len;
+        if (a && addr >= a && addr - a < l)
+        {
+            *va = a; *len = l; *off = ios_swap_ext[i].off + (addr - a); *img = ios_swap_ext[i].img;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Name the memory an uninterruptible thread is waiting for. *ea: the address (or PC). */
+static int ios_pgw_classify( thread_act_t t, uint64_t *ea, long *sysnr )
+{
+    arm_thread_state64_t st;
+    mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+    uint64_t regs[31], pc, sp, a, va, len, off, pg;
+    uint32_t insn[2];
+    mach_vm_size_t got = 0;
+    integer_t disp = 0, refs = 0;
+    unsigned bytes, k;
+    int img;
+    *ea = 0;
+    if (thread_get_state( t, ARM_THREAD_STATE64, (thread_state_t)&st, &n ) != KERN_SUCCESS) return PGW_UNK;
+    pc = arm_thread_state64_get_pc( st );
+    sp = arm_thread_state64_get_sp( st );
+    *ea = pc;
+    /* the instruction page first: reading it below would bring it in */
+    if (mach_vm_page_query( mach_task_self(), pc & ~(uint64_t)host_page_mask, &disp, &refs ) == KERN_SUCCESS &&
+        !(disp & VM_PAGE_QUERY_PAGE_PRESENT)) return PGW_IFETCH;
+    insn[0] = 0;
+    if ((pc & host_page_mask) < 4 ||
+        mach_vm_read_overwrite( mach_task_self(), pc - 4, 8, (mach_vm_address_t)(uintptr_t)insn, &got ) != KERN_SUCCESS || got != 8)
+    {
+        insn[0] = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), pc, 4, (mach_vm_address_t)(uintptr_t)&insn[1], &got ) != KERN_SUCCESS || got != 4)
+            return PGW_UNK;
+    }
+    if (insn[0] == 0xd4001001 || insn[0] == 0xd4000001)   /* svc #0x80 / #0 just before: a syscall */
+    {
+        *sysnr = (long)(int64_t)st.__x[16];
+        return PGW_SYS;
+    }
+    for (k = 0; k < 29; k++) regs[k] = st.__x[k];
+    regs[29] = arm_thread_state64_get_fp( st );
+    regs[30] = arm_thread_state64_get_lr( st );
+    if (!ios_arm64_mem_ea( insn[1], pc, regs, sp, &a, &bytes )) return PGW_OTHER;
+    *ea = a;
+    disp = 0;
+    if (mach_vm_page_query( mach_task_self(), a & ~(uint64_t)host_page_mask, &disp, &refs ) != KERN_SUCCESS) disp = 0;
+    if (ios_pgw_swap_find( a, &va, &len, &off, &img ))
+    {
+        off_t d;
+        if (img) return PGW_IMG;
+        if (disp & VM_PAGE_QUERY_PAGE_PRESENT) return PGW_SWAP_RES;
+        pg = off & ~(uint64_t)host_page_mask;
+        d = lseek( ios_swap_fd, (off_t)pg, SEEK_DATA );   /* data at pg: a read; a hole: a zero fill */
+        return d == (off_t)pg ? PGW_SWAP_RD : PGW_SWAP_ZF;
+    }
+    if (disp & VM_PAGE_QUERY_PAGE_PAGED_OUT) return PGW_ANON_CMP;
+    if (disp & VM_PAGE_QUERY_PAGE_EXTERNAL) return PGW_FILE;
+    /* present: a busy page, or a protection fault waiting for its Mach exception reply */
+    return (disp & VM_PAGE_QUERY_PAGE_PRESENT) ? PGW_PRESENT : PGW_ANON;
+}
+
+/* MADV_WILLNEED the next ios_pgw_pf_kb of the extent around a sampled read, never
+ * anonymous memory: the extent is checked again under the lock. */
+static void ios_pgw_prefetch( uint64_t a )
+{
+    uint64_t start = 0, end = 0;
+    unsigned i;
+    if (ios_pgw_w.pf_issued >= 32) return;
+    if (os_proc_available_memory() < (1536ull << 20)) { ios_pgw_w.pf_low++; return; }
+    if (pthread_mutex_trylock( &virtual_mutex )) { ios_pgw_w.pf_busy++; return; }
+    for (i = 0; i < ios_swap_n; i++)
+    {
+        uint64_t va = (uint64_t)(uintptr_t)ios_swap_ext[i].va, len = ios_swap_ext[i].len;
+        if (!ios_swap_ext[i].img && a >= va && a - va < len)
+        {
+            start = a & ~(uint64_t)host_page_mask;
+            end = start + ((uint64_t)ios_pgw_pf_kb << 10);
+            if (end > va + len) end = va + len;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &virtual_mutex );
+    if (end <= start) return;
+    madvise( (void *)(uintptr_t)start, end - start, MADV_WILLNEED );
+    ios_pgw_w.pf_issued++;
+    ios_pgw_w.pf_bytes += end - start;
+}
+
+static void ios_pgw_note( thread_act_t t, int cls, uint64_t ea, long sysnr, int waiting )
+{
+    thread_identifier_info_data_t idi;
+    mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+    uint64_t tid = 0, mb = ea >> 20;
+    unsigned i;
+    if (waiting) ios_pgw_w.waitf++;
+    else ios_pgw_w.unint++;
+    ios_pgw_w.cls[cls]++;
+    if (thread_info( t, THREAD_IDENTIFIER_INFO, (thread_info_t)&idi, &n ) == KERN_SUCCESS) tid = idi.thread_id;
+    for (i = 0; i < ios_pgw_w.nthr && ios_pgw_w.thr[i].tid != tid; i++) ;
+    if (i == ios_pgw_w.nthr)
+    {
+        if (i < IOS_PGW_THR)
+        {
+            thread_extended_info_data_t xi;
+            uint32_t ids[4] = { 0 };
+            int k, nr = ios_thread_registry_count();
+            memset( &ios_pgw_w.thr[i], 0, sizeof(ios_pgw_w.thr[i]) );
+            ios_pgw_w.thr[i].tid = tid;
+            n = THREAD_EXTENDED_INFO_COUNT;
+            if (thread_info( t, THREAD_EXTENDED_INFO, (thread_info_t)&xi, &n ) == KERN_SUCCESS)
+                memcpy( ios_pgw_w.thr[i].name, xi.pth_name, sizeof(ios_pgw_w.thr[i].name) - 1 );
+            for (k = 0; k < nr; k++)
+                if (ios_thread_registry_mach( k ) == t)
+                {
+                    uintptr_t teb = ios_thread_registry_teb( k );
+                    mach_vm_size_t got = 0;
+                    if (teb && mach_vm_read_overwrite( mach_task_self(), teb + 0x40, 16, (mach_vm_address_t)(uintptr_t)ids, &got ) == KERN_SUCCESS)
+                        ios_pgw_w.thr[i].wtid = ids[2];   /* ClientId.UniqueThread */
+                    break;
+                }
+            ios_pgw_w.nthr++;
+        }
+        else { ios_pgw_w.thr_lost++; i = IOS_PGW_THR; }
+    }
+    if (i < IOS_PGW_THR) { ios_pgw_w.thr[i].n++; ios_pgw_w.thr[i].cls[cls]++; }
+    if (cls == PGW_SYS)
+    {
+        for (i = 0; i < ios_pgw_w.nsys && ios_pgw_w.sys[i].nr != sysnr; i++) ;
+        if (i == ios_pgw_w.nsys && i < IOS_PGW_SYS) { ios_pgw_w.sys[i].nr = sysnr; ios_pgw_w.sys[i].n = 0; ios_pgw_w.nsys++; }
+        if (i < IOS_PGW_SYS) ios_pgw_w.sys[i].n++;
+    }
+    else if (cls != PGW_UNK)
+    {
+        for (i = 0; i < ios_pgw_w.nsite && (ios_pgw_w.site[i].cls != cls || ios_pgw_w.site[i].mb != mb); i++) ;
+        if (i == ios_pgw_w.nsite && i < IOS_PGW_SITE) { ios_pgw_w.site[i].cls = cls; ios_pgw_w.site[i].mb = mb; ios_pgw_w.site[i].n = 0; ios_pgw_w.nsite++; }
+        if (i < IOS_PGW_SITE) ios_pgw_w.site[i].n++;
+    }
+    if (cls == PGW_SWAP_RD)
+    {
+        ios_pgw_w.pf_cand++;
+        if (ios_pgw_pf_kb) ios_pgw_prefetch( ea );
+    }
+}
+
+static const char *ios_pgw_sys_name( long nr )
+{
+    switch (nr)
+    {
+    case 3: return "read"; case 4: return "write"; case 65: return "msync"; case 73: return "munmap";
+    case 74: return "mprotect"; case 75: return "madvise"; case 92: return "fcntl"; case 95: return "fsync";
+    case 153: return "pread"; case 154: return "pwrite"; case 197: return "mmap"; case 396: return "read_nc";
+    case 397: return "write_nc"; case 406: return "fcntl_nc"; case 414: return "pread_nc"; case 415: return "pwrite_nc";
+    case 515: return "ulock_wait"; case 544: return "ulock_wait2"; case -31: return "mach_msg"; case -32: return "mach_msg2";
+    case -36: return "sem_wait"; case -61: return "thread_switch"; case 189: return "fstat"; case 339: return "fstat64";
+    case 199: return "lseek"; case 301: return "psynch_mutexwait"; case 305: return "psynch_cvwait";
+    default: return NULL;
+    }
+}
+
+static void ios_pgw_emit( const struct ios_pgw_snap *a, const struct ios_pgw_snap *b, const mach_timebase_info_data_t *tb )
+{
+    char line[2600], wall[16];
+    size_t n = 0;
+    int i, j;
+    struct timeval tv;
+    struct tm tmv;
+    double dt = (b->ns - a->ns) / 1e6, period = ios_pgw_sample_ms;
+    double pw = tb->denom ? (double)(b->pw - a->pw) * tb->numer / tb->denom / 1e6 : 0;
+    unsigned order[IOS_PGW_THR];
+#define PUT(...) do { if (n < sizeof(line)) n += snprintf( line + n, sizeof(line) - n, __VA_ARGS__ ); } while (0)
+    gettimeofday( &tv, NULL );
+    localtime_r( &tv.tv_sec, &tmv );
+    snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
+    PUT( "[pgw] %s dt=%.0f pgw=%.1f pin=%llu hit=%llu rdKB=%llu faults=%d cow=%d decomp=%llu fpMB=%llu cmpMB=%llu extMB=%llu",
+         wall, dt, pw, (unsigned long long)(b->ru_pageins - a->ru_pageins), (unsigned long long)(b->hits - a->hits),
+         (unsigned long long)((b->rd - a->rd) >> 10), (int)(b->faults - a->faults), (int)(b->cow - a->cow),
+         (unsigned long long)(b->decomp - a->decomp), (unsigned long long)(b->fp >> 20),
+         (unsigned long long)(b->compressed >> 20), (unsigned long long)(b->external >> 20) );
+    if (ios_swap_fd >= 0)
+    {
+        PUT( " | swap rot=%llu/%lluMB inplace=%llu/%lluMB skip(cold/big/ext/prot/res)=%llu/%llu/%llu/%llu/%llu holes=%llu"
+             " punch=%llu/%.0fms done=%llu slow=%llu backs=%llu rel=%llu fileMB=%llu dcache=%llu | recommit<1ms/10/100/1s/10s/more=%llu/%llu/%llu/%llu/%llu/%llu of %llu",
+             b->rot - a->rot, (b->rot_bytes - a->rot_bytes) >> 20, b->zip - a->zip, (b->zip_bytes - a->zip_bytes) >> 20,
+             b->zip_skip[0] - a->zip_skip[0], b->zip_skip[1] - a->zip_skip[1], b->zip_skip[2] - a->zip_skip[2],
+             b->zip_skip[3] - a->zip_skip[3], b->zip_skip[4] - a->zip_skip[4], b->holes - a->holes,
+             b->punch_calls - a->punch_calls, (b->punch_ns - a->punch_ns) / 1e6, b->pq_done - a->pq_done, b->slow - a->slow,
+             b->backs - a->backs, b->releases - a->releases, b->swap_bytes >> 20, b->dchits - a->dchits,
+             b->rec[0] - a->rec[0], b->rec[1] - a->rec[1], b->rec[2] - a->rec[2], b->rec[3] - a->rec[3],
+             b->rec[4] - a->rec[4], b->rec[5] - a->rec[5], b->decs - a->decs );
+    }
+    if (period)
+    {
+        PUT( " | samp %u sweeps x%.0fms, %u checked, unint=%u wait-fault=%u (~%.0f ms):", ios_pgw_w.sweeps, period,
+             ios_pgw_w.checked, ios_pgw_w.unint, ios_pgw_w.waitf, ios_pgw_w.unint * period + ios_pgw_w.waitf * period * 2 );
+        for (i = 0; i < PGW_N; i++) if (ios_pgw_w.cls[i]) PUT( " %s=%u", ios_pgw_cls_name[i], ios_pgw_w.cls[i] );
+        for (i = 0; i < (int)ios_pgw_w.nthr; i++) order[i] = i;
+        for (i = 1; i < (int)ios_pgw_w.nthr; i++)
+            for (j = i; j > 0 && ios_pgw_w.thr[order[j]].n > ios_pgw_w.thr[order[j - 1]].n; j--)
+            { unsigned t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
+        if (ios_pgw_w.nthr) PUT( " | thr" );
+        for (i = 0; i < (int)ios_pgw_w.nthr && i < 6; i++)
+        {
+            int c, best = 0, second = -1;
+            const typeof(ios_pgw_w.thr[0]) *t = &ios_pgw_w.thr[order[i]];
+            for (c = 1; c < PGW_N; c++) if (t->cls[c] > t->cls[best]) best = c;
+            for (c = 0; c < PGW_N; c++) if (c != best && t->cls[c] && (second < 0 || t->cls[c] > t->cls[second])) second = c;
+            PUT( " %04x/%llu(%s):%u[%s %u", t->wtid, (unsigned long long)t->tid, t->name[0] ? t->name : "-", t->n,
+                 ios_pgw_cls_name[best], t->cls[best] );
+            if (second >= 0) PUT( ",%s %u", ios_pgw_cls_name[second], t->cls[second] );
+            PUT( "]" );
+        }
+        if (ios_pgw_w.thr_lost) PUT( " +%u more", ios_pgw_w.thr_lost );
+        if (ios_pgw_w.nsite) PUT( " | at" );
+        for (i = 0; i < 6; i++)
+        {
+            int best = -1, k;
+            for (k = 0; k < (int)ios_pgw_w.nsite; k++)
+                if (ios_pgw_w.site[k].n && (best < 0 || ios_pgw_w.site[k].n > ios_pgw_w.site[best].n)) best = k;
+            if (best < 0) break;
+            PUT( " %s@0x%llx:%u", ios_pgw_cls_name[ios_pgw_w.site[best].cls], (unsigned long long)(ios_pgw_w.site[best].mb << 20),
+                 ios_pgw_w.site[best].n );
+            ios_pgw_w.site[best].n = 0;
+        }
+        if (ios_pgw_w.nsys) PUT( " | sys" );
+        for (i = 0; i < 4; i++)
+        {
+            int best = -1, k;
+            const char *nm;
+            for (k = 0; k < (int)ios_pgw_w.nsys; k++)
+                if (ios_pgw_w.sys[k].n && (best < 0 || ios_pgw_w.sys[k].n > ios_pgw_w.sys[best].n)) best = k;
+            if (best < 0) break;
+            nm = ios_pgw_sys_name( ios_pgw_w.sys[best].nr );
+            if (nm) PUT( " %s:%u", nm, ios_pgw_w.sys[best].n );
+            else PUT( " %ld:%u", ios_pgw_w.sys[best].nr, ios_pgw_w.sys[best].n );
+            ios_pgw_w.sys[best].n = 0;
+        }
+        PUT( " | pf %u/%lluKB cand=%u busy=%u low=%u | lag=%.1fms", ios_pgw_w.pf_issued, ios_pgw_w.pf_bytes >> 10,
+             ios_pgw_w.pf_cand, ios_pgw_w.pf_busy, ios_pgw_w.pf_low, ios_pgw_w.lag_max_ms );
+    }
+#undef PUT
+    if (n >= sizeof(line)) n = sizeof(line) - 1;
+    line[n++] = '\n';
+    (void)!write( 2, line, n );
+}
+
+#define IOS_PGW_MAXTH 1024
+static void *ios_pgw_thread( void *arg )
+{
+    thread_act_array_t th = NULL, nt;
+    mach_msg_type_number_t nth = 0, nn, k, j, rr = 0;
+    unsigned waits_left;
+    static uint64_t cpu[IOS_PGW_MAXTH], ncpu[IOS_PGW_MAXTH];
+    static unsigned char active[IOS_PGW_MAXTH], nactive[IOS_PGW_MAXTH];
+    thread_t self = mach_thread_self();
+    mach_timebase_info_data_t tb;
+    struct ios_pgw_snap a, b;
+    uint64_t next_emit, next_refresh = 0, next_disk = 0;
+    unsigned sleep_ms = ios_pgw_sample_ms ? ios_pgw_sample_ms : ios_pgw_window_ms;
+    sigset_t all;
+    sigfillset( &all );
+    pthread_sigmask( SIG_BLOCK, &all, NULL );
+    pthread_setname_np( "madeira-pgw" );
+    pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+    mach_timebase_info( &tb );
+    ios_pgw_take( &a );
+    next_emit = a.ns + (uint64_t)ios_pgw_window_ms * 1000000ull;
+    for (;;)
+    {
+        uint64_t now, t0;
+        usleep( sleep_ms * 1000 );
+        now = ios_swap_now_ns();
+        if (ios_pgw_sample_ms)
+        {
+            t0 = now;
+            if (now >= next_refresh)
+            {
+                /* the thread list once a second; "active" = ran 1 ms or more since the last
+                 * list, is uninterruptible now, or is new */
+                next_refresh = now + 1000000000ull;
+                if (task_threads( mach_task_self(), &nt, &nn ) == KERN_SUCCESS)
+                {
+                    for (k = 0; k < nn && k < IOS_PGW_MAXTH; k++)
+                    {
+                        thread_basic_info_data_t bi;
+                        mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
+                        nactive[k] = 0; ncpu[k] = 0;
+                        if (nt[k] == self || thread_info( nt[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &bn ) != KERN_SUCCESS) continue;
+                        ncpu[k] = (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000ull +
+                                  bi.user_time.microseconds + bi.system_time.microseconds;
+                        nactive[k] = 1;
+                        for (j = 0; j < nth && j < IOS_PGW_MAXTH; j++)
+                            if (th[j] == nt[k])
+                            {
+                                nactive[k] = ncpu[k] - cpu[j] >= 1000 || bi.run_state == TH_STATE_UNINTERRUPTIBLE;
+                                break;
+                            }
+                    }
+                    for (k = 0; k < nth; k++) mach_port_deallocate( mach_task_self(), th[k] );
+                    if (th) vm_deallocate( mach_task_self(), (vm_address_t)th, nth * sizeof(*th) );
+                    th = nt; nth = nn;
+                    memcpy( cpu, ncpu, sizeof(cpu) );
+                    memcpy( active, nactive, sizeof(active) );
+                }
+            }
+            /* uninterruptible threads every sweep. A user page fault waits interruptibly
+             * (THREAD_ABORTSAFE) for a page another thread is bringing in, so waiting
+             * threads are looked at too, every second sweep and at most 12 a sweep: one
+             * whose PC is not just after an svc is in a fault, not a syscall. */
+            waits_left = (ios_pgw_w.sweeps & 1) ? 0 : 12;
+            for (j = 0; j < nth && j < IOS_PGW_MAXTH; j++)
+            {
+                thread_basic_info_data_t bi;
+                mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
+                k = (j + rr) % (nth < IOS_PGW_MAXTH ? nth : IOS_PGW_MAXTH);
+                if (!active[k]) continue;
+                ios_pgw_w.checked++;
+                if (thread_info( th[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &bn ) != KERN_SUCCESS) continue;
+                if (bi.run_state == TH_STATE_UNINTERRUPTIBLE ||
+                    (bi.run_state == TH_STATE_WAITING && waits_left && waits_left--))
+                {
+                    uint64_t ea = 0;
+                    long nr = 0;
+                    int cls = ios_pgw_classify( th[k], &ea, &nr ), waiting = bi.run_state != TH_STATE_UNINTERRUPTIBLE;
+                    if (!(waiting && (cls == PGW_SYS || cls == PGW_UNK || cls == PGW_OTHER)))
+                        ios_pgw_note( th[k], cls, ea, nr, waiting );
+                }
+            }
+            rr += 7;
+            ios_pgw_w.sweeps++;
+            now = ios_swap_now_ns();
+            if ((now - t0) / 1e6 > ios_pgw_w.lag_max_ms) ios_pgw_w.lag_max_ms = (now - t0) / 1e6;
+        }
+        if (now >= next_disk)   /* madeira-bcd disk-cache: the swap file's size, off the lock */
+        {
+            next_disk = now + 250000000ull;
+            ios_swap_disk_refresh();
+            now = ios_swap_now_ns();
+        }
+        if (now >= next_emit)
+        {
+            ios_pgw_take( &b );
+            ios_pgw_emit( &a, &b, &tb );
+            a = b;
+            memset( &ios_pgw_w, 0, sizeof(ios_pgw_w) );
+            next_emit = now + (uint64_t)ios_pgw_window_ms * 1000000ull;
+        }
+    }
+    return arg;
+}
+
+/* Starts the [pgw] thread once; virtual_mutex held (the commit paths call it). */
+static void ios_pgw_start( void )
+{
+    static int started;
+    pthread_t t;
+    if (started) return;
+    started = 1;
+    ios_pgw_config();
+    dprintf( 2, "[pgw] madeira-bcd pgw %s: sample %u ms, window %u ms, prefetch %u KB%s | zero-inplace %s (max %zu KB, hot %llu ms) "
+                "-- env.MADEIRA_PGW=0, env.MADEIRA_SWAP_ZERO_INPLACE=0 turn them off\n",
+             ios_pgw_on ? "on" : "off", ios_pgw_sample_ms, ios_pgw_window_ms, ios_pgw_pf_kb, ios_pgw_pf_kb ? "" : " (off)",
+             ios_swap_zip ? "on" : "off", ios_swap_zip_max >> 10, (unsigned long long)(ios_swap_zip_hot_ns / 1000000ull) );
+    if (!ios_pgw_on) return;
+    if (!pthread_create( &t, NULL, ios_pgw_thread, NULL )) pthread_detach( t );
+    else dprintf( 2, "[pgw] thread not started (errno %d)\n", errno );
+}
+
 /* madeira-bcd log-volume: env.MADEIRA_DECOMMIT_LOG_ALL = 1 keeps every swap-zero [decommit-zero] line */
 static int ios_decommit_log_all(void)
 {
@@ -23550,7 +24271,13 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
         }
         else if (host_start < host_end)
         {
-            if (ios_swap_punch_resv( host_start, host_end - host_start ))   /* ml1257 */
+            if (ios_swap_zero_inplace( host_start, host_end - host_start ))   /* madeira-bcd zero-inplace */
+            {
+                dc_branch = "swap-inplace";   /* hot range zeroed where it is; read back below */
+                dc_verify = host_start;
+                dc_vsize  = host_end - host_start;
+            }
+            else if (ios_swap_punch_resv( host_start, host_end - host_start ))   /* ml1257 */
                 dc_branch = "swap-zero";   /* rotated backing or fallback hole; no file touches (ml1081) */
             else
             {
@@ -29411,6 +30138,8 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         {
             unsigned int sv = 0;
             ios_swap_init();
+            ios_pgw_start();                 /* madeira-bcd pgw: the [pgw] thread, once */
+            ios_swap_cyc_recommit( base );   /* madeira-bcd zero-inplace: a decommitted base committed again */
             if (any_committed) ios_swap_note( IOS_SW_RECOMMIT, size );   /* census only; never backed */
             else if (!get_vprot_flags( protect, &sv, 0 )) ios_swap_commit( base, size, sv, view );
         }

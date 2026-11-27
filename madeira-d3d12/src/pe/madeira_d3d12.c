@@ -513,6 +513,7 @@ static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV"
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
+static volatile LONG64 g_upload_anon_bytes; static volatile LONG g_upload_anon_n;   /* madeira-bcd upload-anon-mb */
 /* madeira-bcd metal-gap: what the ml1150 line's Metal total is made of, beyond
  * the ml1057 estimate. Red Dead Redemption 2 (build 467, 13:09) grew Metal's
  * currentAllocatedSize from 2366 to 2931 MB in its last minute while the
@@ -1203,6 +1204,7 @@ static void mad_acct_report(void) {
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    if (g_upload_anon_n) d3d12_log("[madeira-d3d12] madeira-bcd upload-anon-mb: %ld CPU-visible buffers, %lld MB, on Metal-owned storage by the budget\n", g_upload_anon_n, (long long)(g_upload_anon_bytes >> 20));
     if (g_hp_dev) d3d12_log("[madeira-d3d12] ml1072 texture heaps: %u (%lld MB reserved, %lld MB live in them), %ld textures placed, %ld fallbacks, %u blocks awaiting GPU\n",
                             g_hp_dev->ntheaps, (long long)(g_hp_dev->hp_total_bytes >> 20), (long long)(g_hp_dev->hp_live_bytes >> 20),
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
@@ -1264,6 +1266,7 @@ struct mad_resource {
     UINT64 placed_off, placed_size;    /* madeira-bcd: where in that heap, and how much Metal took */
     unsigned serial;                   /* madeira-bcd: creation number, names a resource in capture / alias logs */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
+    UINT64 anon_budget;                /* madeira-bcd upload-anon-mb: bytes this buffer holds of that budget */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
@@ -3551,6 +3554,33 @@ static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (defa
     if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
                   d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
     return on;
+}
+/* madeira-bcd upload-anon-mb = N (default 0 = off, every such buffer as upload-swap
+ * says): the first N MB of UPLOAD/CUSTOM buffers that upload-swap would put on the
+ * file tier stay on Metal-owned storage instead, so the pages the CPU fills for the
+ * GPU every frame are never written back to the swap file and paged in again. They
+ * are charged to phys_footprint (jetsam's number) in full: N is a fixed budget,
+ * READBACK buffers are never taken, and a buffer that does not fit stays on the
+ * file. RDR2 (log 1127-0105-wave1) kept 278 MB there in play (128 + 16 + 15 + 15 MB
+ * UPLOAD and an 83 MB CUSTOM buffer) at ~5.9 GB of an 8191 MB limit. */
+static UINT64 mad_upload_anon_budget(void) {
+    static LONG64 mb = -1;
+    if (mb < 0) { long long v = mad_cfg_int_pe("upload-anon-mb", 0); mb = v < 0 ? 0 : v > 2048 ? 2048 : v;
+                  if (mb) d3d12_log("[madeira-d3d12] madeira-bcd upload-anon-mb = %lld: the first %lld MB of UPLOAD/CUSTOM buffers >= 8 MB stay on Metal-owned storage (charged to the footprint), the rest on the file tier\n", (long long)mb, (long long)mb); }
+    return (UINT64)mb << 20;
+}
+/* 1 = this buffer takes `len` of the budget (Metal-owned); 0 = as before */
+static int mad_upload_anon_take(D3D12_HEAP_TYPE heap_type, UINT64 len) {
+    UINT64 budget = mad_upload_anon_budget();
+    LONG64 cur, want;
+    if (!budget || heap_type == D3D12_HEAP_TYPE_READBACK || heap_type == D3D12_HEAP_TYPE_DEFAULT) return 0;
+    do {
+        cur = g_upload_anon_bytes;
+        want = cur + (LONG64)len;
+        if ((UINT64)want > budget) return 0;
+    } while (InterlockedCompareExchange64(&g_upload_anon_bytes, want, cur) != cur);
+    InterlockedIncrement(&g_upload_anon_n);
+    return 1;
 }
 /* madeira-bcd readback-swap = 0 (opt-in): READBACK buffers stay on Metal-owned
  * storage while upload-swap keeps UPLOAD buffers on the file tier. The GPU
@@ -14475,6 +14505,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
         if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
         if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }   /* ml1145 */
+        if (r->anon_budget) { InterlockedExchangeAdd64(&g_upload_anon_bytes, -(LONG64)r->anon_budget); InterlockedDecrement(&g_upload_anon_n); }   /* madeira-bcd upload-anon-mb */
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
             InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
@@ -14871,7 +14902,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * peak is what kills the Lumen runs. Metal-allocated shared storage is
          * charged in full. madeira.cfg upload-swap = 0 turns it off. */
         if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&
-            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {   /* madeira-bcd readback-swap */
+            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on()) &&   /* madeira-bcd readback-swap */
+            !(mad_upload_anon_take(heap_type, info.length) && (r->anon_budget = info.length))) {   /* madeira-bcd upload-anon-mb */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (mem) {
@@ -14882,7 +14914,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                 else { VirtualFree(mem, 0, MEM_RELEASE); info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; }
                 {
                     static unsigned said;
-                    if (said++ < 8)
+                    if (said++ < 32)   /* madeira-bcd pgw: every address, to match [pgw] sites against */
                         d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffer %llu MB (heap type %u) on our storage %p: %s; %ld so far, %lld MB\n",
                                   (unsigned long long)(want >> 20), (unsigned)heap_type, mem, r->buffer ? "Metal accepted it" : "Metal REFUSED it, Metal-owned instead",
                                   g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
@@ -14890,7 +14922,10 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             }
         }
         if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
-        if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
+        if (!r->buffer) {
+            if (r->anon_budget) { InterlockedExchangeAdd64(&g_upload_anon_bytes, -(LONG64)r->anon_budget); InterlockedDecrement(&g_upload_anon_n); }   /* madeira-bcd upload-anon-mb */
+            free(r); return mad_creation_failure(d, "newBuffer");
+        }
         if (!r->placed_heap) {
             mad_acct(r, heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED, info.length, +1);   /* ml1057 */
             mad_resident(d, r->buffer);
